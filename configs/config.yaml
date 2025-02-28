@@ -1,0 +1,13 @@
+# configs/config.yaml
+defaults:
+  - _self_
+  - model: vqvae
+  - data: imagenette2
+  - trainer: default
+  - wandb: default
+
+seed: 42
+output_dir: outputs
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d_%H-%M-%S}

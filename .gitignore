@@ -172,3 +172,12 @@ cython_debug/
 
 # misc
 .idea/
+
+# .gitignore
+outputs/
+wandb/
+__pycache__/
+*.pyc
+.env
+.venv/
+lightning_logs/

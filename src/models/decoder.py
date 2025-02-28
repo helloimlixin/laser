@@ -1,6 +1,5 @@
-import torch
 import torch.nn as nn
-from models.utils import ResidualBlock
+from src.models.utils import ResidualBlock
 
 class Decoder(nn.Module):
     def __init__(self, out_channels, hidden_dims, n_residual_blocks=2):

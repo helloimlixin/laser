@@ -1,0 +1,6 @@
+# Data configuration
+dataset: cifar10
+data_dir: ${hydra:runtime.cwd}/data
+batch_size: 64
+num_workers: 4
+image_size: 32 
