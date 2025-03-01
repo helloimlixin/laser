@@ -5,6 +5,7 @@ num_embeddings: 512
 embedding_dim: 64
 n_residual_blocks: 2
 commitment_cost: 0.25
+decay: 0.99
 learning_rate: 1e-3
 beta: 1.0
 log_images_every_n_steps: 100

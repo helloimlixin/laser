@@ -54,6 +54,7 @@ def main(config: DictConfig):
         embedding_dim=config.model.embedding_dim,
         n_residual_blocks=config.model.n_residual_blocks,
         commitment_cost=config.model.commitment_cost,
+        decay=config.model.decay,
         learning_rate=config.model.learning_rate,
         beta=config.model.beta
     )
