@@ -1,9 +1,10 @@
 # requirements.txt
-torch>=2.0.0
 torchvision
 lightning
 hydra-core
 wandb
 omegaconf
-rich
-pillow
+tqdm
+torchmetrics
+numpy
+matplotlib

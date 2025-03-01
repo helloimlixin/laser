@@ -1,7 +1,7 @@
 # configs/data/imagenette2.yaml
 dataset: imagenette2
 data_dir: ${hydra:runtime.cwd}/data/imagenette2
-batch_size: 64
+batch_size: 32
 num_workers: 4
 image_size: 224
 mean: [0.5, 0.5, 0.5]

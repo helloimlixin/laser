@@ -55,6 +55,7 @@ def main(config: DictConfig):
         n_residual_blocks=config.model.n_residual_blocks,
         commitment_cost=config.model.commitment_cost,
         decay=config.model.decay,
+        perceptual_weight=config.model.perceptual_weight,
         learning_rate=config.model.learning_rate,
         beta=config.model.beta
     )
@@ -76,16 +77,15 @@ def main(config: DictConfig):
         ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename='{epoch}-{val_loss:.2f}',
-            monitor="val_loss",
+            monitor="val/loss",
             mode="min",
             save_last=True,
             save_top_k=3,
         ),
         EarlyStopping(
-            monitor="val_loss",
+            monitor="val/loss",
             patience=config.trainer.early_stopping_patience,
-            mode="min",
-            verbose=True
+            mode="min"
         ),
         LearningRateMonitor(logging_interval='epoch'),
         progress_bar

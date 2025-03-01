@@ -117,7 +117,7 @@ class Imagenette2DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=True
+            pin_memory=False
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -130,5 +130,5 @@ class Imagenette2DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
-            pin_memory=True
+            pin_memory=False
         )
