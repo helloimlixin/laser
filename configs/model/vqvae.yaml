@@ -6,7 +6,7 @@ embedding_dim: 64
 n_residual_blocks: 2
 commitment_cost: 0.25
 decay: 0.99
-perceptual_weight: 0.05
+perceptual_weight: 0.
 learning_rate: 1e-4
 beta: 0.9
 log_images_every_n_steps: 100

@@ -1,5 +1,5 @@
 # configs/trainer/default.yaml
-max_epochs: 10
+max_epochs: 100
 accelerator: auto
 devices: 1
 log_every_n_steps: 50
