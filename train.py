@@ -9,6 +9,7 @@ import torch
 
 from src.data.imagenette2 import Imagenette2DataModule
 from src.models.vqvae import VQVAE
+from src.models.dlvae import DLVAE
 
 from datetime import datetime
 import os
@@ -46,20 +47,30 @@ def main(config: DictConfig):
     # Initialize data module
     data_module = Imagenette2DataModule(config.data)
 
-    # Initialize model
-    model = VQVAE(
-        in_channels=config.model.in_channels,
-        num_hiddens=config.model.num_hiddens,  # Use first hidden dim as num_hiddens
-        num_embeddings=config.model.num_embeddings,
-        embedding_dim=config.model.embedding_dim,
-        num_residual_blocks=config.model.num_residual_blocks,
-        num_residual_hiddens=config.model.num_residual_hiddens,  # Usually 1/4 of num_hiddens
-        commitment_cost=config.model.commitment_cost,
-        decay=config.model.decay,
-        perceptual_weight=config.model.perceptual_weight,
-        learning_rate=config.model.learning_rate,
-        beta=config.model.beta
-    )
+    # Common model parameters
+    model_params = {
+        'in_channels': config.model.in_channels,
+        'num_hiddens': config.model.num_hiddens,
+        'embedding_dim': config.model.embedding_dim,
+        'num_residual_blocks': config.model.num_residual_blocks,
+        'num_residual_hiddens': config.model.num_residual_hiddens,
+        'commitment_cost': config.model.commitment_cost,
+        'decay': config.model.decay,
+        'perceptual_weight': config.model.perceptual_weight,
+        'learning_rate': config.model.learning_rate,
+        'beta': config.model.beta
+    }
+
+    # Initialize model based on type
+    if config.model.type == "vqvae":
+        model_params['num_embeddings'] = config.model.num_embeddings
+        model = VQVAE(**model_params)
+    elif config.model.type == "dlvae":
+        model_params['dict_size'] = config.model.dict_size
+        model_params['sparsity'] = config.model.sparsity
+        model = DLVAE(**model_params)
+    else:
+        raise ValueError(f"Unknown model type: {config.model.type}")
 
     # Convert config to plain dictionary for wandb
     wandb_config = OmegaConf.to_container(config, resolve=True)

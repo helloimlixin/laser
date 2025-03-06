@@ -108,6 +108,11 @@ class VQVAE(pl.LightningModule):
         else:
             self.test_fid = None
 
+        # Initialize PSNR metrics
+        self.train_psnr = PeakSignalNoiseRatio()
+        self.val_psnr = PeakSignalNoiseRatio()
+        self.test_psnr = PeakSignalNoiseRatio()
+
         # Save hyperparameters for logging
         self.save_hyperparameters()
 
@@ -230,6 +235,14 @@ class VQVAE(pl.LightningModule):
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
         self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True)
 
+        # Add PSNR calculation
+        if hasattr(self, f'{prefix}_psnr'):
+            # Ensure images are in range [0, 1]
+            x_psnr = torch.clamp(x, 0, 1)
+            recon_psnr = torch.clamp(recon, 0, 1)
+            psnr_value = getattr(self, f'{prefix}_psnr')(recon_psnr, x_psnr)
+            self.log(f'{prefix}/psnr', psnr_value, on_step=True, on_epoch=True)
+
         return {
             'loss': total_loss,
             'recon_loss': recon_loss,
@@ -274,43 +287,49 @@ class VQVAE(pl.LightningModule):
         # Compute and log the epoch-averaged metrics
         perplexity = self.train_perplexity.compute()
         vq_loss = self.train_vq_loss.compute()
-
-        # Log metrics
-        self.log('train/epoch_perplexity', perplexity)
-        self.log('train/epoch_vq_loss', vq_loss)
-
-        # Reset metrics
+        
+        # Add PSNR
+        psnr = self.train_psnr.compute()
+        self.log('train/epoch_psnr', psnr)
+        
+        # Reset all metrics
         self.train_perplexity.reset()
         self.train_vq_loss.reset()
+        self.train_psnr.reset()
 
     def on_validation_epoch_end(self):
         """Log epoch-level metrics for validation."""
         # Log the epoch-averaged metrics
         perplexity = self.val_perplexity.compute()
         vq_loss = self.val_vq_loss.compute()
-
-        # Log metrics
-        self.log('val/epoch_perplexity', perplexity)
-        self.log('val/epoch_vq_loss', vq_loss)
-
-        # Reset metrics
+        
+        # Add PSNR
+        psnr = self.val_psnr.compute()
+        self.log('val/epoch_psnr', psnr)
+        
+        # Reset all metrics
         self.val_perplexity.reset()
         self.val_vq_loss.reset()
+        self.val_psnr.reset()
 
     def on_test_epoch_end(self):
         """Log epoch-level metrics for testing."""
         # Log final test metrics
         test_loss = self.test_metrics.compute()
         self.log('test/epoch_loss', test_loss)
-
-        # Log FID if available
+        
+        # Add PSNR
+        psnr = self.test_psnr.compute()
+        self.log('test/epoch_psnr', psnr)
+        
+        # Reset metrics
+        self.test_metrics.reset()
+        self.test_psnr.reset()
+        
+        # Existing FID handling
         if self.test_fid is not None:
             fid_score = self.test_fid.compute()
             self.log('test/fid', fid_score)
-
-        # Reset metrics
-        self.test_metrics.reset()
-        if self.test_fid is not None:
             self.test_fid.reset()
 
     def configure_optimizers(self):
