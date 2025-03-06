@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 import numpy as np
 import matplotlib.pyplot as plt
+import math
 
 class VectorQuantizer(nn.Module):
     """
@@ -61,6 +62,14 @@ class VectorQuantizer(nn.Module):
             self.register_buffer('ema_updating', torch.ones(1))
         else:
             print('Using standard backpropagation for codebook... (no EMA)')
+
+        # Enable TF32 math for faster operations on modern GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Pre-allocate buffers for OMP
+        self.register_buffer('_corr_buffer', torch.Tensor())
+        self.register_buffer('_residual_buffer', torch.Tensor())
 
     def forward(self, z):
         """
@@ -182,291 +191,335 @@ class VectorQuantizer(nn.Module):
         
         return z_q
 
-
-def setup_test_environment(seed=42):
+class DictionaryLearningBottleneck(nn.Module):
     """
-    Set up test data and model instances.
-    
-    Args:
-        seed: Random seed for reproducibility
-        
-    Returns:
-        tuple: (test input tensor, VQ model with EMA, VQ model without EMA, test parameters)
+    Dictionary Learning Bottleneck with vectorized Batch Orthogonal Matching Pursuit (OMP) sparse coding.
     """
-    # Set random seed for reproducibility
-    torch.manual_seed(seed)
-    
-    # Test parameters
-    params = {
-        'batch_size': 4,
-        'embedding_dim': 64,
-        'num_embeddings': 512,
-        'height': 16,
-        'width': 16
-    }
-    
-    # Create a vector quantizer instance (with EMA updates)
-    vq_with_ema = VectorQuantizer(
-        num_embeddings=params['num_embeddings'],
-        embedding_dim=params['embedding_dim'],
+    def __init__(
+        self,
+        dict_size=512,
+        embedding_dim=64,
+        sparsity=5,
         commitment_cost=0.25,
-        decay=0.99  # Using EMA updates
-    )
-    
-    # Create another vector quantizer instance (without EMA updates)
-    vq_without_ema = VectorQuantizer(
-        num_embeddings=params['num_embeddings'],
-        embedding_dim=params['embedding_dim'],
-        commitment_cost=0.25,
-        decay=0.0  # No EMA updates
-    )
-    
-    # Generate random encoder output
-    z = torch.randn(
-        params['batch_size'], 
-        params['embedding_dim'], 
-        params['height'], 
-        params['width']
-    )
-    
-    return z, vq_with_ema, vq_without_ema, params
-
-def test_forward_pass(model, input_tensor, name=""):
-    """
-    Test the forward pass of a VectorQuantizer model.
-    
-    Args:
-        model: VectorQuantizer model instance
-        input_tensor: Input tensor for the model
-        name: Name identifier for the model (for printing)
+        decay=0.99,
+        epsilon=1e-6,
+        use_ema=True,
+    ):
+        super().__init__()
         
-    Returns:
-        tuple: (quantized output, loss, indices)
-    """
-    print(f"\n--- Testing VectorQuantizer {name} ---")
-    model.train()  # Set to training mode
-    z_q, loss, indices = model(input_tensor)
+        self.dict_size = dict_size
+        self.embedding_dim = embedding_dim
+        self.sparsity = sparsity
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
+        self.use_ema = use_ema
+        
+        # Initialize buffers for OMP
+        self.register_buffer('_corr_buffer', torch.Tensor())
+        self.register_buffer('_residual_buffer', torch.Tensor())
+        self.register_buffer('_coefficients_buffer', torch.Tensor())
+        self.register_buffer('_active_set_buffer', torch.Tensor())
+        self.register_buffer('_L_buffer', torch.Tensor())  # For Cholesky
+        
+        # Initialize dictionary with random atoms
+        self.dictionary = nn.Parameter(
+            torch.randn(embedding_dim, dict_size), requires_grad=True
+        )
+        self._normalize_dictionary()
+
+    def _normalize_dictionary(self):
+        """Normalize all dictionary atoms to have unit L2 norm."""
+        with torch.no_grad():
+            norms = torch.norm(self.dictionary, p=2, dim=0, keepdim=True)
+            self.dictionary.data = self.dictionary.data / (norms + self.epsilon)
+
+    def batch_omp(self, signals, dictionary, debug=False):
+        device = signals.device
+        # Correct batch size calculation for flattened spatial dimensions
+        total_batch_size = signals.size(1)  # This includes all spatial positions
+        
+        # Normalize input signals
+        signals_norm = torch.norm(signals, dim=0, keepdim=True)  # [1, total_batch_size]
+        signals = signals / (signals_norm + self.epsilon)
+        
+        # Precompute once per forward pass
+        Dt = dictionary.t()
+        DtD = torch.matmul(Dt, dictionary)
+        
+        # Buffer initialization
+        with torch.no_grad():
+            self._corr_buffer = torch.matmul(Dt, signals)
+            self._residual_buffer.resize_(signals.shape).copy_(signals)
+            self._coefficients_buffer.resize_(total_batch_size, self.dict_size).zero_()
+            self._active_set_buffer.resize_(total_batch_size, self.dict_size).zero_()
+        
+        residual = self._residual_buffer
+        active_set = self._active_set_buffer.bool()
+        coefficients = self._coefficients_buffer
+        
+        # Add regularization to DtD diagonal for better conditioning
+        DtD = DtD + torch.eye(self.dict_size, device=device) * self.epsilon
+        
+        # Preallocate Cholesky buffers
+        L = torch.zeros(total_batch_size, self.sparsity, self.sparsity, device=device)
+        
+        for k in range(self.sparsity):
+            # Correlation phase with proper masking
+            correlations = torch.abs(torch.matmul(Dt, residual))
+            correlations[active_set.t()] = -float('inf')
+            
+            # Atom selection with proper masking
+            new_atoms = torch.argmax(correlations, dim=0)
+            active_set[torch.arange(total_batch_size, device=device), new_atoms] = True
+            
+            # Get active indices
+            active_indices = active_set.nonzero()[:,1].view(total_batch_size, k+1)
+            
+            # Stable Cholesky update
+            try:
+                selected_DtD = DtD[active_indices.unsqueeze(-1), active_indices.unsqueeze(-2)]
+                selected_DtD = selected_DtD + torch.eye(k+1, device=device)[None, :, :] * self.epsilon
+                
+                # Compute Cholesky decomposition
+                L[:,:k+1,:k+1] = torch.linalg.cholesky(selected_DtD)
+                
+                # Solve least squares problem
+                y = torch.bmm(Dt[active_indices], residual.t().unsqueeze(-1)).squeeze(-1)
+                coeffs = torch.cholesky_solve(y.unsqueeze(-1), L[:,:k+1,:k+1]).squeeze(-1)
+                
+                # Update residual with numerically stable operation
+                update = torch.bmm(
+                    dictionary[:,active_indices].permute(1,0,2),
+                    coeffs.unsqueeze(-1)
+                ).squeeze(-1).transpose(0,1)
+                residual = signals - update
+                
+                # Store coefficients
+                coefficients.scatter_(1, active_indices, coeffs)
+                
+            except RuntimeError as e:
+                print(f"Cholesky decomposition failed at iteration {k}: {e}")
+                break
+        
+        # Denormalize coefficients with proper broadcasting
+        coefficients = coefficients * signals_norm.t()  # [total_batch_size, dict_size]
+        
+        return coefficients.t()  # Return [dict_size, total_batch_size]
     
+    def forward(self, z):
+        """
+        Forward pass through the dictionary learning bottleneck.
+        
+        Args:
+            z: Input tensor of shape [batch_size, embedding_dim, height, width]
+            
+        Returns:
+            z_q: Quantized tensor of shape [batch_size, embedding_dim, height, width]
+            loss: Commitment loss
+            coefficients: Sparse coefficients
+        """
+        # Save input shape
+        input_shape = z.shape
+        batch_size, embedding_dim, height, width = input_shape
+        
+        # Reshape for sparse coding with proper normalization
+        z_flat = z.permute(0, 2, 3, 1).reshape(-1, embedding_dim).t()
+        
+        # Dictionary updates during training
+        if self.training:
+            with torch.no_grad():
+                self._normalize_dictionary()
+        
+        # Sparse coding with OMP
+        with torch.no_grad():
+            coefficients = self.batch_omp(z_flat, self.dictionary, debug=False)
+            # Clip extreme values
+            coefficients = torch.clamp(coefficients, -1e6, 1e6)
+        
+        # Allow gradients through reconstruction
+        coefficients = coefficients.clone().detach().requires_grad_(True)
+        
+        # Reconstruct with stable computation
+        z_q_flat = torch.matmul(self.dictionary, coefficients)
+        
+        # Reshape back with proper normalization
+        z_q_reshaped = z_q_flat.t().view(batch_size, height, width, embedding_dim).permute(0, 3, 1, 2)
+        
+        # Compute losses with gradient clipping
+        z_flat_orig = z.permute(0, 2, 3, 1).reshape(-1, embedding_dim).t()
+        rec_loss = F.mse_loss(z_q_flat.detach(), z_flat_orig)
+        commit_loss = F.mse_loss(z_q_flat, z_flat_orig.detach())
+        
+        # Scale losses to prevent explosion
+        loss = rec_loss + self.commitment_cost * torch.clamp(commit_loss, -100, 100)
+        
+        # Straight-through estimator with gradient clipping
+        z_q = z + torch.clamp(z_q_reshaped - z, -1, 1).detach()
+        
+        return z_q, loss, coefficients
+
+
+def test_vector_quantizer():
+    print("Testing VectorQuantizer...")
+    
+    # Parameters
+    batch_size = 2
+    embedding_dim = 64
+    height, width = 8, 8
+    num_embeddings = 512
+    
+    # Create random test input
+    z = torch.randn(batch_size, embedding_dim, height, width)
+    
+    # Initialize VQ model
+    vq = VectorQuantizer(
+        num_embeddings=num_embeddings,
+        embedding_dim=embedding_dim,
+        commitment_cost=0.25,
+        decay=0.99
+    )
+    
+    # Test forward pass
+    z_q, loss, indices = vq(z)
+    
+    # Print shapes and stats
+    print(f"Input shape: {z.shape}")
     print(f"Quantized output shape: {z_q.shape}")
-    print(f"VQ Loss: {loss.item():.6f}")
+    print(f"Loss: {loss.item():.4f}")
     print(f"Indices shape: {indices.shape}")
     
-    return z_q, loss, indices
-
-def analyze_codebook_usage(indices, num_embeddings):
-    """
-    Analyze how the codebook is being used.
+    # Test codebook lookup
+    random_indices = torch.randint(0, num_embeddings, (10,))
+    codebook_vectors = vq.get_codebook_entry(random_indices)
+    print(f"Retrieved codebook vectors shape: {codebook_vectors.shape}")
     
-    Args:
-        indices: Indices tensor from VectorQuantizer
-        num_embeddings: Total number of embeddings in the codebook
-        
-    Returns:
-        tuple: (perplexity, number of codebook entries used)
-    """
-    # Convert indices to one-hot encodings
-    encodings = torch.zeros(indices.shape[0], num_embeddings)
-    encodings.scatter_(1, indices.unsqueeze(1), 1)
+    # Visualize codebook usage after forward pass
+    usage_count = torch.bincount(indices, minlength=num_embeddings)
     
-    # Calculate average probability for each codebook entry
-    avg_probs = torch.mean(encodings, dim=0)
-    
-    # Calculate perplexity (effective codebook usage)
-    perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-    
-    # Count how many codebook entries are used
-    codebook_usage = torch.sum(avg_probs > 0)
-    
-    print(f"Perplexity: {perplexity.item():.2f} (effective codebook usage)")
-    print(f"Codebook entries used: {codebook_usage.item()} out of {num_embeddings}")
-    
-    return perplexity, codebook_usage
-
-def test_codebook_retrieval(model, indices, z_q, embedding_dim):
-    """
-    Test the get_codebook_entry method of VectorQuantizer.
-    
-    Args:
-        model: VectorQuantizer model instance
-        indices: Indices tensor from forward pass
-        z_q: Quantized output from forward pass
-        embedding_dim: Dimension of embedding vectors
-        
-    Returns:
-        float: Reconstruction error
-    """
-    print("\n--- Testing get_codebook_entry ---")
-    # Get a subset of indices
-    test_indices = indices[:10]
-    retrieved_embeddings = model.get_codebook_entry(test_indices)
-    print(f"Retrieved embeddings shape: {retrieved_embeddings.shape}")
-    
-    # Verify reconstruction error is minimal
-    original_flat = z_q.permute(0, 2, 3, 1).contiguous().view(-1, embedding_dim)
-    original_subset = original_flat[:10]
-    reconstruction_error = F.mse_loss(retrieved_embeddings, original_subset)
-    print(f"Reconstruction error: {reconstruction_error.item():.10f} (should be close to zero)")
-    
-    return reconstruction_error.item()
-
-def visualize_codebook_usage(indices, model_name=""):
-    """
-    Visualize the distribution of codebook indices used.
-    
-    Args:
-        indices: Indices tensor from VectorQuantizer
-        model_name: Name identifier for the model (for output filename)
-        
-    Returns:
-        str: Path to saved visualization
-    """
-    print(f"\n--- Visualizing Codebook Usage {model_name} ---")
-    used_indices = indices.cpu().numpy()
-    
-    plt.figure(figsize=(10, 5))
-    plt.hist(used_indices, bins=50, alpha=0.7)
-    plt.title(f"Codebook Usage Distribution {model_name}")
+    plt.figure(figsize=(10, 4))
+    plt.bar(range(num_embeddings), usage_count.cpu().numpy())
+    plt.title("VQ Codebook Usage")
     plt.xlabel("Codebook Index")
-    plt.ylabel("Frequency")
+    plt.ylabel("Usage Count")
+    plt.savefig("vq_codebook_usage.png")
+    print("Saved codebook usage visualization to vq_codebook_usage.png")
     
-    filename = f"codebook_usage_{model_name.replace(' ', '_')}.png"
-    plt.savefig(filename)
-    plt.close()
-    
-    print(f"Saved codebook usage visualization to '{filename}'")
-    return filename
+    return vq, z, z_q, loss, indices
 
-def test_inference_mode(model, input_tensor, model_name=""):
-    """
-    Test the model in evaluation/inference mode.
+def test_dictionary_learning_bottleneck():
+    print("\nTesting OnlineDictionaryLearningBottleneck...")
     
-    Args:
-        model: VectorQuantizer model instance
-        input_tensor: Input tensor for the model
-        model_name: Name identifier for the model (for printing)
-        
-    Returns:
-        tuple: (quantized output, loss, indices)
-    """
-    print(f"\n--- Testing inference mode {model_name} ---")
-    model.eval()  # Set to evaluation mode
-    z_q, loss, indices = model(input_tensor)
+    # Parameters
+    batch_size = 2
+    embedding_dim = 64
+    height, width = 8, 8
+    dict_size = 512
+    sparsity = 5
     
-    print(f"Inference mode - Quantized output shape: {z_q.shape}")
-    print(f"Inference mode - VQ Loss: {loss.item():.6f}")
+    # Create random test input
+    z = torch.randn(batch_size, embedding_dim, height, width)
     
-    return z_q, loss, indices
-
-def run_all_tests(
-    test_ema=True,                # Test model with EMA updates
-    test_no_ema=True,             # Test model without EMA updates
-    test_codebook_usage=True,     # Analyze codebook usage statistics
-    test_retrieval=True,          # Test codebook entry retrieval
-    test_visualization=True,      # Generate visualizations
-    test_inference=True,          # Test models in inference mode
-    seed=42                       # Random seed for reproducibility
-):
-    """
-    Run tests for the VectorQuantizer with control over which tests to execute.
+    # Initialize ODL model
+    odl = DictionaryLearningBottleneck(
+        dict_size=dict_size,
+        embedding_dim=embedding_dim,
+        sparsity=sparsity,
+        commitment_cost=0.25,
+        decay=0.99,
+        use_ema=True
+    )
     
-    Args:
-        test_ema: Whether to test the model with EMA updates
-        test_no_ema: Whether to test the model without EMA updates
-        test_codebook_usage: Whether to analyze codebook usage
-        test_retrieval: Whether to test codebook entry retrieval
-        test_visualization: Whether to generate visualizations
-        test_inference: Whether to test inference mode
-        seed: Random seed for reproducibility
-        
-    Returns:
-        dict: Results from the tests that were run
-    """
-    # Setup
-    print("Setting up test environment...")
-    z, vq_with_ema, vq_without_ema, params = setup_test_environment(seed)
+    # Test forward pass
+    z_q, loss, coefficients = odl(z)
+    
+    # Print shapes and stats
     print(f"Input shape: {z.shape}")
+    print(f"Quantized output shape: {z_q.shape}")
+    print(f"Loss: {loss.item():.4f}")
+    print(f"Coefficients shape: {coefficients.shape}")
     
-    # Dictionary to store test results
-    results = {}
+    # Check sparsity of coefficients
+    nonzero_ratio = (coefficients.abs() > 1e-6).float().mean().item()
+    print(f"Nonzero coefficient ratio: {nonzero_ratio:.4f}")
+    print(f"Expected sparsity ratio: {sparsity/dict_size:.4f}")
     
-    # Test model with EMA updates
-    if test_ema:
-        z_q_ema, loss_ema, indices_ema = test_forward_pass(
-            vq_with_ema, z, name="with EMA updates"
-        )
-        results['ema'] = {'z_q': z_q_ema, 'loss': loss_ema, 'indices': indices_ema}
-        
-        # Analyze codebook usage for EMA model
-        if test_codebook_usage:
-            perplexity, usage = analyze_codebook_usage(indices_ema, params['num_embeddings'])
-            results['ema']['perplexity'] = perplexity
-            results['ema']['codebook_usage'] = usage
-        
-        # Test codebook retrieval for EMA model
-        if test_retrieval:
-            error = test_codebook_retrieval(
-                vq_with_ema, indices_ema, z_q_ema, params['embedding_dim']
-            )
-            results['ema']['retrieval_error'] = error
-        
-        # Test inference mode for EMA model
-        if test_inference:
-            z_q_eval, loss_eval, indices_eval = test_inference_mode(
-                vq_with_ema, z, model_name="with EMA"
-            )
-            results['ema']['inference'] = {
-                'z_q': z_q_eval,
-                'loss': loss_eval,
-                'indices': indices_eval
-            }
+    # Visualize dictionary atom usage
+    atom_usage = (coefficients.abs() > 1e-6).float().sum(dim=1).cpu().numpy()
     
-    # Test model without EMA updates
-    if test_no_ema:
-        z_q_no_ema, loss_no_ema, indices_no_ema = test_forward_pass(
-            vq_without_ema, z, name="without EMA updates"
-        )
-        results['no_ema'] = {'z_q': z_q_no_ema, 'loss': loss_no_ema, 'indices': indices_no_ema}
-        
-        # Analyze codebook usage for non-EMA model
-        if test_codebook_usage:
-            perplexity, usage = analyze_codebook_usage(indices_no_ema, params['num_embeddings'])
-            results['no_ema']['perplexity'] = perplexity
-            results['no_ema']['codebook_usage'] = usage
-        
-        # Test codebook retrieval for non-EMA model
-        if test_retrieval:
-            error = test_codebook_retrieval(
-                vq_without_ema, indices_no_ema, z_q_no_ema, params['embedding_dim']
-            )
-            results['no_ema']['retrieval_error'] = error
-        
-        # Test inference mode for non-EMA model
-        if test_inference:
-            z_q_eval, loss_eval, indices_eval = test_inference_mode(
-                vq_without_ema, z, model_name="without EMA"
-            )
-            results['no_ema']['inference'] = {
-                'z_q': z_q_eval,
-                'loss': loss_eval,
-                'indices': indices_eval
-            }
+    plt.figure(figsize=(10, 4))
+    plt.bar(range(dict_size), atom_usage)
+    plt.title("Dictionary Atom Usage")
+    plt.xlabel("Atom Index")
+    plt.ylabel("Usage Count")
+    plt.savefig("dictionary_atom_usage.png")
+    print("Saved dictionary atom usage visualization to dictionary_atom_usage.png")
     
-    # Generate visualizations
-    if test_visualization and test_ema:
-        vis_path = visualize_codebook_usage(
-            results['ema']['indices'], model_name="with EMA"
-        )
-        results['ema']['visualization_path'] = vis_path
+    # Visualize a few dictionary atoms
+    num_atoms_to_show = 10
+    atoms_to_show = np.random.choice(dict_size, num_atoms_to_show, replace=False)
     
-    if test_visualization and test_no_ema:
-        vis_path = visualize_codebook_usage(
-            results['no_ema']['indices'], model_name="without EMA"
-        )
-        results['no_ema']['visualization_path'] = vis_path
+    plt.figure(figsize=(12, 6))
+    for i, atom_idx in enumerate(atoms_to_show):
+        plt.subplot(2, 5, i+1)
+        plt.plot(odl.dictionary[:, atom_idx].detach().cpu().numpy())
+        plt.title(f"Atom {atom_idx}")
+        plt.axis('off')
+    plt.tight_layout()
+    plt.savefig("dictionary_atoms.png")
+    print("Saved dictionary atoms visualization to dictionary_atoms.png")
     
-    print("\nCompleted requested tests successfully!")
-    return results
+    return odl, z, z_q, loss, coefficients
 
-# Add this line at the bottom of the file to run all tests by default when the script is executed
+def compare_reconstructions(vq_data, odl_data):
+    print("\nComparing reconstructions...")
+    
+    # Unpack data
+    _, z_vq, z_q_vq, loss_vq, _ = vq_data
+    _, z_odl, z_q_odl, loss_odl, _ = odl_data
+    
+    # Calculate reconstruction errors
+    vq_mse = torch.mean((z_vq - z_q_vq) ** 2).item()
+    odl_mse = torch.mean((z_odl - z_q_odl) ** 2).item()
+    
+    print(f"VQ-VAE MSE: {vq_mse:.6f}")
+    print(f"ODL MSE: {odl_mse:.6f}")
+    
+    # Visualize sample reconstructions
+    batch_idx = 0
+    channel_idx = 0
+    
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 3, 1)
+    plt.imshow(z_vq[batch_idx, channel_idx].detach().cpu().numpy())
+    plt.title("Original")
+    plt.colorbar()
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(z_q_vq[batch_idx, channel_idx].detach().cpu().numpy())
+    plt.title(f"VQ-VAE (MSE: {vq_mse:.6f})")
+    plt.colorbar()
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(z_q_odl[batch_idx, channel_idx].detach().cpu().numpy())
+    plt.title(f"ODL (MSE: {odl_mse:.6f})")
+    plt.colorbar()
+    
+    plt.tight_layout()
+    plt.savefig("reconstruction_comparison.png")
+    print("Saved reconstruction comparison to reconstruction_comparison.png")
+
 if __name__ == "__main__":
-    run_all_tests()  # Run all tests with default settings
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Run tests
+    vq_data = test_vector_quantizer()
+    odl_data = test_dictionary_learning_bottleneck()
+    
+    # Compare reconstructions
+    compare_reconstructions(vq_data, odl_data)
+    
+    print("\nAll tests completed!")
