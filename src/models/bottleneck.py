@@ -195,6 +195,7 @@ class VectorQuantizer(nn.Module):
         
         return z_q
 
+
 class DictionaryLearningBottleneck(nn.Module):
     """
     Dictionary Learning Bottleneck with vectorized Batch Orthogonal Matching Pursuit (OMP) sparse coding.
@@ -206,7 +207,7 @@ class DictionaryLearningBottleneck(nn.Module):
         sparsity=5,
         commitment_cost=0.25,
         decay=0.99,
-        epsilon=1e-6,
+        epsilon=1e-10,
         use_ema=True,
     ):
         super().__init__()
@@ -236,17 +237,11 @@ class DictionaryLearningBottleneck(nn.Module):
         """Normalize all dictionary atoms to have unit L2 norm."""
         with torch.no_grad():
             norms = torch.norm(self.dictionary, p=2, dim=0, keepdim=True)
-            self.dictionary.data = self.dictionary.data / (norms + self.epsilon)
+            self.dictionary.data = self.dictionary.data / norms
 
     def batch_omp(self, signals, dictionary, debug=False):
         device = signals.device
         batch_size = signals.size(1)
-        
-        # 1. Normalize signals and dictionary
-        signals_norm = torch.norm(signals, dim=0, keepdim=True)
-        signals = signals / (signals_norm + self.epsilon)
-        dictionary_norm = torch.norm(dictionary, dim=0, keepdim=True)
-        dictionary = dictionary / (dictionary_norm + self.epsilon)
         
         # 2. Initialize buffers
         residual = signals.clone()
@@ -293,10 +288,6 @@ class DictionaryLearningBottleneck(nn.Module):
                     print(f"Error at iteration {k}: {e}")
                 break
         
-        # 5. Denormalize coefficients
-        scale_factor = signals_norm.t() / (dictionary_norm + self.epsilon)
-        coefficients = coefficients * scale_factor
-        
         return coefficients.t()
     
     def forward(self, z):
@@ -320,17 +311,14 @@ class DictionaryLearningBottleneck(nn.Module):
         
         # Dictionary updates during training
         if self.training:
-            with torch.no_grad():
-                self._normalize_dictionary()
+            self._normalize_dictionary()
         
         # Sparse coding with OMP
         with torch.no_grad():
             coefficients = self.batch_omp(z_flat, self.dictionary, debug=False)
+
             # Clip extreme values
-            coefficients = torch.clamp(coefficients, -1e6, 1e6)
-        
-        # Allow gradients through reconstruction
-        coefficients = coefficients.clone().detach().requires_grad_(True)
+            coefficients = torch.clamp(coefficients, -1e7, 1e7)
         
         # Reconstruct with stable computation
         z_q_flat = torch.matmul(self.dictionary, coefficients)
@@ -344,20 +332,16 @@ class DictionaryLearningBottleneck(nn.Module):
         commit_loss = F.mse_loss(z_q_flat, z_flat_orig.detach())
         
         # Scale commitment cost with sparsity
-        effective_cost = self.commitment_cost * (1 + self.sparsity/10)
+        effective_cost = self.commitment_cost * (1 + self.sparsity / 10)
         
         # Add L1 regularization to coefficients
         coeff_loss = torch.mean(torch.abs(coefficients))
         
         # Scale losses to prevent explosion
-        loss = rec_loss + effective_cost * torch.clamp(commit_loss, -100, 100) + 0.01*coeff_loss
+        loss = rec_loss + effective_cost * commit_loss + 0.001 * coeff_loss
         
         # Straight-through estimator with gradient clipping
         z_q = z + torch.clamp(z_q_reshaped - z, -1, 1).detach()
-        
-        # Add explicit memory logging
-        # torch.cuda.synchronize()
-        # print(f"Allocated: {torch.cuda.memory_allocated()/1e6:.2f}MB")
 
         return z_q, loss, coefficients
 

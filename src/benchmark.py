@@ -12,7 +12,7 @@ import psutil
 import os
 from sklearn.manifold import TSNE
 
-from bottleneck import VectorQuantizer, DictionaryLearningBottleneck
+from models.bottleneck import VectorQuantizer, DictionaryLearningBottleneck
 
 # Simple VAE architecture for both bottleneck types
 class SimpleVAE(nn.Module):
@@ -295,7 +295,7 @@ def compare_bottlenecks(epochs=5, sparsity_values=[3, 5, 10]):
     test_batch, test_labels = next(iter(test_loader))
     test_batch = test_batch.to(device)
     
-    plt.figure(figsize=(15, 10))
+    plt.figure(figsize=(20, 10))
     
     for i, res in enumerate(results):
         model = res['model']
