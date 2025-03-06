@@ -198,11 +198,11 @@ def benchmark_training(model_type='vq', epochs=5, sparsity=5):
             
             plt.suptitle(f"{model_name} - Epoch {epoch+1}")
             plt.tight_layout()
-            plt.savefig(f"{model_name}_recon_epoch_{epoch+1}.png")
+            plt.savefig(f"visualizations/{model_name}_recon_epoch_{epoch+1}.png")
             plt.close()
     
     # Save model and results
-    torch.save(model.state_dict(), f"{model_name}_model.pt")
+    torch.save(model.state_dict(), f"checkpoints/{model_name}_model.pt")
     
     # Return all metrics for plotting
     return {
@@ -272,7 +272,7 @@ def compare_bottlenecks(epochs=5, sparsity_values=[3, 5, 10]):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig("bottleneck_comparison.png")
+    plt.savefig("visualizations/bottleneck_comparison.png")
     plt.close()
     
     # Plot memory usage
@@ -284,7 +284,7 @@ def compare_bottlenecks(epochs=5, sparsity_values=[3, 5, 10]):
     plt.ylabel('Memory Usage (MB)')
     plt.legend()
     plt.grid(True)
-    plt.savefig("bottleneck_memory_usage.png")
+    plt.savefig("visualizations/bottleneck_memory_usage.png")
     plt.close()
     
     # Visualize latent space structure with test examples
@@ -352,7 +352,7 @@ def compare_bottlenecks(epochs=5, sparsity_values=[3, 5, 10]):
             plt.title(f"{res['name']} - t-SNE of Embeddings")
             
     plt.tight_layout()
-    plt.savefig("bottleneck_latent_space.png")
+    plt.savefig("visualizations/bottleneck_latent_space.png")
     plt.close()
     
     return results
