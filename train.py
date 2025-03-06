@@ -49,10 +49,11 @@ def main(config: DictConfig):
     # Initialize model
     model = VQVAE(
         in_channels=config.model.in_channels,
-        hidden_dims=config.model.hidden_dims,
+        num_hiddens=config.model.num_hiddens,  # Use first hidden dim as num_hiddens
         num_embeddings=config.model.num_embeddings,
         embedding_dim=config.model.embedding_dim,
-        n_residual_blocks=config.model.n_residual_blocks,
+        num_residual_blocks=config.model.num_residual_blocks,
+        num_residual_hiddens=config.model.num_residual_hiddens,  # Usually 1/4 of num_hiddens
         commitment_cost=config.model.commitment_cost,
         decay=config.model.decay,
         perceptual_weight=config.model.perceptual_weight,

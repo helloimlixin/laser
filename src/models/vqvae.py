@@ -4,10 +4,10 @@ import torch.nn.functional as F
 import lightning as pl
 import torchvision
 
-from encoder import Encoder
-from decoder import Decoder
-from bottleneck import VectorQuantizer
-from lpips import LPIPS
+from .encoder import Encoder
+from .decoder import Decoder
+from .bottleneck import VectorQuantizer
+from src.lpips import LPIPS
 
 import torchmetrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -60,19 +60,28 @@ class VQVAE(pl.LightningModule):
                                num_hiddens=num_hiddens,
                                num_residual_blocks=num_residual_blocks,
                                num_residual_hiddens=num_residual_hiddens)
+        
         self.pre_quantization = nn.Conv2d(in_channels=num_hiddens,
                                           out_channels=embedding_dim,
-                                          kernel_size=1)
+                                          kernel_size=1,
+                                          stride=1)
+        
         self.vector_quantizer = VectorQuantizer(
             num_embeddings, embedding_dim, commitment_cost, decay
         )
+
         self.post_quantization = nn.Conv2d(in_channels=embedding_dim,
                                            out_channels=num_hiddens,
                                            kernel_size=3,
                                            stride=1,
-                                           padding=1,
-                                           bias=False)
-        self.decoder = Decoder()
+                                           padding=1)
+        
+        self.decoder = Decoder(
+            in_channels=num_hiddens,  # Input channels for decoder matches hidden dims
+            num_hiddens=num_hiddens,
+            num_residual_blocks=num_residual_blocks,
+            num_residual_hiddens=num_residual_hiddens
+        )
 
         # Initialize custom LPIPS for perceptual loss
         self.lpips = LPIPS()
@@ -173,17 +182,27 @@ class VQVAE(pl.LightningModule):
         Returns:
             dict: Dictionary containing all computed metrics, losses, and reconstructed images
         """
+        # Unpack the batch - ensure we get a single tensor
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        
         # Forward pass
-        x = batch
-        x_recon, vq_loss, perplexity, _, _ = self(x)
+        recon, vq_loss, perplexity = self(x)
 
-        # Compute reconstruction loss
-        recon_loss = F.mse_loss(x_recon, x)
+        # Compute reconstruction loss (ensure it's a scalar)
+        recon_loss = F.mse_loss(recon, x).mean()
 
-        # Compute perceptual loss
+        # Compute perceptual loss (ensure it's a scalar)
         x_norm = x * 2.0 - 1.0
-        x_recon_norm = x_recon * 2.0 - 1.0
-        perceptual_loss = self.lpips(x_recon_norm, x_norm)
+        x_recon_norm = recon * 2.0 - 1.0
+        perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
+
+        # Ensure vq_loss is a scalar
+        if not isinstance(vq_loss, float):
+            vq_loss = vq_loss.mean()
+
+        # Convert perplexity to float tensor before computing mean
+        if torch.is_tensor(perplexity):
+            perplexity = perplexity.float().mean()
 
         # Compute total loss
         total_loss = recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
@@ -199,12 +218,12 @@ class VQVAE(pl.LightningModule):
         if prefix == 'test':
             self.test_metrics.update(total_loss)
             if self.test_fid is not None:
-                x_recon_fid = torch.clamp(x_recon, 0, 1)
+                x_recon_fid = torch.clamp(recon, 0, 1)
                 x_fid = torch.clamp(x, 0, 1)
                 self.test_fid.update(x_recon_fid, real=False)
                 self.test_fid.update(x_fid, real=True)
 
-        # Log all metrics
+        # Log all metrics (now they're all scalars)
         self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True)
         self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True)
         self.log(f'{prefix}/vq_loss', vq_loss, on_step=True, on_epoch=True)
@@ -218,7 +237,7 @@ class VQVAE(pl.LightningModule):
             'perceptual_loss': perceptual_loss,
             'perplexity': perplexity,
             'x': x,
-            'x_recon': x_recon
+            'x_recon': recon
         }
 
     def training_step(self, batch, batch_idx):
@@ -277,7 +296,6 @@ class VQVAE(pl.LightningModule):
         # Reset metrics
         self.val_perplexity.reset()
         self.val_vq_loss.reset()
-        self.lpips.reset()  # Reset LPIPS metric
 
     def on_test_epoch_end(self):
         """Log epoch-level metrics for testing."""
@@ -294,7 +312,6 @@ class VQVAE(pl.LightningModule):
         self.test_metrics.reset()
         if self.test_fid is not None:
             self.test_fid.reset()
-        self.lpips.reset()  # Reset LPIPS metric
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""

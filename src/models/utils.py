@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from tqdm.auto import tqdm
+import torch.nn.functional as F
 
 def compute_accuracy(eval_model, dataloader):
     correct = 0
@@ -41,18 +42,25 @@ class ResidualBlock(nn.Module):
     Dramatically reduces the computation while maintaining the model capacity for very deep networks.
     """
     def __init__(self, in_channels, num_hiddens, num_residual_hiddens):
-        super(ResidualBlock, self).__init__()
-
-        self._block = nn.Sequential(
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=in_channels,
-                      out_channels=num_residual_hiddens,
-                      kernel_size=3, stride=1, padding=1, bias=False),  # padding=1 to keep the same spatial dimensions
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=num_residual_hiddens,
-                      out_channels=num_hiddens,
-                      kernel_size=1, stride=1, bias=False)  # padding=1 to keep the same spatial dimensions
-        )
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, num_residual_hiddens, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(num_residual_hiddens)
+        
+        self.conv2 = nn.Conv2d(num_residual_hiddens, num_hiddens, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(num_hiddens)
 
     def forward(self, x):
-        return x + self._block(x)
+        identity = x
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out, inplace=False)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += identity
+        out = F.relu(out, inplace=False)
+        
+        return out

@@ -1,43 +1,75 @@
 import torch.nn as nn
-from utils import ResidualBlock
+import torch.nn.functional as F
+from .utils import ResidualBlock
 
 class Decoder(nn.Module):
-    def __init__(self, out_channels, hidden_dims, n_residual_blocks=2):
+    """
+    Decoder Network implementation followed from the original Neural Discrete Representation Learning paper.
+
+    Reference:
+        - Van Den Oord, A., & Vinyals, O. (2017). Neural discrete representation learning.
+            Advances in neural information processing systems, 30.
+    
+    Input: batch_size x 256 x 32 x 32
+       │
+       └─► 1 x 1 conv ──► 256 channels (processes features)
+           │
+           └─► 4 x 4 conv ──► 128 channels (reduces dimensions)
+                │
+                └─► 4 x 4 conv ──► 128 channels (processes features)
+    
+    Output: batch_size x 3 x 256 x 256
+
+    The decoder network consists of two residual 3 x 3 blocks, followed by  two transposed convolutions with stride 2 and window size 4 x 4.
+    """
+    def __init__(self, in_channels, num_hiddens, num_residual_blocks, num_residual_hiddens):
         super().__init__()
         
-        # Reverse the hidden dimensions for decoder
-        hidden_dims = hidden_dims[::-1]
-        
         # Initial processing
-        layers = [
-            nn.Conv2d(hidden_dims[0], hidden_dims[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dims[0]),
-            nn.ReLU(inplace=True)
-        ]
+        self.conv1 = nn.Conv2d(in_channels, num_hiddens, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(num_hiddens)
         
         # Residual blocks
-        current_channels = hidden_dims[0]
-        for _ in range(n_residual_blocks):
-            # ResidualBlock expects out_channels to be 1/4 of the final output due to expansion=4
-            layers.append(ResidualBlock(current_channels, current_channels // 4))
-            current_channels = current_channels  # Stays the same due to ResidualBlock design
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(
+                in_channels=num_hiddens,
+                num_hiddens=num_hiddens,
+                num_residual_hiddens=num_residual_hiddens
+            )
+            for _ in range(num_residual_blocks)
+        ])
         
         # Upsampling layers
-        for i in range(len(hidden_dims) - 1):
-            layers.extend([
-                nn.ConvTranspose2d(hidden_dims[i], hidden_dims[i+1], 
-                                  kernel_size=4, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(hidden_dims[i+1]),
-                nn.ReLU(inplace=True)
-            ])
-        
-        # Final layer to get to output channels
-        layers.append(
-            nn.ConvTranspose2d(hidden_dims[-1], out_channels, 
-                              kernel_size=4, stride=2, padding=1)
+        self._conv_trans_1 = nn.ConvTranspose2d(
+            in_channels=num_hiddens,
+            out_channels=num_hiddens // 2,
+            kernel_size=4,
+            stride=2,
+            padding=1
         )
         
-        self.decoder = nn.Sequential(*layers)
-    
+        self._conv_trans_2 = nn.ConvTranspose2d(
+            in_channels=num_hiddens // 2,
+            out_channels=3,  # Output RGB channels
+            kernel_size=4,
+            stride=2,
+            padding=1
+        )
+
     def forward(self, x):
-        return self.decoder(x)
+        # Initial processing
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x, inplace=False)
+        
+        # Residual blocks
+        for block in self.residual_blocks:
+            x = block(x)
+        
+        # Upsampling
+        x = self._conv_trans_1(x)
+        x = F.relu(x, inplace=False)
+        
+        x = self._conv_trans_2(x)
+        
+        return x
