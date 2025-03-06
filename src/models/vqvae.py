@@ -4,44 +4,104 @@ import torch.nn.functional as F
 import lightning as pl
 import torchvision
 
-from src.models.encoder import Encoder
-from src.models.decoder import Decoder
-from src.models.bottleneck import VectorQuantizer
+from encoder import Encoder
+from decoder import Decoder
+from bottleneck import VectorQuantizer
+from lpips import LPIPS
 
 import torchmetrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image.fid import FrechetInceptionDistance
 import wandb
 
 class VQVAE(pl.LightningModule):
-    def __init__(self, in_channels=3, hidden_dims=None,
-                 num_embeddings=512, embedding_dim=64,
-                 n_residual_blocks=2, commitment_cost=0.25, decay=0.99,
-                 perceptual_weight=1.0, learning_rate=1e-3, beta=1.0, log_images_every_n_steps=100):
+    def __init__(
+            self,
+            in_channels,
+            num_hiddens,
+            num_embeddings,
+            embedding_dim,
+            num_residual_blocks,
+            num_residual_hiddens,
+            commitment_cost,
+            decay,
+            perceptual_weight,
+            learning_rate,
+            beta,
+            compute_fid=False
+    ):
+        """Initialize VQVAE model.
+
+        Args:
+            in_channels: Number of input channels, 3 for RGB images
+            num_hiddens: number of hidden units (hidden dimensions)
+            num_embeddings: Number of embeddings in codebook
+            embedding_dim: Dimension of each embedding
+            num_residual_layers: Number of residual layers in encoder and decoder
+            num_residual_blocks: Number of residual blocks
+            commitment_cost: Commitment cost for VQ
+            decay: Decay factor for EMA
+            perceptual_weight: Weight for perceptual loss
+            learning_rate: Learning rate for optimization
+            beta: Beta parameter for optimizer
+            compute_fid: Whether to compute FID metric
+        """
         super().__init__()
 
-        # Save hyperparameters for easy checkpointing and reproducibility
-        if hidden_dims is None:
-            hidden_dims = [128, 256, 512]
-        self.save_hyperparameters()
-        
-        # Model components
-        self.encoder = Encoder(in_channels, hidden_dims, n_residual_blocks)
-        self.pre_quantization = nn.Conv2d(hidden_dims[-1], embedding_dim, kernel_size=1)
-        self.vector_quantizer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost, decay=decay)
-        self.post_quantization = nn.Conv2d(embedding_dim, hidden_dims[-1], kernel_size=1)
-        self.decoder = Decoder(in_channels, hidden_dims, n_residual_blocks)
-        
-        # Training parameters
+        # Store model parameters
         self.learning_rate = learning_rate
         self.beta = beta
-        self.log_images_every_n_steps = log_images_every_n_steps
         self.perceptual_weight = perceptual_weight
+        self.log_images_every_n_steps = 100
+        self.compute_fid = compute_fid
 
-        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg')
+        # Initialize model components
+        self.encoder = Encoder(in_channels=in_channels,
+                               num_hiddens=num_hiddens,
+                               num_residual_blocks=num_residual_blocks,
+                               num_residual_hiddens=num_residual_hiddens)
+        self.pre_quantization = nn.Conv2d(in_channels=num_hiddens,
+                                          out_channels=embedding_dim,
+                                          kernel_size=1)
+        self.vector_quantizer = VectorQuantizer(
+            num_embeddings, embedding_dim, commitment_cost, decay
+        )
+        self.post_quantization = nn.Conv2d(in_channels=embedding_dim,
+                                           out_channels=num_hiddens,
+                                           kernel_size=3,
+                                           stride=1,
+                                           padding=1,
+                                           bias=False)
+        self.decoder = Decoder()
 
-    
+        # Initialize custom LPIPS for perceptual loss
+        self.lpips = LPIPS()
+
+        # Initialize training metrics
+        self.train_perplexity = torchmetrics.MeanMetric()
+        self.train_vq_loss = torchmetrics.MeanMetric()
+        self.train_recon_loss = torchmetrics.MeanMetric()
+        self.train_perceptual_loss = torchmetrics.MeanMetric()
+
+        # Initialize validation metrics
+        self.val_perplexity = torchmetrics.MeanMetric()
+        self.val_vq_loss = torchmetrics.MeanMetric()
+        self.val_recon_loss = torchmetrics.MeanMetric()
+        self.val_perceptual_loss = torchmetrics.MeanMetric()
+
+        # Initialize test metrics
+        self.test_metrics = torchmetrics.MeanMetric()
+        if self.compute_fid:
+            self.test_fid = torchmetrics.image.FrechetInceptionDistance(
+                feature=2048,
+                normalize=True
+            )
+        else:
+            self.test_fid = None
+
+        # Save hyperparameters for logging
+        self.save_hyperparameters()
+
     def encode(self, x):
         """
         Encode input to latent representation
@@ -103,212 +163,92 @@ class VQVAE(pl.LightningModule):
         # Return as tuple instead of dict
         return recon, vq_loss, perplexity
 
-    def compute_metrics(self, batch, output, stage='train'):
-        metrics_dict = {}
-        x = batch
-        recon = output['recon']
-
-        # Get the appropriate metrics dictionary
-        metrics = self.train_metrics if stage == 'train' else self.val_metrics
-        perplexity_tracker = self.train_perplexity if stage == 'train' else self.val_perplexity
-        vq_loss_tracker = self.train_vq_loss if stage == 'train' else self.val_vq_loss
-        fid_metric = self.train_fid if stage == 'train' else self.val_fid
-
-        # Update per-batch metrics
-        metrics[f'{stage}_mse'](recon, x)
-        metrics[f'{stage}_psnr'](recon, x)
-        metrics[f'{stage}_ssim'](recon, x)
-        metrics[f'{stage}_lpips'](recon, x)
-
-        # Update FID metric
-        # Ensure images are in [0, 1] range
-        if x.min() < 0 or x.max() > 1:
-            x = (x + 1) / 2  # Assuming [-1, 1] range
-            recon = (recon + 1) / 2
-
-        # FID expects images in [0, 1] and of shape [B, C, H, W]
-        fid_metric.update(x, real=True)
-        fid_metric.update(recon, real=False)
-
-        # Track perplexity and vq_loss
-        perplexity_tracker(output['perplexity'])
-        vq_loss_tracker(output['vq_loss'])
-
-        return metrics_dict
-
-    def training_step(self, batch, batch_idx):
-        images, labels = batch
-
-        # Forward pass
-        recon, vq_loss, perplexity = self.forward(images)
-
-        # Compute reconstruction loss
-        recon_loss = F.mse_loss(recon, images)
-
-        # Normalize images to [-1, 1] for LPIPS if they're not already normalized
-        recon_normalized = recon * 2 - 1
-        recon_normalized = torch.clamp(recon_normalized, -1, 1)
-        images_normalized = images * 2 - 1
-        images_normalized = torch.clamp(images_normalized, -1, 1)
-
-        # Compute perceptual loss
-        perceptual_loss = self.lpips(recon_normalized, images_normalized)
-
-        # Combine losses
-        total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
-
-        # Update metrics
-        self.train_perplexity.update(perplexity.float().mean())
-        self.train_vq_loss.update(vq_loss)
-        self.train_recon_loss.update(recon_loss)
-        self.train_perceptual_loss.update(perceptual_loss)
-
-        # Log metrics
-        self.log('train/loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/recon_loss', recon_loss, on_step=True, on_epoch=True)
-        self.log('train/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
-        self.log('train/vq_loss', vq_loss, on_step=True, on_epoch=True)
-        self.log('train/perplexity', perplexity.float().mean(), on_step=True, on_epoch=True)
-
-        # Log sample images periodically
-        if batch_idx == 0:
-            self._log_images(images, recon, split='train')
-
-        return total_loss
-
-    def validation_step(self, batch, batch_idx):
-        images, labels = batch
-
-        # Forward pass
-        recon, vq_loss, perplexity = self.forward(images)
-
-        # Compute reconstruction loss
-        recon_loss = F.mse_loss(recon, images)
-
-        # Normalize images to [-1, 1] for LPIPS
-        recon_normalized = recon * 2 - 1
-        recon_normalized = torch.clamp(recon_normalized, -1, 1)
-        images_normalized = images * 2 - 1
-        images_normalized = torch.clamp(images_normalized, -1, 1)
-
-        # Compute perceptual loss with normalized images
-        perceptual_loss = self.lpips(recon_normalized, images_normalized)
-
-        total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
-
-        # Calculate PSNR
-        psnr = PeakSignalNoiseRatio(data_range=1.0).to(images.device)(recon, images)
-        self.log('val/psnr', psnr, on_step=True, on_epoch=True, prog_bar=True)
-
-        # Update metrics
-        self.val_perplexity.update(perplexity.float().mean())
-        self.val_vq_loss.update(vq_loss)
-        self.val_recon_loss.update(recon_loss)
-        self.val_perceptual_loss.update(perceptual_loss)
-
-        # Log metrics
-        self.log('val/loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('val/recon_loss', recon_loss, on_step=True, on_epoch=True)
-        self.log('val/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
-        self.log('val/vq_loss', vq_loss, on_step=True, on_epoch=True)
-        self.log('val/perplexity', perplexity.float().mean(), on_step=True, on_epoch=True)
-
-        # Log sample images
-        if batch_idx == 0:
-            self._log_images(images, recon, split='val')
-
-        return total_loss
-
-    def test_step(self, batch, batch_idx):
-        """Perform the test step.
+    def compute_metrics(self, batch, prefix='train'):
+        """Compute all metrics for training, validation, and test steps.
 
         Args:
             batch: Input batch of data
-            batch_idx: Index of the current batch
+            prefix: Metric prefix ('train', 'val', or 'test')
 
         Returns:
-            dict: Dictionary containing test metrics
+            dict: Dictionary containing all computed metrics, losses, and reconstructed images
         """
-        # Unpack batch and perform forward pass
-        images, labels = batch
         # Forward pass
-        recon, vq_loss, perplexity = self.forward(images)
+        x = batch
+        x_recon, vq_loss, perplexity, _, _ = self(x)
 
         # Compute reconstruction loss
-        recon_loss = F.mse_loss(recon, images)
+        recon_loss = F.mse_loss(x_recon, x)
 
-        # Normalize images to [-1, 1] for LPIPS
-        recon_normalized = recon * 2 - 1
-        recon_normalized = torch.clamp(recon_normalized, -1, 1)
-        images_normalized = images * 2 - 1
-        images_normalized = torch.clamp(images_normalized, -1, 1)
+        # Compute perceptual loss
+        x_norm = x * 2.0 - 1.0
+        x_recon_norm = x_recon * 2.0 - 1.0
+        perceptual_loss = self.lpips(x_recon_norm, x_norm)
 
-        perceptual_loss = self.lpips(recon_normalized, images_normalized)
-
-        # Combine losses
+        # Compute total loss
         total_loss = recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
 
-        # Calculate PSNR
-        psnr = PeakSignalNoiseRatio(data_range=1.0).to(images.device)(recon, images)
-        self.log('test/psnr', psnr, on_step=True, on_epoch=True, prog_bar=True)
+        # Update metrics based on prefix
+        if hasattr(self, f'{prefix}_perplexity'):
+            getattr(self, f'{prefix}_perplexity')(perplexity)
+            getattr(self, f'{prefix}_vq_loss')(vq_loss)
+            getattr(self, f'{prefix}_recon_loss')(recon_loss)
+            getattr(self, f'{prefix}_perceptual_loss')(perceptual_loss)
 
-        # Update test metrics
-        self.test_metrics.update(total_loss)
+        # Special handling for test metrics
+        if prefix == 'test':
+            self.test_metrics.update(total_loss)
+            if self.test_fid is not None:
+                x_recon_fid = torch.clamp(x_recon, 0, 1)
+                x_fid = torch.clamp(x, 0, 1)
+                self.test_fid.update(x_recon_fid, real=False)
+                self.test_fid.update(x_fid, real=True)
 
-        # Update FID if enabled
-        if self.test_fid is not None:
-            # Ensure images are in [0, 1] range
-            x_recon_fid = torch.clamp(recon, 0, 1)
-            x_fid = torch.clamp(images, 0, 1)
-            self.test_fid.update(x_recon_fid, real=False)
-            self.test_fid.update(x_fid, real=True)
-
-        # Log step metrics
-        self.log('test/loss', total_loss, on_step=True, on_epoch=True)
-        self.log('test/recon_loss', recon_loss, on_step=True, on_epoch=True)
-        self.log('test/vq_loss', vq_loss, on_step=True, on_epoch=True)
-        self.log('test/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
-        self.log('test/perplexity', perplexity, on_step=True, on_epoch=True)
-
-        # Log images periodically
-        if batch_idx % self.log_images_every_n_steps == 0:
-            self._log_images(images, recon, split='test')
+        # Log all metrics
+        self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True)
+        self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True)
+        self.log(f'{prefix}/vq_loss', vq_loss, on_step=True, on_epoch=True)
+        self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
+        self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True)
 
         return {
-            'test_loss': total_loss,
+            'loss': total_loss,
             'recon_loss': recon_loss,
             'vq_loss': vq_loss,
             'perceptual_loss': perceptual_loss,
-            'perplexity': perplexity
+            'perplexity': perplexity,
+            'x': x,
+            'x_recon': x_recon
         }
 
-    def setup(self, stage=None):
-        """Setup metrics for each stage of training."""
-        if stage == 'fit' or stage is None:
-            # Training metrics
-            self.train_perplexity = torchmetrics.MeanMetric()
-            self.train_vq_loss = torchmetrics.MeanMetric()
-            self.train_recon_loss = torchmetrics.MeanMetric()  # Add reconstruction loss metric
-            self.train_perceptual_loss = torchmetrics.MeanMetric()  # Add perceptual loss metric
+    def training_step(self, batch, batch_idx):
+        """Perform the training step."""
+        metrics = self.compute_metrics(batch, prefix='train')
 
-            # Validation metrics
-            self.val_perplexity = torchmetrics.MeanMetric()
-            self.val_vq_loss = torchmetrics.MeanMetric()
-            self.val_recon_loss = torchmetrics.MeanMetric()  # Add reconstruction loss metric
-            self.val_perceptual_loss = torchmetrics.MeanMetric()  # Add perceptual loss metric
+        if batch_idx % self.log_images_every_n_steps == 0:
+            self._log_images(metrics['x'], metrics['x_recon'], split='train')
 
-        if stage == 'test' or stage is None:
-            # Test metrics
-            self.test_metrics = torchmetrics.MeanMetric()
+        return metrics
 
-            # Initialize FID for test set if needed
-            if self.compute_fid:
-                self.test_fid = torchmetrics.image.FrechetInceptionDistance(
-                    feature=2048,
-                    normalize=True
-                )
-            else:
-                self.test_fid = None
+    def validation_step(self, batch, batch_idx):
+        """Perform the validation step."""
+        metrics = self.compute_metrics(batch, prefix='val')
+
+        if batch_idx % self.log_images_every_n_steps == 0:
+            self._log_images(metrics['x'], metrics['x_recon'], split='val')
+
+        return metrics
+
+    def test_step(self, batch, batch_idx):
+        """Perform the test step."""
+        # Compute all metrics
+        metrics = self.compute_metrics(batch, prefix='test')
+
+        # Log images periodically
+        if batch_idx % self.log_images_every_n_steps == 0:
+            self._log_images(metrics['x'], metrics['x_recon'], split='test')
+
+        return metrics
 
     def on_train_epoch_end(self):
         """Log epoch-level metrics for training."""
@@ -361,7 +301,7 @@ class VQVAE(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
         # Store the scheduler as an attribute
-        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.5,
@@ -371,7 +311,7 @@ class VQVAE(pl.LightningModule):
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": self.lr_scheduler,
+                "scheduler": lr_scheduler,
                 "monitor": "val/loss",  # Metric to monitor
                 "interval": "epoch",
                 "frequency": 100
@@ -422,6 +362,12 @@ class VQVAE(pl.LightningModule):
             "global_step": self.global_step
         })
 
+
+# test the VQVAE model
+if __name__ == "__main__":
+    vqvae = VQVAE(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32, num_embeddings=1024, embedding_dim=32, commitment_cost=0.25, decay=0.99, perceptual_weight=0.1, learning_rate=1e-4, beta=1.0, compute_fid=True)
+    x = torch.randn(4, 3, 256, 256)  # batch_size x 3 x 256 x 256
+    print(vqvae(x).shape)  # batch_size x 3 x 256 x 256
 
 
 

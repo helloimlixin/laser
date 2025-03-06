@@ -21,8 +21,9 @@ class Encoder(nn.Module):
 
     Output: batch_size x 256 x 32 x 32
 
-    The encoder network consists of 2 convolutional layers with stride 2 and window size 4 x 4, followed by two
-    residual 3 x 3 blocks, which are implemented as ReLU, 3 x 3 conv, ReLU and 1 x 1 conv, all having 256 hidden units.
+    The encoder network consists of 2 convolutional layers with stride 2 and window size 4 x 4, followed by a convolutional
+    layer with stride 1 and window size 3 x 3, and then two residual blocks, which are implemented as ReLU, 3 x 3 conv, ReLU 
+    and 1 x 1 conv, all having 256 hidden units.
     """
     def __init__(self, in_channels, num_hiddens, num_residual_blocks, num_residual_hiddens):
         """
