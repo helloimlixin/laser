@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import numpy as np
+import matplotlib.pyplot as plt
+
 class VectorQuantizer(nn.Module):
     """
     Vector Quantizer implementation for VQ-VAE.
@@ -56,6 +59,8 @@ class VectorQuantizer(nn.Module):
             self.register_buffer('ema_w', self.embedding.weight.data.clone())
             # Flag to control when EMA updates are performed
             self.register_buffer('ema_updating', torch.ones(1))
+        else:
+            print('Using standard backpropagation for codebook... (no EMA)')
 
     def forward(self, z):
         """
@@ -177,98 +182,291 @@ class VectorQuantizer(nn.Module):
         
         return z_q
 
-# Add this testing code at the bottom of the file
-if __name__ == "__main__":
-    import numpy as np
-    import matplotlib.pyplot as plt
+
+def setup_test_environment(seed=42):
+    """
+    Set up test data and model instances.
     
+    Args:
+        seed: Random seed for reproducibility
+        
+    Returns:
+        tuple: (test input tensor, VQ model with EMA, VQ model without EMA, test parameters)
+    """
     # Set random seed for reproducibility
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     
     # Test parameters
-    batch_size = 4
-    embedding_dim = 64
-    num_embeddings = 512
-    height, width = 16, 16  # Spatial dimensions for test
+    params = {
+        'batch_size': 4,
+        'embedding_dim': 64,
+        'num_embeddings': 512,
+        'height': 16,
+        'width': 16
+    }
     
     # Create a vector quantizer instance (with EMA updates)
     vq_with_ema = VectorQuantizer(
-        num_embeddings=num_embeddings,
-        embedding_dim=embedding_dim,
+        num_embeddings=params['num_embeddings'],
+        embedding_dim=params['embedding_dim'],
         commitment_cost=0.25,
         decay=0.99  # Using EMA updates
     )
     
     # Create another vector quantizer instance (without EMA updates)
     vq_without_ema = VectorQuantizer(
-        num_embeddings=num_embeddings,
-        embedding_dim=embedding_dim,
+        num_embeddings=params['num_embeddings'],
+        embedding_dim=params['embedding_dim'],
         commitment_cost=0.25,
         decay=0.0  # No EMA updates
     )
     
     # Generate random encoder output
-    z = torch.randn(batch_size, embedding_dim, height, width)
-    print(f"Input shape: {z.shape}")
+    z = torch.randn(
+        params['batch_size'], 
+        params['embedding_dim'], 
+        params['height'], 
+        params['width']
+    )
     
-    # Test forward pass with EMA updates
-    print("\n--- Testing VectorQuantizer with EMA updates ---")
-    vq_with_ema.train()  # Set to training mode to enable EMA updates
-    z_q_ema, loss_ema, indices_ema = vq_with_ema(z)
+    return z, vq_with_ema, vq_without_ema, params
+
+def test_forward_pass(model, input_tensor, name=""):
+    """
+    Test the forward pass of a VectorQuantizer model.
     
-    print(f"Quantized output shape: {z_q_ema.shape}")
-    print(f"VQ Loss: {loss_ema.item():.6f}")
-    print(f"Indices shape: {indices_ema.shape}")
+    Args:
+        model: VectorQuantizer model instance
+        input_tensor: Input tensor for the model
+        name: Name identifier for the model (for printing)
+        
+    Returns:
+        tuple: (quantized output, loss, indices)
+    """
+    print(f"\n--- Testing VectorQuantizer {name} ---")
+    model.train()  # Set to training mode
+    z_q, loss, indices = model(input_tensor)
     
-    # Test codebook usage (perplexity)
-    encodings = torch.zeros(indices_ema.shape[0], num_embeddings)
-    encodings.scatter_(1, indices_ema.unsqueeze(1), 1)
+    print(f"Quantized output shape: {z_q.shape}")
+    print(f"VQ Loss: {loss.item():.6f}")
+    print(f"Indices shape: {indices.shape}")
+    
+    return z_q, loss, indices
+
+def analyze_codebook_usage(indices, num_embeddings):
+    """
+    Analyze how the codebook is being used.
+    
+    Args:
+        indices: Indices tensor from VectorQuantizer
+        num_embeddings: Total number of embeddings in the codebook
+        
+    Returns:
+        tuple: (perplexity, number of codebook entries used)
+    """
+    # Convert indices to one-hot encodings
+    encodings = torch.zeros(indices.shape[0], num_embeddings)
+    encodings.scatter_(1, indices.unsqueeze(1), 1)
+    
+    # Calculate average probability for each codebook entry
     avg_probs = torch.mean(encodings, dim=0)
+    
+    # Calculate perplexity (effective codebook usage)
     perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+    
+    # Count how many codebook entries are used
     codebook_usage = torch.sum(avg_probs > 0)
     
     print(f"Perplexity: {perplexity.item():.2f} (effective codebook usage)")
     print(f"Codebook entries used: {codebook_usage.item()} out of {num_embeddings}")
     
-    # Test forward pass without EMA updates
-    print("\n--- Testing VectorQuantizer without EMA updates ---")
-    vq_without_ema.train()
-    z_q_no_ema, loss_no_ema, indices_no_ema = vq_without_ema(z)
+    return perplexity, codebook_usage
+
+def test_codebook_retrieval(model, indices, z_q, embedding_dim):
+    """
+    Test the get_codebook_entry method of VectorQuantizer.
     
-    print(f"Quantized output shape: {z_q_no_ema.shape}")
-    print(f"VQ Loss: {loss_no_ema.item():.6f}")
-    
-    # Test get_codebook_entry method
+    Args:
+        model: VectorQuantizer model instance
+        indices: Indices tensor from forward pass
+        z_q: Quantized output from forward pass
+        embedding_dim: Dimension of embedding vectors
+        
+    Returns:
+        float: Reconstruction error
+    """
     print("\n--- Testing get_codebook_entry ---")
-    # Get the first 10 indices
-    test_indices = indices_ema[:10]
-    retrieved_embeddings = vq_with_ema.get_codebook_entry(test_indices)
+    # Get a subset of indices
+    test_indices = indices[:10]
+    retrieved_embeddings = model.get_codebook_entry(test_indices)
     print(f"Retrieved embeddings shape: {retrieved_embeddings.shape}")
     
-    # Verify reconstruction error is minimal (should be zero or very close)
-    # Get the original quantized vectors for these indices
-    original_flat = z_q_ema.permute(0, 2, 3, 1).contiguous().view(-1, embedding_dim)
+    # Verify reconstruction error is minimal
+    original_flat = z_q.permute(0, 2, 3, 1).contiguous().view(-1, embedding_dim)
     original_subset = original_flat[:10]
     reconstruction_error = F.mse_loss(retrieved_embeddings, original_subset)
     print(f"Reconstruction error: {reconstruction_error.item():.10f} (should be close to zero)")
     
-    # Visualize codebook usage
-    print("\n--- Visualizing Codebook Usage ---")
-    used_indices = indices_ema.cpu().numpy()
+    return reconstruction_error.item()
+
+def visualize_codebook_usage(indices, model_name=""):
+    """
+    Visualize the distribution of codebook indices used.
+    
+    Args:
+        indices: Indices tensor from VectorQuantizer
+        model_name: Name identifier for the model (for output filename)
+        
+    Returns:
+        str: Path to saved visualization
+    """
+    print(f"\n--- Visualizing Codebook Usage {model_name} ---")
+    used_indices = indices.cpu().numpy()
+    
     plt.figure(figsize=(10, 5))
     plt.hist(used_indices, bins=50, alpha=0.7)
-    plt.title("Codebook Usage Distribution")
+    plt.title(f"Codebook Usage Distribution {model_name}")
     plt.xlabel("Codebook Index")
     plt.ylabel("Frequency")
-    plt.savefig("codebook_usage.png")
-    print(f"Saved codebook usage visualization to 'codebook_usage.png'")
     
-    # Test inference mode
-    print("\n--- Testing inference mode ---")
-    vq_with_ema.eval()  # Set to evaluation mode
-    z_q_eval, loss_eval, indices_eval = vq_with_ema(z)
+    filename = f"codebook_usage_{model_name.replace(' ', '_')}.png"
+    plt.savefig(filename)
+    plt.close()
     
-    print(f"Inference mode - Quantized output shape: {z_q_eval.shape}")
-    print(f"Inference mode - VQ Loss: {loss_eval.item():.6f}")
+    print(f"Saved codebook usage visualization to '{filename}'")
+    return filename
+
+def test_inference_mode(model, input_tensor, model_name=""):
+    """
+    Test the model in evaluation/inference mode.
     
-    print("\nTest completed successfully!")
+    Args:
+        model: VectorQuantizer model instance
+        input_tensor: Input tensor for the model
+        model_name: Name identifier for the model (for printing)
+        
+    Returns:
+        tuple: (quantized output, loss, indices)
+    """
+    print(f"\n--- Testing inference mode {model_name} ---")
+    model.eval()  # Set to evaluation mode
+    z_q, loss, indices = model(input_tensor)
+    
+    print(f"Inference mode - Quantized output shape: {z_q.shape}")
+    print(f"Inference mode - VQ Loss: {loss.item():.6f}")
+    
+    return z_q, loss, indices
+
+def run_all_tests(
+    test_ema=True,                # Test model with EMA updates
+    test_no_ema=True,             # Test model without EMA updates
+    test_codebook_usage=True,     # Analyze codebook usage statistics
+    test_retrieval=True,          # Test codebook entry retrieval
+    test_visualization=True,      # Generate visualizations
+    test_inference=True,          # Test models in inference mode
+    seed=42                       # Random seed for reproducibility
+):
+    """
+    Run tests for the VectorQuantizer with control over which tests to execute.
+    
+    Args:
+        test_ema: Whether to test the model with EMA updates
+        test_no_ema: Whether to test the model without EMA updates
+        test_codebook_usage: Whether to analyze codebook usage
+        test_retrieval: Whether to test codebook entry retrieval
+        test_visualization: Whether to generate visualizations
+        test_inference: Whether to test inference mode
+        seed: Random seed for reproducibility
+        
+    Returns:
+        dict: Results from the tests that were run
+    """
+    # Setup
+    print("Setting up test environment...")
+    z, vq_with_ema, vq_without_ema, params = setup_test_environment(seed)
+    print(f"Input shape: {z.shape}")
+    
+    # Dictionary to store test results
+    results = {}
+    
+    # Test model with EMA updates
+    if test_ema:
+        z_q_ema, loss_ema, indices_ema = test_forward_pass(
+            vq_with_ema, z, name="with EMA updates"
+        )
+        results['ema'] = {'z_q': z_q_ema, 'loss': loss_ema, 'indices': indices_ema}
+        
+        # Analyze codebook usage for EMA model
+        if test_codebook_usage:
+            perplexity, usage = analyze_codebook_usage(indices_ema, params['num_embeddings'])
+            results['ema']['perplexity'] = perplexity
+            results['ema']['codebook_usage'] = usage
+        
+        # Test codebook retrieval for EMA model
+        if test_retrieval:
+            error = test_codebook_retrieval(
+                vq_with_ema, indices_ema, z_q_ema, params['embedding_dim']
+            )
+            results['ema']['retrieval_error'] = error
+        
+        # Test inference mode for EMA model
+        if test_inference:
+            z_q_eval, loss_eval, indices_eval = test_inference_mode(
+                vq_with_ema, z, model_name="with EMA"
+            )
+            results['ema']['inference'] = {
+                'z_q': z_q_eval,
+                'loss': loss_eval,
+                'indices': indices_eval
+            }
+    
+    # Test model without EMA updates
+    if test_no_ema:
+        z_q_no_ema, loss_no_ema, indices_no_ema = test_forward_pass(
+            vq_without_ema, z, name="without EMA updates"
+        )
+        results['no_ema'] = {'z_q': z_q_no_ema, 'loss': loss_no_ema, 'indices': indices_no_ema}
+        
+        # Analyze codebook usage for non-EMA model
+        if test_codebook_usage:
+            perplexity, usage = analyze_codebook_usage(indices_no_ema, params['num_embeddings'])
+            results['no_ema']['perplexity'] = perplexity
+            results['no_ema']['codebook_usage'] = usage
+        
+        # Test codebook retrieval for non-EMA model
+        if test_retrieval:
+            error = test_codebook_retrieval(
+                vq_without_ema, indices_no_ema, z_q_no_ema, params['embedding_dim']
+            )
+            results['no_ema']['retrieval_error'] = error
+        
+        # Test inference mode for non-EMA model
+        if test_inference:
+            z_q_eval, loss_eval, indices_eval = test_inference_mode(
+                vq_without_ema, z, model_name="without EMA"
+            )
+            results['no_ema']['inference'] = {
+                'z_q': z_q_eval,
+                'loss': loss_eval,
+                'indices': indices_eval
+            }
+    
+    # Generate visualizations
+    if test_visualization and test_ema:
+        vis_path = visualize_codebook_usage(
+            results['ema']['indices'], model_name="with EMA"
+        )
+        results['ema']['visualization_path'] = vis_path
+    
+    if test_visualization and test_no_ema:
+        vis_path = visualize_codebook_usage(
+            results['no_ema']['indices'], model_name="without EMA"
+        )
+        results['no_ema']['visualization_path'] = vis_path
+    
+    print("\nCompleted requested tests successfully!")
+    return results
+
+# Add this line at the bottom of the file to run all tests by default when the script is executed
+if __name__ == "__main__":
+    run_all_tests()  # Run all tests with default settings
