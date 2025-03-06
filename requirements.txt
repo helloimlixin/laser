@@ -8,5 +8,3 @@ tqdm
 torchmetrics
 numpy
 matplotlib
-torch
-requests
