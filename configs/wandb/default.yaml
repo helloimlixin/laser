@@ -1,3 +1,3 @@
 # configs/wandb/default.yaml
 project: "laser"
-name: ${now:%Y-%m-%d_%H-%M-%S}_vqvae
+name: ${now:%Y-%m-%d_%H-%M-%S}
