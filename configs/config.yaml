@@ -1,8 +1,8 @@
 # configs/config.yaml
 defaults:
   - _self_
-  - model: vqvae
-  - data: imagenette2
+  - model: dlvae
+  - data: cifar10
   - trainer: default
   - wandb: default
 

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DataConfig:
+class ImageNette2Config:
     dataset: str
     data_dir: str
     image_size: int
@@ -23,8 +23,8 @@ class DataConfig:
     std: List[float]
 
     @staticmethod
-    def from_dict(config: DictConfig) -> 'DataConfig':
-        return DataConfig(
+    def from_dict(config: DictConfig) -> 'ImageNette2Config':
+        return ImageNette2Config(
             dataset=config.dataset,
             data_dir=config.data_dir,
             image_size=config.image_size,
@@ -52,7 +52,7 @@ class Imagenette2DataModule(pl.LightningDataModule):
     def __init__(self, config: DictConfig):
         super().__init__()
         self.save_hyperparameters()
-        self.config = DataConfig.from_dict(config)
+        self.config = ImageNette2Config.from_dict(config)
         self.config.validate()
         self.train_dataset = None
         self.val_dataset = None

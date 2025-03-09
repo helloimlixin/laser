@@ -59,7 +59,7 @@ class LPIPS(nn.Module):
 
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(name, "vgg_lpips")
-        self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu")), strict=False)
+        self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"), weights_only=True), strict=False)
 
     def forward(self, real_x, fake_x):
         outs_real = self.vgg(self.scaling_layer(real_x))
