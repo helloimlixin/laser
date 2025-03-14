@@ -2,9 +2,10 @@
 defaults:
   - _self_
   - model: dlvae
-  - data: imagenette2
-  - trainer: default
+  - data: cifar10
+  - train: default
   - wandb: default
+  - checkpoint: default
 
 seed: 42
 output_dir: outputs

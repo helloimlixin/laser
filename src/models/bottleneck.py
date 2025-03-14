@@ -202,7 +202,7 @@ class DictionaryLearningBottleneck(nn.Module):
     """
     def __init__(
         self,
-        dict_size=512,
+        num_embeddings=512,
         embedding_dim=64,
         sparsity=5,
         commitment_cost=0.25,
@@ -212,7 +212,7 @@ class DictionaryLearningBottleneck(nn.Module):
     ):
         super().__init__()
         
-        self.dict_size = dict_size
+        self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.sparsity = sparsity
         self.commitment_cost = commitment_cost
@@ -229,7 +229,7 @@ class DictionaryLearningBottleneck(nn.Module):
         
         # Initialize dictionary with random atoms
         self.dictionary = nn.Parameter(
-            torch.randn(embedding_dim, dict_size), requires_grad=True
+            torch.randn(embedding_dim, num_embeddings), requires_grad=True
         )
         self._normalize_dictionary()
 
@@ -245,13 +245,13 @@ class DictionaryLearningBottleneck(nn.Module):
         
         # 2. Initialize buffers
         residual = signals.clone()
-        coefficients = torch.zeros(batch_size, self.dict_size, device=device)
-        active_set = torch.zeros(batch_size, self.dict_size, dtype=torch.bool, device=device)
+        coefficients = torch.zeros(batch_size, self.num_embeddings, device=device)
+        active_set = torch.zeros(batch_size, self.num_embeddings, dtype=torch.bool, device=device)
         
         # 3. Precompute DtD and Dt once
         Dt = dictionary.t()
         DtD = torch.matmul(Dt, dictionary)
-        DtD = DtD + torch.eye(self.dict_size, device=device) * self.epsilon
+        DtD = DtD + torch.eye(self.num_embeddings, device=device) * self.epsilon
         
         # 4. Main OMP loop
         for k in range(self.sparsity):
@@ -400,7 +400,7 @@ def test_dictionary_learning_bottleneck():
     batch_size = 2
     embedding_dim = 64
     height, width = 8, 8
-    dict_size = 512
+    num_embeddings = 512
     sparsity = 5
     
     # Create random test input
@@ -408,7 +408,7 @@ def test_dictionary_learning_bottleneck():
     
     # Initialize ODL model
     odl = DictionaryLearningBottleneck(
-        dict_size=dict_size,
+        num_embeddings=num_embeddings,
         embedding_dim=embedding_dim,
         sparsity=sparsity,
         commitment_cost=0.25,
@@ -428,13 +428,13 @@ def test_dictionary_learning_bottleneck():
     # Check sparsity of coefficients
     nonzero_ratio = (coefficients.abs() > 1e-6).float().mean().item()
     print(f"Nonzero coefficient ratio: {nonzero_ratio:.4f}")
-    print(f"Expected sparsity ratio: {sparsity/dict_size:.4f}")
+    print(f"Expected sparsity ratio: {sparsity/num_embeddings:.4f}")
     
     # Visualize dictionary atom usage
     atom_usage = (coefficients.abs() > 1e-6).float().sum(dim=1).cpu().numpy()
     
     plt.figure(figsize=(10, 4))
-    plt.bar(range(dict_size), atom_usage)
+    plt.bar(range(num_embeddings), atom_usage)
     plt.title("Dictionary Atom Usage")
     plt.xlabel("Atom Index")
     plt.ylabel("Usage Count")
@@ -443,7 +443,7 @@ def test_dictionary_learning_bottleneck():
     
     # Visualize a few dictionary atoms
     num_atoms_to_show = 10
-    atoms_to_show = np.random.choice(dict_size, num_atoms_to_show, replace=False)
+    atoms_to_show = np.random.choice(num_embeddings, num_atoms_to_show, replace=False)
     
     plt.figure(figsize=(12, 6))
     for i, atom_idx in enumerate(atoms_to_show):

@@ -1,0 +1,10 @@
+# configs/trainer/default.yaml
+learning_rate: 3.0e-4
+beta: 0.9
+max_epochs: 100
+accelerator: "gpu"
+devices: 1
+precision: 32
+gradient_clip_val: 1.0
+log_every_n_steps: 50
+early_stopping_patience: 10

@@ -1,7 +1,7 @@
 type: dlvae
 in_channels: 3
 num_hiddens: 128
-dict_size: 512
+num_embeddings: 512
 embedding_dim: 64
 sparsity: 5
 num_residual_blocks: 2

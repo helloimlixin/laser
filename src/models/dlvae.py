@@ -19,7 +19,7 @@ class DLVAE(pl.LightningModule):
             self,
             in_channels,
             num_hiddens,
-            dict_size,
+            num_embeddings,
             embedding_dim,
             sparsity,
             num_residual_blocks,
@@ -36,7 +36,7 @@ class DLVAE(pl.LightningModule):
         Args:
             in_channels: Number of input channels (3 for RGB)
             num_hiddens: Number of hidden units
-            dict_size: Size of the dictionary
+            num_embeddings: Number of embeddings
             embedding_dim: Dimension of latent space
             sparsity: Sparsity parameter for DictionaryLearningBottleneck
             num_residual_blocks: Number of residual blocks
@@ -48,7 +48,7 @@ class DLVAE(pl.LightningModule):
             beta: Beta parameter for Adam optimizer
             compute_fid: Whether to compute FID
         """
-        super().__init__()
+        super(DLVAE, self).__init__()
 
         # Store parameters
         self.learning_rate = learning_rate
@@ -72,7 +72,7 @@ class DLVAE(pl.LightningModule):
 
         # Initialize bottleneck
         self.bottleneck = DictionaryLearningBottleneck(
-            dict_size=dict_size,
+            num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             sparsity=sparsity,
             commitment_cost=commitment_cost,

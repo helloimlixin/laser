@@ -1,0 +1,20 @@
+# Model configuration for CIFAR10
+type: "vqvae"  # or "dlvae"
+in_channels: 3
+num_hiddens: 128
+embedding_dim: 64
+num_residual_blocks: 2
+num_residual_hiddens: 32
+commitment_cost: 0.25
+decay: 0.99
+perceptual_weight: 0.1
+
+# VQVAE specific parameters
+num_embeddings: 512
+
+# DLVAE specific parameters
+dict_size: 512
+sparsity: 10
+
+# FID computation
+compute_fid: true 
