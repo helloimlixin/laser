@@ -4,9 +4,14 @@ The [original development repository](https://anonymous.4open.science/r/dlgan-0C
 
 ## Overview
 
-A PyTorch Lightning implementation of two neural compression approaches:
-- Vector Quantized VAE (VQ-VAE) with EMA codebook updates
-- Dictionary Learning VAE (DL-VAE) with gradient-based dictionary learning
+
+This project implements two different types of autoencoder architectures:
+1. **Vector Quantized Variational Autoencoder (VQVAE)** - A discrete latent variable model that uses vector quantization
+
+2. **Dictionary Learning Variational Autoencoder (DLVAE)** - An autoencoder with dictionary learning bottleneck for sparse representations
+
+
+The project includes training and evaluation pipelines with configurable hyperparameters through Hydra.
 
 ## Features
 
@@ -26,18 +31,62 @@ A PyTorch Lightning implementation of two neural compression approaches:
   - Hydra for configuration management
   - Weights & Biases logging
 
-## Usage
-
-Train VQ-VAE:
+## Installation
 
 ```bash
-python train.py model=vqvae
+# Clone the repository
+git clone https://github.com/yourusername/vae-models.git
+cd vae-models
+
+# Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-Train DL-VAE:
+## Project Structure
+
+```
+├── configs/                # Hydra configuration files
+│   ├── checkpoint/         # Checkpoint configurations
+│   ├── data/               # Dataset configurations
+│   ├── model/              # Model configurations
+│   ├── train/              # Training configurations
+│   ├── wandb/              # W&B logging configurations
+│   └── config.yaml         # Main configuration
+├── src/
+│   ├── data/               # Data modules
+│   │   ├── cifar10.py      # CIFAR10 data module
+│   │   ├── imagenette2.py  # Imagenette2 data module
+│   │   └── config.py       # Data configuration
+│   ├── models/             # Model implementations
+│   │   ├── bottleneck.py   # Bottleneck implementations
+│   │   ├── decoder.py      # Decoder architecture
+│   │   ├── dlvae.py        # DLVAE implementation
+│   │   ├── encoder.py      # Encoder architecture
+│   │   └── vqvae.py        # VQVAE implementation
+│   └── lpips.py            # LPIPS perceptual loss
+└── train.py                # Main training script
+```
+
+## Usage
+
+### Training a Model
+
+
+To train a model, use the `train.py` script with Hydra configuration:
 
 ```bash
-python train.py model=dlvae
+# Train VQVAE on CIFAR10
+python train.py model.type=vqvae data=cifar10
+
+# Train DLVAE on CIFAR10
+python train.py model.type=dlvae data=cifar10
+
+# Train on Imagenette2 dataset
+python train.py model.type=vqvae data=imagenette2
 ```
 
 ## Configuration
