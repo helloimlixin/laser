@@ -15,7 +15,7 @@ class VectorQuantizer(nn.Module):
     
     The quantization process involves:
     1. Finding the nearest embedding vector in the codebook for each spatial position in the input
-    2. Replacing the input vectors with their corresponding codebook vectors
+    2. Replacing the input vectors with their corresponding codebook vectors from nearest neighbor search
     3. Computing loss terms to train both the encoder and the codebook
     4. Using a straight-through estimator to allow gradient flow through the discrete bottleneck
     
@@ -48,35 +48,30 @@ class VectorQuantizer(nn.Module):
         # Create embedding table (codebook)
         # This is the dictionary of codes that continuous vectors will be mapped to
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        # Initialize embedding weights with small random values
-        self.embedding.weight.data.uniform_(-1 / num_embeddings, 1 / num_embeddings)
 
         if self.use_ema:
             print('Using EMA updates for codebook...')
-            # Register buffers for EMA updates (not model parameters - not directly optimized)
-            # ema_cluster_size: Tracks how often each codebook entry is used
-            self.register_buffer('ema_cluster_size', torch.zeros(num_embeddings))
-            # ema_w: EMA of the encoder outputs assigned to each codebook entry
-            self.register_buffer('ema_w', self.embedding.weight.data.clone())
-            # Flag to control when EMA updates are performed
-            self.register_buffer('ema_updating', torch.ones(1))
+            # Initialize the embedding weights using normal distribution
+            self.embedding.weight.data.normal_()
         else:
             print('Using standard backpropagation for codebook... (no EMA)')
+            # Initialize embedding weights with small random values
+            self.embedding.weight.data.uniform_(-1 / num_embeddings, 1 / num_embeddings)
 
-        # Enable TF32 math for faster operations on modern GPUs
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        # Pre-allocate buffers for OMP
-        self.register_buffer('_corr_buffer', torch.Tensor())
-        self.register_buffer('_residual_buffer', torch.Tensor())
+        # Register buffers for EMA updates (not model parameters - not directly optimized)
+        # ema_cluster_size: Tracks how often each codebook entry is used
+        self.register_buffer('_ema_cluster_size', torch.zeros(num_embeddings))
+        # ema_w: EMA of the encoder outputs assigned to each codebook entry
+        self._ema_w = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
+        # Flag to control when EMA updates are performed
+        self._ema_w.data.normal_()
 
-    def forward(self, z):
+    def forward(self, z_e):
         """
         Forward pass through the vector quantizer.
         
         Args:
-            z (torch.Tensor): Output from encoder with shape [B, D, H, W]
+            z_e (torch.Tensor): Output from encoder with shape [B, D, H, W]
                               B: batch size, D: embedding dimension, H, W: spatial dimensions
         
         Returns:
@@ -88,23 +83,32 @@ class VectorQuantizer(nn.Module):
 
         # Reshape z to [B*H*W, D] for easier processing
         # The permute operation reorders dimensions to [B, H, W, D] before reshaping
-        z_flattened = z.permute(0, 2, 3, 1).contiguous().view(-1, self.embedding_dim)
+        z_e = z_e.permute(0, 2, 3, 1).contiguous()
+        input_shape = z_e.shape
+
+        # Flatten the input
+        ze_flattened = z_e.view(-1, self.embedding_dim)
         
         # Calculate squared distances between z_flattened and embedding vectors
         # This uses the || x - e ||^2 = ||x||^2 + ||e||^2 - 2*x^T*e formula for efficiency
         # Rather than computing distances directly, which would be more expensive
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+        distances = torch.sum(ze_flattened ** 2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight ** 2, dim=1) - \
-            2 * torch.matmul(z_flattened, self.embedding.weight.t())
+            2 * torch.matmul(ze_flattened, self.embedding.weight.t())
 
         # Find nearest embedding for each z_flattened vector
-        # min_encoding_indices contains indices of the closest codebook entry for each position
-        min_encoding_indices = torch.argmin(d, dim=1)
+        # encoding_indices contains indices of the closest codebook entry for each position
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         
         # Convert indices to one-hot encodings for gathering embeddings
-        # min_encodings shape: [B*H*W, num_embeddings]
-        min_encodings = torch.zeros(min_encoding_indices.shape[0], self.num_embeddings, device=z.device)
-        min_encodings.scatter_(1, min_encoding_indices.unsqueeze(1), 1)
+        # encodings shape: [B*H*W, num_embeddings]
+        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=z_e.device)
+        encodings.scatter_(1, encoding_indices, 1)
+
+        # Get the quantized latent vectors using embedding lookup
+        # Multiply one-hot encodings by embedding weights to get quantized vectors
+        # Then reshape back to the original tensor shape [B, H, W, D]
+        z_q = torch.matmul(encodings, self.embedding.weight).view(input_shape)
 
         # Update codebook using EMA if enabled and in training mode
         if self.use_ema and self.training:
@@ -112,88 +116,53 @@ class VectorQuantizer(nn.Module):
             
             # 1. Update cluster size (how many vectors are assigned to each codebook entry)
             # Count occurrences of each embedding being used in this batch
-            encodings_sum = min_encodings.sum(0)
             # Update the exponential moving average of cluster sizes
-            self.ema_cluster_size.data.mul_(self.decay).add_(
-                encodings_sum, alpha=(1 - self.decay)
-            )
+            self._ema_cluster_size = self._ema_cluster_size * self.decay + \
+                (1 - self.decay) * encodings.sum(0)
 
             # 2. Update embedding vectors based on assigned encoder outputs
             # Compute sum of all z vectors assigned to each embedding
-            dw = torch.matmul(min_encodings.t(), z_flattened)
+            dw = torch.matmul(encodings.t(), ze_flattened)
             # Update the exponential moving average of assigned vectors
-            self.ema_w.data.mul_(self.decay).add_(dw, alpha=(1 - self.decay))
+            self._ema_w = nn.Parameter(self._ema_w * self.decay + (1 - self.decay) * dw)
 
             # 3. Normalize the updated embeddings
             # Get total cluster size (with smoothing to prevent division by zero)
-            n = self.ema_cluster_size.sum()
+            n = torch.sum(self._ema_cluster_size.data)
             # Normalize cluster sizes with Laplace smoothing
-            cluster_size = ((self.ema_cluster_size + self.epsilon) /
-                            (n + self.num_embeddings * self.epsilon) * n)
-            # Normalize embeddings by their corresponding cluster sizes
-            embed_normalized = self.ema_w / cluster_size.unsqueeze(1)
+            self._ema_cluster_size = (
+                    (self._ema_cluster_size + self.epsilon) / (n + self.num_embeddings * self.epsilon) * n)
             # Update the actual embedding weights with the EMA-updated version
-            self.embedding.weight.data.copy_(embed_normalized)
-
-        # Get the quantized latent vectors using embedding lookup
-        # Multiply one-hot encodings by embedding weights to get quantized vectors
-        # Then reshape back to the original tensor shape [B, H, W, D]
-        z_q = torch.matmul(min_encodings, self.embedding.weight).view(
-            z.shape[0], z.shape[2], z.shape[3], self.embedding_dim)
-        # Permute back to match input tensor ordering [B, D, H, W]
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+            self.embedding.weight = nn.Parameter(self._ema_w / self._ema_cluster_size.unsqueeze(1))
 
         # Compute VQ losses:
-        
+
         # 1. Codebook loss (makes codebook vectors move towards encoder outputs)
-        # The detach() on z prevents gradients from flowing back to the encoder
-        vq_loss = F.mse_loss(z_q.detach(), z)
+        # The detach() on z prevents gradients from flowing back to the quantization
+        e_latent_loss = F.mse_loss(z_q.detach(), z_e)
         
         # 2. Commitment loss (makes encoder outputs move towards codebook vectors)
         # The detach() on z_q prevents gradients from flowing back to the codebook
-        commitment_loss = F.mse_loss(z_q, z.detach())
+        commitment_loss = self.commitment_cost * e_latent_loss
         
         # Combine losses with commitment_cost weighting
-        loss = vq_loss + self.commitment_cost * commitment_loss
+        if self.use_ema:
+            loss = commitment_loss
+        else:
+            q_latent_loss = F.mse_loss(z_q, z_e.detach())
+            loss = q_latent_loss + commitment_loss
 
         # Straight-through estimator
         # This allows gradients to flow back to encoder even though quantization is discrete
         # In the forward pass: z_q = selected embeddings
         # In the backward pass: gradients flow directly from z_q to z, bypassing quantization
-        z_q = z + (z_q - z).detach()
+        z_q = z_e + (z_q - z_e).detach()
 
-        # Add explicit memory logging
-        # torch.cuda.synchronize()
-        # print(f"Allocated: {torch.cuda.memory_allocated()/1e6:.2f}MB")
+        # Compute perplexity evaluation
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
-        return z_q, loss, min_encoding_indices
-
-    def get_codebook_entry(self, indices):
-        """
-        Retrieve specific vectors from the codebook using their indices.
-        
-        This is used during inference to map from discrete codes back to latent vectors.
-        
-        Args:
-            indices (torch.Tensor): Indices of the codebook entries to retrieve
-        
-        Returns:
-            z_q (torch.Tensor): The corresponding vectors from the codebook
-        """
-        # Flatten indices to 1D
-        indices = indices.view(-1)
-        
-        # Convert indices to one-hot encodings
-        min_encodings = torch.zeros(indices.shape[0], self.num_embeddings, device=indices.device)
-        min_encodings.scatter_(1, indices.unsqueeze(1), 1)
-        
-        # Get corresponding embedding vectors using matmul with one-hot encodings
-        z_q = torch.matmul(min_encodings, self.embedding.weight)
-        
-        # Reshape to match expected dimensions
-        z_q = z_q.view(indices.shape[0], self.embedding_dim)
-        
-        return z_q
+        return z_q.permute(0, 3, 1, 2).contiguous(), loss, perplexity, encodings
 
 
 class DictionaryLearningBottleneck(nn.Module):

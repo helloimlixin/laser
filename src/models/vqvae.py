@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
 import torchvision
+from torchmetrics.functional.text import perplexity
 
 from .encoder import Encoder
 from .decoder import Decoder
@@ -37,8 +38,7 @@ class VQVAE(pl.LightningModule):
             num_hiddens: number of hidden units (hidden dimensions)
             num_embeddings: Number of embeddings in codebook
             embedding_dim: Dimension of each embedding
-            num_residual_layers: Number of residual layers in encoder and decoder
-            num_residual_blocks: Number of residual blocks
+            num_residual_blocks: Number of residual blocks in encoder and decoder
             commitment_cost: Commitment cost for VQ
             decay: Decay factor for EMA
             perceptual_weight: Weight for perceptual loss
@@ -86,32 +86,15 @@ class VQVAE(pl.LightningModule):
         # Initialize custom LPIPS for perceptual loss
         self.lpips = LPIPS()
 
-        # Initialize training metrics
-        self.train_perplexity = torchmetrics.MeanMetric()
-        self.train_vq_loss = torchmetrics.MeanMetric()
-        self.train_recon_loss = torchmetrics.MeanMetric()
-        self.train_perceptual_loss = torchmetrics.MeanMetric()
-
-        # Initialize validation metrics
-        self.val_perplexity = torchmetrics.MeanMetric()
-        self.val_vq_loss = torchmetrics.MeanMetric()
-        self.val_recon_loss = torchmetrics.MeanMetric()
-        self.val_perceptual_loss = torchmetrics.MeanMetric()
-
-        # Initialize test metrics
-        self.test_metrics = torchmetrics.MeanMetric()
         if self.compute_fid:
             self.test_fid = torchmetrics.image.FrechetInceptionDistance(
-                feature=2048,
+                feature=64,
                 normalize=True
             )
         else:
             self.test_fid = None
 
-        # Initialize PSNR metrics
-        self.train_psnr = PeakSignalNoiseRatio()
-        self.val_psnr = PeakSignalNoiseRatio()
-        self.test_psnr = PeakSignalNoiseRatio()
+        self.psnr = PeakSignalNoiseRatio()
 
         # Save hyperparameters for logging
         self.save_hyperparameters()
@@ -129,8 +112,8 @@ class VQVAE(pl.LightningModule):
         """
         z = self.encoder(x)
         z = self.pre_quantization(z)
-        z_q, _, indices = self.vector_quantizer(z)
-        return z_q, indices
+        z_q, quantization_loss, _, _ = self.vector_quantizer(z)
+        return z_q, quantization_loss
     
     def decode(self, z_q):
         """
@@ -145,32 +128,11 @@ class VQVAE(pl.LightningModule):
         z_q = self.post_quantization(z_q)
         x_recon = self.decoder(z_q)
         return x_recon
-    
-    def decode_indices(self, indices, latent_shape):
-        """
-        Decode indices to reconstruction
-        
-        Args:
-            indices: Indices of the codebook entries [B, H, W]
-            latent_shape: Shape of the latent representation [H, W]
-        
-        Returns:
-            x_recon: Reconstructed input
-        """
-        # Reshape indices to match latent shape
-        indices = indices.view(-1, *latent_shape)
-        
-        # Get codebook entries
-        z_q = self.vector_quantizer.get_codebook_entry(indices)
-        z_q = z_q.view(-1, self.vector_quantizer.embedding_dim, *latent_shape)
-        
-        # Decode
-        return self.decode(z_q)
 
     def forward(self, x):
         z = self.encoder(x)
         z = self.pre_quantization(z)
-        z_q, vq_loss, perplexity = self.vector_quantizer(z)
+        z_q, vq_loss, perplexity, encodings = self.vector_quantizer(z)
         z_q = self.post_quantization(z_q)
         recon = self.decoder(z_q)
 
@@ -201,27 +163,11 @@ class VQVAE(pl.LightningModule):
         x_recon_norm = recon * 2.0 - 1.0
         perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
 
-        # Ensure vq_loss is a scalar
-        if not isinstance(vq_loss, float):
-            vq_loss = vq_loss.mean()
-
-        # Convert perplexity to float tensor before computing mean
-        if torch.is_tensor(perplexity):
-            perplexity = perplexity.float().mean()
-
         # Compute total loss
-        total_loss = recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
-
-        # Update metrics based on prefix
-        if hasattr(self, f'{prefix}_perplexity'):
-            getattr(self, f'{prefix}_perplexity')(perplexity)
-            getattr(self, f'{prefix}_vq_loss')(vq_loss)
-            getattr(self, f'{prefix}_recon_loss')(recon_loss)
-            getattr(self, f'{prefix}_perceptual_loss')(perceptual_loss)
+        total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
 
         # Special handling for test metrics
         if prefix == 'test':
-            self.test_metrics.update(total_loss)
             if self.test_fid is not None:
                 x_recon_fid = torch.clamp(recon, 0, 1)
                 x_fid = torch.clamp(x, 0, 1)
@@ -236,12 +182,8 @@ class VQVAE(pl.LightningModule):
         self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True)
 
         # Add PSNR calculation
-        if hasattr(self, f'{prefix}_psnr'):
-            # Ensure images are in range [0, 1]
-            x_psnr = torch.clamp(x, 0, 1)
-            recon_psnr = torch.clamp(recon, 0, 1)
-            psnr_value = getattr(self, f'{prefix}_psnr')(recon_psnr, x_psnr)
-            self.log(f'{prefix}/psnr', psnr_value, on_step=True, on_epoch=True)
+        psnr = self.psnr(x, recon)
+        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True)
 
         return {
             'loss': total_loss,
@@ -249,6 +191,7 @@ class VQVAE(pl.LightningModule):
             'vq_loss': vq_loss,
             'perceptual_loss': perceptual_loss,
             'perplexity': perplexity,
+            'psnr': psnr,
             'x': x,
             'x_recon': recon
         }
@@ -284,47 +227,21 @@ class VQVAE(pl.LightningModule):
 
     def on_train_epoch_end(self):
         """Log epoch-level metrics for training."""
-        # Compute and log the epoch-averaged metrics
-        perplexity = self.train_perplexity.compute()
-        vq_loss = self.train_vq_loss.compute()
-        
         # Add PSNR
-        psnr = self.train_psnr.compute()
+        psnr = self.psnr.compute()
         self.log('train/epoch_psnr', psnr)
-        
-        # Reset all metrics
-        self.train_perplexity.reset()
-        self.train_vq_loss.reset()
-        self.train_psnr.reset()
 
     def on_validation_epoch_end(self):
         """Log epoch-level metrics for validation."""
-        # Log the epoch-averaged metrics
-        perplexity = self.val_perplexity.compute()
-        vq_loss = self.val_vq_loss.compute()
-        
         # Add PSNR
-        psnr = self.val_psnr.compute()
+        psnr = self.psnr.compute()
         self.log('val/epoch_psnr', psnr)
-        
-        # Reset all metrics
-        self.val_perplexity.reset()
-        self.val_vq_loss.reset()
-        self.val_psnr.reset()
 
     def on_test_epoch_end(self):
         """Log epoch-level metrics for testing."""
-        # Log final test metrics
-        test_loss = self.test_metrics.compute()
-        self.log('test/epoch_loss', test_loss)
-        
         # Add PSNR
-        psnr = self.test_psnr.compute()
+        psnr = self.psnr.compute()
         self.log('test/epoch_psnr', psnr)
-        
-        # Reset metrics
-        self.test_metrics.reset()
-        self.test_psnr.reset()
         
         # Existing FID handling
         if self.test_fid is not None:
@@ -340,17 +257,14 @@ class VQVAE(pl.LightningModule):
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.5,
-            patience=5
+            factor=0.1
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": lr_scheduler,
-                "monitor": "val/loss",  # Metric to monitor
-                "interval": "epoch",
-                "frequency": 100
+                "monitor": "val/epoch_psnr",  # Metric to monitor
             }
         }
 

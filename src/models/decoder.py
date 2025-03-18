@@ -26,18 +26,17 @@ class Decoder(nn.Module):
         super().__init__()
         
         # Initial processing
-        self.conv1 = nn.Conv2d(in_channels, num_hiddens, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(num_hiddens)
+        self.conv1 = nn.Conv2d(in_channels,
+                               num_hiddens,
+                               kernel_size=3,
+                               stride=1,
+                               padding=1)
         
         # Residual blocks
-        self.residual_blocks = nn.ModuleList([
-            ResidualBlock(
-                in_channels=num_hiddens,
-                num_hiddens=num_hiddens,
-                num_residual_hiddens=num_residual_hiddens
-            )
-            for _ in range(num_residual_blocks)
-        ])
+        self.residual_blocks = nn.Sequential(*[ResidualBlock(in_channels=num_hiddens,
+                                                             num_hiddens=num_hiddens,
+                                                             num_residual_hiddens=num_residual_hiddens)
+                                               for _ in range(num_residual_blocks)])
         
         # Upsampling layers
         self._conv_trans_1 = nn.ConvTranspose2d(
@@ -59,17 +58,12 @@ class Decoder(nn.Module):
     def forward(self, x):
         # Initial processing
         x = self.conv1(x)
-        x = self.bn1(x)
-        x = F.relu(x, inplace=False)
         
         # Residual blocks
-        for block in self.residual_blocks:
-            x = block(x)
+        x = self.residual_blocks(x)
         
         # Upsampling
         x = self._conv_trans_1(x)
-        x = F.relu(x, inplace=False)
+        x = F.relu(x)
         
-        x = self._conv_trans_2(x)
-        
-        return x
+        return self._conv_trans_2(x)

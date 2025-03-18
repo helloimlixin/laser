@@ -11,7 +11,7 @@ output_dir: "./outputs/cifar10"
 training:
   learning_rate: 3.0e-4
   beta: 0.9
-  max_epochs: 100
+  max_epochs: 1000
   accelerator: "gpu"
   devices: 1
   precision: 32
