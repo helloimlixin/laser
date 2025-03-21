@@ -176,7 +176,7 @@ class DLVAE(pl.LightningModule):
         perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
         
         # Total loss
-        total_loss = recon_loss + dl_loss + self.perceptual_weight * perceptual_loss
+        total_loss = (1 - self.perceptual_weight) * recon_loss + dl_loss + self.perceptual_weight * perceptual_loss
 
         # Handle FID for test
         if prefix == 'test' and self.test_fid is not None:

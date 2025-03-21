@@ -218,19 +218,21 @@ class DictionaryLearning(nn.Module):
         """
         # 1. Initialize variables and Precompute Dt and DtD
         embedding_dim, num_signals = signals.size()
+        device = signals.device
+        dtype = signals.dtype
         dictionary_t = dictionary.t()  # save the transposed dictionary for faster computation
-        gram_matrix = torch.matmul(dictionary_t, dictionary)  # precompute the Gram matrix [num_embeddings, num_embeddings]
-        init_correlations = torch.matmul(dictionary_t, signals).t()  # initial correlations [num_embeddings, batch_size]
+        gram_matrix = torch.mm(dictionary_t, dictionary)  # precompute the Gram matrix [num_embeddings, num_embeddings]
+        init_correlations = torch.mm(dictionary_t, signals).t()  # initial correlations [num_embeddings, batch_size]
 
         # 2. Initialize buffers
         residual = torch.norm(signals, p=2, dim=0)  # initial residual [batch_size], which is the L2 norm of each signal
-        delta = torch.zeros(num_signals, device=signals.device)  # placeholder for the residual update
-        coefficients = torch.zeros_like(init_correlations)  # placeholder for the sparse coefficients
+        delta = torch.zeros(num_signals, device=device)  # placeholder for the residual update
+        coefficients = torch.zeros_like(init_correlations, dtype=dtype)  # placeholder for the sparse coefficients
         correlations = init_correlations  # correlations are initialized to the initial correlations
-        L = torch.ones(num_signals, 1, 1, device=signals.device)  # contains the progressive Cholesky of the Gram matrix in the selected indices
-        I = torch.zeros(num_signals, 0, dtype=torch.long, device=signals.device)  # placeholder for the selected indices
+        L = torch.ones(num_signals, 1, 1, device=device)  # contains the progressive Cholesky of the Gram matrix in the selected indices
+        I = torch.zeros(num_signals, 0, dtype=torch.long, device=device)  # placeholder for the selected indices
         omega = torch.ones_like(init_correlations, dtype=torch.bool)  # operator to mask out zero elements in the correlations
-        signal_idx = torch.arange(num_signals, device=signals.device)  # indices for the signals
+        signal_idx = torch.arange(num_signals, device=device)  # indices for the signals
         
         # 3. Main OMP loop
         k = 0
@@ -239,7 +241,7 @@ class DictionaryLearning(nn.Module):
             k += 1
             k_hats = torch.argmax(torch.abs(correlations * omega), dim=1)  # find the index of the maximum correlation
             # update the mask to make sure we do not select the same atoms again
-            omega[torch.arange(k_hats.size(0)), k_hats] = 0
+            omega.scatter_(1, k_hats.unsqueeze(1), 0)
             expanded_signal_idx = signal_idx.unsqueeze(0).expand(k, num_signals).t()  # expand the signal indices for batch processing, more efficient than repeating
 
             if  k > 1:

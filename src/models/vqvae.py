@@ -230,21 +230,17 @@ class VQVAE(pl.LightningModule):
         # Add PSNR
         psnr = self.psnr.compute()
         self.log('train/epoch_psnr', psnr)
-        self.psnr.reset()
 
     def on_validation_epoch_end(self):
         """Log epoch-level metrics for validation."""
         # Add PSNR
         psnr = self.psnr.compute()
         self.log('val/epoch_psnr', psnr)
-        self.psnr.reset()
-
     def on_test_epoch_end(self):
         """Log epoch-level metrics for testing."""
         # Add PSNR
         psnr = self.psnr.compute()
         self.log('test/epoch_psnr', psnr)
-        self.psnr.reset()
         
         # Existing FID handling
         if self.test_fid is not None:
