@@ -226,7 +226,7 @@ def compare_bottlenecks(epochs=5, sparsity_values=[3, 5, 10]):
     vq_results = benchmark_training(model_type='vq', epochs=epochs)
     results.append(vq_results)
     
-    # Benchmark ODL with different sparsity values
+    # Benchmark ODL with different sparsity_level values
     for sparsity in sparsity_values:
         print(f"Benchmarking ODL with sparsity={sparsity}...")
         odl_results = benchmark_training(model_type='odl', epochs=epochs, sparsity=sparsity)

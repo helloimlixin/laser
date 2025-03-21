@@ -34,7 +34,7 @@ progress_bar = RichProgressBar(
     leave=True
 )
 
-@hydra.main(config_path="configs", config_name="config")
+@hydra.main(config_path="configs", config_name="config", version_base="1.2")
 def train(cfg: DictConfig):
     """
     Main training function using Hydra for configuration.
@@ -71,7 +71,7 @@ def train(cfg: DictConfig):
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     elif cfg.model.type == "dlvae":
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
-        print(f"Sparsity: {cfg.model.sparsity}")
+        print(f"Sparsity: {cfg.model.sparsity_level}")
     
     print("\nTraining Configuration:")
     print(f"Learning Rate: {cfg.train.learning_rate}")
@@ -133,7 +133,7 @@ def train(cfg: DictConfig):
     if cfg.model.type == "vqvae":
         model = VQVAE(**model_params)
     elif cfg.model.type == "dlvae":
-        model_params['sparsity'] = cfg.model.sparsity
+        model_params['sparsity_level'] = cfg.model.sparsity_level
         model = DLVAE(**model_params)
     else:
         raise ValueError(f"Unknown model type: {cfg.model.type}")

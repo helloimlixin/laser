@@ -6,7 +6,7 @@ import torchvision
 
 from .encoder import Encoder
 from .decoder import Decoder
-from .bottleneck import DictionaryLearningBottleneck
+from .bottleneck import DictionaryLearning
 from src.lpips import LPIPS
 
 import torchmetrics
@@ -21,7 +21,7 @@ class DLVAE(pl.LightningModule):
             num_hiddens,
             num_embeddings,
             embedding_dim,
-            sparsity,
+            sparsity_level,
             num_residual_blocks,
             num_residual_hiddens,
             commitment_cost,
@@ -71,10 +71,10 @@ class DLVAE(pl.LightningModule):
                                         stride=1)
 
         # Initialize bottleneck
-        self.bottleneck = DictionaryLearningBottleneck(
+        self.bottleneck = DictionaryLearning(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
-            sparsity=sparsity,
+            sparsity_level=sparsity_level,
             commitment_cost=commitment_cost,
             decay=decay
         )
@@ -87,7 +87,7 @@ class DLVAE(pl.LightningModule):
 
         # Initialize decoder
         self.decoder = Decoder(
-            in_channels=embedding_dim,
+            in_channels=num_hiddens,
             num_hiddens=num_hiddens,
             num_residual_blocks=num_residual_blocks,
             num_residual_hiddens=num_residual_hiddens
@@ -96,46 +96,68 @@ class DLVAE(pl.LightningModule):
         # Initialize LPIPS for perceptual loss
         self.lpips = LPIPS()
 
-        # Initialize metrics
-        self._init_metrics()
+        # Initialize the PSNR metric
+        self.psnr = PeakSignalNoiseRatio()
+
+        # Initialize the SSIM metric
+        self.ssim = StructuralSimilarityIndexMeasure()
+
+        # Initialize metrics for Frechet Inception Distance (FID Score)
+        if self.compute_fid:
+            self.test_fid = FrechetInceptionDistance(feature=64, normalize=True)
+        else:
+            self.test_fid = None
 
         # Save hyperparameters
         self.save_hyperparameters()
 
-    def _init_metrics(self):
-        # Training metrics
-        self.train_recon_loss = torchmetrics.MeanMetric()
-        self.train_commit_loss = torchmetrics.MeanMetric()
-        self.train_perceptual_loss = torchmetrics.MeanMetric()
-        self.train_psnr = PeakSignalNoiseRatio()
+    def encode(self, x):
+        """
+        Encode input to latent representation.
 
-        # Validation metrics
-        self.val_recon_loss = torchmetrics.MeanMetric()
-        self.val_commit_loss = torchmetrics.MeanMetric()
-        self.val_perceptual_loss = torchmetrics.MeanMetric()
-        self.val_psnr = PeakSignalNoiseRatio()
+        Args:
+            x: Input tensor [B, C, H, W]
 
-        # Test metrics
-        self.test_metrics = torchmetrics.MeanMetric()
-        self.test_psnr = PeakSignalNoiseRatio()
+        Returns:
+            z_dl: latent representation reconstructed from the dictionary learning bottleneck
+            bottleneck_loss: loss from the dictionary learning bottleneck
+        """
+        z_e = self.encoder(x)
+        z_e = self.pre_bottleneck(z_e)
+        z_dl, bottleneck_loss, coefficients = self.bottleneck(z_e)
+        return z_dl, bottleneck_loss, coefficients
 
-        if self.compute_fid:
-            self.test_fid = FrechetInceptionDistance(feature=2048, normalize=True)
-        else:
-            self.test_fid = None
+    def decode(self, z_dl):
+        """
+        Decode latent representation to reconstruction.
+
+        Args:
+            z_dl: latent representation reconstructed from the dictionary learning bottleneck
+
+        Returns:
+            x_recon: reconstruction of the input
+        """
+        z_dl = self.post_bottleneck(z_dl)
+        x_recon = self.decoder(z_dl)
+        return x_recon
 
     def forward(self, x):
-        # Encode
-        h = self.encoder(x)
-        h = self.pre_bottleneck(h)
-        
-        # Apply bottleneck
-        z_q, loss, coefficients = self.bottleneck(h)
-        
-        # Decode
-        recon = self.decoder(z_q)
-        
-        return recon, loss, coefficients
+        """
+        Forward pass of the model.
+
+        Args:
+            x: Input tensor [B, C, H, W]
+
+        Returns:
+            tuple: (recon, bottleneck_loss, coefficients)
+        """
+        z = self.encoder(x)
+        z = self.pre_bottleneck(z)
+        z_dl, bottleneck_loss, coefficients = self.bottleneck(z)
+        z_dl = self.post_bottleneck(z_dl)
+        recon = self.decoder(z_dl)
+
+        return recon, bottleneck_loss, coefficients
 
     def compute_metrics(self, batch, prefix='train'):
         """Compute metrics for a batch."""
@@ -143,7 +165,7 @@ class DLVAE(pl.LightningModule):
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         
         # Forward pass
-        recon, commit_loss, coefficients = self(x)
+        recon, dl_loss, coefficients = self(x)
         
         # Compute losses
         recon_loss = F.mse_loss(recon, x).mean()
@@ -154,13 +176,7 @@ class DLVAE(pl.LightningModule):
         perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
         
         # Total loss
-        total_loss = recon_loss + commit_loss + self.perceptual_weight * perceptual_loss
-        
-        # Update metrics
-        if hasattr(self, f'{prefix}_recon_loss'):
-            getattr(self, f'{prefix}_recon_loss')(recon_loss)
-            getattr(self, f'{prefix}_commit_loss')(commit_loss)
-            getattr(self, f'{prefix}_perceptual_loss')(perceptual_loss)
+        total_loss = recon_loss + dl_loss + self.perceptual_weight * perceptual_loss
 
         # Handle FID for test
         if prefix == 'test' and self.test_fid is not None:
@@ -172,24 +188,21 @@ class DLVAE(pl.LightningModule):
         # Log metrics
         self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True)
         self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/commit_loss', commit_loss, on_step=True, on_epoch=True)
+        self.log(f'{prefix}/dl_loss', dl_loss, on_step=True, on_epoch=True)
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
 
         # Add PSNR calculation
-        if hasattr(self, f'{prefix}_psnr'):
-            x_psnr = torch.clamp(x, 0, 1)
-            recon_psnr = torch.clamp(recon, 0, 1)
-            psnr_value = getattr(self, f'{prefix}_psnr')(recon_psnr, x_psnr)
-            self.log(f'{prefix}/psnr', psnr_value, on_step=True, on_epoch=True)
+        psnr = self.psnr(x, recon)
+        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True)
 
         return {
             'loss': total_loss,
             'recon_loss': recon_loss,
-            'commit_loss': commit_loss,
+            'dl_loss': dl_loss,
             'perceptual_loss': perceptual_loss,
+            'psnr': psnr,
             'x': x,
-            'x_recon': recon,
-            'coefficients': coefficients
+            'x_recon': recon
         }
 
     def training_step(self, batch, batch_idx):
@@ -216,23 +229,40 @@ class DLVAE(pl.LightningModule):
             
         return metrics
 
+    def on_train_epoch_end(self):
+        """Log the average PSNR for the epoch."""
+        avg_psnr = self.psnr.compute()
+        self.log("train/epoch_psnr", avg_psnr, on_epoch=True)
+
+    def on_validation_epoch_end(self):
+        """Log the average PSNR for the epoch."""
+        avg_psnr = self.psnr.compute()
+        self.log("val/epoch_psnr", avg_psnr, on_epoch=True)
+
+    def on_test_epoch_end(self):
+        """Log the average PSNR for the epoch."""
+        avg_psnr = self.psnr.compute()
+        self.log("test/epoch_psnr", avg_psnr, on_epoch=True)
+
+        if self.test_fid is not None:
+            fid_score = self.test_fid.compute()
+            self.log("test/fid", fid_score, on_epoch=True)
+            self.test_fid.reset()
+
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, betas=(self.beta, 0.999))
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.5,
-            patience=5
+            factor=0.1
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val/loss",
-                "interval": "epoch",
-                "frequency": 1
+                "monitor": "val/epoch_psnr"
             }
         }
 
@@ -256,6 +286,7 @@ class DLVAE(pl.LightningModule):
                 wandb.Image(x_grid, caption="Original"),
                 wandb.Image(x_recon_grid, caption="Reconstructed")
             ],
+            f"{split}/reconstruction_error": F.mse_loss(x_recon, x).item(),
             "global_step": self.global_step
         })
         

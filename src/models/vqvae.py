@@ -61,20 +61,20 @@ class VQVAE(pl.LightningModule):
                                num_residual_blocks=num_residual_blocks,
                                num_residual_hiddens=num_residual_hiddens)
         
-        self.pre_quantization = nn.Conv2d(in_channels=num_hiddens,
-                                          out_channels=embedding_dim,
-                                          kernel_size=1,
-                                          stride=1)
+        self.pre_bottleneck = nn.Conv2d(in_channels=num_hiddens,
+                                        out_channels=embedding_dim,
+                                        kernel_size=1,
+                                        stride=1)
         
         self.vector_quantizer = VectorQuantizer(
             num_embeddings, embedding_dim, commitment_cost, decay
         )
 
-        self.post_quantization = nn.Conv2d(in_channels=embedding_dim,
-                                           out_channels=num_hiddens,
-                                           kernel_size=3,
-                                           stride=1,
-                                           padding=1)
+        self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
+                                         out_channels=num_hiddens,
+                                         kernel_size=3,
+                                         stride=1,
+                                         padding=1)
         
         self.decoder = Decoder(
             in_channels=num_hiddens,  # Input channels for decoder matches hidden dims
@@ -111,7 +111,7 @@ class VQVAE(pl.LightningModule):
             indices: Indices of the codebook entries
         """
         z = self.encoder(x)
-        z = self.pre_quantization(z)
+        z = self.pre_bottleneck(z)
         z_q, quantization_loss, _, _ = self.vector_quantizer(z)
         return z_q, quantization_loss
     
@@ -125,15 +125,15 @@ class VQVAE(pl.LightningModule):
         Returns:
             x_recon: Reconstructed input
         """
-        z_q = self.post_quantization(z_q)
+        z_q = self.post_bottleneck(z_q)
         x_recon = self.decoder(z_q)
         return x_recon
 
     def forward(self, x):
         z = self.encoder(x)
-        z = self.pre_quantization(z)
+        z = self.pre_bottleneck(z)
         z_q, vq_loss, perplexity, encodings = self.vector_quantizer(z)
-        z_q = self.post_quantization(z_q)
+        z_q = self.post_bottleneck(z_q)
         recon = self.decoder(z_q)
 
         # Return as tuple instead of dict
@@ -230,18 +230,21 @@ class VQVAE(pl.LightningModule):
         # Add PSNR
         psnr = self.psnr.compute()
         self.log('train/epoch_psnr', psnr)
+        self.psnr.reset()
 
     def on_validation_epoch_end(self):
         """Log epoch-level metrics for validation."""
         # Add PSNR
         psnr = self.psnr.compute()
         self.log('val/epoch_psnr', psnr)
+        self.psnr.reset()
 
     def on_test_epoch_end(self):
         """Log epoch-level metrics for testing."""
         # Add PSNR
         psnr = self.psnr.compute()
         self.log('test/epoch_psnr', psnr)
+        self.psnr.reset()
         
         # Existing FID handling
         if self.test_fid is not None:
@@ -254,7 +257,7 @@ class VQVAE(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
         # Store the scheduler as an attribute
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.1
@@ -263,7 +266,7 @@ class VQVAE(pl.LightningModule):
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": lr_scheduler,
+                "scheduler": scheduler,
                 "monitor": "val/epoch_psnr",  # Metric to monitor
             }
         }
@@ -286,16 +289,14 @@ class VQVAE(pl.LightningModule):
             x,
             nrow=8,
             normalize=True,
-            value_range=(-1, 1),
-            pad_value=1
+            value_range=(-1, 1)
         )
 
         x_recon_grid = torchvision.utils.make_grid(
             x_recon,
             nrow=8,
             normalize=True,
-            value_range=(-1, 1),
-            pad_value=1
+            value_range=(-1, 1)
         )
 
         # Convert to numpy and transpose to correct format (H,W,C)

@@ -36,7 +36,7 @@ class VectorQuantizer(nn.Module):
                            If 0, standard backpropagation is used to update embeddings
             epsilon (float): Small constant to prevent division by zero in EMA update normalization
         """
-        super().__init__()
+        super(VectorQuantizer, self).__init__()
 
         self.embedding_dim = embedding_dim  # Dimension of each embedding vector
         self.num_embeddings = num_embeddings  # Number of embedding vectors in the codebook
@@ -165,7 +165,7 @@ class VectorQuantizer(nn.Module):
         return z_q.permute(0, 3, 1, 2).contiguous(), loss, perplexity, encodings
 
 
-class DictionaryLearningBottleneck(nn.Module):
+class DictionaryLearning(nn.Module):
     """
     Dictionary Learning Bottleneck with vectorized Batch Orthogonal Matching Pursuit (OMP) sparse coding.
     """
@@ -173,28 +173,21 @@ class DictionaryLearningBottleneck(nn.Module):
         self,
         num_embeddings=512,
         embedding_dim=64,
-        sparsity=5,
+        sparsity_level=5,
         commitment_cost=0.25,
         decay=0.99,
         epsilon=1e-10,
-        use_ema=True,
+        use_ema=True
     ):
-        super().__init__()
+        super(DictionaryLearning, self).__init__()
         
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.sparsity = sparsity
+        self.sparsity_level = sparsity_level
         self.commitment_cost = commitment_cost
         self.decay = decay
         self.epsilon = epsilon
         self.use_ema = use_ema
-        
-        # Initialize buffers for OMP
-        self.register_buffer('_corr_buffer', torch.Tensor())
-        self.register_buffer('_residual_buffer', torch.Tensor())
-        self.register_buffer('_coefficients_buffer', torch.Tensor())
-        self.register_buffer('_active_set_buffer', torch.Tensor())
-        self.register_buffer('_L_buffer', torch.Tensor())  # For Cholesky
         
         # Initialize dictionary with random atoms
         self.dictionary = nn.Parameter(
@@ -205,114 +198,129 @@ class DictionaryLearningBottleneck(nn.Module):
     def _normalize_dictionary(self):
         """Normalize all dictionary atoms to have unit L2 norm."""
         with torch.no_grad():
-            norms = torch.norm(self.dictionary, p=2, dim=0, keepdim=True)
-            self.dictionary.data = self.dictionary.data / norms
+            self.dictionary.data = self.dictionary.data / torch.linalg.norm(self.dictionary.data, dim=0)
 
     def batch_omp(self, signals, dictionary, debug=False):
-        device = signals.device
-        batch_size = signals.size(1)
-        
+        """
+        Sparce coding using Batch Orthogonal Matching Pursuit (OMP).
+
+        References:
+            - Rubinstein, R., Zibulevsky, M. and Elad, M., "Efficient Implementation of the K-SVD Algorithm using
+                Batch Orthogonal Matching Pursuit," CS Technion, 2008.
+
+        Args:
+            signals (torch.Tensor): Input tensor of shape [batch_size, embedding_dim, height, width]
+            dictionary (torch.Tensor): Dictionary of shape [embedding_dim, num_embeddings]
+            debug (bool): If True, print debug information during
+
+        Returns:
+            coefficients (torch.Tensor): Sparse coefficients of shape [batch_size, num_embeddings]
+        """
+        # 1. Initialize variables and Precompute Dt and DtD
+        embedding_dim, num_signals = signals.size()
+        dictionary_t = dictionary.t()  # save the transposed dictionary for faster computation
+        gram_matrix = torch.matmul(dictionary_t, dictionary)  # precompute the Gram matrix [num_embeddings, num_embeddings]
+        init_correlations = torch.matmul(dictionary_t, signals).t()  # initial correlations [num_embeddings, batch_size]
+
         # 2. Initialize buffers
-        residual = signals.clone()
-        coefficients = torch.zeros(batch_size, self.num_embeddings, device=device)
-        active_set = torch.zeros(batch_size, self.num_embeddings, dtype=torch.bool, device=device)
+        residual = torch.norm(signals, p=2, dim=0)  # initial residual [batch_size], which is the L2 norm of each signal
+        delta = torch.zeros(num_signals, device=signals.device)  # placeholder for the residual update
+        coefficients = torch.zeros_like(init_correlations)  # placeholder for the sparse coefficients
+        correlations = init_correlations  # correlations are initialized to the initial correlations
+        L = torch.ones(num_signals, 1, 1, device=signals.device)  # contains the progressive Cholesky of the Gram matrix in the selected indices
+        I = torch.zeros(num_signals, 0, dtype=torch.long, device=signals.device)  # placeholder for the selected indices
+        omega = torch.ones_like(init_correlations, dtype=torch.bool)  # operator to mask out zero elements in the correlations
+        signal_idx = torch.arange(num_signals, device=signals.device)  # indices for the signals
         
-        # 3. Precompute DtD and Dt once
-        Dt = dictionary.t()
-        DtD = torch.matmul(Dt, dictionary)
-        DtD = DtD + torch.eye(self.num_embeddings, device=device) * self.epsilon
-        
-        # 4. Main OMP loop
-        for k in range(self.sparsity):
-            # Compute correlations
-            correlations = torch.matmul(Dt, residual)
-            correlations[active_set.t()] = -float('inf')
-            
-            # Select new atoms
-            new_atoms = torch.argmax(correlations, dim=0)
-            row_indices = torch.arange(batch_size, device=device)
-            active_set[row_indices, new_atoms] = True
-            
-            # Get active indices
-            active_indices = active_set.nonzero()[:,1].view(batch_size, k+1)
-            
-            try:
-                # Solve least squares
-                selected_DtD = DtD[active_indices.unsqueeze(-1), active_indices.unsqueeze(-2)]
-                y = torch.bmm(Dt[active_indices], residual.t().unsqueeze(-1)).squeeze(-1)
-                coeffs = torch.linalg.solve(selected_DtD, y.unsqueeze(-1)).squeeze(-1)
-                
-                # Update residual
-                update = torch.bmm(
-                    dictionary[:,active_indices].permute(1,0,2),
-                    coeffs.unsqueeze(-1)
-                ).squeeze(-1).transpose(0,1)
-                residual = signals - update
-                
-                # Store coefficients
-                coefficients.scatter_(1, active_indices, coeffs)
-                
-            except RuntimeError as e:
-                if debug:
-                    print(f"Error at iteration {k}: {e}")
-                break
-        
+        # 3. Main OMP loop
+        k = 0
+
+        while k < self.sparsity_level:
+            k += 1
+            k_hats = torch.argmax(torch.abs(correlations * omega), dim=1)  # find the index of the maximum correlation
+            # update the mask to make sure we do not select the same atoms again
+            omega[torch.arange(k_hats.size(0)), k_hats] = 0
+            expanded_signal_idx = signal_idx.unsqueeze(0).expand(k, num_signals).t()  # expand the signal indices for batch processing, more efficient than repeating
+
+            if  k > 1:
+                G_ = gram_matrix[I[signal_idx, :], k_hats[expanded_signal_idx[...,: -1]]].view(num_signals, k - 1, 1)  # compute for all the signals in a vectorized manner
+                w = torch.linalg.solve_triangular(L, G_, upper=False).view(-1, 1, k - 1)  # solve the triangular system for the current signal
+                w_br = torch.sqrt(1 - (w ** 2).sum(dim=2, keepdim=True))  # L bottom-right corner element: sqrt(1 - w.t() @ w)
+
+                # concatenate into the new Cholesky: L = [[L, 0], [w, w_br]]
+                k_zeros = torch.zeros(num_signals, k - 1, 1, device=signals.device)
+                L = torch.cat((
+                    torch.cat((L, k_zeros), dim=2),
+                    torch.cat((w, w_br), dim=2)
+                ), dim=1)
+
+            # update non-zero indices
+            I = torch.cat((I, k_hats.unsqueeze(1)), dim=1)
+
+            # solve for L
+            correlations_ = init_correlations[expanded_signal_idx, I[signal_idx, :]].view(num_signals, k, 1)
+            coefficients_ = torch.cholesky_solve(correlations_, L)
+
+            # de-stack the coefficients into the non-zero elements
+            coefficients[signal_idx.unsqueeze(1), I[signal_idx]] = coefficients_[signal_idx].squeeze(-1)
+
+            # beta = G_I @ coefficients
+            beta = torch.bmm(coefficients[signal_idx.unsqueeze(1), I[signal_idx]].unsqueeze(1),
+                                gram_matrix[I[signal_idx], :]).squeeze(1)  # [batch_size, num_embeddings]
+
+            # update the correlations
+            correlations = init_correlations - beta
+
+            # update the residual
+            new_delta = (coefficients * beta).sum(dim=1)  # [batch_size]
+            residual += delta - new_delta
+            delta = new_delta
+
+            if debug and k % 1 == 0:
+                print('Step {}, residual: {:.4f}, below tolerance: {:.4f}'.format(k, residual.max(), (residual < 1e-7).float().mean().item()))
+
         return coefficients.t()
     
-    def forward(self, z):
+    def forward(self, z_e):
         """
         Forward pass through the dictionary learning bottleneck.
         
         Args:
-            z: Input tensor of shape [batch_size, embedding_dim, height, width]
+            z_e: Input tensor of shape [batch_size, embedding_dim, height, width]
             
         Returns:
-            z_q: Quantized tensor of shape [batch_size, embedding_dim, height, width]
-            loss: Commitment loss
-            coefficients: Sparse coefficients
+            z_dl: latent representation reconstructed from the dictionary learning bottleneck
+            loss: loss from the dictionary learning bottleneck
+            coefficients: sparse coefficients
         """
-        # Save input shape
-        input_shape = z.shape
-        batch_size, embedding_dim, height, width = input_shape
-        
-        # Reshape for sparse coding with proper normalization
-        z_flat = z.permute(0, 2, 3, 1).reshape(-1, embedding_dim).t()
-        
-        # Dictionary updates during training
-        if self.training:
-            self._normalize_dictionary()
-        
-        # Sparse coding with OMP
-        with torch.no_grad():
-            coefficients = self.batch_omp(z_flat, self.dictionary, debug=False)
+        # z shape: [batch_size, embedding_dim, height, width]
 
-            # Clip extreme values
-            coefficients = torch.clamp(coefficients, -1e7, 1e7)
+        z_e = z_e.permute(0, 2, 3, 1).contiguous()  # [batch_size, height, width, embedding_dim]
+        input_shape = z_e.shape
         
-        # Reconstruct with stable computation
-        z_q_flat = torch.matmul(self.dictionary, coefficients)
+        # Flatten the input
+        ze_flattened = z_e.view(self.embedding_dim, -1)  # [batch_size * height * width, embedding_dim]
         
-        # Reshape back with proper normalization
-        z_q_reshaped = z_q_flat.t().view(batch_size, height, width, embedding_dim).permute(0, 3, 1, 2)
-        
-        # Compute losses with gradient clipping
-        z_flat_orig = z.permute(0, 2, 3, 1).reshape(-1, embedding_dim).t()
-        rec_loss = F.mse_loss(z_q_flat.detach(), z_flat_orig)
-        commit_loss = F.mse_loss(z_q_flat, z_flat_orig.detach())
-        
-        # Scale commitment cost with sparsity
-        effective_cost = self.commitment_cost * (1 + self.sparsity / 10)
-        
-        # Add L1 regularization to coefficients
-        coeff_loss = torch.mean(torch.abs(coefficients))
-        
-        # Scale losses to prevent explosion
-        loss = rec_loss + effective_cost * commit_loss + 0.001 * coeff_loss
-        
-        # Straight-through estimator with gradient clipping
-        z_q = z + torch.clamp(z_q_reshaped - z, -1, 1).detach()
+        '''
+        Sparse coding stage
+        '''
+        self._normalize_dictionary()
+        coefficients = self.batch_omp(ze_flattened, self.dictionary, debug=False)  # [num_embeddings, batch_size * height * width]
 
-        return z_q, loss, coefficients
+        z_dl = self.dictionary @ coefficients  # [embedding_dim, batch_size * height * width]
+        z_dl = z_dl.view(input_shape) # [batch_size, embedding_dim, height, width]
+
+        # Compute the commitment loss
+        e_latent_loss = F.mse_loss(z_dl.detach(), z_e)  # [batch_size, height, width, embedding_dim]
+        dl_latent_loss = F.mse_loss(z_dl, z_e.detach())  # [batch_size, height, width, embedding_dim]
+
+        # Compute the total loss
+        loss = self.commitment_cost * e_latent_loss + dl_latent_loss
+
+        # Straight-through estimator
+        z_dl = z_e + (z_dl - z_e).detach()  # Allow gradients to flow back to encoder
+
+        return z_dl.permute(0, 3, 1, 2).contiguous(), loss, coefficients  # Return the reconstructed latent representation, loss, and sparse coefficients
 
 
 def test_vector_quantizer():
@@ -376,10 +384,10 @@ def test_dictionary_learning_bottleneck():
     z = torch.randn(batch_size, embedding_dim, height, width)
     
     # Initialize ODL model
-    odl = DictionaryLearningBottleneck(
+    odl = DictionaryLearning(
         num_embeddings=num_embeddings,
         embedding_dim=embedding_dim,
-        sparsity=sparsity,
+        sparsity_level=sparsity,
         commitment_cost=0.25,
         decay=0.99,
         use_ema=True
@@ -394,7 +402,7 @@ def test_dictionary_learning_bottleneck():
     print(f"Loss: {loss.item():.4f}")
     print(f"Coefficients shape: {coefficients.shape}")
     
-    # Check sparsity of coefficients
+    # Check sparsity_level of coefficients
     nonzero_ratio = (coefficients.abs() > 1e-6).float().mean().item()
     print(f"Nonzero coefficient ratio: {nonzero_ratio:.4f}")
     print(f"Expected sparsity ratio: {sparsity/num_embeddings:.4f}")
