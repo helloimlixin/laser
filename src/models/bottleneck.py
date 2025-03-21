@@ -4,7 +4,6 @@ import torch.nn.functional as F
 
 import numpy as np
 import matplotlib.pyplot as plt
-import math
 
 class VectorQuantizer(nn.Module):
     """
@@ -249,86 +248,6 @@ class DictionaryLearning(nn.Module):
             residual = residual - d_selected * alpha.unsqueeze(0)  # shape (M, B)
 
         return coefficients
-
-    # def batch_omp(self, signals, dictionary, debug=False):
-    #     """
-    #     Sparce coding using Batch Orthogonal Matching Pursuit (OMP).
-    #
-    #     References:
-    #         - Rubinstein, R., Zibulevsky, M. and Elad, M., "Efficient Implementation of the K-SVD Algorithm using
-    #             Batch Orthogonal Matching Pursuit," CS Technion, 2008.
-    #
-    #     Args:
-    #         signals (torch.Tensor): Input tensor of shape [embedding_dim, num_signals]
-    #         dictionary (torch.Tensor): Dictionary of shape [embedding_dim, num_embeddings]
-    #         debug (bool): If True, print debug information during
-    #
-    #     Returns:
-    #         coefficients (torch.Tensor): Sparse coefficients of shape [batch_size, num_embeddings]
-    #     """
-    #     # 1. Initialize variables and Precompute Dt and DtD
-    #     embedding_dim, num_signals = signals.size()
-    #     device = signals.device
-    #     dtype = signals.dtype
-    #     dictionary_t = dictionary.t()  # save the transposed dictionary for faster computation
-    #     gram_matrix = torch.mm(dictionary_t, dictionary)  # precompute the Gram matrix [num_embeddings, num_embeddings]
-    #     init_correlations = torch.mm(dictionary_t, signals).t()  # initial correlations [num_embeddings, batch_size]
-    #
-    #     # 2. Initialize buffers
-    #     residual = torch.norm(signals, p=2, dim=0)  # initial residual [batch_size], which is the L2 norm of each signal
-    #     delta = torch.zeros(num_signals, device=device)  # placeholder for the residual update
-    #     coefficients = torch.zeros_like(init_correlations, dtype=dtype)  # placeholder for the sparse coefficients
-    #     correlations = init_correlations  # correlations are initialized to the initial correlations
-    #     L = torch.ones(num_signals, 1, 1, device=device)  # contains the progressive Cholesky of the Gram matrix in the selected indices
-    #     I = torch.zeros(num_signals, 0, dtype=torch.long, device=device)  # placeholder for the selected indices
-    #     omega = torch.ones_like(init_correlations, dtype=torch.bool)  # operator to mask out zero elements in the correlations
-    #     signal_idx = torch.arange(num_signals, device=device)  # indices for the signals
-    #
-    #     # 3. Main OMP loop
-    #     for k in range(self.sparsity_level):
-    #         k_hats = torch.argmax(torch.abs(correlations * omega), dim=1)  # find the index of the maximum correlation
-    #         # update the mask to make sure we do not select the same atoms again
-    #         omega.scatter_(1, k_hats.unsqueeze(1), 0)
-    #         expanded_signal_idx = signal_idx.unsqueeze(0).expand(k, num_signals).t()  # expand the signal indices for batch processing, more efficient than repeating
-    #
-    #         if  k > 1:
-    #             G_ = gram_matrix[I[signal_idx, :], k_hats[expanded_signal_idx[...,: -1]]].view(num_signals, k - 1, 1)  # compute for all the signals in a vectorized manner
-    #             w = torch.linalg.solve_triangular(L, G_, upper=False).view(-1, 1, k - 1)  # solve the triangular system for the current signal
-    #             w_br = torch.sqrt(1 - (w ** 2).sum(dim=2, keepdim=True))  # L bottom-right corner element: sqrt(1 - w.t() @ w)
-    #
-    #             # concatenate into the new Cholesky: L = [[L, 0], [w, w_br]]
-    #             k_zeros = torch.zeros(num_signals, k - 1, 1, device=signals.device)
-    #             L = torch.cat((
-    #                 torch.cat((L, k_zeros), dim=2),
-    #                 torch.cat((w, w_br), dim=2)
-    #             ), dim=1)
-    #
-    #         # update non-zero indices
-    #         I = torch.cat((I, k_hats.unsqueeze(1)), dim=1)
-    #
-    #         # solve for L
-    #         correlations_ = init_correlations[expanded_signal_idx, I[signal_idx, :]].view(num_signals, k, 1)
-    #         coefficients_ = torch.cholesky_solve(correlations_, L)
-    #
-    #         # de-stack the coefficients into the non-zero elements
-    #         coefficients[signal_idx.unsqueeze(1), I[signal_idx]] = coefficients_[signal_idx].squeeze(-1)
-    #
-    #         # beta = G_I @ coefficients
-    #         beta = torch.bmm(coefficients[signal_idx.unsqueeze(1), I[signal_idx]].unsqueeze(1),
-    #                             gram_matrix[I[signal_idx], :]).squeeze(1)  # [batch_size, num_embeddings]
-    #
-    #         # update the correlations
-    #         correlations = init_correlations - beta
-    #
-    #         # update the residual
-    #         new_delta = (coefficients * beta).sum(dim=1)  # [batch_size]
-    #         residual += delta - new_delta
-    #         delta = new_delta
-    #
-    #         if debug and k % 1 == 0:
-    #             print('Step {}, residual: {:.4f}, below tolerance: {:.4f}'.format(k, residual.max(), (residual < 1e-7).float().mean().item()))
-    #
-    #     return coefficients.t()
     
     def forward(self, z_e):
         """
