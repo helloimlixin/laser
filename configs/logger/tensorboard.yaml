@@ -1,4 +1,0 @@
-# Logger configuration
-name: tensorboard
-save_dir: ${output_dir}/logs
-experiment_name: ${experiment_name} 

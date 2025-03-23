@@ -223,30 +223,13 @@ class VQVAE(pl.LightningModule):
         if batch_idx % self.log_images_every_n_steps == 0:
             self._log_images(metrics['x'], metrics['x_recon'], split='test')
 
-        return metrics
-
-    def on_train_epoch_end(self):
-        """Log epoch-level metrics for training."""
-        # Add PSNR
-        psnr = self.psnr.compute()
-        self.log('train/epoch_psnr', psnr)
-
-    def on_validation_epoch_end(self):
-        """Log epoch-level metrics for validation."""
-        # Add PSNR
-        psnr = self.psnr.compute()
-        self.log('val/epoch_psnr', psnr)
-    def on_test_epoch_end(self):
-        """Log epoch-level metrics for testing."""
-        # Add PSNR
-        psnr = self.psnr.compute()
-        self.log('test/epoch_psnr', psnr)
-        
         # Existing FID handling
         if self.test_fid is not None:
             fid_score = self.test_fid.compute()
             self.log('test/fid', fid_score)
             self.test_fid.reset()
+
+        return metrics
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
@@ -263,7 +246,7 @@ class VQVAE(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val/epoch_psnr",  # Metric to monitor
+                "monitor": "val/loss_epoch",  # Metric to monitor
             }
         }
 

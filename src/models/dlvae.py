@@ -226,28 +226,13 @@ class DLVAE(pl.LightningModule):
         
         if batch_idx % self.log_images_every_n_steps == 0:
             self._log_images(metrics['x'], metrics['x_recon'], split='test')
-            
-        return metrics
-
-    def on_train_epoch_end(self):
-        """Log the average PSNR for the epoch."""
-        avg_psnr = self.psnr.compute()
-        self.log("train/epoch_psnr", avg_psnr, on_epoch=True)
-
-    def on_validation_epoch_end(self):
-        """Log the average PSNR for the epoch."""
-        avg_psnr = self.psnr.compute()
-        self.log("val/epoch_psnr", avg_psnr, on_epoch=True)
-
-    def on_test_epoch_end(self):
-        """Log the average PSNR for the epoch."""
-        avg_psnr = self.psnr.compute()
-        self.log("test/epoch_psnr", avg_psnr, on_epoch=True)
 
         if self.test_fid is not None:
             fid_score = self.test_fid.compute()
             self.log("test/fid", fid_score, on_epoch=True)
             self.test_fid.reset()
+            
+        return metrics
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -262,7 +247,7 @@ class DLVAE(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val/epoch_psnr"
+                "monitor": "val/loss_epoch"
             }
         }
 

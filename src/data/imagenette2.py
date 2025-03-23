@@ -132,3 +132,17 @@ class Imagenette2DataModule(pl.LightningDataModule):
             num_workers=self.config.num_workers,
             pin_memory=False
         )
+
+    def test_dataloader(self) -> DataLoader:
+        """Create the test data loader."""
+        # For Imagenette2, we typically don't have a separate test set, so we can use the validation set.
+        if self.val_dataset is None:
+            raise RuntimeError("Validation dataset not initialized. Call setup() first.")
+
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=False
+        )

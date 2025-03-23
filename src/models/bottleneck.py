@@ -206,7 +206,6 @@ class DictionaryLearning(nn.Module):
         Args:
             X (torch.Tensor): Input signals of shape (B, M).
             D (torch.Tensor): Dictionary of shape (M, N), where each column is an atom of dimension M.
-            sparsity (int): Number of atoms to select.
 
         Returns:
             support: (B, sparsity) LongTensor with indices of selected atoms.
@@ -224,7 +223,7 @@ class DictionaryLearning(nn.Module):
         residual = X.clone()  # shape (M, B)
 
         for k in range(self.sparsity_level):
-            # Compute the correlations (projections): D^T (shape N x M) x residual (M x B) = (N x B)
+            # # Compute the correlations (projections): D^T (shape N x M) x residual (M x B) = (N x B)
             correlations = torch.mm(D.t(), residual)  # shape (N, B)
 
             # For each signal (each column), select the atom with the highest absolute correlation / projection

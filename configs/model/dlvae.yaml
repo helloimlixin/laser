@@ -3,7 +3,7 @@ in_channels: 3
 num_hiddens: 128
 num_embeddings: 512
 embedding_dim: 16
-sparsity_level: 5
+sparsity_level: 3
 num_residual_blocks: 2
 num_residual_hiddens: 32
 commitment_cost: 0.25

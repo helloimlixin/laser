@@ -1,4 +1,4 @@
 # configs/wandb/default.yaml
-project: "vae-bottlenecks"
+project: "vae-bottlenecks-${data.dataset}"
 name: "${model.type}_${data.dataset}"
 save_dir: "${output_dir}/wandb"
