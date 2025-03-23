@@ -1,8 +1,5 @@
 # LASER: Learning Adaptive Sparse Representations for Image Compression
 
-## Overview
-
-
 This project implements two different types of autoencoder architectures:
 1. **Vector Quantized Variational Autoencoder (VQVAE)** - A discrete latent variable model that uses vector quantization
 
