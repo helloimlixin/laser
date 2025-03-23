@@ -208,9 +208,7 @@ class DictionaryLearning(nn.Module):
             D (torch.Tensor): Dictionary of shape (M, N), where each column is an atom of dimension M.
 
         Returns:
-            support: (B, sparsity) LongTensor with indices of selected atoms.
-            coeffs: (B, sparsity) Tensor with the corresponding coefficients.
-            Y_hat: (B, M) Reconstructed signals from the sparse codes.
+            coefficients: (N, B) Tensor with the corresponding coefficients.
         """
         M, B = X.shape
         _, N = D.shape
@@ -223,7 +221,7 @@ class DictionaryLearning(nn.Module):
         residual = X.clone()  # shape (M, B)
 
         for k in range(self.sparsity_level):
-            # # Compute the correlations (projections): D^T (shape N x M) x residual (M x B) = (N x B)
+            # Compute the correlations (projections): D^T (shape N x M) x residual (M x B) = (N x B)
             correlations = torch.mm(D.t(), residual)  # shape (N, B)
 
             # For each signal (each column), select the atom with the highest absolute correlation / projection
@@ -274,6 +272,10 @@ class DictionaryLearning(nn.Module):
         self._normalize_dictionary()
         # coefficients = self.batch_omp(ze_flattened, self.dictionary, debug=False)  # [num_embeddings, batch_size * height * width]
         coefficients = self.batch_omp(ze_flattened, self.dictionary)  # [num_embeddings, batch_size * height * width]
+
+        # # validate the coefficients sparsity level (number of non-zero coefficients along the first dimension)
+        # sparsity_level = (coefficients.abs() > 1e-6).float().sum(dim=0).mean().item()
+        # print(f"DEBUG Sparsity level: {sparsity_level:.4f}")
 
         z_dl = self.dictionary @ coefficients  # [embedding_dim, batch_size * height * width]
         z_dl = z_dl.view(input_shape) # [batch_size, embedding_dim, height, width]
