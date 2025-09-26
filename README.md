@@ -1,9 +1,11 @@
 # LASER: Learnable Adaptive Structured Embedding Representation for Deep Generative Models
 
 This project implements the following autoencoder architectures:
-1. **Vector Quantized Variational Autoencoder (VQVAE)** - A discrete latent variable model that uses vector quantization
+1. **Vector Quantized Variational Autoencoder (VQ-VAE)** - A discrete latent variable model that uses vector quantization
 
-2. **Dictionary Learning Variational Autoencoder (DLVAE)** - An autoencoder with dictionary learning bottleneck for sparse representations
+2. **Dictionary Learning Variational Autoencoder (DL-VAE)** - An autoencoder with dictionary learning bottleneck for sparse representations
+
+3. **Low-Seperation Rank Variational Autoencoder (LSR-VAE)**
 
 
 The project includes training and evaluation pipelines with configurable hyperparameters through Hydra.
