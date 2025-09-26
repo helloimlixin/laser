@@ -1,6 +1,6 @@
-# LASER: Learning Adaptive Sparse Representations for Image Compression
+# LASER: Learnable Adaptive Structured Embedding Representation for Deep Generative Models
 
-This project implements two different types of autoencoder architectures:
+This project implements the following autoencoder architectures:
 1. **Vector Quantized Variational Autoencoder (VQVAE)** - A discrete latent variable model that uses vector quantization
 
 2. **Dictionary Learning Variational Autoencoder (DLVAE)** - An autoencoder with dictionary learning bottleneck for sparse representations
@@ -30,8 +30,8 @@ The project includes training and evaluation pipelines with configurable hyperpa
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/vae-models.git
-cd vae-models
+git clone https://github.com/helloimlixin/laser.git
+cd laser
 
 # Create and activate a virtual environment
 python -m venv venv
