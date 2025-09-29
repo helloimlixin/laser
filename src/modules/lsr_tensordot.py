@@ -3,10 +3,10 @@ import tensorly as ten
 import tltorch as tlt
 from functools import lru_cache
 
-# Class for Low Separation Rank tensor decomposition
-class LSR_tensor_dot(torch.nn.Module):
+# Class for Low Separation Rank Tensor Dot
+class LSR_tensordot(torch.nn.Module):
     def __init__(self, shape, ranks, separation_rank, dtype=torch.float32, device=torch.device("cpu"), initialize=True):
-        super(LSR_tensor_dot, self).__init__()
+        super(LSR_tensordot, self).__init__()
          
         self.dtype = dtype
         self.device = device
