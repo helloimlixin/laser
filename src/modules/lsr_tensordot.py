@@ -1,20 +1,48 @@
+from typing import Tuple
 import torch
 import tensorly as ten
 import tltorch as tlt
 from functools import lru_cache
 
 # Class for Low Separation Rank Tensor Dot
-class LSR_tensordot(torch.nn.Module):
-    def __init__(self, shape, ranks, separation_rank, dtype=torch.float32, device=torch.device("cpu"), initialize=True):
-        super(LSR_tensordot, self).__init__()
+class LSRTensorDot(torch.nn.Module):
+    def __init__(
+        self,
+        shape: Tuple[int, ...],
+        ranks: Tuple[int, ...],
+        separation_rank: int,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device = torch.device("cpu"),
+        initialize: bool = True):
+        """
+        Initialize LSRTensorDot module.
+
+        Args:
+            shape: tuple of tensor dimensions (number of modes = len(shape))
+            ranks: tuple of rank values for each mode
+            separation_rank: separation rank of the tensor (number of summation terms in the
+                separation rank decomposition)
+            dtype: data type of the tensors
+            device: device for computation
+            initialize: whether to initialize the parameters
+        """
+        
+        super(LSRTensorDot, self).__init__()
+
+        # input validation for critical parameters
+        if len(shape) != len(ranks):
+            raise ValueError(f"Shape {len(shape)} and ranks {len(ranks)} must have the same length")
+        if separation_rank <= 0:
+            raise ValueError(f"Separation rank must be positive, got {separation_rank}")
+        if separation_rank > len(shape):
+            raise ValueError(f"Separation rank {separation_rank} must be less than or equal to the number of modes in the tensor {len(shape)}")
          
         self.dtype = dtype
         self.device = device
-
         self.shape = shape
         self.ranks = ranks
-        self.separation_rank = separation_rank        
-        self.order = len(shape)
+        self.separation_rank = separation_rank
+        self.order = len(shape)  # number of modes in the tensor
         
         self.init_params(initialize)
 
