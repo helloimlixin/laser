@@ -86,6 +86,32 @@ python train.py model.type=dlvae data=cifar10
 python train.py model.type=vqvae data=imagenette2
 ```
 
+## Testing
+
+### Quick start
+
+```bash
+# From repo root
+pytest -q
+```
+
+### Targeted tests
+
+```bash
+# Encoder unit tests (shapes, gradients, quick visualization)
+pytest -q tests/test_encoder.py -vv -k "test_shapes_and_grads or test_vis_random"
+
+# CelebA GPU visualization (slow)
+export CELEBA_DIR=/path/to/celeba_or_celeba_hq/images   # optional; auto-discovers ../../Data/celeba/img_align_celeba and /home/xl598/Data/celeba/img_align_celeba
+pytest -q tests/test_encoder.py -vv -k test_celeba --maxfail=1
+
+# FFHQ GPU visualization (slow)
+export FFHQ_DIR=/path/to/ffhq/images1024x1024   # optional; auto-discovers ../../Data/ffhq/images1024x1024 and /home/xl598/Data/ffhq/images1024x1024
+pytest -q tests/test_encoder.py -vv -k test_ffhq --maxfail=1
+```
+
+Artifacts from visualization tests are written to `tests/artifacts/` (CelebA outputs under `tests/artifacts/celeba/`).
+
 ## Configuration
 
 Configuration is managed using Hydra. The configuration files are located in the `configs` directory.

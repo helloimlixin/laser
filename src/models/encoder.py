@@ -5,25 +5,30 @@ from .utils import ResidualBlock
 
 class Encoder(nn.Module):
     """
-    Encoder Network implementation followed from the original Neural Discrete Representation Learning paper.
+    Encoder network inspired by Neural Discrete Representation Learning (VQ‑VAE).
 
     Reference:
         - Van Den Oord, A., & Vinyals, O. (2017). Neural discrete representation learning.
-            Advances in neural information processing systems, 30.
-    
-    Input: batch_size x 3 x 256 x 256
+            Advances in Neural Information Processing Systems, 30.
+
+    Input: batch_size x in_channels x H x W (e.g., 3 x 256 x 256)
        │
-       └─► 4 x 4 conv ──► 128 channels (reduces dimensions)
+       └─► 4x4, stride 2 conv ──► num_hiddens // 2 channels (downsample by 2)
            │
-           └─► 4 x 4 conv ──► 128 channels (processes features)
+           └─► 4x4, stride 2 conv ──► num_hiddens channels (downsample by 2 again)
                 │
-                └─► 2 x Residual Blocks ──► 256 channels
+                └─► 3x3, stride 1 conv ──► num_hiddens channels (no spatial change)
+                    │
+                    └─► num_residual_blocks × ResidualBlock(in_channels=num_hiddens,
+                        hidden=num_residual_hiddens → num_hiddens)
 
-    Output: batch_size x 256 x 32 x 32
+    Output: batch_size x num_hiddens x (H/4) x (W/4)
+        - Example with num_hiddens=128 and input 256x256: 128 x 64 x 64
 
-    The encoder network consists of 2 convolutional layers with stride 2 and window size 4 x 4, followed by a convolutional
-    layer with stride 1 and window size 3 x 3, and then two residual blocks, which are implemented as ReLU, 3 x 3 conv, ReLU 
-    and 1 x 1 conv, all having 256 hidden units.
+    Notes:
+        - This implementation downsamples by a total factor of 4. To obtain (H/8, W/8)
+          outputs (e.g., 32 x 32 from 256 x 256), add another downsampling stage
+          (e.g., make the third conv stride=2 or insert an extra strided conv).
     """
     def __init__(self, in_channels, num_hiddens, num_residual_blocks, num_residual_hiddens):
         """

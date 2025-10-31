@@ -22,8 +22,9 @@ def compute_accuracy(eval_model, dataloader):
     return correct / total
 
 class ResidualBlock(nn.Module):
-    """Residual Block for the Encoder Network. Implemented as
-        ReLU -> 3 x 3 conv -> ReLU -> 1 x 1 conv
+    """Residual block used in the encoder.
+    Implemented as 3x3 conv → BN → ReLU → 1x1 conv → BN with a skip connection,
+    followed by a ReLU on the summed output.
 
     References:
         - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep residual learning for image recognition.
@@ -31,15 +32,14 @@ class ResidualBlock(nn.Module):
         - Van Den Oord, A., & Vinyals, O. (2017). Neural discrete representation learning.
             Advances in neural information processing systems, 30.
 
-    Input: 256 channels
+    Input/Output: num_hiddens channels
        │
-       └─► 1×1 conv ──► 64 channels    (reduces dimensions)
+       └─► 3×3 conv ──► num_residual_hiddens channels (process features)
            │
-           └─► 3×3 conv ──► 64 channels (processes features)
-               │
-               └─► 1×1 conv ──► 256 channels (expands: 64 * expansion=4)
+           └─► 1×1 conv ──► num_hiddens channels (project back to input width)
 
-    Dramatically reduces the computation while maintaining the model capacity for very deep networks.
+    This keeps spatial resolution and channel width while adding capacity via a
+    lightweight bottleneck.
     """
     def __init__(self, in_channels, num_hiddens, num_residual_hiddens):
         super().__init__()
