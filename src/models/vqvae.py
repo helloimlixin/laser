@@ -94,7 +94,7 @@ class VQVAE(pl.LightningModule):
         else:
             self.test_fid = None
 
-        self.psnr = PeakSignalNoiseRatio()
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
 
         # Save hyperparameters for logging
         self.save_hyperparameters()
