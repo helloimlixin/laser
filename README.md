@@ -112,6 +112,13 @@ pytest -q tests/test_encoder.py -vv -k test_ffhq --maxfail=1
 
 Artifacts from visualization tests are written to `tests/artifacts/` (CelebA outputs under `tests/artifacts/celeba/`).
 
+### Using the `laser` conda environment
+
+```bash
+# From repo root
+conda run -n laser pytest -q -rA tests/test_encoder.py::test_celeba tests/test_encoder.py::test_ffhq
+```
+
 ## Configuration
 
 Configuration is managed using Hydra. The configuration files are located in the `configs` directory.
