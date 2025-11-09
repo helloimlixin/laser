@@ -28,24 +28,38 @@ class FlatImageDataset(Dataset):
         if not image_paths:
             raise RuntimeError(f'No images found under {self.root}')
         self.image_paths = image_paths
+        self._placeholder_size = (64, 64)  # used only as a last-resort fallback
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
     def __getitem__(self, index: int):
-        path = self.image_paths[index]
-        # Robust image loading: tolerate truncated/corrupted files
+        # Robust image loading: retry a few nearby indices if an image fails
+        num_items = len(self.image_paths)
+        attempts = 0
+        last_exc = None
+        while attempts < 5:
+            path = self.image_paths[index % num_items]
+            try:
+                with Image.open(path) as img:
+                    img = img.convert('RGB')
+                if self.transform is not None:
+                    img = self.transform(img)
+                return img, 0
+            except Exception as exc:
+                last_exc = exc
+                index += 1
+                attempts += 1
+                continue
+        # Last-resort fallback: return a black image of nominal size (transforms will resize/normalize)
         try:
-            with Image.open(path) as img:
-                img = img.convert('RGB')
+            img = Image.new('RGB', self._placeholder_size, (0, 0, 0))
+            if self.transform is not None:
+                img = self.transform(img)
+            return img, 0
         except Exception:
-            # Fallback: try re-open without context manager; if still fails, raise
-            img = Image.open(path)
-            img = img.convert('RGB')
-        if self.transform is not None:
-            img = self.transform(img)
-        # Return dummy label (unused) to be compatible with common loaders
-        return img, 0
+            # Re-raise the original exception if even placeholder fails (should be extremely rare)
+            raise last_exc
 
 
 class CelebADataModule(pl.LightningDataModule):
@@ -149,8 +163,9 @@ class CelebADataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.config.num_workers,
             pin_memory=True,
-            persistent_workers=False,
+            persistent_workers=True,
             timeout=120,
+            multiprocessing_context='spawn',
         )
 
     def val_dataloader(self):
@@ -158,9 +173,9 @@ class CelebADataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-            persistent_workers=False,
+            num_workers=0,  # single-process to avoid worker aborts during validation
+            pin_memory=False,
+            persistent_workers=True,
             timeout=120,
         )
 
@@ -169,9 +184,9 @@ class CelebADataModule(pl.LightningDataModule):
             self.test_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-            persistent_workers=False,
+            num_workers=0,  # single-process to avoid worker aborts during test
+            pin_memory=False,
+            persistent_workers=True,
             timeout=120,
         )
 

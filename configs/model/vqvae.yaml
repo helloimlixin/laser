@@ -7,7 +7,7 @@ embedding_dim: 64
 num_residual_blocks: 2
 num_residual_hiddens: 64
 commitment_cost: 0.25
-decay: 0.0
+decay: 0.99
 perceptual_weight: 0.0
 compute_fid: false
 log_images_every_n_steps: 100
