@@ -104,9 +104,8 @@ class DLVAE(pl.LightningModule):
         # Initialize LPIPS for perceptual loss only if used
         self.lpips = LPIPS() if self.perceptual_weight > 0 else None
 
-        # Initialize the PSNR metric
-        # Inputs are typically normalized to roughly [-1, 1], so data_range ≈ 2.0
-        self.psnr = PeakSignalNoiseRatio(data_range=2.0)
+        # Initialize the PSNR metric (evaluate on de-normalized [0,1] images)
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
 
         # Initialize the SSIM metric
         self.ssim = StructuralSimilarityIndexMeasure()
@@ -206,8 +205,17 @@ class DLVAE(pl.LightningModule):
         self.log(f'{prefix}/dl_loss', dl_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
 
-        # Add PSNR calculation
-        psnr = self.psnr(x_vis, recon_vis)
+        # Add PSNR calculation on de-normalized [0,1] images to avoid scale drift
+        dm = getattr(getattr(self, "trainer", None), "datamodule", None)
+        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+            mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            x_dn = (x * std + mean).clamp(0.0, 1.0)
+            recon_dn = (recon_raw * std + mean).clamp(0.0, 1.0)
+        else:
+            x_dn = ((x + 1.0) / 2.0).clamp(0.0, 1.0)
+            recon_dn = ((recon_raw + 1.0) / 2.0).clamp(0.0, 1.0)
+        psnr = self.psnr(x_dn, recon_dn)
         self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True, sync_dist=True)
 
         return {

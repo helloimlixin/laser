@@ -94,8 +94,8 @@ class VQVAE(pl.LightningModule):
         else:
             self.test_fid = None
 
-        # Inputs normalized around [-1, 1] per data config -> data_range ≈ 2.0
-        self.psnr = PeakSignalNoiseRatio(data_range=2.0)
+        # Compute PSNR on de-normalized [0,1] images
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
 
         # Save hyperparameters for logging
         self.save_hyperparameters()
@@ -188,8 +188,17 @@ class VQVAE(pl.LightningModule):
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True, sync_dist=True)
 
-        # Add PSNR calculation
-        psnr = self.psnr(x_vis, recon_vis)
+        # Add PSNR calculation on de-normalized [0,1] images for stable progression
+        dm = getattr(getattr(self, "trainer", None), "datamodule", None)
+        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+            mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            x_dn = (x * std + mean).clamp(0.0, 1.0)
+            recon_dn = (recon_raw * std + mean).clamp(0.0, 1.0)
+        else:
+            x_dn = ((x + 1.0) / 2.0).clamp(0.0, 1.0)
+            recon_dn = ((recon_raw + 1.0) / 2.0).clamp(0.0, 1.0)
+        psnr = self.psnr(x_dn, recon_dn)
         self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True, sync_dist=True)
 
         return {
