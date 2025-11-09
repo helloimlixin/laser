@@ -94,7 +94,8 @@ class VQVAE(pl.LightningModule):
         else:
             self.test_fid = None
 
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        # Inputs normalized around [-1, 1] per data config -> data_range ≈ 2.0
+        self.psnr = PeakSignalNoiseRatio(data_range=2.0)
 
         # Save hyperparameters for logging
         self.save_hyperparameters()
@@ -153,18 +154,21 @@ class VQVAE(pl.LightningModule):
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         
         # Forward pass
-        recon, vq_loss, perplexity = self(x)
+        recon_raw, vq_loss, perplexity = self(x)
+        # Keep raw for loss; sanitized copies for metrics/visualization
+        recon_vis = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+        x_vis = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
 
         # Compute reconstruction loss (ensure it's a scalar)
-        recon_loss = F.mse_loss(recon, x).mean()
+        recon_loss = F.mse_loss(recon_raw, x).mean()
 
         # Compute perceptual loss only if enabled
         if self.perceptual_weight > 0 and self.lpips is not None:
             x_norm = x * 2.0 - 1.0
-            x_recon_norm = recon * 2.0 - 1.0
+            x_recon_norm = recon_raw * 2.0 - 1.0
             perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
         else:
-            perceptual_loss = torch.zeros((), device=x.device, dtype=recon.dtype)
+            perceptual_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
 
         # Compute total loss
         total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
@@ -172,21 +176,21 @@ class VQVAE(pl.LightningModule):
         # Special handling for test metrics
         if prefix == 'test':
             if self.test_fid is not None:
-                x_recon_fid = torch.clamp(recon, 0, 1)
+                x_recon_fid = torch.clamp(recon_raw, 0, 1)
                 x_fid = torch.clamp(x, 0, 1)
                 self.test_fid.update(x_recon_fid, real=False)
                 self.test_fid.update(x_fid, real=True)
 
-        # Log all metrics (now they're all scalars)
-        self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/vq_loss', vq_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True)
+        # Log all metrics (sync across devices for epoch-level aggregation)
+        self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/vq_loss', vq_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True, sync_dist=True)
 
         # Add PSNR calculation
-        psnr = self.psnr(x, recon)
-        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True)
+        psnr = self.psnr(x_vis, recon_vis)
+        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True, sync_dist=True)
 
         return {
             'loss': total_loss,
@@ -195,8 +199,8 @@ class VQVAE(pl.LightningModule):
             'perceptual_loss': perceptual_loss,
             'perplexity': perplexity,
             'psnr': psnr,
-            'x': x,
-            'x_recon': recon
+            'x': x_vis,
+            'x_recon': recon_vis
         }
 
     def training_step(self, batch, batch_idx):
@@ -262,24 +266,32 @@ class VQVAE(pl.LightningModule):
             x_recon (torch.Tensor): Reconstructed images
             split (str): Data split (train/val/test)
         """
+        # Only log from rank zero in DDP to avoid multi-process logger contention
+        if getattr(getattr(self, "trainer", None), "is_global_zero", False) is False:
+            return
         # Take first 16 images
         x = x[:32]
         x_recon = x_recon[:32]
 
         # Create grids with smaller size
-        x_grid = torchvision.utils.make_grid(
-            x,
-            nrow=8,
-            normalize=True,
-            value_range=(-1, 1)
-        )
+        # De-normalize using datamodule config if available; otherwise assume [-1,1] → [0,1]
+        dm = getattr(getattr(self, "trainer", None), "datamodule", None)
+        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+            mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            x_disp = x * std + mean
+            x_recon_disp = x_recon * std + mean
+        else:
+            x_disp = (x + 1.0) / 2.0
+            x_recon_disp = (x_recon + 1.0) / 2.0
+        x_disp = x_disp.clamp(0.0, 1.0)
+        x_recon_disp = x_recon_disp.clamp(0.0, 1.0)
+        x_grid = torchvision.utils.make_grid(x_disp, nrow=8, normalize=False)
+        x_recon_grid = torchvision.utils.make_grid(x_recon_disp, nrow=8, normalize=False)
 
-        x_recon_grid = torchvision.utils.make_grid(
-            x_recon,
-            nrow=8,
-            normalize=True,
-            value_range=(-1, 1)
-        )
+        # Sanitize NaN/Inf and clamp to [0,1] before converting to numpy
+        x_grid = torch.nan_to_num(x_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        x_recon_grid = torch.nan_to_num(x_recon_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
         # Convert to numpy and transpose to correct format (H,W,C)
         x_grid = x_grid.cpu().numpy().transpose(1, 2, 0)

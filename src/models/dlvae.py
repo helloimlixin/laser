@@ -174,25 +174,28 @@ class DLVAE(pl.LightningModule):
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         
         # Forward pass
-        recon, dl_loss, coefficients = self(x)
+        recon_raw, dl_loss, coefficients = self(x)
+        # Keep raw tensors for loss; create sanitized copies for metrics/visualization only
+        recon_vis = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+        x_vis = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
         
         # Compute losses
-        recon_loss = F.mse_loss(recon, x).mean()
+        recon_loss = F.mse_loss(recon_raw, x).mean()
         
         # Perceptual loss (optional)
         if self.perceptual_weight > 0 and self.lpips is not None:
             x_norm = x * 2.0 - 1.0
-            x_recon_norm = recon * 2.0 - 1.0
+            x_recon_norm = recon_raw * 2.0 - 1.0
             perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
         else:
-            perceptual_loss = torch.tensor(0.0, device=self.device, dtype=recon.dtype)
+            perceptual_loss = torch.tensor(0.0, device=self.device, dtype=recon_raw.dtype)
         
         # Total loss
         total_loss = (1 - self.perceptual_weight) * recon_loss + dl_loss + self.perceptual_weight * perceptual_loss
 
         # Handle FID for test
         if prefix == 'test' and self.test_fid is not None:
-            x_recon_fid = torch.clamp(recon, 0, 1)
+            x_recon_fid = torch.clamp(recon_raw, 0, 1)
             x_fid = torch.clamp(x, 0, 1)
             self.test_fid.update(x_recon_fid, real=False)
             self.test_fid.update(x_fid, real=True)
@@ -204,7 +207,7 @@ class DLVAE(pl.LightningModule):
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
 
         # Add PSNR calculation
-        psnr = self.psnr(x, recon)
+        psnr = self.psnr(x_vis, recon_vis)
         self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True, sync_dist=True)
 
         return {
@@ -213,8 +216,8 @@ class DLVAE(pl.LightningModule):
             'dl_loss': dl_loss,
             'perceptual_loss': perceptual_loss,
             'psnr': psnr,
-            'x': x,
-            'x_recon': recon
+            'x': x_vis,
+            'x_recon': recon_vis
         }
 
     def training_step(self, batch, batch_idx):
@@ -265,6 +268,9 @@ class DLVAE(pl.LightningModule):
 
     def _log_images(self, x, x_recon, split='train'):
         """Log images to wandb."""
+        # Only log from rank zero in DDP to avoid multi-process logger contention
+        if getattr(getattr(self, "trainer", None), "is_global_zero", False) is False:
+            return
         # If logger is disabled or doesn't support experiment logging, skip
         if not getattr(self, "logger", None) or not hasattr(self.logger, "experiment"):
             return
@@ -274,8 +280,24 @@ class DLVAE(pl.LightningModule):
         x_recon = x_recon[:32]
 
         # Create image grids
-        x_grid = torchvision.utils.make_grid(x, nrow=8, normalize=True, value_range=(-1, 1))
-        x_recon_grid = torchvision.utils.make_grid(x_recon, nrow=8, normalize=True, value_range=(-1, 1))
+        # De-normalize using datamodule config if available; otherwise assume [-1,1] → [0,1]
+        dm = getattr(getattr(self, "trainer", None), "datamodule", None)
+        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+            mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+            x_disp = x * std + mean
+            x_recon_disp = x_recon * std + mean
+        else:
+            x_disp = (x + 1.0) / 2.0
+            x_recon_disp = (x_recon + 1.0) / 2.0
+        x_disp = x_disp.clamp(0.0, 1.0)
+        x_recon_disp = x_recon_disp.clamp(0.0, 1.0)
+        x_grid = torchvision.utils.make_grid(x_disp, nrow=8, normalize=False)
+        x_recon_grid = torchvision.utils.make_grid(x_recon_disp, nrow=8, normalize=False)
+
+        # Sanitize NaN/Inf and clamp to [0,1] before converting to numpy
+        x_grid = torch.nan_to_num(x_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        x_recon_grid = torch.nan_to_num(x_recon_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
         # Convert to numpy
         x_grid = x_grid.cpu().numpy().transpose(1, 2, 0)

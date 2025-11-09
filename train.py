@@ -160,26 +160,29 @@ def train(cfg: DictConfig):
     callbacks = [
         ModelCheckpoint(
             dirpath=os.path.join(checkpoint_dir, cfg.model.type),
-            filename=f"{cfg.model.type}-{{epoch}}-{{val_loss:.2f}}",
+            filename=f"{cfg.model.type}-{{epoch}}-{{val_loss_epoch:.2f}}",
             save_top_k=cfg.checkpoint.save_top_k,
-            monitor='val/loss',
+            monitor='val/loss_epoch',
             mode='min',
             save_last=True
-        ),
-        EarlyStopping(
-            monitor="val/loss",
-            patience=cfg.train.early_stopping_patience,
-            mode="min"
         ),
         LearningRateMonitor(logging_interval='step'),
         progress_bar
     ]
+    # Add EarlyStopping only if configured
+    if getattr(cfg.train, "early_stopping_patience", None):
+        callbacks.insert(1, EarlyStopping(
+            monitor="val/loss_epoch",
+            patience=cfg.train.early_stopping_patience,
+            mode="min"
+        ))
 
     # Initialize trainer
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,
         accelerator=cfg.train.accelerator,
         devices=cfg.train.devices,
+        strategy=getattr(cfg.train, "strategy", None),
         logger=wandb_logger,
         callbacks=callbacks,
         precision=cfg.train.precision,
@@ -187,13 +190,25 @@ def train(cfg: DictConfig):
         log_every_n_steps=cfg.train.log_every_n_steps,
         deterministic=True,
         enable_progress_bar=True,
-        enable_model_summary=(str(cfg.train.precision) == "32")
+        enable_model_summary=(str(cfg.train.precision) == "32"),
+        reload_dataloaders_every_n_epochs=1,
+        num_sanity_val_steps=0,
     )
 
     # Train and test model
     torch.set_float32_matmul_precision('medium')
     trainer.fit(model, datamodule=datamodule)
-    trainer.test(model, datamodule=datamodule)
+    # Run test on a single device to avoid DistributedSampler duplications
+    test_trainer = pl.Trainer(
+        accelerator=('gpu' if (cfg.train.accelerator == 'gpu' and torch.cuda.is_available()) else 'cpu'),
+        devices=1,
+        logger=wandb_logger,
+        precision=cfg.train.precision,
+        deterministic=True,
+        enable_progress_bar=True,
+        enable_model_summary=(str(cfg.train.precision) == "32")
+    )
+    test_trainer.test(model, datamodule=datamodule)
 
 if __name__ == "__main__":
     train()

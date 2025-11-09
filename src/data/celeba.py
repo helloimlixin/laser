@@ -6,7 +6,8 @@ from typing import Optional, Tuple, Union, List
 import lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset, random_split
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torchvision.transforms as transforms
 
 from src.data.config import DataConfig
@@ -33,7 +34,13 @@ class FlatImageDataset(Dataset):
 
     def __getitem__(self, index: int):
         path = self.image_paths[index]
-        with Image.open(path) as img:
+        # Robust image loading: tolerate truncated/corrupted files
+        try:
+            with Image.open(path) as img:
+                img = img.convert('RGB')
+        except Exception:
+            # Fallback: try re-open without context manager; if still fails, raise
+            img = Image.open(path)
             img = img.convert('RGB')
         if self.transform is not None:
             img = self.transform(img)
@@ -142,6 +149,8 @@ class CelebADataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.config.num_workers,
             pin_memory=True,
+            persistent_workers=False,
+            timeout=120,
         )
 
     def val_dataloader(self):
@@ -151,6 +160,8 @@ class CelebADataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.config.num_workers,
             pin_memory=True,
+            persistent_workers=False,
+            timeout=120,
         )
 
     def test_dataloader(self):
@@ -160,6 +171,8 @@ class CelebADataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.config.num_workers,
             pin_memory=True,
+            persistent_workers=False,
+            timeout=120,
         )
 
 
