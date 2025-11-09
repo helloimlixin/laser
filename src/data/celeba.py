@@ -162,32 +162,37 @@ class CelebADataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=True,
-            persistent_workers=True,
+            pin_memory=False,
+            persistent_workers=(self.config.num_workers > 0),
             timeout=120,
             multiprocessing_context='spawn',
         )
 
     def val_dataloader(self):
+        # Use a small, safe number of workers for validation to improve throughput without instability
+        val_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
         return DataLoader(
             self.val_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=0,  # single-process to avoid worker aborts during validation
+            num_workers=val_workers,
             pin_memory=False,
-            persistent_workers=True,
-            timeout=120,
+            persistent_workers=(val_workers > 0),
+            timeout=(120 if val_workers > 0 else 0),
+            multiprocessing_context='spawn',
         )
 
     def test_dataloader(self):
+        test_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
         return DataLoader(
             self.test_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=0,  # single-process to avoid worker aborts during test
+            num_workers=test_workers,
             pin_memory=False,
-            persistent_workers=True,
-            timeout=120,
+            persistent_workers=(test_workers > 0),
+            timeout=(120 if test_workers > 0 else 0),
+            multiprocessing_context='spawn',
         )
 
 

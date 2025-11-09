@@ -195,7 +195,7 @@ def train(cfg: DictConfig):
         deterministic=True,
         enable_progress_bar=True,
         enable_model_summary=(str(cfg.train.precision) == "32"),
-        reload_dataloaders_every_n_epochs=1,
+        reload_dataloaders_every_n_epochs=0,
         num_sanity_val_steps=0,
     )
 
