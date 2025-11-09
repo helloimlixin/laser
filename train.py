@@ -178,11 +178,15 @@ def train(cfg: DictConfig):
         ))
 
     # Initialize trainer
+    # Prefer plain DDP for DLVAE to avoid unnecessary find_unused traversal
+    strategy_cfg = getattr(cfg.train, "strategy", None)
+    if cfg.model.type == "dlvae" and strategy_cfg == "ddp_find_unused_parameters_true":
+        strategy_cfg = "ddp"
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,
         accelerator=cfg.train.accelerator,
         devices=cfg.train.devices,
-        strategy=getattr(cfg.train, "strategy", None),
+        strategy=strategy_cfg,
         logger=wandb_logger,
         callbacks=callbacks,
         precision=cfg.train.precision,
