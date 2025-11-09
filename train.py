@@ -187,7 +187,7 @@ def train(cfg: DictConfig):
         log_every_n_steps=cfg.train.log_every_n_steps,
         deterministic=True,
         enable_progress_bar=True,
-        enable_model_summary=True
+        enable_model_summary=(str(cfg.train.precision) == "32")
     )
 
     # Train and test model

@@ -101,8 +101,8 @@ class DLVAE(pl.LightningModule):
             num_residual_hiddens=num_residual_hiddens
         )
 
-        # Initialize LPIPS for perceptual loss
-        self.lpips = LPIPS()
+        # Initialize LPIPS for perceptual loss only if used
+        self.lpips = LPIPS() if self.perceptual_weight > 0 else None
 
         # Initialize the PSNR metric
         # Inputs are typically normalized to roughly [-1, 1], so data_range ≈ 2.0
@@ -179,10 +179,13 @@ class DLVAE(pl.LightningModule):
         # Compute losses
         recon_loss = F.mse_loss(recon, x).mean()
         
-        # Perceptual loss
-        x_norm = x * 2.0 - 1.0
-        x_recon_norm = recon * 2.0 - 1.0
-        perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
+        # Perceptual loss (optional)
+        if self.perceptual_weight > 0 and self.lpips is not None:
+            x_norm = x * 2.0 - 1.0
+            x_recon_norm = recon * 2.0 - 1.0
+            perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
+        else:
+            perceptual_loss = torch.tensor(0.0, device=self.device, dtype=recon.dtype)
         
         # Total loss
         total_loss = (1 - self.perceptual_weight) * recon_loss + dl_loss + self.perceptual_weight * perceptual_loss
@@ -194,15 +197,15 @@ class DLVAE(pl.LightningModule):
             self.test_fid.update(x_recon_fid, real=False)
             self.test_fid.update(x_fid, real=True)
 
-        # Log metrics
-        self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/dl_loss', dl_loss, on_step=True, on_epoch=True)
-        self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True)
+        # Log metrics (sync across devices for epoch-level aggregation)
+        self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/dl_loss', dl_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
 
         # Add PSNR calculation
         psnr = self.psnr(x, recon)
-        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True)
+        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True, sync_dist=True)
 
         return {
             'loss': total_loss,

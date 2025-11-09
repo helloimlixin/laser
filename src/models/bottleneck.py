@@ -375,7 +375,7 @@ class DictionaryLearning(nn.Module):
         self._normalize_dictionary()
         # Run OMP in float32 to avoid AMP dtype mismatches; cast back after
         orig_dtype = ze_flattened.dtype
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             ze_flattened_f32 = ze_flattened.to(torch.float32)
             dictionary_f32 = self.dictionary.to(torch.float32)
             coefficients = BatchOMP(

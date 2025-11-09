@@ -2,7 +2,7 @@
 defaults:
   - _self_
   - model: dlvae
-  - data: cifar10
+  - data: celeba
   - train: default
   - wandb: default
   - checkpoint: default
