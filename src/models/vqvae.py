@@ -83,8 +83,8 @@ class VQVAE(pl.LightningModule):
             num_residual_hiddens=num_residual_hiddens
         )
 
-        # Initialize custom LPIPS for perceptual loss
-        self.lpips = LPIPS()
+        # Initialize LPIPS only if used
+        self.lpips = LPIPS() if self.perceptual_weight > 0 else None
 
         if self.compute_fid:
             self.test_fid = torchmetrics.image.FrechetInceptionDistance(
@@ -158,10 +158,13 @@ class VQVAE(pl.LightningModule):
         # Compute reconstruction loss (ensure it's a scalar)
         recon_loss = F.mse_loss(recon, x).mean()
 
-        # Compute perceptual loss (ensure it's a scalar)
-        x_norm = x * 2.0 - 1.0
-        x_recon_norm = recon * 2.0 - 1.0
-        perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
+        # Compute perceptual loss only if enabled
+        if self.perceptual_weight > 0 and self.lpips is not None:
+            x_norm = x * 2.0 - 1.0
+            x_recon_norm = recon * 2.0 - 1.0
+            perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
+        else:
+            perceptual_loss = torch.zeros((), device=x.device, dtype=recon.dtype)
 
         # Compute total loss
         total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss

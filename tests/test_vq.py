@@ -180,5 +180,5 @@ def test_save_visuals():
 
     assert usage_path.exists() and usage_path.stat().st_size > 0
     assert comp_path.exists() and comp_path.stat().st_size > 0
-
+    
 

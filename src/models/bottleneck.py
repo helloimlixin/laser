@@ -5,6 +5,105 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
+def _update_logical(logical, to_add):
+    """Mark selected indices as used in the logical mask."""
+    running_idx = torch.arange(to_add.shape[0], device=to_add.device)
+    logical[running_idx, to_add] = 1
+
+
+def BatchOMP(data, dictionary, max_nonzero, tolerance=1e-7, debug=False):
+    """
+    Vectorized Batch Orthogonal Matching Pursuit (OMP).
+    Adapted from: https://github.com/amzn/sparse-vqvae/blob/main/utils/pyomp.py
+    Reference links:
+    - https://sparse-plex.readthedocs.io/en/latest/book/pursuit/omp/batch_omp.html
+    - http://www.cs.technion.ac.il/~ronrubin/Publications/KSVD-OMP-v2.pdf
+
+    Args:
+        data (torch.Tensor): (vector_dim, batch_size)
+        dictionary (torch.Tensor): (vector_dim, num_atoms), column-normalized recommended
+        max_nonzero (int): Maximum number of non-zero coefficients per signal
+        tolerance (float): Early stopping tolerance on residual norm
+        debug (bool): If True, prints per-iteration diagnostics
+
+    Returns:
+        torch.Tensor: (num_atoms, batch_size) sparse coefficients
+    """
+    vector_dim, batch_size = data.size()
+    dictionary_t = dictionary.t()  # (num_atoms, vector_dim)
+    G = dictionary_t.mm(dictionary)  # (num_atoms, num_atoms) Gram matrix
+
+    # residual norms initialized as ||x||_2
+    eps = torch.norm(data, dim=0)  # (batch_size,)
+
+    # initial correlation vector, transposed to (batch_size, num_atoms)
+    h_bar = dictionary_t.mm(data).t()
+
+    # working variables
+    h = h_bar
+    x = torch.zeros_like(h_bar)  # (batch_size, num_atoms) resulting sparse code
+    L = torch.ones(batch_size, 1, 1, device=h.device)  # progressive Cholesky of G in selected indices
+    I = torch.ones(batch_size, 0, device=h.device).long()
+    I_logic = torch.zeros_like(h_bar).bool()  # mask to avoid reselecting same index
+    delta = torch.zeros(batch_size, device=h.device)  # to track errors
+
+    k = 0
+    while k < max_nonzero and eps.max() > tolerance:
+        k += 1
+        # select next index per sample, masking already selected positions
+        index = (h * (~I_logic).float()).abs().argmax(dim=1)  # (batch_size,)
+        _update_logical(I_logic, index)
+
+        batch_idx = torch.arange(batch_size, device=G.device)
+        expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()  # (batch_size, k)
+
+        if k > 1:
+            # Gather G[I, index] efficiently across batch
+            G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
+            # Solve L w = G_stack for w using triangular solve (lower triangular)
+            w = torch.linalg.solve_triangular(L, G_stack, upper=False).view(-1, 1, k - 1)
+            # Corner element: sqrt(max(1 - ||w||^2, 0)) for numerical stability
+            w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=0.0))
+
+            # Concatenate into new Cholesky factor
+            k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device)
+            L = torch.cat((
+                torch.cat((L, k_zeros), dim=2),
+                torch.cat((w, w_corner), dim=2),
+            ), dim=1)
+
+        # update non-zero indices
+        I = torch.cat([I, index.unsqueeze(1)], dim=1)  # (batch_size, k)
+
+        # Solve for x_I with the Cholesky factor: G_I x_I = h_bar_I
+        h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)  # (B, k, 1)
+        # Use two triangular solves instead of deprecated cholesky_solve:
+        # 1) L y = h_stack
+        y_stack = torch.linalg.solve_triangular(L, h_stack, upper=False)  # (B, k, 1)
+        # 2) L^T x = y
+        x_stack = torch.linalg.solve_triangular(L.transpose(1, 2), y_stack, upper=True)  # (B, k, 1)
+
+        # Scatter x_stack into x at active indices
+        x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack.squeeze(-1)
+
+        # beta = G_I * x_I (projected correlations)
+        beta = x[batch_idx.unsqueeze(1), I[batch_idx]].unsqueeze(1).bmm(G[I[batch_idx], :]).squeeze(1)
+
+        # Update correlations for next selection step
+        h = h_bar - beta
+
+        # Update residual via energy tracking
+        new_delta = (x * beta).sum(dim=1)
+        eps += delta - new_delta
+        delta = new_delta
+
+        if debug:
+            print('OMP step {}, residual: {:.4f}, below tolerance: {:.4f}'.format(
+                k, eps.max().item(), (eps < tolerance).float().mean().item()))
+
+    # Return transposed to (num_atoms, batch_size)
+    return x.t()
+
 class VectorQuantizer(nn.Module):
     """
     Vector Quantizer implementation for VQ-VAE.
@@ -176,7 +275,9 @@ class DictionaryLearning(nn.Module):
         commitment_cost=0.25,
         decay=0.99,
         epsilon=1e-10,
-        use_ema=True
+        use_ema=True,
+        tolerance=1e-7,
+        omp_debug=False
     ):
         super(DictionaryLearning, self).__init__()
         
@@ -187,6 +288,8 @@ class DictionaryLearning(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
         self.use_ema = use_ema
+        self.tolerance = tolerance
+        self.omp_debug = omp_debug
         
         # Initialize dictionary with random atoms
         self.dictionary = nn.Parameter(
@@ -264,20 +367,31 @@ class DictionaryLearning(nn.Module):
         input_shape = z_e.shape
         
         # Flatten the input
-        ze_flattened = z_e.view(self.embedding_dim, -1)  # [batch_size * height * width, embedding_dim]
+        ze_flattened = z_e.view(self.embedding_dim, -1)  # [embedding_dim, batch_size * height * width]
         
         '''
         Sparse coding stage
         '''
         self._normalize_dictionary()
-        # coefficients = self.batch_omp(ze_flattened, self.dictionary, debug=False)  # [num_embeddings, batch_size * height * width]
-        coefficients = self.batch_omp(ze_flattened, self.dictionary)  # [num_embeddings, batch_size * height * width]
+        # Run OMP in float32 to avoid AMP dtype mismatches; cast back after
+        orig_dtype = ze_flattened.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            ze_flattened_f32 = ze_flattened.to(torch.float32)
+            dictionary_f32 = self.dictionary.to(torch.float32)
+            coefficients = BatchOMP(
+                data=ze_flattened_f32,
+                dictionary=dictionary_f32,
+                max_nonzero=self.sparsity_level,
+                tolerance=self.tolerance,
+                debug=self.omp_debug
+            )  # [num_embeddings, batch_size * height * width]
+            z_dl_f32 = dictionary_f32 @ coefficients  # [embedding_dim, batch_size * height * width]
 
         # # validate the coefficients sparsity level (number of non-zero coefficients along the first dimension)
         # sparsity_level = (coefficients.abs() > 1e-6).float().sum(dim=0).mean().item()
         # print(f"DEBUG Sparsity level: {sparsity_level:.4f}")
 
-        z_dl = self.dictionary @ coefficients  # [embedding_dim, batch_size * height * width]
+        z_dl = z_dl_f32.to(orig_dtype)  # cast back to original dtype (could be fp16 under AMP)
         z_dl = z_dl.view(input_shape) # [batch_size, embedding_dim, height, width]
 
         # Compute the commitment loss

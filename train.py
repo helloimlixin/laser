@@ -13,6 +13,7 @@ from src.models.dlvae import DLVAE
 from src.data.cifar10 import CIFAR10DataModule
 from src.data.config import DataConfig
 from src.data.imagenette2 import Imagenette2DataModule
+from src.data.celeba import CelebADataModule
 
 # Create a unique directory for each run
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -72,6 +73,10 @@ def train(cfg: DictConfig):
     elif cfg.model.type == "dlvae":
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
+        if hasattr(cfg.model, "omp_tolerance"):
+            print(f"OMP Tolerance: {cfg.model.omp_tolerance}")
+        if hasattr(cfg.model, "omp_debug"):
+            print(f"OMP Debug: {cfg.model.omp_debug}")
     
     print("\nTraining Configuration:")
     print(f"Learning Rate: {cfg.train.learning_rate}")
@@ -107,6 +112,8 @@ def train(cfg: DictConfig):
         datamodule = CIFAR10DataModule(DataConfig.from_dict(cfg.data))
     elif cfg.data.dataset == 'imagenette2':
         datamodule = Imagenette2DataModule(DataConfig.from_dict(cfg.data))
+    elif cfg.data.dataset == 'celeba':
+        datamodule = CelebADataModule(DataConfig.from_dict(cfg.data))
     else:
         raise ValueError(f"Unsupported dataset: {cfg.data.dataset}")
 
@@ -134,6 +141,9 @@ def train(cfg: DictConfig):
         model = VQVAE(**model_params)
     elif cfg.model.type == "dlvae":
         model_params['sparsity_level'] = cfg.model.sparsity_level
+        # Optional OMP params with sensible defaults
+        model_params['omp_tolerance'] = getattr(cfg.model, 'omp_tolerance', 1e-7)
+        model_params['omp_debug'] = getattr(cfg.model, 'omp_debug', False)
         model = DLVAE(**model_params)
     else:
         raise ValueError(f"Unknown model type: {cfg.model.type}")

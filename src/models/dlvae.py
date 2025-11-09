@@ -29,7 +29,9 @@ class DLVAE(pl.LightningModule):
             perceptual_weight,
             learning_rate,
             beta,
-            compute_fid=False
+            compute_fid=False,
+            omp_tolerance=1e-7,
+            omp_debug=False
     ):
         """Initialize DLVAE model.
 
@@ -47,6 +49,8 @@ class DLVAE(pl.LightningModule):
             learning_rate: Learning rate
             beta: Beta parameter for Adam optimizer
             compute_fid: Whether to compute FID
+            omp_tolerance: Early stopping tolerance for BatchOMP residual
+            omp_debug: Enable BatchOMP debug logging
         """
         super(DLVAE, self).__init__()
 
@@ -56,6 +60,8 @@ class DLVAE(pl.LightningModule):
         self.perceptual_weight = perceptual_weight
         self.log_images_every_n_steps = 100
         self.compute_fid = compute_fid
+        self.omp_tolerance = omp_tolerance
+        self.omp_debug = omp_debug
 
         # Initialize encoder
         self.encoder = Encoder(
@@ -76,7 +82,9 @@ class DLVAE(pl.LightningModule):
             embedding_dim=embedding_dim,
             sparsity_level=sparsity_level,
             commitment_cost=commitment_cost,
-            decay=decay
+            decay=decay,
+            tolerance=self.omp_tolerance,
+            omp_debug=self.omp_debug
         )
 
         self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
@@ -97,7 +105,8 @@ class DLVAE(pl.LightningModule):
         self.lpips = LPIPS()
 
         # Initialize the PSNR metric
-        self.psnr = PeakSignalNoiseRatio()
+        # Inputs are typically normalized to roughly [-1, 1], so data_range ≈ 2.0
+        self.psnr = PeakSignalNoiseRatio(data_range=2.0)
 
         # Initialize the SSIM metric
         self.ssim = StructuralSimilarityIndexMeasure()
@@ -253,6 +262,10 @@ class DLVAE(pl.LightningModule):
 
     def _log_images(self, x, x_recon, split='train'):
         """Log images to wandb."""
+        # If logger is disabled or doesn't support experiment logging, skip
+        if not getattr(self, "logger", None) or not hasattr(self.logger, "experiment"):
+            return
+        
         # Take first 32 images
         x = x[:32]
         x_recon = x_recon[:32]
