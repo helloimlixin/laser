@@ -1,6 +1,6 @@
 dataset: celeba
 data_dir: ${oc.env:CELEBA_DIR,${hydra:runtime.cwd}/data/celeba}
-batch_size: 128
+batch_size: 4
 num_workers: 8
 image_size: 128
 mean: [0.5, 0.5, 0.5]

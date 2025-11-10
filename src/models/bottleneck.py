@@ -48,7 +48,7 @@ def BatchOMP(data, dictionary, max_nonzero, tolerance=1e-7, debug=False):
     delta = torch.zeros(batch_size, device=h.device)  # to track errors
 
     k = 0
-    while k < max_nonzero and eps.max() > tolerance:
+    while k < max_nonzero:
         k += 1
         # select next index per sample, masking already selected positions
         index = (h * (~I_logic).float()).abs().argmax(dim=1)  # (batch_size,)

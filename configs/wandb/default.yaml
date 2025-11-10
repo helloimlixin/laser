@@ -1,4 +1,4 @@
 # configs/wandb/default.yaml
 project: "laser"
-name: "dlvae_celeba"
+name: "celeba"
 save_dir: "${output_dir}/wandb"
