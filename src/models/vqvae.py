@@ -8,7 +8,7 @@ from torchmetrics.functional.text import perplexity
 from .encoder import Encoder
 from .decoder import Decoder
 from .bottleneck import VectorQuantizer
-from src.lpips import LPIPS
+from .lpips import LPIPS
 
 import torchmetrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -66,8 +66,11 @@ class VQVAE(pl.LightningModule):
                                         kernel_size=1,
                                         stride=1)
         
+        # Use Zalando-style non-EMA vector quantizer
         self.vector_quantizer = VectorQuantizer(
-            num_embeddings, embedding_dim, commitment_cost, decay
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+            commitment_cost=commitment_cost
         )
 
         self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
@@ -100,6 +103,38 @@ class VQVAE(pl.LightningModule):
         # Save hyperparameters for logging
         self.save_hyperparameters()
 
+    def encode_to_indices(self, x):
+        """
+        Encode images to codebook indices sequence. Returns:
+          indices: LongTensor [B, H_z*W_z]
+          H_z, W_z: latent spatial dims
+        """
+        with torch.no_grad():
+            z = self.encoder(x)
+            z = self.pre_bottleneck(z)
+            # VectorQuantizer returns (z_q, loss, perplexity, indices)
+            _, _, _, enc = self.vector_quantizer(z)
+            B, _, H_z, W_z = z.shape
+            indices = enc.view(B, H_z * W_z).long()
+        return indices, H_z, W_z
+
+    def decode_from_indices(self, indices, H_z, W_z):
+        """
+        Decode codebook indices back to images using the decoder.
+        Args:
+          indices: LongTensor [B, H_z*W_z]
+          H_z, W_z: latent spatial dims
+        Returns:
+          recon: FloatTensor [B, C, H, W]
+        """
+        B = indices.size(0)
+        # Gather codebook vectors and reshape to latent feature map
+        codebook = self.vector_quantizer.embedding.weight  # [K, D]
+        z_q_flat = codebook[indices.view(-1)]              # [B*H_z*W_z, D]
+        z_q = z_q_flat.view(B, H_z, W_z, -1).permute(0, 3, 1, 2).contiguous()  # [B, D, H_z, W_z]
+        z_q = self.post_bottleneck(z_q)
+        recon = self.decoder(z_q)
+        return recon
     def encode(self, x):
         """
         Encode input to latent representation

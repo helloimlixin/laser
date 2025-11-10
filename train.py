@@ -178,9 +178,13 @@ def train(cfg: DictConfig):
         ))
 
     # Initialize trainer
-    # Prefer plain DDP for DLVAE to avoid unnecessary find_unused traversal
+    # Choose DDP strategy per model type:
+    # - DLVAE: all params used in loss → prefer plain DDP
+    # - VQVAE (non-EMA now): all params used → plain DDP
     strategy_cfg = getattr(cfg.train, "strategy", None)
-    if cfg.model.type == "dlvae" and strategy_cfg == "ddp_find_unused_parameters_true":
+    if cfg.model.type == "dlvae":
+        strategy_cfg = "ddp"
+    elif cfg.model.type == "vqvae":
         strategy_cfg = "ddp"
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,

@@ -122,7 +122,7 @@ class VectorQuantizer(nn.Module):
     - Gradient descent (when decay = 0): Standard backpropagation approach
     """
     def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25,
-                 decay=0.99, epsilon=1e-5):
+                 decay=0.0, epsilon=1e-5):
         """
         Initialize the Vector Quantizer.
         
@@ -139,30 +139,14 @@ class VectorQuantizer(nn.Module):
         self.embedding_dim = embedding_dim  # Dimension of each embedding vector
         self.num_embeddings = num_embeddings  # Number of embedding vectors in the codebook
         self.commitment_cost = commitment_cost  # Weighting for commitment loss
-        self.use_ema = bool(decay > 0.0)  # Whether to use EMA updates for the codebook
-        self.decay = decay  # EMA decay factor (higher = slower updates)
+        self.decay = 0.0  # Non-EMA for Zalando-style VQ
         self.epsilon = epsilon  # Small constant for numerical stability
 
         # Create embedding table (codebook)
         # This is the dictionary of codes that continuous vectors will be mapped to
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-
-        if self.use_ema:
-            print('Using EMA updates for codebook...')
-            # Initialize the embedding weights using normal distribution
-            self.embedding.weight.data.normal_()
-        else:
-            print('Using standard backpropagation for codebook... (no EMA)')
-            # Initialize embedding weights with small random values
-            self.embedding.weight.data.uniform_(-1 / num_embeddings, 1 / num_embeddings)
-
-        # Register buffers for EMA updates (not model parameters - not directly optimized)
-        # ema_cluster_size: Tracks how often each codebook entry is used
-        self.register_buffer('_ema_cluster_size', torch.zeros(num_embeddings))
-        # ema_w: EMA of the encoder outputs assigned to each codebook entry
-        self._ema_w = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
-        # Flag to control when EMA updates are performed
-        self._ema_w.data.normal_()
+        # Initialize embedding weights with small random values (Zalando)
+        self.embedding.weight.data.uniform_(-1 / num_embeddings, 1 / num_embeddings)
 
     def forward(self, z_e):
         """
@@ -185,70 +169,32 @@ class VectorQuantizer(nn.Module):
         input_shape = z_e.shape
 
         # Flatten the input
-        ze_flattened = z_e.view(-1, self.embedding_dim)
-        
-        # Calculate squared distances between z_flattened and embedding vectors
-        # This uses the || x - e ||^2 = ||x||^2 + ||e||^2 - 2*x^T*e formula for efficiency
-        # Rather than computing distances directly, which would be more expensive
-        distances = torch.sum(ze_flattened ** 2, dim=1, keepdim=True) + \
-            torch.sum(self.embedding.weight ** 2, dim=1) - \
-            2 * torch.matmul(ze_flattened, self.embedding.weight.t())
+        ze_flattened = z_e.view(-1, self.embedding_dim)  # [N, D]
+        N = ze_flattened.size(0)
 
-        # Find nearest embedding for each z_flattened vector
-        # encoding_indices contains indices of the closest codebook entry for each position
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        
-        # Convert indices to one-hot encodings for gathering embeddings
-        # encodings shape: [B*H*W, num_embeddings]
-        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=z_e.device)
-        encodings.scatter_(1, encoding_indices, 1)
+        # Memory-efficient nearest neighbor search in chunks (Zalando)
+        emb = self.embedding.weight  # [K, D]
+        emb_norm2 = (emb ** 2).sum(dim=1)  # [K]
+        chunk_size = 32768
+        all_indices = []
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            x = ze_flattened[start:end]                      # [n, D]
+            x_norm2 = (x ** 2).sum(dim=1, keepdim=True)      # [n,1]
+            logits = x @ emb.t()                             # [n, K]
+            dists = x_norm2 + emb_norm2.unsqueeze(0) - 2.0 * logits
+            idx = torch.argmin(dists, dim=1)                 # [n]
+            all_indices.append(idx)
+        encoding_indices = torch.cat(all_indices, dim=0)     # [N]
 
-        # Get the quantized latent vectors using embedding lookup
-        # Multiply one-hot encodings by embedding weights to get quantized vectors
-        # Then reshape back to the original tensor shape [B, H, W, D]
-        z_q = torch.matmul(encodings, self.embedding.weight).view(input_shape)
+        # Quantize via gather and reshape back
+        z_q_flat = emb[encoding_indices]                     # [N, D]
+        z_q = z_q_flat.view(input_shape)                     # [B, H, W, D]
 
-        # Update codebook using EMA if enabled and in training mode
-        if self.use_ema and self.training:
-            # EMA update for the codebook
-            
-            # 1. Update cluster size (how many vectors are assigned to each codebook entry)
-            # Count occurrences of each embedding being used in this batch
-            # Update the exponential moving average of cluster sizes
-            self._ema_cluster_size = self._ema_cluster_size * self.decay + \
-                (1 - self.decay) * encodings.sum(0)
-
-            # 2. Update embedding vectors based on assigned encoder outputs
-            # Compute sum of all z vectors assigned to each embedding
-            dw = torch.matmul(encodings.t(), ze_flattened)
-            # Update the exponential moving average of assigned vectors
-            self._ema_w = nn.Parameter(self._ema_w * self.decay + (1 - self.decay) * dw)
-
-            # 3. Normalize the updated embeddings
-            # Get total cluster size (with smoothing to prevent division by zero)
-            n = torch.sum(self._ema_cluster_size.data)
-            # Normalize cluster sizes with Laplace smoothing
-            self._ema_cluster_size = (
-                    (self._ema_cluster_size + self.epsilon) / (n + self.num_embeddings * self.epsilon) * n)
-            # Update the actual embedding weights with the EMA-updated version
-            self.embedding.weight = nn.Parameter(self._ema_w / self._ema_cluster_size.unsqueeze(1))
-
-        # Compute VQ losses:
-
-        # 1. Codebook loss (makes codebook vectors move towards encoder outputs)
-        # The detach() on z prevents gradients from flowing back to the quantization
+        # Losses (Zalando): codebook + commitment
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
-        
-        # 2. Commitment loss (makes encoder outputs move towards codebook vectors)
-        # The detach() on z_q prevents gradients from flowing back to the codebook
-        commitment_loss = self.commitment_cost * e_latent_loss
-        
-        # Combine losses with commitment_cost weighting
-        if self.use_ema:
-            loss = commitment_loss
-        else:
-            q_latent_loss = F.mse_loss(z_q, z_e.detach())
-            loss = q_latent_loss + commitment_loss
+        q_latent_loss = F.mse_loss(z_q, z_e.detach())
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
 
         # Straight-through estimator
         # This allows gradients to flow back to encoder even though quantization is discrete
@@ -257,10 +203,12 @@ class VectorQuantizer(nn.Module):
         z_q = z_e + (z_q - z_e).detach()
 
         # Compute perplexity evaluation
-        avg_probs = torch.mean(encodings, dim=0)
+        counts_for_pp = torch.bincount(encoding_indices, minlength=self.num_embeddings).to(z_e.dtype)
+        avg_probs = counts_for_pp / float(N)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
-        return z_q.permute(0, 3, 1, 2).contiguous(), loss, perplexity, encodings
+        # Return indices instead of full one-hot to avoid memory blow-up; caller ignores it
+        return z_q.permute(0, 3, 1, 2).contiguous(), loss, perplexity, encoding_indices
 
 
 class DictionaryLearning(nn.Module):
@@ -405,6 +353,8 @@ class DictionaryLearning(nn.Module):
         z_dl = z_e + (z_dl - z_e).detach()  # Allow gradients to flow back to encoder
 
         return z_dl.permute(0, 3, 1, 2).contiguous(), loss, coefficients  # Return the reconstructed latent representation, loss, and sparse coefficients
+
+
 
 
 def test_vector_quantizer():

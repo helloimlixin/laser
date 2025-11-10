@@ -7,7 +7,7 @@ import torchvision
 from .encoder import Encoder
 from .decoder import Decoder
 from .bottleneck import DictionaryLearning
-from src.lpips import LPIPS
+from .lpips import LPIPS
 
 import torchmetrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
