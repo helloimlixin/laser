@@ -111,34 +111,16 @@ class GPTModule(nn.Module):
 		return logits
 
 	@torch.no_grad()
-	def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, forbid_token=None):
+	def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
 		for _ in range(max_new_tokens):
 			idx_cond = idx[:, -self.block_size:]
 			logits = self(idx_cond)
 			logits = logits[:, -1, :] / max(temperature, 1e-8)
-			# Optionally forbid a specific token (e.g., BOS after the first step)
-			if forbid_token is not None and idx.size(1) >= 1:
-				logits[:, forbid_token] = -float('Inf')
-			# Top-p (nucleus) sampling takes precedence if provided
-			if top_p is not None:
-				probs = F.softmax(logits, dim=-1)
-				sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
-				cumprobs = torch.cumsum(sorted_probs, dim=-1)
-				# mask tokens where cumulative prob exceeds threshold (keep minimal set > top_p)
-				mask = cumprobs > float(top_p)
-				# ensure at least one token kept
-				mask[..., 1:] = mask[..., :-1].clone()
-				mask[..., 0] = False
-				sorted_probs[mask] = 0.0
-				sorted_probs = sorted_probs / (sorted_probs.sum(dim=-1, keepdim=True) + 1e-12)
-				next_sorted = torch.multinomial(sorted_probs, num_samples=1)
-				next_idx = sorted_indices.gather(-1, next_sorted)
-			else:
-				if top_k is not None:
-					v, _ = torch.topk(logits, top_k)
-					logits[logits < v[:, [-1]]] = -float('Inf')
-				probs = F.softmax(logits, dim=-1)
-				next_idx = torch.multinomial(probs, num_samples=1)
+			if top_k is not None:
+				v, _ = torch.topk(logits, top_k)
+				logits[logits < v[:, [-1]]] = -float('Inf')
+			probs = F.softmax(logits, dim=-1)
+			next_idx = torch.multinomial(probs, num_samples=1)
 			idx = torch.cat((idx, next_idx), dim=1)
 		return idx
 
@@ -164,9 +146,7 @@ class MinGPT(pl.LightningModule):
 					p.requires_grad = False
 			except Exception:
 				pass
-		codebook_size = self.vqvae.vector_quantizer.num_embeddings
-		self.bos_id = codebook_size  # reserve last id for BOS
-		vocab_size = codebook_size + 1
+		vocab_size = self.vqvae.vector_quantizer.num_embeddings
 		self.gpt = GPTModule(vocab_size=vocab_size, block_size=block_size,
 		                     n_layer=n_layer, n_head=n_head, n_embd=n_embd)
 		self.learning_rate = learning_rate
@@ -182,10 +162,9 @@ class MinGPT(pl.LightningModule):
 		if T > self.gpt.get_block_size():
 			indices = indices[:, :self.gpt.get_block_size()]
 			T = self.gpt.get_block_size()
-		# Autoregressive with BOS priming: predict the true tokens given BOS+shifted inputs
-		bos = torch.full((indices.size(0), 1), self.bos_id, dtype=torch.long, device=indices.device)
-		x_in = torch.cat([bos, indices[:, :-1]], dim=1)
-		x_out = indices
+		# Autoregressive targets
+		x_in = indices[:, :-1]
+		x_out = indices[:, 1:]
 		logits = self.gpt(x_in)
 		loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), x_out.reshape(-1))
 		self._safe_log('train/transformer_loss', loss, on_step=True, on_epoch=True, sync_dist=True)
@@ -203,9 +182,8 @@ class MinGPT(pl.LightningModule):
 		if T > self.gpt.get_block_size():
 			indices = indices[:, :self.gpt.get_block_size()]
 			T = self.gpt.get_block_size()
-		bos = torch.full((indices.size(0), 1), self.bos_id, dtype=torch.long, device=indices.device)
-		x_in = torch.cat([bos, indices[:, :-1]], dim=1)
-		x_out = indices
+		x_in = indices[:, :-1]
+		x_out = indices[:, 1:]
 		logits = self.gpt(x_in)
 		loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), x_out.reshape(-1))
 		self._safe_log('val/transformer_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
@@ -223,9 +201,8 @@ class MinGPT(pl.LightningModule):
 	def sample(self, batch_size: int, H_z: int, W_z: int, temperature: float = 1.0, top_k: int = None):
 		device = next(self.parameters()).device
 		T = H_z * W_z
-		start = torch.full((batch_size, 1), self.bos_id, dtype=torch.long, device=device)
-		tokens_bos = self.gpt.generate(start, max_new_tokens=T, temperature=temperature, top_k=top_k, top_p=None, forbid_token=self.bos_id)
-		tokens = tokens_bos[:, 1:1+T]
+		start = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+		tokens = self.gpt.generate(start, max_new_tokens=T - 1, temperature=temperature, top_k=top_k)
 		recon = self.vqvae.decode_from_indices(tokens, H_z, W_z)
 		return recon
 
@@ -235,13 +212,12 @@ class MinGPT(pl.LightningModule):
 		T = H_z * W_z
 		milestones = [max(1, int(T * r)) for r in (0.25, 0.5, 0.75, 1.0)]
 		milestones = sorted(set(milestones))
-		idx = torch.full((batch_size, 1), self.bos_id, dtype=torch.long, device=device)
+		idx = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
 		progress_recons = []
 		for step in range(1, T):
 			idx_cond = idx[:, -self.gpt.get_block_size():]
 			logits = self.gpt(idx_cond)
 			logits = logits[:, -1, :] / max(temperature, 1e-8)
-			logits[:, self.bos_id] = -float('Inf')
 			if top_k is not None:
 				v, _ = torch.topk(logits, top_k)
 				logits[logits < v[:, [-1]]] = -float('Inf')
@@ -253,8 +229,7 @@ class MinGPT(pl.LightningModule):
 				if tokens_full.size(1) < T:
 					pad = torch.zeros(batch_size, T - tokens_full.size(1), dtype=torch.long, device=device)
 					tokens_full = torch.cat([tokens_full, pad], dim=1)
-				# drop BOS for decoding
-				recon = self.vqvae.decode_from_indices(tokens_full[:, 1:1+T], H_z, W_z)
+				recon = self.vqvae.decode_from_indices(tokens_full, H_z, W_z)
 				progress_recons.append(recon)
 			if idx.size(1) >= T:
 				break
@@ -263,7 +238,7 @@ class MinGPT(pl.LightningModule):
 			if tokens_full.size(1) < T:
 				pad = torch.zeros(batch_size, T - tokens_full.size(1), dtype=torch.long, device=device)
 				tokens_full = torch.cat([tokens_full, pad], dim=1)
-			recon = self.vqvae.decode_from_indices(tokens_full[:, 1:1+T], H_z, W_z)
+			recon = self.vqvae.decode_from_indices(tokens_full, H_z, W_z)
 			progress_recons.append(recon)
 		return progress_recons
 
