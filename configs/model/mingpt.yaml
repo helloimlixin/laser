@@ -12,7 +12,7 @@ perceptual_weight: 0.0
 compute_fid: false
 
 # Pretrained VQVAE checkpoint (leave empty to use randomly initialized VQVAE)
-vqvae_ckpt: "/home/xl598/Projects/laser/outputs/checkpoints/run_20251110_155507/vqvae/last.ckpt"
+vqvae_ckpt: "/home/xl598/Projects/laser/outputs/checkpoints/run_20251111_134837/vqvae/last.ckpt/checkpoint/mp_rank_00_model_states.pt"
 freeze_vqvae: true
 
 # GPT configuration
