@@ -87,25 +87,25 @@ The `tests/test_bottleneck.py` generates comprehensive visualizations comparing 
 ### Reconstruction Comparison
 VQ vs Dictionary Learning reconstruction quality (K=16 codebook/atoms, S=4 sparsity):
 
-![Reconstruction Comparison](tests/artifacts/bottleneck/reconstruction_comparison.png)
+![Reconstruction Comparison](img/bottleneck/reconstruction_comparison.png)
 
 ### Code Interpretability Heatmaps
 Spatial visualization of VQ indices and DL sparse coefficients:
 
-![Code Heatmaps](tests/artifacts/bottleneck/code_heatmaps.png)
+![Code Heatmaps](img/bottleneck/code_heatmaps.png)
 
 ### Channel-wise Comparison
 RGB channel-level reconstruction fidelity:
 
-![Channel Comparison](tests/artifacts/bottleneck/vq_channel_comparison.png)
+![Channel Comparison](img/bottleneck/vq_channel_comparison.png)
 
 ### Usage Statistics
 
 **VQ Codebook Usage:**
-![VQ Usage](tests/artifacts/bottleneck/vq_codebook_usage.png)
+![VQ Usage](img/bottleneck/vq_codebook_usage.png)
 
 **Dictionary Atom Usage:**
-![DL Usage](tests/artifacts/bottleneck/dictionary_atom_usage.png)
+![DL Usage](img/bottleneck/dictionary_atom_usage.png)
 
 ### Performance Summary (K=16, Sparsity=4)
 
@@ -117,6 +117,9 @@ Run visualizations:
 ```bash
 conda activate research
 pytest tests/test_bottleneck.py::test_bottleneck_visualizations -v
+
+# Update README images after regenerating visualizations
+cp tests/artifacts/bottleneck/*.png img/bottleneck/
 ```
 
 ## License
