@@ -80,6 +80,45 @@ All configuration is managed through Hydra. Adjust the YAML files under `configs
 python train.py model.type=dlvae data=celeba train.max_epochs=50
 ```
 
+## Bottleneck Visualizations
+
+The `tests/test_bottleneck.py` generates comprehensive visualizations comparing VQ and DL bottlenecks on CelebA data:
+
+### Reconstruction Comparison
+VQ vs Dictionary Learning reconstruction quality (K=16 codebook/atoms, S=4 sparsity):
+
+![Reconstruction Comparison](tests/artifacts/bottleneck/reconstruction_comparison.png)
+
+### Code Interpretability Heatmaps
+Spatial visualization of VQ indices and DL sparse coefficients:
+
+![Code Heatmaps](tests/artifacts/bottleneck/code_heatmaps.png)
+
+### Channel-wise Comparison
+RGB channel-level reconstruction fidelity:
+
+![Channel Comparison](tests/artifacts/bottleneck/vq_channel_comparison.png)
+
+### Usage Statistics
+
+**VQ Codebook Usage:**
+![VQ Usage](tests/artifacts/bottleneck/vq_codebook_usage.png)
+
+**Dictionary Atom Usage:**
+![DL Usage](tests/artifacts/bottleneck/dictionary_atom_usage.png)
+
+### Performance Summary (K=16, Sparsity=4)
+
+- **VQ**: 2.4 ms inference, MSE=0.00867
+- **DL**: 11.8 ms inference (4.9x slower), MSE=0.00258 (3.4x better quality)
+- **Atom utilization**: 16/16 atoms used (100% with diversity bonus)
+
+Run visualizations:
+```bash
+conda activate research
+pytest tests/test_bottleneck.py::test_bottleneck_visualizations -v
+```
+
 ## License
 
 MIT
