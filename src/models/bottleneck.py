@@ -2,9 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import numpy as np
-import matplotlib.pyplot as plt
-
 def _update_logical(logical, to_add):
     """Mark selected indices as used in the logical mask."""
     running_idx = torch.arange(to_add.shape[0], device=to_add.device)
@@ -15,6 +12,7 @@ def BatchOMP(data, dictionary, max_nonzero, tolerance=1e-7, debug=False):
     """
     Vectorized Batch Orthogonal Matching Pursuit (OMP).
     Adapted from: https://github.com/amzn/sparse-vqvae/blob/main/utils/pyomp.py
+    
     Reference links:
     - https://sparse-plex.readthedocs.io/en/latest/book/pursuit/omp/batch_omp.html
     - http://www.cs.technion.ac.il/~ronrubin/Publications/KSVD-OMP-v2.pdf
@@ -30,42 +28,40 @@ def BatchOMP(data, dictionary, max_nonzero, tolerance=1e-7, debug=False):
         torch.Tensor: (num_atoms, batch_size) sparse coefficients
     """
     vector_dim, batch_size = data.size()
-    dictionary_t = dictionary.t()  # (num_atoms, vector_dim)
-    G = dictionary_t.mm(dictionary)  # (num_atoms, num_atoms) Gram matrix
+    dictionary_t = dictionary.t()
+    G = dictionary_t.mm(dictionary)  # Gram matrix
+    # Add regularization to Gram matrix for numerical stability
+    # Larger epsilon needed for low-dimensional problems like RGB (d=3)
+    G = G + torch.eye(G.size(0), device=G.device) * 1e-4
+    eps = torch.norm(data, dim=0)  # residual, initialized as L2 norm of signal
+    h_bar = dictionary_t.mm(data).t()  # initial correlation vector, transposed
 
-    # residual norms initialized as ||x||_2
-    eps = torch.norm(data, dim=0)  # (batch_size,)
-
-    # initial correlation vector, transposed to (batch_size, num_atoms)
-    h_bar = dictionary_t.mm(data).t()
-
-    # working variables
     h = h_bar
-    x = torch.zeros_like(h_bar)  # (batch_size, num_atoms) resulting sparse code
-    L = torch.ones(batch_size, 1, 1, device=h.device)  # progressive Cholesky of G in selected indices
+    x = torch.zeros_like(h_bar)  # resulting sparse code
+    L = torch.ones(batch_size, 1, 1, device=h.device)  # progressive Cholesky
     I = torch.ones(batch_size, 0, device=h.device).long()
     I_logic = torch.zeros_like(h_bar).bool()  # mask to avoid reselecting same index
-    delta = torch.zeros(batch_size, device=h.device)  # to track errors
+    delta = torch.zeros(batch_size, device=h.device)
 
     k = 0
-    while k < max_nonzero:
+    while k < max_nonzero and eps.max() > tolerance:
         k += 1
         # select next index per sample, masking already selected positions
-        index = (h * (~I_logic).float()).abs().argmax(dim=1)  # (batch_size,)
+        index = (h * (~I_logic).float()).abs().argmax(dim=1)
         _update_logical(I_logic, index)
-
+        
         batch_idx = torch.arange(batch_size, device=G.device)
-        expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()  # (batch_size, k)
+        expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()
 
         if k > 1:
-            # Gather G[I, index] efficiently across batch
+            # Cholesky update
             G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
-            # Solve L w = G_stack for w using triangular solve (lower triangular)
+            # Use modern triangular_solve replacement
             w = torch.linalg.solve_triangular(L, G_stack, upper=False).view(-1, 1, k - 1)
-            # Corner element: sqrt(max(1 - ||w||^2, 0)) for numerical stability
-            w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=0.0))
+            # Add small epsilon to prevent numerical issues
+            w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-10))
 
-            # Concatenate into new Cholesky factor
+            # Concatenate into new Cholesky: L <- [[L, 0], [w, w_corner]]
             k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device)
             L = torch.cat((
                 torch.cat((L, k_zeros), dim=2),
@@ -73,142 +69,133 @@ def BatchOMP(data, dictionary, max_nonzero, tolerance=1e-7, debug=False):
             ), dim=1)
 
         # update non-zero indices
-        I = torch.cat([I, index.unsqueeze(1)], dim=1)  # (batch_size, k)
+        I = torch.cat([I, index.unsqueeze(1)], dim=1)
 
-        # Solve for x_I with the Cholesky factor: G_I x_I = h_bar_I
-        h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)  # (B, k, 1)
-        # Use two triangular solves instead of deprecated cholesky_solve:
-        # 1) L y = h_stack
-        y_stack = torch.linalg.solve_triangular(L, h_stack, upper=False)  # (B, k, 1)
-        # 2) L^T x = y
-        x_stack = torch.linalg.solve_triangular(L.transpose(1, 2), y_stack, upper=True)  # (B, k, 1)
+        # Solve for x using Cholesky factor
+        h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)
+        # Replace deprecated cholesky_solve with two triangular solves
+        y_stack = torch.linalg.solve_triangular(L, h_stack, upper=False)
+        x_stack = torch.linalg.solve_triangular(L.transpose(1, 2), y_stack, upper=True)
 
         # Scatter x_stack into x at active indices
         x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack.squeeze(-1)
 
-        # beta = G_I * x_I (projected correlations)
+        # beta = G_I * x_I
         beta = x[batch_idx.unsqueeze(1), I[batch_idx]].unsqueeze(1).bmm(G[I[batch_idx], :]).squeeze(1)
 
-        # Update correlations for next selection step
         h = h_bar - beta
 
-        # Update residual via energy tracking
+        # update residual
         new_delta = (x * beta).sum(dim=1)
         eps += delta - new_delta
         delta = new_delta
 
         if debug:
-            print('OMP step {}, residual: {:.4f}, below tolerance: {:.4f}'.format(
+            print('Step {}, residual: {:.4f}, below tolerance: {:.4f}'.format(
                 k, eps.max().item(), (eps < tolerance).float().mean().item()))
 
-    # Return transposed to (num_atoms, batch_size)
-    return x.t()
+    return x.t()  # transpose since sparse codes should be used as D * x
 
 class VectorQuantizer(nn.Module):
     """
     Vector Quantizer implementation for VQ-VAE.
-    
+
     The Vector Quantizer maps continuous encodings to discrete codes from a learned codebook.
     This is the key component that enables VQ-VAE to learn discrete representations.
-    
-    The quantization process involves:
-    1. Finding the nearest embedding vector in the codebook for each spatial position in the input
-    2. Replacing the input vectors with their corresponding codebook vectors from nearest neighbor search
-    3. Computing loss terms to train both the encoder and the codebook
-    4. Using a straight-through estimator to allow gradient flow through the discrete bottleneck
-    
-    The codebook can be updated using either:
-    - EMA updates (when decay > 0): More stable, not directly influenced by optimizer
-    - Gradient descent (when decay = 0): Standard backpropagation approach
     """
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25,
-                 decay=0.0, epsilon=1e-5):
-        """
-        Initialize the Vector Quantizer.
-        
-        Args:
-            num_embeddings (int): Size of the embedding dictionary (codebook size, typically 512 or 1024)
-            embedding_dim (int): Dimension of each embedding vector in the codebook
-            commitment_cost (float): Weight for the commitment loss, balancing encoder vs codebook training
-            decay (float): Decay factor for exponential moving average updates of embeddings
-                           If 0, standard backpropagation is used to update embeddings
-            epsilon (float): Small constant to prevent division by zero in EMA update normalization
-        """
-        super(VectorQuantizer, self).__init__()
 
-        self.embedding_dim = embedding_dim  # Dimension of each embedding vector
-        self.num_embeddings = num_embeddings  # Number of embedding vectors in the codebook
-        self.commitment_cost = commitment_cost  # Weighting for commitment loss
-        self.decay = 0.0  # Non-EMA for Zalando-style VQ
-        self.epsilon = epsilon  # Small constant for numerical stability
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        commitment_cost=0.25,
+        decay=0.0,
+        epsilon=1e-5,
+    ):
+        super().__init__()
 
-        # Create embedding table (codebook)
-        # This is the dictionary of codes that continuous vectors will be mapped to
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
+
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        # Initialize embedding weights with small random values (Zalando)
         self.embedding.weight.data.uniform_(-1 / num_embeddings, 1 / num_embeddings)
 
-    def forward(self, z_e):
+        if self.decay > 0:
+            self.register_buffer("_ema_cluster_size", torch.zeros(num_embeddings))
+            self.register_buffer("_ema_w", torch.zeros(num_embeddings, embedding_dim))
+            self._ema_w.data.copy_(self.embedding.weight.detach())
+
+    def forward(self, z_e: torch.Tensor):
         """
-        Forward pass through the vector quantizer.
-        
         Args:
-            z_e (torch.Tensor): Output from encoder with shape [B, D, H, W]
-                              B: batch size, D: embedding dimension, H, W: spatial dimensions
-        
+            z_e: Input tensor of shape [B, D, H, W]
+
         Returns:
-            z_q (torch.Tensor): Quantized tensor with same shape as input [B, D, H, W]
-            loss (torch.Tensor): VQ loss (codebook loss + commitment loss)
-            min_encoding_indices (torch.Tensor): Indices of the nearest embedding vectors [B*H*W]
+            Tuple of (quantized tensor, loss, perplexity, one-hot encodings)
         """
-        # z shape: [B, D, H, W]
+        # Permute to [B, H, W, D] for convenience and flatten to [N, D]
+        z = z_e.permute(0, 2, 3, 1).contiguous()
+        flat_inputs = z.view(-1, self.embedding_dim)
+        num_vectors = flat_inputs.size(0)
 
-        # Reshape z to [B*H*W, D] for easier processing
-        # The permute operation reorders dimensions to [B, H, W, D] before reshaping
-        z_e = z_e.permute(0, 2, 3, 1).contiguous()
-        input_shape = z_e.shape
+        embeddings = self.embedding.weight
+        emb_norm_sq = (embeddings ** 2).sum(dim=1)
 
-        # Flatten the input
-        ze_flattened = z_e.view(-1, self.embedding_dim)  # [N, D]
-        N = ze_flattened.size(0)
-
-        # Memory-efficient nearest neighbor search in chunks (Zalando)
-        emb = self.embedding.weight  # [K, D]
-        emb_norm2 = (emb ** 2).sum(dim=1)  # [K]
+        # Chunked nearest neighbour search
         chunk_size = 32768
-        all_indices = []
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            x = ze_flattened[start:end]                      # [n, D]
-            x_norm2 = (x ** 2).sum(dim=1, keepdim=True)      # [n,1]
-            logits = x @ emb.t()                             # [n, K]
-            dists = x_norm2 + emb_norm2.unsqueeze(0) - 2.0 * logits
-            idx = torch.argmin(dists, dim=1)                 # [n]
-            all_indices.append(idx)
-        encoding_indices = torch.cat(all_indices, dim=0)     # [N]
+        indices_list = []
+        for start in range(0, num_vectors, chunk_size):
+            end = min(start + chunk_size, num_vectors)
+            x = flat_inputs[start:end]
+            x_norm_sq = (x ** 2).sum(dim=1, keepdim=True)
+            distances = x_norm_sq + emb_norm_sq.unsqueeze(0) - 2.0 * x @ embeddings.t()
+            indices_list.append(torch.argmin(distances, dim=1))
+        encoding_indices = torch.cat(indices_list, dim=0)  # [N]
 
-        # Quantize via gather and reshape back
-        z_q_flat = emb[encoding_indices]                     # [N, D]
-        z_q = z_q_flat.view(input_shape)                     # [B, H, W, D]
+        # One-hot encodings and quantized latents
+        encodings = F.one_hot(encoding_indices, self.num_embeddings).to(flat_inputs.dtype)
+        z_q_flat = encodings @ embeddings  # [N, D]
+        z_q = z_q_flat.view_as(z)
 
-        # Losses (Zalando): codebook + commitment
-        e_latent_loss = F.mse_loss(z_q.detach(), z_e)
-        q_latent_loss = F.mse_loss(z_q, z_e.detach())
+        # Loss terms
+        e_latent_loss = F.mse_loss(z_q.detach(), z)
+        q_latent_loss = F.mse_loss(z_q, z.detach())
         loss = q_latent_loss + self.commitment_cost * e_latent_loss
 
         # Straight-through estimator
-        # This allows gradients to flow back to encoder even though quantization is discrete
-        # In the forward pass: z_q = selected embeddings
-        # In the backward pass: gradients flow directly from z_q to z, bypassing quantization
-        z_q = z_e + (z_q - z_e).detach()
+        z_q = z_q.to(z.dtype)
+        z_st = z + (z_q - z).detach()
 
-        # Compute perplexity evaluation
-        counts_for_pp = torch.bincount(encoding_indices, minlength=self.num_embeddings).to(z_e.dtype)
-        avg_probs = counts_for_pp / float(N)
+        # Perplexity (codebook usage)
+        encoding_sum = encodings.float().sum(dim=0)
+        avg_probs = encoding_sum / float(num_vectors)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
-        # Return indices instead of full one-hot to avoid memory blow-up; caller ignores it
-        return z_q.permute(0, 3, 1, 2).contiguous(), loss, perplexity, encoding_indices
+        # EMA updates when enabled and in training mode
+        if self.training and self.decay > 0:
+            self._ema_cluster_size = (
+                self._ema_cluster_size * self.decay
+                + (1 - self.decay) * encoding_sum
+            )
+
+            ema_w = encodings.float().t() @ flat_inputs.float()
+            self._ema_w = self._ema_w * self.decay + (1 - self.decay) * ema_w
+
+            n = self._ema_cluster_size.sum()
+            cluster_size = (
+                (self._ema_cluster_size + self.epsilon)
+                / (n + self.num_embeddings * self.epsilon)
+                * n
+            )
+            self.embedding.weight.data.copy_(
+                (self._ema_w / cluster_size.unsqueeze(1)).to(self.embedding.weight.data.dtype)
+            )
+
+        encodings = encodings.view(num_vectors, self.num_embeddings)
+        return z_st.permute(0, 3, 1, 2).contiguous(), loss, perplexity, encodings
 
 
 class DictionaryLearning(nn.Module):
@@ -225,7 +212,8 @@ class DictionaryLearning(nn.Module):
         epsilon=1e-10,
         use_ema=True,
         tolerance=1e-7,
-        omp_debug=False
+        omp_debug=False,
+        normalize_atoms=True
     ):
         super(DictionaryLearning, self).__init__()
         
@@ -238,12 +226,14 @@ class DictionaryLearning(nn.Module):
         self.use_ema = use_ema
         self.tolerance = tolerance
         self.omp_debug = omp_debug
+        self.normalize_atoms = normalize_atoms
         
         # Initialize dictionary with random atoms
         self.dictionary = nn.Parameter(
             torch.randn(embedding_dim, num_embeddings), requires_grad=True
         )
-        self._normalize_dictionary()
+        if self.normalize_atoms:
+            self._normalize_dictionary()
 
     def _normalize_dictionary(self):
         """Normalize all dictionary atoms to have unit L2 norm."""
@@ -252,10 +242,12 @@ class DictionaryLearning(nn.Module):
 
     def batch_omp(self, X, D):
         """
-        Batched Orthogonal Matching Pursuit.
+        Batched Orthogonal Matching Pursuit (greedy selection only).
+        
+        Fast implementation using greedy atom selection without LS refinement.
 
         Args:
-            X (torch.Tensor): Input signals of shape (B, M).
+            X (torch.Tensor): Input signals of shape (M, B).
             D (torch.Tensor): Dictionary of shape (M, N), where each column is an atom of dimension M.
 
         Returns:
@@ -265,36 +257,52 @@ class DictionaryLearning(nn.Module):
         _, N = D.shape
         device = X.device
 
-        # Initialize the full coefficients matrix (N, B) with zeros.
+        # Greedy atom selection with diversity penalty
         coefficients = torch.zeros(N, B, device=device, dtype=X.dtype)
-
-        # Initialize residual as the input signals.
-        residual = X.clone()  # shape (M, B)
-
+        residual = X.clone()
+        
+        # Mask to prevent reselecting the same atom per signal
+        omega = torch.ones(B, N, device=device, dtype=torch.bool)  # (B, N)
+        batch_idx = torch.arange(B, device=device)
+        
+        # Track global atom usage for diversity penalty
+        global_usage = torch.zeros(N, device=device, dtype=X.dtype)
+        diversity_weight = 0.001  # Very small penalty to gently encourage diversity
+        
         for k in range(self.sparsity_level):
-            # Compute the correlations (projections): D^T (shape N x M) x residual (M x B) = (N x B)
-            correlations = torch.mm(D.t(), residual)  # shape (N, B)
-
-            # For each signal (each column), select the atom with the highest absolute correlation / projection
-            idx = torch.argmax(torch.abs(correlations), dim=0)  # shape (B,)
-
-            # Gather the selected atoms: for each signal i, d_selected[:, i] = D[:, idx[i]]
-            # D is (M, N) and idx is (B,), so D[:, idx] is (M, B).
-            d_selected = D[:, idx]  # shape (M, B)
-
-            # Compute coefficients for each signal:
-            # alpha[i] = (residual[:, i] @ d_selected[:, i]) / (|| d_selected[:, i] ||^2)
-            numerator = (residual * d_selected).sum(dim=0)  # shape (B,)
-            denominator = (d_selected ** 2).sum(dim=0)  # shape (B,)
-            alpha = numerator / (denominator + self.epsilon)  # shape (B,)
-
-            # Update the full coefficient matrix.
-            sample_indices = torch.arange(B, device=device)  # shape (B,)
-            coefficients.index_put_((idx, sample_indices), alpha, accumulate=True)
-
-            # Update the residual: residual = X - D @ coefficients
-            residual = residual - d_selected * alpha.unsqueeze(0)  # shape (M, B)
-
+            # Find best atom for current residual
+            correlations = torch.mm(D.t(), residual)  # (N, B)
+            abs_correlations = torch.abs(correlations)  # (N, B)
+            
+            # Apply soft diversity bonus: boost underused atoms
+            # Instead of penalty on overused, give bonus to underused
+            avg_usage = global_usage.mean() if global_usage.sum() > 0 else 0
+            diversity_bonus = diversity_weight * (avg_usage - global_usage).clamp(min=0).unsqueeze(1)
+            abs_correlations_adjusted = abs_correlations + diversity_bonus  # (N, B)
+            
+            # Mask prevents reselection
+            correlations_masked = abs_correlations_adjusted.t() * omega  # (B, N)
+            idx = torch.argmax(correlations_masked, dim=1)  # (B,)
+            
+            # Update mask and global usage
+            omega[batch_idx, idx] = False
+            for b in range(B):
+                global_usage[idx[b]] += 1
+            
+            # Gather selected atoms
+            d_selected = D[:, idx]  # (M, B)
+            
+            # Compute greedy coefficients
+            numerator = (residual * d_selected).sum(dim=0)  # (B,)
+            denominator = (d_selected ** 2).sum(dim=0)  # (B,)
+            alpha = numerator / (denominator + self.epsilon)  # (B,)
+            
+            # Update coefficient matrix
+            coefficients[idx, batch_idx] = alpha
+            
+            # Update residual
+            residual = residual - d_selected * alpha.unsqueeze(0)
+        
         return coefficients
     
     def forward(self, z_e):
@@ -314,33 +322,41 @@ class DictionaryLearning(nn.Module):
         z_e = z_e.permute(0, 2, 3, 1).contiguous()  # [batch_size, height, width, embedding_dim]
         input_shape = z_e.shape
         
-        # Flatten the input
-        ze_flattened = z_e.view(self.embedding_dim, -1)  # [embedding_dim, batch_size * height * width]
+        # Flatten the input: [B, H, W, C] -> [B*H*W, C] -> [C, B*H*W]
+        ze_flattened = z_e.reshape(-1, self.embedding_dim).t().contiguous()  # [embedding_dim, batch_size * height * width]
         
         '''
         Sparse coding stage
         '''
-        self._normalize_dictionary()
         # Run OMP in float32 to avoid AMP dtype mismatches; cast back after
         orig_dtype = ze_flattened.dtype
         with torch.amp.autocast('cuda', enabled=False):
             ze_flattened_f32 = ze_flattened.to(torch.float32)
             dictionary_f32 = self.dictionary.to(torch.float32)
-            coefficients = BatchOMP(
-                data=ze_flattened_f32,
-                dictionary=dictionary_f32,
-                max_nonzero=self.sparsity_level,
-                tolerance=self.tolerance,
-                debug=self.omp_debug
-            )  # [num_embeddings, batch_size * height * width]
-            z_dl_f32 = dictionary_f32 @ coefficients  # [embedding_dim, batch_size * height * width]
+            
+            # For pixel-level data without atom normalization, OMP still needs normalized dictionary
+            # The dictionary atoms store the actual RGB color values
+            if self.normalize_atoms:
+                # Standard DL: normalize and keep normalized
+                dict_norms = torch.linalg.norm(dictionary_f32, dim=0, keepdim=True)
+                dict_for_omp = dictionary_f32 / (dict_norms + 1e-10)
+                dict_for_recon = dict_for_omp
+            else:
+                # Pixel-level: use atoms as-is (they're already RGB colors from k-means)
+                dict_for_omp = dictionary_f32
+                dict_for_recon = dictionary_f32
+            
+            # Use simpler batch_omp method (more stable for pixel-level data)
+            coefficients = self.batch_omp(ze_flattened_f32, dict_for_omp)
+            z_dl_f32 = dict_for_recon @ coefficients
 
         # # validate the coefficients sparsity level (number of non-zero coefficients along the first dimension)
         # sparsity_level = (coefficients.abs() > 1e-6).float().sum(dim=0).mean().item()
         # print(f"DEBUG Sparsity level: {sparsity_level:.4f}")
 
         z_dl = z_dl_f32.to(orig_dtype)  # cast back to original dtype (could be fp16 under AMP)
-        z_dl = z_dl.view(input_shape) # [batch_size, embedding_dim, height, width]
+        # Reshape back: [C, B*H*W] -> [B*H*W, C] -> [B, H, W, C]
+        z_dl = z_dl.t().reshape(input_shape).contiguous()  # [batch_size, height, width, embedding_dim]
 
         # Compute the commitment loss
         e_latent_loss = F.mse_loss(z_dl.detach(), z_e)  # [batch_size, height, width, embedding_dim]
@@ -356,167 +372,3 @@ class DictionaryLearning(nn.Module):
 
 
 
-
-def test_vector_quantizer():
-    print("Testing VectorQuantizer...")
-    
-    # Parameters
-    batch_size = 2
-    embedding_dim = 64
-    height, width = 8, 8
-    num_embeddings = 512
-    
-    # Create random test input
-    z = torch.randn(batch_size, embedding_dim, height, width)
-    
-    # Initialize VQ model
-    vq = VectorQuantizer(
-        num_embeddings=num_embeddings,
-        embedding_dim=embedding_dim,
-        commitment_cost=0.25,
-        decay=0.99
-    )
-    
-    # Test forward pass
-    z_q, loss, indices = vq(z)
-    
-    # Print shapes and stats
-    print(f"Input shape: {z.shape}")
-    print(f"Quantized output shape: {z_q.shape}")
-    print(f"Loss: {loss.item():.4f}")
-    print(f"Indices shape: {indices.shape}")
-    
-    # Test codebook lookup
-    random_indices = torch.randint(0, num_embeddings, (10,))
-    codebook_vectors = vq.get_codebook_entry(random_indices)
-    print(f"Retrieved codebook vectors shape: {codebook_vectors.shape}")
-    
-    # Visualize codebook usage after forward pass
-    usage_count = torch.bincount(indices, minlength=num_embeddings)
-    
-    plt.figure(figsize=(10, 4))
-    plt.bar(range(num_embeddings), usage_count.cpu().numpy())
-    plt.title("VQ Codebook Usage")
-    plt.xlabel("Codebook Index")
-    plt.ylabel("Usage Count")
-    plt.savefig("vq_codebook_usage.png")
-    print("Saved codebook usage visualization to vq_codebook_usage.png")
-    
-    return vq, z, z_q, loss, indices
-
-def test_dictionary_learning_bottleneck():
-    print("\nTesting OnlineDictionaryLearningBottleneck...")
-    
-    # Parameters
-    batch_size = 2
-    embedding_dim = 64
-    height, width = 8, 8
-    num_embeddings = 512
-    sparsity = 5
-    
-    # Create random test input
-    z = torch.randn(batch_size, embedding_dim, height, width)
-    
-    # Initialize ODL model
-    odl = DictionaryLearning(
-        num_embeddings=num_embeddings,
-        embedding_dim=embedding_dim,
-        sparsity_level=sparsity,
-        commitment_cost=0.25,
-        decay=0.99,
-        use_ema=True
-    )
-    
-    # Test forward pass
-    z_q, loss, coefficients = odl(z)
-    
-    # Print shapes and stats
-    print(f"Input shape: {z.shape}")
-    print(f"Quantized output shape: {z_q.shape}")
-    print(f"Loss: {loss.item():.4f}")
-    print(f"Coefficients shape: {coefficients.shape}")
-    
-    # Check sparsity_level of coefficients
-    nonzero_ratio = (coefficients.abs() > 1e-6).float().mean().item()
-    print(f"Nonzero coefficient ratio: {nonzero_ratio:.4f}")
-    print(f"Expected sparsity ratio: {sparsity/num_embeddings:.4f}")
-    
-    # Visualize dictionary atom usage
-    atom_usage = (coefficients.abs() > 1e-6).float().sum(dim=1).cpu().numpy()
-    
-    plt.figure(figsize=(10, 4))
-    plt.bar(range(num_embeddings), atom_usage)
-    plt.title("Dictionary Atom Usage")
-    plt.xlabel("Atom Index")
-    plt.ylabel("Usage Count")
-    plt.savefig("dictionary_atom_usage.png")
-    print("Saved dictionary atom usage visualization to dictionary_atom_usage.png")
-    
-    # Visualize a few dictionary atoms
-    num_atoms_to_show = 10
-    atoms_to_show = np.random.choice(num_embeddings, num_atoms_to_show, replace=False)
-    
-    plt.figure(figsize=(12, 6))
-    for i, atom_idx in enumerate(atoms_to_show):
-        plt.subplot(2, 5, i+1)
-        plt.plot(odl.dictionary[:, atom_idx].detach().cpu().numpy())
-        plt.title(f"Atom {atom_idx}")
-        plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("dictionary_atoms.png")
-    print("Saved dictionary atoms visualization to dictionary_atoms.png")
-    
-    return odl, z, z_q, loss, coefficients
-
-def compare_reconstructions(vq_data, odl_data):
-    print("\nComparing reconstructions...")
-    
-    # Unpack data
-    _, z_vq, z_q_vq, loss_vq, _ = vq_data
-    _, z_odl, z_q_odl, loss_odl, _ = odl_data
-    
-    # Calculate reconstruction errors
-    vq_mse = torch.mean((z_vq - z_q_vq) ** 2).item()
-    odl_mse = torch.mean((z_odl - z_q_odl) ** 2).item()
-    
-    print(f"VQ-VAE MSE: {vq_mse:.6f}")
-    print(f"ODL MSE: {odl_mse:.6f}")
-    
-    # Visualize sample reconstructions
-    batch_idx = 0
-    channel_idx = 0
-    
-    plt.figure(figsize=(12, 4))
-    
-    plt.subplot(1, 3, 1)
-    plt.imshow(z_vq[batch_idx, channel_idx].detach().cpu().numpy())
-    plt.title("Original")
-    plt.colorbar()
-    
-    plt.subplot(1, 3, 2)
-    plt.imshow(z_q_vq[batch_idx, channel_idx].detach().cpu().numpy())
-    plt.title(f"VQ-VAE (MSE: {vq_mse:.6f})")
-    plt.colorbar()
-    
-    plt.subplot(1, 3, 3)
-    plt.imshow(z_q_odl[batch_idx, channel_idx].detach().cpu().numpy())
-    plt.title(f"ODL (MSE: {odl_mse:.6f})")
-    plt.colorbar()
-    
-    plt.tight_layout()
-    plt.savefig("reconstruction_comparison.png")
-    print("Saved reconstruction comparison to reconstruction_comparison.png")
-
-if __name__ == "__main__":
-    # Set random seeds for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    # Run tests
-    vq_data = test_vector_quantizer()
-    odl_data = test_dictionary_learning_bottleneck()
-    
-    # Compare reconstructions
-    compare_reconstructions(vq_data, odl_data)
-    
-    print("\nAll tests completed!")

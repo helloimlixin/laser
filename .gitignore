@@ -181,3 +181,9 @@ __pycache__/
 .env
 .venv/
 lightning_logs/
+
+# Project-specific ignores
+tests/artifacts/
+Data/
+.ruff_cache/
+.vscode/

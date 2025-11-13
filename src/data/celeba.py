@@ -155,44 +155,46 @@ class CelebADataModule(pl.LightningDataModule):
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
-
     def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
+        return self._build_loader(
+            dataset=self.train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=False,
-            persistent_workers=(self.config.num_workers > 0),
-            timeout=120,
-            multiprocessing_context='spawn',
         )
 
     def val_dataloader(self):
-        # Use a small, safe number of workers for validation to improve throughput without instability
         val_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
-        return DataLoader(
-            self.val_dataset,
+        return self._build_loader(
+            dataset=self.val_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=val_workers,
-            pin_memory=False,
-            persistent_workers=(val_workers > 0),
-            timeout=(120 if val_workers > 0 else 0),
-            multiprocessing_context='spawn',
         )
 
     def test_dataloader(self):
         test_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
-        return DataLoader(
-            self.test_dataset,
+        return self._build_loader(
+            dataset=self.test_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=test_workers,
-            pin_memory=False,
-            persistent_workers=(test_workers > 0),
-            timeout=(120 if test_workers > 0 else 0),
-            multiprocessing_context='spawn',
         )
 
-
+    def _build_loader(self, dataset, batch_size, shuffle, num_workers):
+        if dataset is None:
+            return None
+        kwargs = dict(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=False,
+            persistent_workers=(num_workers > 0),
+        )
+        if num_workers > 0:
+            kwargs['timeout'] = 120
+            kwargs['multiprocessing_context'] = 'spawn'
+        else:
+            kwargs['timeout'] = 0
+        return DataLoader(**kwargs)

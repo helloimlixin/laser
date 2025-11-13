@@ -4,7 +4,6 @@ dirpath: ${output_dir}/checkpoints
 filename: "${model.type}-{epoch:03d}"
 # Monitor key defaults will be chosen per model type in code unless overridden here.
 # For VQVAE/DLVAE: "val/loss_epoch"
-# For MinGPT:      "val/transformer_loss_epoch"
 monitor: ""
 mode: "min"
 save_top_k: 3

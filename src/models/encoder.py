@@ -41,8 +41,7 @@ class Encoder(nn.Module):
             num_residual_hiddens: Number of residual hidden units
         """
         super(Encoder, self).__init__()
-        
-        # Initial convolution layers
+
         self._conv_1 = nn.Conv2d(in_channels=in_channels,
                                  out_channels=num_hiddens // 2,
                                  kernel_size=4,
@@ -52,7 +51,7 @@ class Encoder(nn.Module):
                                  out_channels=num_hiddens,
                                  kernel_size=4,
                                  stride=2, padding=1)
-        
+
         self._conv_3 = nn.Conv2d(in_channels=num_hiddens,
                                  out_channels=num_hiddens,
                                  kernel_size=3,
@@ -74,6 +73,5 @@ class Encoder(nn.Module):
 # test the encoder
 if __name__ == "__main__":
     encoder = Encoder(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32)
-    x = torch.randn(4, 3, 256, 256)  # batch_size x 3 x 256 x 256
-    print(encoder(x).shape)  # batch_size x 128 x 64 x 64
-
+    x = torch.randn(4, 3, 256, 256)
+    print(encoder(x).shape)

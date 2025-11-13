@@ -24,7 +24,7 @@ class Decoder(nn.Module):
     """
     def __init__(self, in_channels, num_hiddens, num_residual_blocks, num_residual_hiddens):
         super().__init__()
-        
+
         # Initial processing
         self.conv1 = nn.Conv2d(in_channels,
                                num_hiddens,
@@ -46,10 +46,10 @@ class Decoder(nn.Module):
             stride=2,
             padding=1
         )
-        
+
         self._conv_trans_2 = nn.ConvTranspose2d(
             in_channels=num_hiddens // 2,
-            out_channels=3,  # Output RGB channels
+            out_channels=3,
             kernel_size=4,
             stride=2,
             padding=1
@@ -65,5 +65,5 @@ class Decoder(nn.Module):
         # Upsampling
         x = self._conv_trans_1(x)
         x = F.relu(x)
-        
+
         return self._conv_trans_2(x)

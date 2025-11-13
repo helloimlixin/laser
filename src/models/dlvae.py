@@ -320,5 +320,3 @@ class DLVAE(pl.LightningModule):
             f"{split}/reconstruction_error": F.mse_loss(x_recon, x).item(),
             "global_step": self.global_step
         })
-        
-        
