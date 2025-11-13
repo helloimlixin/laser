@@ -413,9 +413,9 @@ def test_bottleneck_visualizations():
     # Load data
     celeba_dir = _get_celeba_dir()
     if celeba_dir:
-        z = _load_celeba_batch(batch_size=4, image_size=64)
+        z = _load_celeba_batch(batch_size=4, image_size=128)
     else:
-        z = torch.randn(4, 3, 64, 64)
+        z = torch.randn(4, 3, 128, 128)
     
     B, C, H, W = z.shape
     K = 16  # Use 16 atoms/codebook vectors for maximum interpretability

@@ -257,42 +257,43 @@ class DictionaryLearning(nn.Module):
         _, N = D.shape
         device = X.device
 
-        # Greedy atom selection with diversity penalty
+        # Vectorized greedy atom selection with diversity penalty
         coefficients = torch.zeros(N, B, device=device, dtype=X.dtype)
         residual = X.clone()
         
-        # Mask to prevent reselecting the same atom per signal
-        omega = torch.ones(B, N, device=device, dtype=torch.bool)  # (B, N)
+        # Mask to prevent reselecting the same atom per signal (N, B) format
+        mask = torch.ones(N, B, device=device, dtype=X.dtype)  # Use float for efficient multiply
         batch_idx = torch.arange(B, device=device)
         
         # Track global atom usage for diversity penalty
         global_usage = torch.zeros(N, device=device, dtype=X.dtype)
-        diversity_weight = 0.001  # Very small penalty to gently encourage diversity
+        diversity_weight = 0.001  # Small bonus to encourage diversity
         
         for k in range(self.sparsity_level):
-            # Find best atom for current residual
+            # Compute correlations (keep in N, B format - avoid transpose)
             correlations = torch.mm(D.t(), residual)  # (N, B)
-            abs_correlations = torch.abs(correlations)  # (N, B)
+            abs_corr = torch.abs(correlations)
             
-            # Apply soft diversity bonus: boost underused atoms
-            # Instead of penalty on overused, give bonus to underused
-            avg_usage = global_usage.mean() if global_usage.sum() > 0 else 0
-            diversity_bonus = diversity_weight * (avg_usage - global_usage).clamp(min=0).unsqueeze(1)
-            abs_correlations_adjusted = abs_correlations + diversity_bonus  # (N, B)
+            # Apply diversity bonus (vectorized)
+            if k > 0:
+                avg_usage = global_usage.sum() / N
+                diversity_bonus = diversity_weight * (avg_usage - global_usage).clamp(min=0).unsqueeze(1)
+                abs_corr = abs_corr + diversity_bonus
             
-            # Mask prevents reselection
-            correlations_masked = abs_correlations_adjusted.t() * omega  # (B, N)
-            idx = torch.argmax(correlations_masked, dim=1)  # (B,)
+            # Apply mask and find argmax (avoid transpose by using dim=0)
+            abs_corr_masked = abs_corr * mask  # (N, B) - already in right shape!
+            idx = torch.argmax(abs_corr_masked, dim=0)  # (B,)
             
-            # Update mask and global usage
-            omega[batch_idx, idx] = False
-            for b in range(B):
-                global_usage[idx[b]] += 1
+            # Update mask (vectorized) - set selected atoms to 0
+            mask[idx, batch_idx] = 0.0
+            
+            # Update global usage (vectorized with scatter_add)
+            global_usage.scatter_add_(0, idx, torch.ones(B, device=device, dtype=X.dtype))
             
             # Gather selected atoms
             d_selected = D[:, idx]  # (M, B)
             
-            # Compute greedy coefficients
+            # Compute coefficients
             numerator = (residual * d_selected).sum(dim=0)  # (B,)
             denominator = (d_selected ** 2).sum(dim=0)  # (B,)
             alpha = numerator / (denominator + self.epsilon)  # (B,)
@@ -300,7 +301,7 @@ class DictionaryLearning(nn.Module):
             # Update coefficient matrix
             coefficients[idx, batch_idx] = alpha
             
-            # Update residual
+            # Update residual (not in-place to preserve gradients)
             residual = residual - d_selected * alpha.unsqueeze(0)
         
         return coefficients
