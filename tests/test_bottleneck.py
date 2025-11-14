@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
+import torchvision
 
 # Ensure project sources are importable
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,6 +180,166 @@ def test_dictionary_learning_shapes():
     assert z_dl.shape == z.shape
     assert coeffs.shape == (32, 2 * 4 * 4)
     assert loss.ndim == 0 and torch.isfinite(loss)
+
+
+def test_dictionary_learning_patch_tokens():
+    """Patch-wise sparse codes reduce number of tokens."""
+    torch.manual_seed(5)
+    model = DictionaryLearning(
+        num_embeddings=32,
+        embedding_dim=8,
+        sparsity_level=3,
+        patch_size=2,
+    )
+    z = torch.randn(2, 8, 8, 8, requires_grad=True)
+    z_dl, loss, coeffs = model(z)
+
+    assert z_dl.shape == z.shape
+    patches_per_sample = (8 // 2) * (8 // 2)
+    assert coeffs.shape == (32, 2 * patches_per_sample)
+    assert torch.isfinite(loss)
+
+
+def test_patch_dictionary_reconstructs_tiled_patterns():
+    """Patch-based encoding should perfectly reconstruct tiled atoms."""
+    torch.manual_seed(7)
+    patch_size = 4
+    model = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=1,
+        sparsity_level=1,
+        patch_size=patch_size,
+        normalize_atoms=False,
+    )
+    atom_dim = model.atom_dim
+    with torch.no_grad():
+        ones_atom = torch.ones(atom_dim)
+        zeros_atom = torch.zeros(atom_dim)
+        model.dictionary.copy_(torch.stack([ones_atom, zeros_atom], dim=1))
+
+    # Create latent grid with quadrants of ones/zeros aligned with patch tiling
+    z = torch.zeros(1, 1, 8, 8)
+    z[:, :, :4, :4] = 1.0
+    z[:, :, 4:, 4:] = 1.0
+
+    z_dl, loss, coeffs = model(z)
+    assert torch.allclose(z_dl, z, atol=1e-6)
+    assert torch.isfinite(loss)
+    patches_per_sample = (z.shape[2] // patch_size) * (z.shape[3] // patch_size)
+    assert coeffs.shape == (2, patches_per_sample)
+    # Each patch should select at most sparsity_level atoms
+    active_counts = (coeffs.abs() > 1e-6).sum(dim=0)
+    assert torch.all(active_counts <= model.sparsity_level)
+
+
+def test_patch_dictionary_visualization_artifact():
+    """Visualize CelebA latent RGB projection patches and corresponding pixel regions."""
+    celeba_dir = _get_celeba_dir()
+    if celeba_dir is None:
+        pytest.skip("CelebA images not available for patch visualization.")
+
+    torch.manual_seed(0)
+    patch_size = 4  # latent cells
+    pixel_image_size = 64
+    latent_stride = 4  # each latent cell corresponds to 4x4 pixels (avg pool)
+
+    batch = _load_celeba_batch(batch_size=1, image_size=pixel_image_size)
+    # Denormalize to [0,1]
+    pixel_rgb_tensor = _denorm(batch[0]).unsqueeze(0)
+
+    # Simple latent representation: avg pool to emulate encoder downsampling (H/4, W/4)
+    latent_map = torch.nn.functional.avg_pool2d(
+        pixel_rgb_tensor, kernel_size=latent_stride, stride=latent_stride
+    )
+    latent_map = latent_map.clamp(0.0, 1.0)
+
+    latent_h, latent_w = latent_map.shape[2], latent_map.shape[3]
+    patch_rows = latent_h // patch_size
+    patch_cols = latent_w // patch_size
+    num_patches = patch_rows * patch_cols
+
+    patches_flat = torch.nn.functional.unfold(
+        latent_map, kernel_size=patch_size, stride=patch_size
+    )
+    patch_vectors = patches_flat.squeeze(0)
+    coeff_map = torch.arange(num_patches, dtype=torch.long).reshape(patch_rows, patch_cols)
+
+    def _to_disp(arr):
+        return np.clip(arr, 0.0, 1.0) ** (1 / 2.2)
+
+    latent_rgb = latent_map[0].permute(1, 2, 0).cpu().numpy()
+    latent_rgb_disp = _to_disp(latent_rgb)
+    latent_tokens = patch_vectors.t().contiguous().reshape(num_patches, 3, patch_size, patch_size)
+    latent_token_grid = torchvision.utils.make_grid(
+        latent_tokens, nrow=patch_cols, padding=2
+    ).permute(1, 2, 0).cpu().numpy()
+    latent_token_grid_disp = _to_disp(latent_token_grid)
+
+    pixel_rgb = pixel_rgb_tensor[0].permute(1, 2, 0).cpu().numpy()
+    pixel_rgb_disp = _to_disp(pixel_rgb)
+    pixel_patch_px = patch_size * latent_stride
+    pixel_patches_flat = torch.nn.functional.unfold(
+        pixel_rgb_tensor, kernel_size=pixel_patch_px, stride=pixel_patch_px
+    )
+    pixel_patches = pixel_patches_flat.permute(0, 2, 1).reshape(
+        num_patches, 3, pixel_patch_px, pixel_patch_px
+    )
+    pixel_token_grid = torchvision.utils.make_grid(
+        pixel_patches, nrow=patch_cols, padding=4
+    ).permute(1, 2, 0).cpu().numpy()
+    pixel_token_grid_disp = _to_disp(pixel_token_grid)
+
+    def _plot_with_grid(ax, image, patch_px, title, labels=None):
+        ax.imshow(image, interpolation="nearest")
+        h, w = image.shape[:2]
+        ax.set_xticks(np.arange(0, w + 1, patch_px))
+        ax.set_yticks(np.arange(0, h + 1, patch_px))
+        ax.grid(color="white", linewidth=1.0, alpha=0.7)
+        if labels is not None:
+            for r in range(labels.shape[0]):
+                for c in range(labels.shape[1]):
+                    ax.text(
+                        c * patch_px + patch_px / 2,
+                        r * patch_px + patch_px / 2,
+                        f"{int(labels[r, c])}",
+                        ha="center",
+                        va="center",
+                        color="white",
+                        fontsize=10,
+                        weight="bold",
+                    )
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_title(title)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 11))
+    _plot_with_grid(
+        axes[0, 0],
+        latent_rgb_disp,
+        patch_size,
+        "Latent RGB projection\n(avg pooled) with patch indices",
+        labels=coeff_map,
+    )
+    axes[0, 1].imshow(latent_token_grid_disp, interpolation="nearest")
+    axes[0, 1].set_title("Latent patch tokens (normalized for visibility)")
+    axes[0, 1].axis("off")
+
+    _plot_with_grid(
+        axes[1, 0],
+        pixel_rgb_disp,
+        pixel_patch_px,
+        "Original CelebA crop with corresponding patches",
+        labels=coeff_map,
+    )
+    axes[1, 1].imshow(pixel_token_grid_disp, interpolation="nearest")
+    axes[1, 1].set_title("Pixel-space patches for each latent token")
+    axes[1, 1].axis("off")
+
+    artifact_path = ARTIFACT_DIR / "patch_latent_reconstruction.png"
+    fig.tight_layout()
+    fig.savefig(artifact_path, dpi=160)
+    plt.close(fig)
+    assert artifact_path.exists()
 
 
 def test_dictionary_learning_backward():
@@ -473,4 +634,3 @@ def test_bottleneck_visualizations():
     
     for name in expected_files:
         assert (ARTIFACT_DIR / name).exists()
-

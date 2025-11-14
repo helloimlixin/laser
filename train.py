@@ -1,4 +1,10 @@
 import os
+import warnings
+
+# Suppress TF32 deprecation warnings (PyTorch 2.9 with Lightning compatibility)
+warnings.filterwarnings('ignore', message='.*TF32.*')
+os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
+
 import torch
 import hydra
 from omegaconf import DictConfig
@@ -10,6 +16,8 @@ from datetime import datetime
 
 # Reduce DeepSpeed info logs
 os.environ.setdefault("DEEPSPEED_LOG_LEVEL", "warning")
+
+torch.set_float32_matmul_precision('medium')
 
 from src.models.dlvae import DLVAE
 from src.models.vqvae import VQVAE
@@ -69,6 +77,8 @@ def train(cfg: DictConfig):
     if cfg.model.type == "dlvae":
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
+        if hasattr(cfg.model, "patch_size"):
+            print(f"Latent Patch Size: {cfg.model.patch_size}")
         if hasattr(cfg.model, "omp_tolerance"):
             print(f"OMP Tolerance: {cfg.model.omp_tolerance}")
         if hasattr(cfg.model, "omp_debug"):
@@ -215,6 +225,7 @@ def train(cfg: DictConfig):
             'sparsity_level': cfg.model.sparsity_level,
             'omp_tolerance': getattr(cfg.model, 'omp_tolerance', 1e-7),
             'omp_debug': getattr(cfg.model, 'omp_debug', False),
+            'patch_size': getattr(cfg.model, 'patch_size', 1),
         }
         model = DLVAE(**model_params)
     elif cfg.model.type == "vqvae":

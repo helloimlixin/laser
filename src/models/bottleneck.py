@@ -213,7 +213,8 @@ class DictionaryLearning(nn.Module):
         use_ema=True,
         tolerance=1e-7,
         omp_debug=False,
-        normalize_atoms=True
+        normalize_atoms=True,
+        patch_size=1,
     ):
         super(DictionaryLearning, self).__init__()
         
@@ -227,10 +228,18 @@ class DictionaryLearning(nn.Module):
         self.tolerance = tolerance
         self.omp_debug = omp_debug
         self.normalize_atoms = normalize_atoms
+        if isinstance(patch_size, int):
+            self.patch_size = (patch_size, patch_size)
+        else:
+            if len(patch_size) != 2:
+                raise ValueError("patch_size must be an int or a tuple of two ints")
+            self.patch_size = tuple(int(p) for p in patch_size)
+        self.patch_area = self.patch_size[0] * self.patch_size[1]
+        self.atom_dim = self.embedding_dim * self.patch_area
         
-        # Initialize dictionary with random atoms
+        # Initialize dictionary with random atoms shaped for flattened patches
         self.dictionary = nn.Parameter(
-            torch.randn(embedding_dim, num_embeddings), requires_grad=True
+            torch.randn(self.atom_dim, num_embeddings), requires_grad=True
         )
         if self.normalize_atoms:
             self._normalize_dictionary()
@@ -238,7 +247,8 @@ class DictionaryLearning(nn.Module):
     def _normalize_dictionary(self):
         """Normalize all dictionary atoms to have unit L2 norm."""
         with torch.no_grad():
-            self.dictionary.data = self.dictionary.data / torch.linalg.norm(self.dictionary.data, dim=0)
+            norms = torch.linalg.norm(self.dictionary.data, dim=0, keepdim=True)
+            self.dictionary.data = self.dictionary.data / (norms + 1e-10)
 
     def batch_omp(self, X, D):
         """
@@ -319,12 +329,24 @@ class DictionaryLearning(nn.Module):
             coefficients: sparse coefficients
         """
         # z shape: [batch_size, embedding_dim, height, width]
-
-        z_e = z_e.permute(0, 2, 3, 1).contiguous()  # [batch_size, height, width, embedding_dim]
-        input_shape = z_e.shape
+        z_e = z_e.contiguous()
+        batch_size, channels, height, width = z_e.shape
+        patch_h, patch_w = self.patch_size
+        if height % patch_h != 0 or width % patch_w != 0:
+            raise ValueError(
+                f"Feature map ({height}x{width}) must be divisible by patch_size {self.patch_size}"
+            )
+        num_patches_per_sample = (height // patch_h) * (width // patch_w)
         
-        # Flatten the input: [B, H, W, C] -> [B*H*W, C] -> [C, B*H*W]
-        ze_flattened = z_e.reshape(-1, self.embedding_dim).t().contiguous()  # [embedding_dim, batch_size * height * width]
+        # Extract non-overlapping patches and flatten to patch tokens
+        ze_unfold = F.unfold(
+            z_e,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )  # [batch_size, atom_dim, num_patches_per_sample]
+        ze_flattened = (
+            ze_unfold.permute(0, 2, 1).reshape(-1, self.atom_dim).t().contiguous()
+        )  # [atom_dim, batch_size * num_patches_per_sample]
         
         '''
         Sparse coding stage
@@ -351,17 +373,27 @@ class DictionaryLearning(nn.Module):
             coefficients = self.batch_omp(ze_flattened_f32, dict_for_omp)
             z_dl_f32 = dict_for_recon @ coefficients
 
-        # # validate the coefficients sparsity level (number of non-zero coefficients along the first dimension)
-        # sparsity_level = (coefficients.abs() > 1e-6).float().sum(dim=0).mean().item()
-        # print(f"DEBUG Sparsity level: {sparsity_level:.4f}")
+        # Reshape flattened patch reconstructions back to feature maps
+        z_dl_patches = (
+            z_dl_f32.t()
+            .reshape(batch_size, num_patches_per_sample, self.atom_dim)
+            .permute(0, 2, 1)
+            .contiguous()
+        )  # [batch_size, atom_dim, num_patches_per_sample]
+        z_dl_nchw = F.fold(
+            z_dl_patches,
+            output_size=(height, width),
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
 
-        z_dl = z_dl_f32.to(orig_dtype)  # cast back to original dtype (could be fp16 under AMP)
-        # Reshape back: [C, B*H*W] -> [B*H*W, C] -> [B, H, W, C]
-        z_dl = z_dl.t().reshape(input_shape).contiguous()  # [batch_size, height, width, embedding_dim]
+        z_dl = z_dl_nchw.to(orig_dtype)  # cast back to original dtype (could be fp16 under AMP)
 
         # Compute the commitment loss
-        e_latent_loss = F.mse_loss(z_dl.detach(), z_e)  # [batch_size, height, width, embedding_dim]
-        dl_latent_loss = F.mse_loss(z_dl, z_e.detach())  # [batch_size, height, width, embedding_dim]
+        z_e_nhwc = z_e.permute(0, 2, 3, 1).contiguous()
+        z_dl_nhwc = z_dl.permute(0, 2, 3, 1).contiguous()
+        e_latent_loss = F.mse_loss(z_dl_nhwc.detach(), z_e_nhwc)
+        dl_latent_loss = F.mse_loss(z_dl_nhwc, z_e_nhwc.detach())
 
         # Compute the total loss
         loss = self.commitment_cost * e_latent_loss + dl_latent_loss
@@ -369,7 +401,4 @@ class DictionaryLearning(nn.Module):
         # Straight-through estimator
         z_dl = z_e + (z_dl - z_e).detach()  # Allow gradients to flow back to encoder
 
-        return z_dl.permute(0, 3, 1, 2).contiguous(), loss, coefficients  # Return the reconstructed latent representation, loss, and sparse coefficients
-
-
-
+        return z_dl, loss, coefficients  # Return the reconstructed latent representation, loss, and sparse coefficients

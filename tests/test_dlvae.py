@@ -74,6 +74,7 @@ def test_dlvae_tiny_train_on_celeba():
         compute_fid=False,
         omp_tolerance=1e-7,
         omp_debug=False,
+        patch_size=2,
     )
 
     before_dict = model.bottleneck.dictionary.detach().clone()
@@ -171,6 +172,7 @@ def _build_eval_dlvae(cfg_model):
         num_embeddings=cfg_model.num_embeddings,
         embedding_dim=cfg_model.embedding_dim,
         sparsity_level=cfg_model.sparsity_level,
+        patch_size=getattr(cfg_model, "patch_size", 1),
         num_residual_blocks=cfg_model.num_residual_blocks,
         num_residual_hiddens=cfg_model.num_residual_hiddens,
         commitment_cost=cfg_model.commitment_cost,
@@ -258,4 +260,3 @@ def test_dlvae_checkpoint_reconstruction_visuals():
     artifact_path = ARTIFACT_DIR / f"celeba_recon_{recon_source}.png"
     _save_recon_grid(x.detach(), recon.detach(), data_cfg.mean, data_cfg.std, artifact_path)
     assert artifact_path.exists(), f"Failed to write recon grid to {artifact_path}"
-

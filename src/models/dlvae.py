@@ -31,7 +31,8 @@ class DLVAE(pl.LightningModule):
             beta,
             compute_fid=False,
             omp_tolerance=1e-7,
-            omp_debug=False
+            omp_debug=False,
+            patch_size=1,
     ):
         """Initialize DLVAE model.
 
@@ -51,6 +52,7 @@ class DLVAE(pl.LightningModule):
             compute_fid: Whether to compute FID
             omp_tolerance: Early stopping tolerance for BatchOMP residual
             omp_debug: Enable BatchOMP debug logging
+            patch_size: Spatial patch size (int or tuple) encoded per dictionary token
         """
         super(DLVAE, self).__init__()
 
@@ -84,7 +86,8 @@ class DLVAE(pl.LightningModule):
             commitment_cost=commitment_cost,
             decay=decay,
             tolerance=self.omp_tolerance,
-            omp_debug=self.omp_debug
+            omp_debug=self.omp_debug,
+            patch_size=patch_size,
         )
 
         self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
