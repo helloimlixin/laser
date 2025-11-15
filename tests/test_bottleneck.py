@@ -649,35 +649,70 @@ def test_bottleneck_visualizations():
     dl = _build_dictionary_learning(num_embeddings=K, embedding_dim=C, sparsity_level=4, normalize_atoms=False)
     dl.dictionary.data.copy_(codebook.t().contiguous())
     
-    # Benchmark inference speed (warmup + timed runs)
+    # Benchmark inference speed across different batch sizes
+    batch_sizes = [1, 4, 8, 16]
+    vq_times_by_batch = {}
+    dl_times_by_batch = {}
+    
+    print("\n" + "="*60)
+    print("INFERENCE SPEED BENCHMARKS")
+    print("="*60)
+    
+    for batch_size in batch_sizes:
+        # Create test batch
+        if celeba_dir:
+            z_test = _load_celeba_batch(batch_size=batch_size, image_size=128)
+        else:
+            z_test = torch.randn(batch_size, C, H, W)
+        
+        with torch.no_grad():
+            # Warmup
+            for _ in range(3):
+                _ = vq(z_test)
+                _ = dl(z_test)
+            
+            # Benchmark VQ
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            vq_times = []
+            for _ in range(10):
+                start = time.perf_counter()
+                _ = vq(z_test)
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                vq_times.append(time.perf_counter() - start)
+            vq_time_ms = np.mean(vq_times) * 1000
+            
+            # Benchmark DL
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            dl_times = []
+            for _ in range(10):
+                start = time.perf_counter()
+                _ = dl(z_test)
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                dl_times.append(time.perf_counter() - start)
+            dl_time_ms = np.mean(dl_times) * 1000
+            
+            vq_times_by_batch[batch_size] = vq_time_ms
+            dl_times_by_batch[batch_size] = dl_time_ms
+            
+            num_pixels = batch_size * H * W
+            print(f"\nBatch Size {batch_size} ({num_pixels:,} pixels):")
+            print(f"  VQ: {vq_time_ms:6.2f} ms ({vq_time_ms*1000/num_pixels:.3f} µs/pixel)")
+            print(f"  DL: {dl_time_ms:6.2f} ms ({dl_time_ms*1000/num_pixels:.3f} µs/pixel)")
+            print(f"  Slowdown: {dl_time_ms/vq_time_ms:.1f}×")
+    
+    print("\n" + "="*60)
+    
+    # Use batch_size=4 for the rest of the visualizations
+    if celeba_dir:
+        z = _load_celeba_batch(batch_size=4, image_size=128)
+    else:
+        z = torch.randn(4, C, H, W)
+    
     with torch.no_grad():
-        vq.eval()
-        dl.eval()
-        
-        # Warmup
-        for _ in range(3):
-            _ = vq(z)
-            _ = dl(z)
-        
-        # Benchmark VQ
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
-        vq_times = []
-        for _ in range(10):
-            start = time.perf_counter()
-            z_q_vq, _, _, enc_vq = vq(z)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            vq_times.append(time.perf_counter() - start)
-        vq_time_ms = np.mean(vq_times) * 1000
-        
-        # Benchmark DL
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
-        dl_times = []
-        for _ in range(10):
-            start = time.perf_counter()
-            z_q_dl, _, coeffs = dl(z)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            dl_times.append(time.perf_counter() - start)
-        dl_time_ms = np.mean(dl_times) * 1000
+        z_q_vq, _, _, enc_vq = vq(z)
+        z_q_dl, _, coeffs = dl(z)
+    
+    B = z.shape[0]
     
     is_celeba = celeba_dir is not None
     
@@ -736,8 +771,10 @@ def test_bottleneck_visualizations():
     print(f"   Average atoms per pixel: {(coeffs.abs() > 1e-6).sum(dim=0).float().mean().item():.2f}")
     
     # Inference speed
-    num_pixels = B * H * W
-    print(f"\n⚡ Inference Speed (batch={B}, resolution={H}×{W}, {num_pixels:,} pixels):")
+    vq_time_ms = vq_times_by_batch[4]
+    dl_time_ms = dl_times_by_batch[4]
+    num_pixels = 4 * H * W
+    print(f"\n⚡ Inference Speed (batch=4, resolution={H}×{W}, {num_pixels:,} pixels):")
     print(f"   VQ  - {vq_time_ms:.2f} ms total, {vq_time_ms*1000/num_pixels:.3f} µs/pixel")
     print(f"   DL  - {dl_time_ms:.2f} ms total, {dl_time_ms*1000/num_pixels:.3f} µs/pixel")
     print(f"   DL Slowdown: {dl_time_ms/vq_time_ms:.1f}× (greedy OMP overhead)")
