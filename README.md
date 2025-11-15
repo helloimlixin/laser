@@ -88,19 +88,19 @@ The `tests/test_bottleneck.py` generates comprehensive visualizations comparing 
 
 Side-by-side comparison of VQ and DL reconstruction quality (K=16 codebook/atoms, S=4 sparsity):
 
-![Reconstruction Comparison](img/bottleneck/reconstruction_comparison.png)
+![Reconstruction Comparison](img/reconstruction_comparison.png)
 
 **Key Observations:**
 - **VQ (Vector Quantization)**: Maps each pixel to the nearest RGB color from 16 learned codebook entries. Fast but limited to discrete color matching.
 - **DL (Dictionary Learning)**: Represents each pixel as a sparse combination of 4 atoms from 16 options. More expressive representation.
 - **Error Maps**: DL shows consistently lower error (darker error maps) across all images, especially in complex regions like faces.
-- **Quantitative**: DL achieves **3.4× lower MSE** than VQ while using the same 16-entry codebook, demonstrating the power of sparse combinations.
+- **Quantitative**: DL achieves **10.4× lower MSE** than VQ while using the same 16-entry codebook, demonstrating the power of sparse combinations.
 
 ### Code Interpretability Heatmaps
 
 Spatial visualization of how VQ and DL encode the image structure:
 
-![Code Heatmaps](img/bottleneck/code_heatmaps.png)
+![Code Heatmaps](img/code_heatmaps.png)
 
 **Understanding the Heatmaps:**
 - **Column 1 (Original)**: Input CelebA images at 128×128 resolution
@@ -108,22 +108,23 @@ Spatial visualization of how VQ and DL encode the image structure:
   - Each pixel uses exactly **1 code** from 16 options
   - Spatial patterns show how VQ segments the image into color regions
   - Viridis colormap: Purple (low indices) → Yellow (high indices)
-- **Column 3 (DL Max Coefficient)**: Shows the strength of the strongest atom activation at each pixel (log scale).
+- **Column 3 (DL Sparse Code Strength)**: Shows the L1 norm (sum of absolute coefficients) at each pixel location.
   - Each pixel uses **4 different atoms** with varying weights
-  - Darker regions (purple) = weak coefficients, brighter regions (yellow) = strong coefficients
-  - Reveals which image areas need stronger sparse representations
-  - Log scale (log₁₀(1+coeff)) reveals full dynamic range across 4 orders of magnitude
+  - Darker regions (purple) = weak total activation, brighter regions (yellow) = strong total activation
+  - Reveals which image areas require stronger sparse representations
+  - L1 norm provides a stable measure of total "activation energy" per location
+  - Normalized to [0, 1] using percentile clipping (1st-99th percentile) for clean visualization
 
 **VQ vs DL Encoding:**
 - VQ: Discrete, categorical assignment (one-hot selection)
 - DL: Continuous, weighted combination (sparse weighted sum)
-- DL's flexibility enables better reconstruction despite using the same codebook size
+- DL's flexibility with L1-normalized coefficients enables better reconstruction with the same codebook size
 
 ### Channel-wise Comparison
 
 Pixel-level RGB channel analysis comparing original vs reconstructions:
 
-![Channel Comparison](img/bottleneck/vq_channel_comparison.png)
+![Channel Comparison](img/vq_channel_comparison.png)
 
 **Analysis:**
 - Shows a horizontal slice through the center of the first image across all three color channels
@@ -138,13 +139,13 @@ Pixel-level RGB channel analysis comparing original vs reconstructions:
 How frequently each codebook entry (VQ) or dictionary atom (DL) is utilized:
 
 **VQ Codebook Usage:**
-![VQ Usage](img/bottleneck/vq_codebook_usage.png)
+![VQ Usage](img/vq_codebook_usage.png)
 
 - **All 16 codes are used**, showing k-means initialization creates a representative color palette
 - Usage distribution is moderately skewed (dominant colors like skin, hair, background are used more)
 
 **Dictionary Atom Usage:**
-![DL Usage](img/bottleneck/dictionary_atom_usage.png)
+![DL Usage](img/dictionary_atom_usage.png)
 
 - **All 16 atoms are used** thanks to diversity bonus in OMP selection
 - More balanced distribution than VQ due to sparse combination (each pixel can use multiple atoms)
@@ -156,73 +157,68 @@ How frequently each codebook entry (VQ) or dictionary atom (DL) is utilized:
 
 | Method | Overall MSE | Per-Pixel Color Distance | Quality Gain |
 |--------|-------------|-------------------------|--------------|
-| **VQ** | 0.00905 | 0.1314 | Baseline |
-| **DL** | 0.00329 | 0.0598 | **2.8× better MSE**, **45% of VQ color error** |
+| **VQ** | 0.00905 | 0.0759 | Baseline |
+| **DL** | 0.00087 | 0.0163 | **10.4× better MSE**, **21% of VQ color error** |
 
-**Key Insight**: DL reduces per-pixel color distance by more than half compared to VQ, demonstrating significantly better perceptual quality.
+**Key Insight**: With the simplified greedy OMP, DL reduces per-pixel color distance to just 21% of VQ's error, demonstrating dramatically better perceptual quality. The greedy algorithm provides excellent reconstruction while being simpler and faster than Cholesky-based OMP.
 
 #### Channel-wise Performance
 
-Breaking down reconstruction quality by RGB channel reveals DL's balanced improvement:
+Breaking down reconstruction quality by RGB channel reveals DL's exceptional improvement:
 
 | Channel | VQ MSE | DL MSE | DL Improvement |
 |---------|--------|--------|----------------|
-| **Red** | 0.0103 | 0.0021 | **4.9× better** |
-| **Green** | 0.0084 | 0.0052 | **1.6× better** |
-| **Blue** | 0.0085 | 0.0025 | **3.4× better** |
+| **Red** | 0.0103 | 0.0003 | **30.8× better** |
+| **Green** | 0.0084 | 0.0013 | **6.3× better** |
+| **Blue** | 0.0085 | 0.0010 | **8.9× better** |
 
 **Analysis**: 
-- DL excels particularly in Red and Blue channels (3-5× improvement)
-- Green channel shows modest but consistent improvement (1.6×)
-- No channel-specific color shifts - all channels improve uniformly
-- Balanced performance indicates proper sparse coding without artifacts
+- DL excels particularly in Red channel (30×+ improvement!)
+- All channels show significant improvement (6-31× better)
+- Green channel shows most modest but still strong improvement (6.3×)
+- Balanced performance across all channels indicates proper sparse coding without artifacts
 
 #### Codebook/Atom Utilization
 
 | Method | Entries Used | Distribution | Notes |
 |--------|--------------|--------------|-------|
 | **VQ** | 16/16 (100%) | Moderately skewed | Each pixel uses exactly 1 code |
-| **DL** | 16/16 (100%) | More balanced | Each pixel uses 4 different atoms with diversity bonus |
+| **DL** | 16/16 (100%) | Balanced | Each pixel uses exactly 4 different atoms |
 
-**Diversity Mechanism**: The OMP implementation includes a soft diversity bonus that encourages selection of underutilized atoms, ensuring all 16 atoms contribute meaningfully to the reconstruction.
-
-#### Inference Speed
-
-| Method | Speed | Per-Pixel Time | Scaling |
-|--------|-------|----------------|---------|
-| **VQ** | 2.1 ms | 0.13 µs/pixel | Linear with pixels |
-| **DL** | 34 ms | 2.1 µs/pixel | **16.4× slower** but practical |
-
-**Speed Analysis**:
-- VQ uses simple nearest-neighbor lookup (very fast)
-- DL performs 4 iterations of greedy OMP per pixel (optimization overhead)
-- **Vectorized implementation** achieves 34× speedup over naive per-pixel approach
-- At 128×128, DL remains practical for batch processing and visualization
+**Full Utilization**: Both methods use all 16 codebook entries/atoms thanks to k-means initialization (VQ) and greedy selection with no-reselection masking (DL), ensuring the full representation capacity is utilized.
 
 ### Key Advantages of Dictionary Learning
 
-- ✓ **Superior reconstruction**: 2.8× lower MSE with same 16-entry codebook
+- ✓ **Superior reconstruction**: 10.4× lower MSE with same 16-entry codebook
 - ✓ **Sparse representation**: Each pixel uses only 4/16 atoms (25% sparsity) vs VQ's 1/16 selection
-- ✓ **Perceptual quality**: 45% color distance of VQ (more than 2× improvement)
-- ✓ **Channel balance**: Outperforms VQ on all RGB channels (1.6-4.9× better)
-- ✓ **Full utilization**: Diversity bonus ensures all 16 atoms contribute
-- ✓ **Interpretable**: Continuous coefficients reveal spatial importance patterns (see heatmaps)
+- ✓ **Perceptual quality**: 21% color distance of VQ (nearly 5× improvement)
+- ✓ **Channel balance**: Outperforms VQ on all RGB channels (6-31× better)
+- ✓ **Full utilization**: All 16 atoms actively contribute to reconstruction
+- ✓ **Interpretable**: L1 norm visualization reveals spatial importance patterns (see heatmaps)
 - ✓ **Gradient-friendly**: Supports end-to-end training with proper backpropagation
+- ✓ **Simpler implementation**: Greedy OMP is cleaner and faster than Cholesky-based approaches
 
 ### Tradeoffs
 
-- ✗ **Slower inference**: ~16× slower (34ms vs 2.1ms) due to iterative OMP sparse coding
+- ✗ **Slower inference**: Iterative greedy OMP is slower than VQ's simple nearest-neighbor lookup
 - ✗ **Memory overhead**: Must store and compute with full dictionary + sparse coefficients
 - ✗ **Computational complexity**: O(K × S × N) vs VQ's O(K × N) where S=sparsity, N=pixels
 
+Despite these tradeoffs, the **10× reconstruction quality improvement** makes DL highly attractive for applications where quality matters more than raw speed.
+
 ### Technical Implementation
 
-**Optimizations**:
-- ⚡ Vectorized batch OMP with (N, B) tensor format (no transposes)
-- ⚡ Float masking instead of boolean for faster multiplication  
-- ⚡ `scatter_add_` for global usage tracking (no Python loops)
-- ⚡ Diversity bonus prevents dominant atoms from monopolizing selections
-- ⚡ No-reselection masking ensures each pixel uses 4 distinct atoms
+**Simplified Greedy OMP**:
+- 🚀 **Greedy atom selection**: Simplified OMP without Cholesky decomposition (faster and cleaner)
+- 🚀 **Vectorized batch processing**: (N, B) tensor format for efficient parallel sparse coding
+- 🚀 **Float masking**: Uses multiplicative masking instead of boolean indexing for speed
+- 🚀 **Projection-based coefficients**: Direct inner product computation (no least squares solve)
+- 🚀 **No-reselection masking**: Ensures each signal uses exactly S distinct atoms
+
+**Visualization Improvements**:
+- 📊 **L1 norm visualization**: Uses sum of absolute coefficients for stable, interpretable heatmaps
+- 📊 **Percentile normalization**: Robust 1-99th percentile clipping for clean contrast
+- 📊 **Fold/unfold mapping**: Properly maps patch-based coefficients to pixel space for visualization
 
 Run visualizations:
 ```bash
@@ -230,7 +226,7 @@ conda activate research
 pytest tests/test_bottleneck.py::test_bottleneck_visualizations -v
 
 # Update README images after regenerating visualizations
-cp tests/artifacts/bottleneck/*.png img/bottleneck/
+cp tests/artifacts/bottleneck/*.png img/
 ```
 
 ## License

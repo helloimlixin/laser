@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 import torchvision
 
 # Ensure project sources are importable
@@ -676,6 +677,41 @@ def test_bottleneck_visualizations():
     
     # Plot code heatmaps for interpretability
     _plot_code_heatmaps(z, enc_vq, coeffs, is_celeba)
+    
+    # Compute and print comprehensive metrics
+    print("\n" + "="*60)
+    print("COMPREHENSIVE PERFORMANCE METRICS")
+    print("="*60)
+    
+    # Overall reconstruction quality
+    mse_vq = F.mse_loss(z_q_vq, z).item()
+    mse_dl = F.mse_loss(z_q_dl, z).item()
+    color_dist_vq = torch.sqrt(F.mse_loss(z_q_vq, z, reduction='none').mean(dim=1)).mean().item()
+    color_dist_dl = torch.sqrt(F.mse_loss(z_q_dl, z, reduction='none').mean(dim=1)).mean().item()
+    
+    print(f"\n📊 Overall Reconstruction Quality:")
+    print(f"   VQ  - MSE: {mse_vq:.5f}, Per-Pixel Color Distance: {color_dist_vq:.4f}")
+    print(f"   DL  - MSE: {mse_dl:.5f}, Per-Pixel Color Distance: {color_dist_dl:.4f}")
+    print(f"   DL Improvement: {mse_vq/mse_dl:.1f}× better MSE, {color_dist_dl/color_dist_vq:.1%} of VQ color error")
+    
+    # Channel-wise metrics
+    if C == 3:
+        print(f"\n🎨 Channel-wise Performance:")
+        channel_names = ['Red', 'Green', 'Blue']
+        for ch in range(3):
+            ch_mse_vq = F.mse_loss(z_q_vq[:, ch], z[:, ch]).item()
+            ch_mse_dl = F.mse_loss(z_q_dl[:, ch], z[:, ch]).item()
+            print(f"   {channel_names[ch]:5} - VQ: {ch_mse_vq:.5f}, DL: {ch_mse_dl:.5f} ({ch_mse_vq/ch_mse_dl:.1f}× improvement)")
+    
+    # Codebook/atom utilization
+    print(f"\n📚 Codebook/Atom Utilization:")
+    vq_used = (usage_vq > 0).sum().item()
+    dl_used = (usage_dl > 0).sum().item()
+    print(f"   VQ Codes Used: {vq_used}/{K} ({100*vq_used/K:.0f}%)")
+    print(f"   DL Atoms Used: {dl_used}/{K} ({100*dl_used/K:.0f}%)")
+    print(f"   Average atoms per pixel: {(coeffs.abs() > 1e-6).sum(dim=0).float().mean().item():.2f}")
+    
+    print("\n" + "="*60)
     
     # Verify all files created
     expected_files = [
