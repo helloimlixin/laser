@@ -236,28 +236,34 @@ Breaking down reconstruction quality by RGB channel reveals DL's exceptional imp
 
 #### Patch-Based Dictionary Learning
 
-Using larger patches dramatically reduces computation by processing fewer tokens, but **severely degrades reconstruction quality**:
+Using larger patches dramatically reduces computation by processing fewer tokens, with a tradeoff in reconstruction quality:
 
 | Patch Size | Patches/Image | DL Time | Speedup | DL MSE | VQ MSE | Quality vs VQ |
 |------------|---------------|---------|---------|--------|--------|---------------|
-| **1×1** (pixel) | 16,384 | 33.5 ms | 1.0× | 0.00001 | 0.00964 | **DL 662× better** ✓ |
-| **2×2** | 4,096 | 9.5 ms | **3.6×** | 0.07200 | 0.00964 | VQ 7.5× better ✗ |
-| **4×4** | 1,024 | 3.7 ms | **9.2×** | 0.30006 | 0.00964 | VQ 31× better ✗ |
-| **8×8** | 256 | 2.3 ms | **14.8×** | 0.38781 | 0.00964 | VQ 40× better ✗ |
+| **1×1** (pixel) | 65,536 | 33.6 ms | 1.0× | 0.00817 | 0.00964 | **DL 1.2× better** ✓ |
+| **2×2** | 16,384 | 9.3 ms | **3.6×** | 0.01071 | 0.00964 | VQ 1.1× better ≈ |
+| **4×4** | 4,096 | 3.7 ms | **9.1×** | 0.06227 | 0.00964 | VQ 6.5× better ✗ |
+| **8×8** | 1,024 | 2.3 ms | **14.8×** | 0.09623 | 0.00964 | VQ 10× better ✗ |
 
 **Key Findings**:
-- **Patches lose fine-grained spatial information**: 2×2 patches already worse than pixel-level VQ
-- **Only pixel-level DL beats VQ**: 662× better MSE, but requires processing all pixels
-- **Speedup comes at severe quality cost**: Even 2×2 patches (3.6× faster) lose DL's quality advantage
-- **Workaround doesn't exist**: Patches fundamentally trade spatial resolution for speed
+- **Pixel-level DL best quality**: 1.2× better than VQ with full spatial resolution
+- **2×2 patches competitive**: Only 1.1× worse than VQ but 3.6× faster than pixel-level DL
+- **Larger patches trade quality for speed**: 4×4 and 8×8 achieve 9-15× speedup but sacrifice quality
+- **Proper initialization critical**: Dictionary must be initialized with k-means on patches (not pixels!)
 
-**Why Patches Fail**:
-1. Each patch is treated as a single token → loses within-patch details
-2. Dictionary atoms represent entire patch neighborhoods, not fine structures
-3. Can't reconstruct sharp edges or fine textures within each patch area
-4. The sparse combination operates at patch-level, blurring sub-patch features
+**Why Larger Patches Degrade**:
+1. Higher-dimensional atoms (e.g., 8×8 RGB patch = 192D) harder to represent with fixed sparsity
+2. Each patch is single token → coarser spatial granularity than pixel-level
+3. K-means initialization on high-D patch space less effective than on pixels
+4. Fixed 4-atom sparsity insufficient for complex patch patterns
 
-**Conclusion**: **Pixel-level (1×1) is mandatory** for DL to maintain its quality advantage over VQ. The 662× quality improvement justifies the 17-26× slower inference compared to VQ.
+**Practical Recommendations**:
+- **High quality needed**: Use **1×1 (pixel-level)** for 1.2× better MSE than VQ
+- **Speed/quality balance**: Use **2×2 patches** for 3.6× speedup with competitive quality (1.1× worse)
+- **Maximum speed**: Use **4×4 patches** for 9× speedup if some quality loss acceptable
+- **Avoid 8×8**: Too coarse, loses too much detail (10× worse than VQ)
+
+**Conclusion**: **Patch-based DL offers a flexible speed/quality tradeoff**. For most use cases, **2×2 patches** provide the best balance: 3.6× faster than pixel-level with only marginal quality loss. Pixel-level remains best for maximum quality.
 
 ### Key Advantages of Dictionary Learning
 
@@ -279,6 +285,32 @@ Using larger patches dramatically reduces computation by processing fewer tokens
 
 **Bottom Line**: Despite being 8-26× slower (depending on batch size), DL achieves **10.4× better reconstruction quality**. Both methods remain practical for real-time use with sub-microsecond per-pixel processing. For applications where quality matters, DL's superior reconstruction far outweighs the speed cost.
 
+### Codebook Visualization in RGB Space
+
+To understand how VQ and DL learn different representations, we can visualize their codebooks/dictionaries in 2D using dimensionality reduction:
+
+![Codebook Embeddings](img/codebook_embeddings.png)
+
+**Key Observations**:
+- **PCA (Linear)**: Both VQ and DL spread their atoms across similar RGB subspaces, with the first two principal components capturing ~85% variance
+- **t-SNE (Non-linear)**: Reveals local clustering structure - both methods form distinct color clusters (e.g., skin tones, hair colors, backgrounds)
+- **UMAP (Manifold)**: Shows the global topology - atoms are distributed along a smooth manifold representing the continuous RGB color space
+
+**Pairwise Distance Analysis**:
+
+![Codebook Distances](img/codebook_distances.png)
+
+- **VQ**: Mean pairwise distance = 2.49 ± 0.90 (more uniform spacing)
+- **DL**: Mean pairwise distance = 2.48 ± 0.90 (similar distribution)
+
+Both methods achieve similar codebook diversity, but DL's advantage comes from **sparse combinations** (4 atoms per pixel) rather than just better atom selection.
+
+Run codebook visualization:
+```bash
+conda activate research
+pytest tests/test_codebook_visualization.py::test_visualize_codebook_embeddings -v
+```
+
 ### Technical Implementation
 
 **Simplified Greedy OMP**:
@@ -292,6 +324,7 @@ Using larger patches dramatically reduces computation by processing fewer tokens
 - 📊 **L1 norm visualization**: Uses sum of absolute coefficients for stable, interpretable heatmaps
 - 📊 **Percentile normalization**: Robust 1-99th percentile clipping for clean contrast
 - 📊 **Fold/unfold mapping**: Properly maps patch-based coefficients to pixel space for visualization
+- 📊 **RGB space embeddings**: PCA, t-SNE, and UMAP projections reveal codebook structure and diversity
 
 Run visualizations:
 ```bash
@@ -300,6 +333,7 @@ pytest tests/test_bottleneck.py::test_bottleneck_visualizations -v
 
 # Update README images after regenerating visualizations
 cp tests/artifacts/bottleneck/*.png img/
+cp tests/artifacts/codebook_embeddings/*.png img/
 ```
 
 ## License

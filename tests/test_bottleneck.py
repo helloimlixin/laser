@@ -25,6 +25,14 @@ from src.models.bottleneck import DictionaryLearning, VectorQuantizer  # noqa: E
 from src.data.celeba import CelebADataModule  # noqa: E402
 from src.data.config import DataConfig  # noqa: E402
 
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    import umap
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
 
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "bottleneck"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -841,8 +849,14 @@ def test_patch_based_speed_comparison():
             normalize_atoms=False,
             patch_size=patch_size
         )
-        # Note: Can't reuse VQ codebook for patches since atom_dim changes
-        # Each patch size needs its own initialization
+        
+        # Initialize dictionary with k-means on patches
+        # Extract patches from the data to initialize dictionary properly
+        patches = F.unfold(z, kernel_size=(patch_size, patch_size), stride=(patch_size, patch_size))
+        # patches shape: [B, C*patch_size^2, num_patches]
+        patches_flat = patches.reshape(patches.shape[0] * patches.shape[2], patches.shape[1])  # [B*num_patches, atom_dim]
+        patch_codebook = _kmeans_codebook(patches_flat.t().reshape(1, patches.shape[1], -1, 1), K)
+        dl.dictionary.data.copy_(patch_codebook.squeeze().t().contiguous())
         
         # Warmup
         with torch.no_grad():
