@@ -187,6 +187,26 @@ Breaking down reconstruction quality by RGB channel reveals DL's exceptional imp
 
 **Full Utilization**: Both methods use all 16 codebook entries/atoms thanks to k-means initialization (VQ) and greedy selection with no-reselection masking (DL), ensuring the full representation capacity is utilized.
 
+#### Inference Speed & Computational Complexity
+
+**Benchmark Setup**: 4 images × 128×128 resolution (65,536 pixels total), K=16, S=4
+
+| Method | Total Time | Per-Pixel Time | Complexity | Measured Slowdown |
+|--------|------------|----------------|------------|-------------------|
+| **VQ** | 3.1 ms | 0.047 µs/pixel | O(K × N) | Baseline (1.0×) |
+| **DL** | 33.6 ms | 0.512 µs/pixel | O(K × S × N) | **11.0×** |
+
+**Complexity Analysis**:
+- **VQ**: O(K × N) - Single nearest-neighbor search per pixel across K=16 codebook entries
+- **DL**: O(K × S × N) - S=4 iterations of greedy atom selection, each searching K=16 atoms
+- **Theoretical slowdown**: ~4× (from sparsity level)
+- **Measured slowdown**: 11.0× (includes additional overhead: correlation computation, residual updates, coefficient storage)
+
+**Speed vs Quality Tradeoff**:
+- DL is ~11× slower but achieves **10.4× better MSE**
+- Per-pixel time: VQ at 47 ns/pixel, DL at 512 ns/pixel (both highly practical)
+- For batch processing and offline training, the quality gain far outweighs the modest speed cost
+
 ### Key Advantages of Dictionary Learning
 
 - ✓ **Superior reconstruction**: 10.4× lower MSE with same 16-entry codebook
@@ -200,11 +220,11 @@ Breaking down reconstruction quality by RGB channel reveals DL's exceptional imp
 
 ### Tradeoffs
 
-- ✗ **Slower inference**: Iterative greedy OMP is slower than VQ's simple nearest-neighbor lookup
-- ✗ **Memory overhead**: Must store and compute with full dictionary + sparse coefficients
-- ✗ **Computational complexity**: O(K × S × N) vs VQ's O(K × N) where S=sparsity, N=pixels
+- ✗ **Slower inference**: ~11× slower than VQ (33.6ms vs 3.1ms for 4×128×128 images) due to iterative greedy OMP
+- ✗ **Memory overhead**: Must store and compute with full dictionary + sparse coefficients  
+- ✗ **Computational complexity**: O(K × S × N) vs VQ's O(K × N) where K=atoms, S=sparsity, N=pixels
 
-Despite these tradeoffs, the **10× reconstruction quality improvement** makes DL highly attractive for applications where quality matters more than raw speed.
+**Bottom Line**: Despite being 11× slower, DL achieves **10.4× better reconstruction quality**, making it highly attractive for applications where quality matters more than raw speed. Both methods remain practical for real-time use (sub-millisecond per-pixel processing).
 
 ### Technical Implementation
 

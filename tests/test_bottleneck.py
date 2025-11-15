@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import math
+import time
 import matplotlib
 
 matplotlib.use("Agg")
@@ -648,12 +649,35 @@ def test_bottleneck_visualizations():
     dl = _build_dictionary_learning(num_embeddings=K, embedding_dim=C, sparsity_level=4, normalize_atoms=False)
     dl.dictionary.data.copy_(codebook.t().contiguous())
     
-    # Forward pass
+    # Benchmark inference speed (warmup + timed runs)
     with torch.no_grad():
         vq.eval()
         dl.eval()
-        z_q_vq, _, _, enc_vq = vq(z)
-        z_q_dl, _, coeffs = dl(z)
+        
+        # Warmup
+        for _ in range(3):
+            _ = vq(z)
+            _ = dl(z)
+        
+        # Benchmark VQ
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        vq_times = []
+        for _ in range(10):
+            start = time.perf_counter()
+            z_q_vq, _, _, enc_vq = vq(z)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            vq_times.append(time.perf_counter() - start)
+        vq_time_ms = np.mean(vq_times) * 1000
+        
+        # Benchmark DL
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        dl_times = []
+        for _ in range(10):
+            start = time.perf_counter()
+            z_q_dl, _, coeffs = dl(z)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            dl_times.append(time.perf_counter() - start)
+        dl_time_ms = np.mean(dl_times) * 1000
     
     is_celeba = celeba_dir is not None
     
@@ -710,6 +734,19 @@ def test_bottleneck_visualizations():
     print(f"   VQ Codes Used: {vq_used}/{K} ({100*vq_used/K:.0f}%)")
     print(f"   DL Atoms Used: {dl_used}/{K} ({100*dl_used/K:.0f}%)")
     print(f"   Average atoms per pixel: {(coeffs.abs() > 1e-6).sum(dim=0).float().mean().item():.2f}")
+    
+    # Inference speed
+    num_pixels = B * H * W
+    print(f"\n⚡ Inference Speed (batch={B}, resolution={H}×{W}, {num_pixels:,} pixels):")
+    print(f"   VQ  - {vq_time_ms:.2f} ms total, {vq_time_ms*1000/num_pixels:.3f} µs/pixel")
+    print(f"   DL  - {dl_time_ms:.2f} ms total, {dl_time_ms*1000/num_pixels:.3f} µs/pixel")
+    print(f"   DL Slowdown: {dl_time_ms/vq_time_ms:.1f}× (greedy OMP overhead)")
+    
+    # Complexity analysis
+    print(f"\n🔢 Computational Complexity:")
+    print(f"   VQ  - O(K × N) = O({K} × {num_pixels:,}) distance computations")
+    print(f"   DL  - O(K × S × N) = O({K} × 4 × {num_pixels:,}) for {4} OMP iterations per pixel")
+    print(f"   Theoretical Slowdown: ~{4}× (measured: {dl_time_ms/vq_time_ms:.1f}×)")
     
     print("\n" + "="*60)
     
