@@ -66,7 +66,7 @@ def train(cfg: DictConfig):
     print(f"Image Size: {cfg.data.image_size}")
     print(f"Mean: {cfg.data.mean}")
     print(f"Std: {cfg.data.std}")
-    
+
     print("\nModel Configuration:")
     print(f"Model Type: {cfg.model.type}")
     print(f"Input Channels: {cfg.model.in_channels}")
@@ -79,6 +79,12 @@ def train(cfg: DictConfig):
         print(f"Sparsity: {cfg.model.sparsity_level}")
         if hasattr(cfg.model, "patch_size"):
             print(f"Latent Patch Size: {cfg.model.patch_size}")
+        if getattr(cfg.model, "multi_res_dct_weight", 0.0) > 0:
+            print(f"Multi-res DCT: weight={cfg.model.multi_res_dct_weight}, levels={cfg.model.multi_res_dct_levels}")
+        if getattr(cfg.model, "multi_res_grad_weight", 0.0) > 0:
+            print(f"Multi-res Grad: weight={cfg.model.multi_res_grad_weight}, levels={cfg.model.multi_res_grad_levels}")
+        if getattr(cfg.model, "dictionary_ortho_weight", 0.0) > 0:
+            print(f"Dictionary Ortho Weight: {cfg.model.dictionary_ortho_weight}")
         if hasattr(cfg.model, "omp_tolerance"):
             print(f"OMP Tolerance: {cfg.model.omp_tolerance}")
         if hasattr(cfg.model, "omp_debug"):
@@ -226,6 +232,11 @@ def train(cfg: DictConfig):
             'omp_tolerance': getattr(cfg.model, 'omp_tolerance', 1e-7),
             'omp_debug': getattr(cfg.model, 'omp_debug', False),
             'patch_size': getattr(cfg.model, 'patch_size', 1),
+            'multi_res_dct_weight': getattr(cfg.model, 'multi_res_dct_weight', 0.0),
+            'multi_res_dct_levels': getattr(cfg.model, 'multi_res_dct_levels', 3),
+            'multi_res_grad_weight': getattr(cfg.model, 'multi_res_grad_weight', 0.0),
+            'multi_res_grad_levels': getattr(cfg.model, 'multi_res_grad_levels', 3),
+            'dictionary_ortho_weight': getattr(cfg.model, 'dictionary_ortho_weight', 0.0),
         }
         model = DLVAE(**model_params)
     elif cfg.model.type == "vqvae":
@@ -283,13 +294,11 @@ def train(cfg: DictConfig):
     # Choose DDP strategy only when using >1 device (GPU or CPU). Respect explicit config if provided.
     strategy_cfg = getattr(cfg.train, "strategy", None)
     if strategy_cfg is None:
-        # Determine effective number of devices requested
         devices_cfg = cfg.train.devices
         try:
             num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
         except Exception:
             num_devices = 1
-        # Use DDP for these model types only when running multi-device
         if cfg.model.type in ("dlvae", "vqvae") and num_devices and num_devices > 1:
             strategy_cfg = "ddp"
     trainer = pl.Trainer(

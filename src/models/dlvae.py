@@ -8,6 +8,7 @@ from .encoder import Encoder
 from .decoder import Decoder
 from .bottleneck import DictionaryLearning
 from .lpips import LPIPS
+from .losses import multi_resolution_dct_loss, multi_resolution_gradient_loss
 
 import torchmetrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -33,6 +34,11 @@ class DLVAE(pl.LightningModule):
             omp_tolerance=1e-7,
             omp_debug=False,
             patch_size=1,
+            multi_res_dct_weight=0.0,
+            multi_res_dct_levels=3,
+            multi_res_grad_weight=0.0,
+            multi_res_grad_levels=3,
+            dictionary_ortho_weight=0.0,
     ):
         """Initialize DLVAE model.
 
@@ -53,6 +59,11 @@ class DLVAE(pl.LightningModule):
             omp_tolerance: Early stopping tolerance for BatchOMP residual
             omp_debug: Enable BatchOMP debug logging
             patch_size: Spatial patch size (int or tuple) encoded per dictionary token
+            multi_res_dct_weight: weight for DCT-based high-frequency loss
+            multi_res_dct_levels: number of pyramid levels for DCT loss
+            multi_res_grad_weight: weight for edge-preserving gradient loss
+            multi_res_grad_levels: number of pyramid levels for gradient loss
+            dictionary_ortho_weight: weight of the atom orthogonality penalty
         """
         super(DLVAE, self).__init__()
 
@@ -64,6 +75,11 @@ class DLVAE(pl.LightningModule):
         self.compute_fid = compute_fid
         self.omp_tolerance = omp_tolerance
         self.omp_debug = omp_debug
+        self.mr_dct_weight = multi_res_dct_weight
+        self.mr_dct_levels = multi_res_dct_levels
+        self.mr_grad_weight = multi_res_grad_weight
+        self.mr_grad_levels = multi_res_grad_levels
+        self.dictionary_ortho_weight = dictionary_ortho_weight
 
         # Initialize encoder
         self.encoder = Encoder(
@@ -191,9 +207,35 @@ class DLVAE(pl.LightningModule):
             perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
         else:
             perceptual_loss = torch.tensor(0.0, device=self.device, dtype=recon_raw.dtype)
+
+        if self.mr_dct_weight > 0:
+            dct_loss = multi_resolution_dct_loss(
+                x, recon_raw, num_levels=max(1, self.mr_dct_levels)
+            )
+        else:
+            dct_loss = torch.tensor(0.0, device=self.device, dtype=recon_raw.dtype)
+
+        if self.mr_grad_weight > 0:
+            grad_loss = multi_resolution_gradient_loss(
+                x, recon_raw, num_levels=max(1, self.mr_grad_levels)
+            )
+        else:
+            grad_loss = torch.tensor(0.0, device=self.device, dtype=recon_raw.dtype)
+
+        if self.dictionary_ortho_weight > 0:
+            ortho_loss = self.bottleneck.orthogonality_loss()
+        else:
+            ortho_loss = torch.tensor(0.0, device=self.device, dtype=recon_raw.dtype)
         
         # Total loss
-        total_loss = (1 - self.perceptual_weight) * recon_loss + dl_loss + self.perceptual_weight * perceptual_loss
+        total_loss = (
+            (1 - self.perceptual_weight) * recon_loss
+            + dl_loss
+            + self.perceptual_weight * perceptual_loss
+            + self.mr_dct_weight * dct_loss
+            + self.mr_grad_weight * grad_loss
+            + self.dictionary_ortho_weight * ortho_loss
+        )
 
         # Handle FID for test
         if prefix == 'test' and self.test_fid is not None:
@@ -207,6 +249,9 @@ class DLVAE(pl.LightningModule):
         self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f'{prefix}/dl_loss', dl_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/dct_loss', dct_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/grad_loss', grad_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/ortho_loss', ortho_loss, on_step=True, on_epoch=True, sync_dist=True)
 
         # Add PSNR calculation on de-normalized [0,1] images to avoid scale drift
         dm = getattr(getattr(self, "trainer", None), "datamodule", None)
@@ -226,6 +271,9 @@ class DLVAE(pl.LightningModule):
             'recon_loss': recon_loss,
             'dl_loss': dl_loss,
             'perceptual_loss': perceptual_loss,
+            'dct_loss': dct_loss,
+            'grad_loss': grad_loss,
+            'ortho_loss': ortho_loss,
             'psnr': psnr,
             'x': x_vis,
             'x_recon': recon_vis
@@ -276,7 +324,7 @@ class DLVAE(pl.LightningModule):
                 "monitor": "val/loss_epoch"
             }
         }
-
+    
     def _log_images(self, x, x_recon, split='train'):
         """Log images to wandb."""
         # Only log from rank zero in DDP to avoid multi-process logger contention

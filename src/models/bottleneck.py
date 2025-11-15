@@ -2,99 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def _update_logical(logical, to_add):
-    """Mark selected indices as used in the logical mask."""
-    running_idx = torch.arange(to_add.shape[0], device=to_add.device)
-    logical[running_idx, to_add] = 1
-
-
-def BatchOMP(data, dictionary, max_nonzero, tolerance=1e-7, debug=False):
-    """
-    Vectorized Batch Orthogonal Matching Pursuit (OMP).
-    Adapted from: https://github.com/amzn/sparse-vqvae/blob/main/utils/pyomp.py
-    
-    Reference links:
-    - https://sparse-plex.readthedocs.io/en/latest/book/pursuit/omp/batch_omp.html
-    - http://www.cs.technion.ac.il/~ronrubin/Publications/KSVD-OMP-v2.pdf
-
-    Args:
-        data (torch.Tensor): (vector_dim, batch_size)
-        dictionary (torch.Tensor): (vector_dim, num_atoms), column-normalized recommended
-        max_nonzero (int): Maximum number of non-zero coefficients per signal
-        tolerance (float): Early stopping tolerance on residual norm
-        debug (bool): If True, prints per-iteration diagnostics
-
-    Returns:
-        torch.Tensor: (num_atoms, batch_size) sparse coefficients
-    """
-    vector_dim, batch_size = data.size()
-    dictionary_t = dictionary.t()
-    G = dictionary_t.mm(dictionary)  # Gram matrix
-    # Add regularization to Gram matrix for numerical stability
-    # Larger epsilon needed for low-dimensional problems like RGB (d=3)
-    G = G + torch.eye(G.size(0), device=G.device) * 1e-4
-    eps = torch.norm(data, dim=0)  # residual, initialized as L2 norm of signal
-    h_bar = dictionary_t.mm(data).t()  # initial correlation vector, transposed
-
-    h = h_bar
-    x = torch.zeros_like(h_bar)  # resulting sparse code
-    L = torch.ones(batch_size, 1, 1, device=h.device)  # progressive Cholesky
-    I = torch.ones(batch_size, 0, device=h.device).long()
-    I_logic = torch.zeros_like(h_bar).bool()  # mask to avoid reselecting same index
-    delta = torch.zeros(batch_size, device=h.device)
-
-    k = 0
-    while k < max_nonzero and eps.max() > tolerance:
-        k += 1
-        # select next index per sample, masking already selected positions
-        index = (h * (~I_logic).float()).abs().argmax(dim=1)
-        _update_logical(I_logic, index)
-        
-        batch_idx = torch.arange(batch_size, device=G.device)
-        expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()
-
-        if k > 1:
-            # Cholesky update
-            G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
-            # Use modern triangular_solve replacement
-            w = torch.linalg.solve_triangular(L, G_stack, upper=False).view(-1, 1, k - 1)
-            # Add small epsilon to prevent numerical issues
-            w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-10))
-
-            # Concatenate into new Cholesky: L <- [[L, 0], [w, w_corner]]
-            k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device)
-            L = torch.cat((
-                torch.cat((L, k_zeros), dim=2),
-                torch.cat((w, w_corner), dim=2),
-            ), dim=1)
-
-        # update non-zero indices
-        I = torch.cat([I, index.unsqueeze(1)], dim=1)
-
-        # Solve for x using Cholesky factor
-        h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)
-        # Replace deprecated cholesky_solve with two triangular solves
-        y_stack = torch.linalg.solve_triangular(L, h_stack, upper=False)
-        x_stack = torch.linalg.solve_triangular(L.transpose(1, 2), y_stack, upper=True)
-
-        # Scatter x_stack into x at active indices
-        x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack.squeeze(-1)
-
-        # beta = G_I * x_I
-        beta = x[batch_idx.unsqueeze(1), I[batch_idx]].unsqueeze(1).bmm(G[I[batch_idx], :]).squeeze(1)
-
-        h = h_bar - beta
-
-        # update residual
-        new_delta = (x * beta).sum(dim=1)
-        eps += delta - new_delta
-        delta = new_delta
-
-        if debug:
-            print('Step {}, residual: {:.4f}, below tolerance: {:.4f}'.format(
-                k, eps.max().item(), (eps < tolerance).float().mean().item()))
-
-    return x.t()  # transpose since sparse codes should be used as D * x
 
 class VectorQuantizer(nn.Module):
     """
@@ -201,6 +108,7 @@ class VectorQuantizer(nn.Module):
 class DictionaryLearning(nn.Module):
     """
     Dictionary Learning Bottleneck with vectorized Batch Orthogonal Matching Pursuit (OMP) sparse coding.
+    Uses a simplified greedy OMP implementation for faster and cleaner sparse coding.
     """
     def __init__(
         self,
@@ -211,8 +119,6 @@ class DictionaryLearning(nn.Module):
         decay=0.99,
         epsilon=1e-10,
         use_ema=True,
-        tolerance=1e-7,
-        omp_debug=False,
         normalize_atoms=True,
         patch_size=1,
     ):
@@ -225,8 +131,6 @@ class DictionaryLearning(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
         self.use_ema = use_ema
-        self.tolerance = tolerance
-        self.omp_debug = omp_debug
         self.normalize_atoms = normalize_atoms
         if isinstance(patch_size, int):
             self.patch_size = (patch_size, patch_size)
@@ -249,12 +153,24 @@ class DictionaryLearning(nn.Module):
         with torch.no_grad():
             norms = torch.linalg.norm(self.dictionary.data, dim=0, keepdim=True)
             self.dictionary.data = self.dictionary.data / (norms + 1e-10)
+    
+    def orthogonality_loss(self):
+        """
+        Encourage dictionary atoms to be orthogonal by penalizing off-diagonal Gram entries.
+        Always evaluates atoms in normalized space so the penalty is scale-invariant.
+        """
+        dict_norm = F.normalize(self.dictionary, dim=0)
+        gram = dict_norm.t() @ dict_norm  # [num_embeddings, num_embeddings]
+        eye = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
+        loss = (gram - eye).pow(2)
+        return loss.mean()
 
     def batch_omp(self, X, D):
         """
         Batched Orthogonal Matching Pursuit (greedy selection only).
         
         Fast implementation using greedy atom selection without LS refinement.
+        Simpler and faster than Cholesky-based OMP.
 
         Args:
             X (torch.Tensor): Input signals of shape (M, B).
@@ -267,7 +183,7 @@ class DictionaryLearning(nn.Module):
         _, N = D.shape
         device = X.device
 
-        # Vectorized greedy atom selection with diversity penalty
+        # Vectorized greedy atom selection
         coefficients = torch.zeros(N, B, device=device, dtype=X.dtype)
         residual = X.clone()
         
@@ -275,20 +191,10 @@ class DictionaryLearning(nn.Module):
         mask = torch.ones(N, B, device=device, dtype=X.dtype)  # Use float for efficient multiply
         batch_idx = torch.arange(B, device=device)
         
-        # Track global atom usage for diversity penalty
-        global_usage = torch.zeros(N, device=device, dtype=X.dtype)
-        diversity_weight = 0.001  # Small bonus to encourage diversity
-        
         for k in range(self.sparsity_level):
             # Compute correlations (keep in N, B format - avoid transpose)
             correlations = torch.mm(D.t(), residual)  # (N, B)
             abs_corr = torch.abs(correlations)
-            
-            # Apply diversity bonus (vectorized)
-            if k > 0:
-                avg_usage = global_usage.sum() / N
-                diversity_bonus = diversity_weight * (avg_usage - global_usage).clamp(min=0).unsqueeze(1)
-                abs_corr = abs_corr + diversity_bonus
             
             # Apply mask and find argmax (avoid transpose by using dim=0)
             abs_corr_masked = abs_corr * mask  # (N, B) - already in right shape!
@@ -297,13 +203,10 @@ class DictionaryLearning(nn.Module):
             # Update mask (vectorized) - set selected atoms to 0
             mask[idx, batch_idx] = 0.0
             
-            # Update global usage (vectorized with scatter_add)
-            global_usage.scatter_add_(0, idx, torch.ones(B, device=device, dtype=X.dtype))
-            
             # Gather selected atoms
             d_selected = D[:, idx]  # (M, B)
             
-            # Compute coefficients
+            # Compute coefficients using projection
             numerator = (residual * d_selected).sum(dim=0)  # (B,)
             denominator = (d_selected ** 2).sum(dim=0)  # (B,)
             alpha = numerator / (denominator + self.epsilon)  # (B,)
@@ -336,48 +239,38 @@ class DictionaryLearning(nn.Module):
             raise ValueError(
                 f"Feature map ({height}x{width}) must be divisible by patch_size {self.patch_size}"
             )
-        num_patches_per_sample = (height // patch_h) * (width // patch_w)
-        
-        # Extract non-overlapping patches and flatten to patch tokens
-        ze_unfold = F.unfold(
+        # Extract non-overlapping patches using the same layout that PyTorch fold/unfold expect
+        patches = F.unfold(
             z_e,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-        )  # [batch_size, atom_dim, num_patches_per_sample]
-        ze_flattened = (
-            ze_unfold.permute(0, 2, 1).reshape(-1, self.atom_dim).t().contiguous()
-        )  # [atom_dim, batch_size * num_patches_per_sample]
+        ).permute(2, 0, 1).contiguous()  # [num_patches_per_sample, batch_size, atom_dim]
+        patches_shape = (patches.size(0), patches.size(1), patches.size(2))
+        patch_tokens = patches.view(-1, self.atom_dim).t().contiguous()  # [atom_dim, batch_size * num_patches_per_sample]
         
         '''
         Sparse coding stage
         '''
         # Run OMP in float32 to avoid AMP dtype mismatches; cast back after
-        orig_dtype = ze_flattened.dtype
+        orig_dtype = patch_tokens.dtype
         with torch.amp.autocast('cuda', enabled=False):
-            ze_flattened_f32 = ze_flattened.to(torch.float32)
+            patch_tokens_f32 = patch_tokens.to(torch.float32)
             dictionary_f32 = self.dictionary.to(torch.float32)
+            atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(1e-10)
+            dict_for_omp = dictionary_f32 / atom_norms.unsqueeze(0)
+            dict_for_recon = dict_for_omp if self.normalize_atoms else dictionary_f32
             
-            # For pixel-level data without atom normalization, OMP still needs normalized dictionary
-            # The dictionary atoms store the actual RGB color values
-            if self.normalize_atoms:
-                # Standard DL: normalize and keep normalized
-                dict_norms = torch.linalg.norm(dictionary_f32, dim=0, keepdim=True)
-                dict_for_omp = dictionary_f32 / (dict_norms + 1e-10)
-                dict_for_recon = dict_for_omp
-            else:
-                # Pixel-level: use atoms as-is (they're already RGB colors from k-means)
-                dict_for_omp = dictionary_f32
-                dict_for_recon = dictionary_f32
-            
-            # Use simpler batch_omp method (more stable for pixel-level data)
-            coefficients = self.batch_omp(ze_flattened_f32, dict_for_omp)
+            # Use BatchOMP to compute sparse coefficients
+            coefficients = self.batch_omp(patch_tokens_f32, dict_for_omp)
+            if not self.normalize_atoms:
+                coefficients = coefficients / atom_norms.unsqueeze(1)
             z_dl_f32 = dict_for_recon @ coefficients
 
         # Reshape flattened patch reconstructions back to feature maps
         z_dl_patches = (
             z_dl_f32.t()
-            .reshape(batch_size, num_patches_per_sample, self.atom_dim)
-            .permute(0, 2, 1)
+            .view(*patches_shape)
+            .permute(1, 2, 0)
             .contiguous()
         )  # [batch_size, atom_dim, num_patches_per_sample]
         z_dl_nchw = F.fold(

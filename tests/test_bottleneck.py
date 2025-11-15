@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 
+import math
 import matplotlib
 
 matplotlib.use("Agg")
@@ -100,7 +101,7 @@ def _get_celeba_dir():
     return None
 
 
-def _load_celeba_batch(batch_size: int = 4, image_size: int = 64):
+def _load_celeba_batch(batch_size: int = 4, image_size: int = 128):
     """Load a batch of CelebA images."""
     data_dir = _get_celeba_dir()
     if data_dir is None:
@@ -164,8 +165,6 @@ def _build_dictionary_learning(num_embeddings=32, embedding_dim=16, sparsity_lev
         sparsity_level=sparsity_level,
         commitment_cost=0.25,
         decay=0.99,
-        tolerance=1e-7,
-        omp_debug=False,
         normalize_atoms=normalize_atoms,
     )
 
@@ -203,7 +202,7 @@ def test_dictionary_learning_patch_tokens():
 def test_patch_dictionary_reconstructs_tiled_patterns():
     """Patch-based encoding should perfectly reconstruct tiled atoms."""
     torch.manual_seed(7)
-    patch_size = 4
+    patch_size = 8
     model = DictionaryLearning(
         num_embeddings=2,
         embedding_dim=1,
@@ -218,9 +217,10 @@ def test_patch_dictionary_reconstructs_tiled_patterns():
         model.dictionary.copy_(torch.stack([ones_atom, zeros_atom], dim=1))
 
     # Create latent grid with quadrants of ones/zeros aligned with patch tiling
-    z = torch.zeros(1, 1, 8, 8)
-    z[:, :, :4, :4] = 1.0
-    z[:, :, 4:, 4:] = 1.0
+    latent_size = patch_size * 2
+    z = torch.zeros(1, 1, latent_size, latent_size)
+    z[:, :, :patch_size, :patch_size] = 1.0
+    z[:, :, patch_size:, patch_size:] = 1.0
 
     z_dl, loss, coeffs = model(z)
     assert torch.allclose(z_dl, z, atol=1e-6)
@@ -518,18 +518,74 @@ def _plot_channel_comparison(z, z_q_vq, z_q_dl):
 def _plot_code_heatmaps(z, enc_vq, coeffs, is_celeba):
     """Plot VQ indices and DL sparse codes as heatmaps for interpretability."""
     B, C, H, W = z.shape
+    num_atoms = coeffs.shape[0]  # K = number of dictionary atoms
+    # Columns are ordered as (patch_idx, batch_idx) because batching happens inside the unfolding.
+    # Reshape to [num_atoms, num_patches, batch] first, then permute so batch dimension comes before tokens.
+    num_patches_total = coeffs.shape[1] // B
+    coeffs_view = coeffs.view(coeffs.shape[0], num_patches_total, B).permute(0, 2, 1).contiguous()
+    num_tokens = max(1, coeffs_view.shape[2])
+
+    def _infer_patch_dims(height, width, tokens):
+        """Infer patch height/width from the number of sparse-code tokens."""
+        total_pixels = height * width
+        if total_pixels % tokens != 0:
+            return 1, 1  # fallback to per-pixel visualization
+        patch_area = total_pixels // tokens
+        best = (1, patch_area)
+        target = math.sqrt(patch_area)
+        for candidate in range(1, patch_area + 1):
+            if patch_area % candidate != 0:
+                continue
+            patch_h = candidate
+            patch_w = patch_area // candidate
+            if height % patch_h == 0 and width % patch_w == 0:
+                best = min(best, (patch_h, patch_w), key=lambda hw: abs(hw[0] - target))
+                if patch_h == patch_w:
+                    return patch_h, patch_w
+        patch_h, patch_w = best
+        if height % patch_h != 0 or width % patch_w != 0:
+            return 1, 1
+        return patch_h, patch_w
+
+    patch_h, patch_w = _infer_patch_dims(H, W, num_tokens)
+    patch_rows = max(1, H // patch_h)
+    patch_cols = max(1, W // patch_w)
+
+    def _tokens_to_grid(sample_tokens):
+        """Reshape [B, num_tokens] tensor into [B, patch_rows, patch_cols]."""
+        if sample_tokens.numel() != B * patch_rows * patch_cols:
+            return sample_tokens.reshape(B, H, W)
+        return sample_tokens.view(B, patch_rows, patch_cols)
+
+    def _expand_patches(patch_tensor):
+        """Nearest-neighbour upsample patch tokens back to pixel resolution for visualization."""
+        upsampled = patch_tensor.repeat_interleave(patch_h, dim=1).repeat_interleave(patch_w, dim=2)
+        return upsampled[:, :H, :W]
     
     # Get VQ indices: enc_vq is (B*H*W, K), find argmax for each position
     vq_indices = torch.argmax(enc_vq, dim=1).reshape(B, H, W)
     
-    # Get DL sparsity pattern: coeffs is (K, B*H*W)
-    # For each position, count how many atoms are active
-    dl_sparsity = (coeffs.abs() > 1e-6).sum(dim=0).reshape(B, H, W).float()
+    # Create pixel-level coefficient map for DL
+    # Use L1 norm (sum of absolute coefficients) as it's more stable and interpretable
+    # This represents the total "activation strength" at each patch
     
-    # Get DL coefficient magnitudes
-    dl_magnitude_raw = coeffs.abs().sum(dim=0).reshape(B, H, W)
-    # Use max coefficient per pixel for clearer interpretation
-    dl_max_coeff = coeffs.abs().max(dim=0)[0].reshape(B, H, W)
+    # coeffs_view shape: [num_atoms, batch, num_patches]
+    # Compute L1 norm per patch (sum of absolute coefficients across all atoms)
+    l1_norm_per_patch = coeffs_view.abs().sum(dim=0)  # [batch, num_patches]
+    
+    if patch_h == 1 and patch_w == 1:
+        # Pixel-level DL: direct mapping
+        dl_activation = l1_norm_per_patch.reshape(B, H, W)
+    else:
+        # Patch-level DL: use fold operation to map to pixels
+        coeff_for_fold = l1_norm_per_patch.unsqueeze(1)  # [batch, 1, num_patches]
+        
+        dl_activation = F.fold(
+            coeff_for_fold,
+            output_size=(H, W),
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w)
+        ).squeeze(1)  # [batch, H, W]
     
     num_images = min(2, B)  # Show first 2 images
     fig, axes = plt.subplots(num_images, 3, figsize=(12, 4 * num_images))
@@ -548,16 +604,16 @@ def _plot_code_heatmaps(z, enc_vq, coeffs, is_celeba):
         axes[i, 1].axis('off')
         plt.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
         
-        # DL max coefficient magnitude
-        mag_data = dl_max_coeff[i].cpu().numpy()
-        # Use log1p for better handling of small values
-        mag_log = np.log1p(mag_data)
+        # DL: Show L1 norm of sparse codes (simpler and cleaner)
+        activation_data = dl_activation[i].cpu().numpy()
         
-        # Use percentile-based normalization for better contrast
-        vmin, vmax = np.percentile(mag_log, [2, 98])
-        im2 = axes[i, 2].imshow(mag_log, cmap='viridis', interpolation='nearest', 
-                                 vmin=vmin, vmax=vmax)
-        axes[i, 2].set_title(f'DL Max Coefficient\n(log scale)', fontsize=11)
+        # Simple percentile normalization for clean visualization
+        p_low, p_high = np.percentile(activation_data, [1, 99])
+        activation_norm = np.clip(activation_data, p_low, p_high)
+        activation_norm = (activation_norm - p_low) / (p_high - p_low + 1e-10)
+        
+        im2 = axes[i, 2].imshow(activation_norm, cmap='viridis', interpolation='nearest')
+        axes[i, 2].set_title(f'DL Sparse Code Strength\n(L1 norm)', fontsize=11)
         axes[i, 2].axis('off')
         plt.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
     
