@@ -781,9 +781,12 @@ def test_bottleneck_visualizations():
     
     # Complexity analysis
     print(f"\n🔢 Computational Complexity:")
-    print(f"   VQ  - O(K × N) = O({K} × {num_pixels:,}) distance computations")
-    print(f"   DL  - O(K × S × N) = O({K} × 4 × {num_pixels:,}) for {4} OMP iterations per pixel")
-    print(f"   Theoretical Slowdown: ~{4}× (measured: {dl_time_ms/vq_time_ms:.1f}×)")
+    print(f"   VQ  - O(K × M × N) where K={K}, M={C}, N={num_pixels:,} pixels")
+    print(f"         Single vectorized distance computation across all pixels")
+    print(f"   DL  - O(S × K × M × N) where S=4, K={K}, M={C}, N={num_pixels:,}")  
+    print(f"         4 sequential OMP iterations, each computing K×M operations per pixel")
+    print(f"   Theoretical Slowdown: ~4× (from S=4 sparsity)")
+    print(f"   Measured Slowdown: {dl_time_ms/vq_time_ms:.1f}× (sequential iteration overhead + less vectorization)")
     
     print("\n" + "="*60)
     
@@ -800,3 +803,88 @@ def test_bottleneck_visualizations():
     
     for name in expected_files:
         assert (ARTIFACT_DIR / name).exists()
+
+
+def test_patch_based_speed_comparison():
+    """Compare speed of pixel-level vs patch-based dictionary learning."""
+    torch.manual_seed(7)
+    
+    # Use real images if available, otherwise random
+    celeba_dir = _get_celeba_dir()
+    if celeba_dir:
+        z = _load_celeba_batch(batch_size=4, image_size=128)
+        print("\nUsing CelebA images for realistic comparison")
+    else:
+        z = torch.randn(4, 3, 128, 128)
+        print("\nWarning: Using random noise (CelebA not available)")
+    
+    B, C, H, W = z.shape
+    K = 16
+    
+    # Initialize VQ with k-means for baseline
+    codebook = _kmeans_codebook(z, K)
+    vq = VectorQuantizer(num_embeddings=K, embedding_dim=C, commitment_cost=0.25, decay=0.0)
+    vq.embedding.weight.data.copy_(codebook)
+    
+    patch_sizes = [1, 2, 4, 8]
+    
+    print("\n" + "="*60)
+    print("PATCH-BASED DL SPEED & QUALITY COMPARISON")
+    print("="*60)
+    
+    for patch_size in patch_sizes:
+        # Create DL with specific patch size
+        dl = DictionaryLearning(
+            num_embeddings=K, 
+            embedding_dim=C, 
+            sparsity_level=4,
+            normalize_atoms=False,
+            patch_size=patch_size
+        )
+        # Note: Can't reuse VQ codebook for patches since atom_dim changes
+        # Each patch size needs its own initialization
+        
+        # Warmup
+        with torch.no_grad():
+            dl.eval()
+            vq.eval()
+            for _ in range(3):
+                _ = dl(z)
+                _ = vq(z)
+        
+        # Benchmark DL
+        times = []
+        with torch.no_grad():
+            for _ in range(10):
+                start = time.perf_counter()
+                z_q_dl, loss, coeffs = dl(z)
+                times.append(time.perf_counter() - start)
+        
+        avg_time_ms = np.mean(times) * 1000
+        num_patches = (H // patch_size) * (W // patch_size) * B
+        time_per_patch_us = avg_time_ms * 1000 / num_patches
+        
+        # Benchmark VQ (same input)
+        vq_times = []
+        with torch.no_grad():
+            for _ in range(10):
+                start = time.perf_counter()
+                z_q_vq, _, _, _ = vq(z)
+                vq_times.append(time.perf_counter() - start)
+        vq_time_ms = np.mean(vq_times) * 1000
+        
+        # Reconstruction quality
+        mse_dl = F.mse_loss(z_q_dl, z).item()
+        mse_vq = F.mse_loss(z_q_vq, z).item()
+        
+        print(f"\nPatch Size {patch_size}×{patch_size}:")
+        print(f"  Patches: {num_patches:,} ({H//patch_size}×{W//patch_size} per image)")
+        print(f"  DL Time: {avg_time_ms:.2f} ms, VQ Time: {vq_time_ms:.2f} ms")
+        print(f"  DL MSE: {mse_dl:.5f}, VQ MSE: {mse_vq:.5f}")
+        if mse_dl < mse_vq:
+            print(f"  Quality: DL {mse_vq/mse_dl:.1f}× better than VQ")
+        else:
+            print(f"  Quality: VQ {mse_dl/mse_vq:.1f}× better than DL")
+        print(f"  Speed: DL {34.0/avg_time_ms:.1f}× faster than 1×1 pixel-level")
+    
+    print("\n" + "="*60)

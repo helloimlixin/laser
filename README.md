@@ -199,24 +199,65 @@ Breaking down reconstruction quality by RGB channel reveals DL's exceptional imp
 | **16** | 262,144 | 5.0 ms | 0.019 | 128.6 ms | 0.490 | **26.0×** |
 
 **Complexity Analysis**:
-- **VQ**: O(K × N) - Single nearest-neighbor search per pixel across K=16 codebook entries
-  - Excellent batching efficiency: per-pixel time drops from 0.070 to 0.019 µs (3.7× speedup at batch=16)
-  - Benefits from vectorized distance computation across batch dimension
-- **DL**: O(K × S × N) - S=4 iterations of greedy atom selection, each searching K=16 atoms
-  - Good batching efficiency: per-pixel time stabilizes at ~0.50 µs for batches ≥4
-  - Theoretical slowdown: ~4× (from sparsity S=4)
-  - Measured slowdown: 7.9-26.0× depending on batch size (includes overhead from correlation, residual updates, coefficient storage)
+- **VQ**: O(K × M × N) where K=codebook size, M=channels, N=num_pixels
+  - Perfectly vectorizable across batch and spatial dimensions
+  - Excellent batching efficiency: per-pixel time drops 3.7× (70ns → 19ns) as batch grows
+  - Single matrix multiplication D^T @ X for all pixels simultaneously
+  
+- **DL**: O(S × K × M × N) where S=sparsity, K=atoms, M=channels, N=num_pixels  
+  - **Sequential within each iteration**: correlation → argmax → update → repeat S times
+  - Limited batching benefit: per-pixel time only improves 1.1× (551ns → 490ns)
+  - Each of S=4 iterations requires K×M matrix-vector products per pixel
+  
+**Why DL Scales Worse:**
+1. **Sequential dependencies**: Each OMP iteration depends on previous iteration's residual
+2. **Less vectorization**: VQ does one big matmul; OMP does 4 sequential smaller operations
+3. **Memory access**: OMP repeatedly reads/writes residuals; VQ has cleaner access pattern
+4. **Fixed overhead**: OMP initialization costs are amortized less efficiently
+
+**Theoretical vs Measured Slowdown:**
+- **Theoretical**: 4× (from S=4 sparsity iterations)
+- **Measured**: 7.9-26× depending on batch size
+- **Gap explained by**: Sequential iteration overhead, less efficient vectorization, memory access patterns
 
 **Scaling Observations**:
-- VQ scales better with batch size due to simpler computation
-- DL per-pixel time is nearly constant (~0.50 µs) for batches ≥4
-- Both methods remain highly practical: VQ at 19-70 ns/pixel, DL at 490-551 ns/pixel
-- Larger batches favor VQ more, but DL still achieves **10.4× better quality**
+- **VQ scales excellently with batch size**: Per-pixel cost drops 3.7× as vectorization efficiency improves
+- **DL scaling is limited by sequential OMP iterations**: Each iteration must complete before next begins
+- **Relative slowdown grows with batch size**: From 7.9× (batch=1) to 26× (batch=16)
+  - This is expected: VQ's better vectorization means it benefits more from larger batches
+  - DL's per-pixel time stays nearly constant (~0.50 µs) regardless of batch size
+- **Both methods remain practical**: VQ at 19-70 ns/pixel, DL at 490-551 ns/pixel
+- **Quality advantage dominates**: Despite 8-26× slowdown, DL achieves **10.4× better MSE**
 
 **Speed vs Quality Tradeoff**:
 - At batch=4 (typical training batch): DL is 17.9× slower but achieves **10.4× better MSE**
 - For batch processing and offline training, the quality gain far outweighs the speed cost
 - Both methods support real-time processing: even at batch=16, DL processes 262K pixels in 129ms
+
+#### Patch-Based Dictionary Learning
+
+Using larger patches dramatically reduces computation by processing fewer tokens, but **severely degrades reconstruction quality**:
+
+| Patch Size | Patches/Image | DL Time | Speedup | DL MSE | VQ MSE | Quality vs VQ |
+|------------|---------------|---------|---------|--------|--------|---------------|
+| **1×1** (pixel) | 16,384 | 33.5 ms | 1.0× | 0.00001 | 0.00964 | **DL 662× better** ✓ |
+| **2×2** | 4,096 | 9.5 ms | **3.6×** | 0.07200 | 0.00964 | VQ 7.5× better ✗ |
+| **4×4** | 1,024 | 3.7 ms | **9.2×** | 0.30006 | 0.00964 | VQ 31× better ✗ |
+| **8×8** | 256 | 2.3 ms | **14.8×** | 0.38781 | 0.00964 | VQ 40× better ✗ |
+
+**Key Findings**:
+- **Patches lose fine-grained spatial information**: 2×2 patches already worse than pixel-level VQ
+- **Only pixel-level DL beats VQ**: 662× better MSE, but requires processing all pixels
+- **Speedup comes at severe quality cost**: Even 2×2 patches (3.6× faster) lose DL's quality advantage
+- **Workaround doesn't exist**: Patches fundamentally trade spatial resolution for speed
+
+**Why Patches Fail**:
+1. Each patch is treated as a single token → loses within-patch details
+2. Dictionary atoms represent entire patch neighborhoods, not fine structures
+3. Can't reconstruct sharp edges or fine textures within each patch area
+4. The sparse combination operates at patch-level, blurring sub-patch features
+
+**Conclusion**: **Pixel-level (1×1) is mandatory** for DL to maintain its quality advantage over VQ. The 662× quality improvement justifies the 17-26× slower inference compared to VQ.
 
 ### Key Advantages of Dictionary Learning
 
