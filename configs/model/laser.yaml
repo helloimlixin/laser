@@ -54,18 +54,18 @@ commitment_cost: 0.5
 # 0 = gradient-based learning only
 # 1-2 = fast K-SVD updates
 # 3-5 = better atoms, slower
-ksvd_iterations: 0  # Disabled when using backprop-only mode
+ksvd_iterations: 1
 
 # Dictionary update frequency (update every N training steps)
-# Options: 0 (every step), 1-10 (every N steps)
+# Options: 0 (every step), 1+ (every N steps)
 # 0 = update every step (recommended)
-dictionary_update_frequency: 0
+dictionary_update_frequency: 100
 
 # Use online dictionary learning instead of K-SVD
 # Options: true (fast online updates), false (classical K-SVD)
 # true = faster, good for large datasets
 # false = higher quality atoms, better for small datasets
-use_online_learning: false  # Disabled when using backprop-only mode
+use_online_learning: false
 
 # Learning rate for online dictionary updates
 # Only used if use_online_learning=true
@@ -95,12 +95,12 @@ iht_iterations: 10
 # 0.9 = good manual default for normalized dictionaries
 iht_step_size: null
 
-# Use backprop-only mode (dense representation, no sparsity)
-# Options: true (dense, fast but no sparsity), false (sparse, RECOMMENDED)
+# Use backprop-only mode (dictionary learned via gradients instead of K-SVD)
+# Options: true (gradient-based), false (K-SVD/online learning)
 # true = dictionary learned via gradients (smoother updates, may help overfitting)
 # false = dictionary updated via K-SVD/online learning
-# NOTE: When true, IHT still used for sparse coding! Only dictionary update changes.
-use_backprop_only: true
+# NOTE: When true, sparse coding still used! Only dictionary update changes.
+use_backprop_only: false
 
 # L1 regularization weight on sparse coefficients
 # Typical range: 0.0-0.1

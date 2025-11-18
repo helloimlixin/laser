@@ -37,11 +37,15 @@ class LASER(pl.LightningModule):
             multi_res_dct_levels=3,
             multi_res_grad_weight=0.0,
             multi_res_grad_levels=3,
-        use_online_learning=True,
-        use_backprop_only=False,
-        sparsity_reg_weight=0.01,  # L1 regularization on coefficients
+            use_online_learning=False,
+            use_backprop_only=False,
+            dict_learning_rate=0.1,
+            sparse_solver='omp',
+            iht_iterations=10,
+            iht_step_size=None,
+            sparsity_reg_weight=0.01,
     ):
-        """Initialize K-SVD VAE model.
+        """Initialize LASER model.
 
         Args:
             in_channels: Number of input channels (3 for RGB)
@@ -63,7 +67,12 @@ class LASER(pl.LightningModule):
             multi_res_dct_levels: number of pyramid levels for DCT loss
             multi_res_grad_weight: weight for edge-preserving gradient loss
             multi_res_grad_levels: number of pyramid levels for gradient loss
-            use_backprop_only: whether to use only backprop for dictionary learning (much faster, no sparsity)
+            use_online_learning: whether to use online dictionary learning (vs K-SVD)
+            use_backprop_only: whether to use only backprop for dictionary learning (no K-SVD/online)
+            dict_learning_rate: learning rate for online dictionary updates
+            sparse_solver: sparse coding algorithm ('omp', 'iht', 'topk')
+            iht_iterations: number of IHT iterations (if using IHT)
+            iht_step_size: step size for IHT (None = auto-compute)
             sparsity_reg_weight: L1 regularization weight on sparse coefficients
         """
         super(LASER, self).__init__()
@@ -104,6 +113,10 @@ class LASER(pl.LightningModule):
             patch_size=patch_size,
             use_online_learning=use_online_learning,
             use_backprop_only=use_backprop_only,
+            dict_learning_rate=dict_learning_rate,
+            sparse_solver=sparse_solver,
+            iht_iterations=iht_iterations,
+            iht_step_size=iht_step_size,
         )
 
         self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
