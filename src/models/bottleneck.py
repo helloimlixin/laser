@@ -107,206 +107,18 @@ class VectorQuantizer(nn.Module):
 
 class DictionaryLearning(nn.Module):
     """
-    Dictionary Learning Bottleneck with vectorized Batch Orthogonal Matching Pursuit (OMP) sparse coding.
-    Uses a simplified greedy OMP implementation for faster and cleaner sparse coding.
-    """
-    def __init__(
-        self,
-        num_embeddings=512,
-        embedding_dim=64,
-        sparsity_level=5,
-        commitment_cost=0.25,
-        decay=0.99,
-        epsilon=1e-10,
-        use_ema=True,
-        normalize_atoms=True,
-        patch_size=1,
-    ):
-        super(DictionaryLearning, self).__init__()
-        
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.sparsity_level = sparsity_level
-        self.commitment_cost = commitment_cost
-        self.decay = decay
-        self.epsilon = epsilon
-        self.use_ema = use_ema
-        self.normalize_atoms = normalize_atoms
-        if isinstance(patch_size, int):
-            self.patch_size = (patch_size, patch_size)
-        else:
-            if len(patch_size) != 2:
-                raise ValueError("patch_size must be an int or a tuple of two ints")
-            self.patch_size = tuple(int(p) for p in patch_size)
-        self.patch_area = self.patch_size[0] * self.patch_size[1]
-        self.atom_dim = self.embedding_dim * self.patch_area
-        
-        # Initialize dictionary with random atoms shaped for flattened patches
-        self.dictionary = nn.Parameter(
-            torch.randn(self.atom_dim, num_embeddings), requires_grad=True
-        )
-        if self.normalize_atoms:
-            self._normalize_dictionary()
-
-    def _normalize_dictionary(self):
-        """Normalize all dictionary atoms to have unit L2 norm."""
-        with torch.no_grad():
-            norms = torch.linalg.norm(self.dictionary.data, dim=0, keepdim=True)
-            self.dictionary.data = self.dictionary.data / (norms + 1e-10)
+    Dictionary Learning Bottleneck with sparse coding and flexible dictionary updates.
     
-    def orthogonality_loss(self):
-        """
-        Encourage dictionary atoms to be orthogonal by penalizing off-diagonal Gram entries.
-        Always evaluates atoms in normalized space so the penalty is scale-invariant.
-        """
-        dict_norm = F.normalize(self.dictionary, dim=0)
-        gram = dict_norm.t() @ dict_norm  # [num_embeddings, num_embeddings]
-        eye = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
-        loss = (gram - eye).pow(2)
-        return loss.mean()
-
-    def batch_omp(self, X, D):
-        """
-        Batched Orthogonal Matching Pursuit (greedy selection only).
-        
-        Fast implementation using greedy atom selection without LS refinement.
-        Simpler and faster than Cholesky-based OMP.
-
-        Args:
-            X (torch.Tensor): Input signals of shape (M, B).
-            D (torch.Tensor): Dictionary of shape (M, N), where each column is an atom of dimension M.
-
-        Returns:
-            coefficients: (N, B) Tensor with the corresponding coefficients.
-        """
-        M, B = X.shape
-        _, N = D.shape
-        device = X.device
-
-        # Vectorized greedy atom selection
-        coefficients = torch.zeros(N, B, device=device, dtype=X.dtype)
-        residual = X.clone()
-        
-        # Mask to prevent reselecting the same atom per signal (N, B) format
-        mask = torch.ones(N, B, device=device, dtype=X.dtype)  # Use float for efficient multiply
-        batch_idx = torch.arange(B, device=device)
-        
-        for k in range(self.sparsity_level):
-            # Compute correlations (keep in N, B format - avoid transpose)
-            correlations = torch.mm(D.t(), residual)  # (N, B)
-            abs_corr = torch.abs(correlations)
-            
-            # Apply mask and find argmax (avoid transpose by using dim=0)
-            abs_corr_masked = abs_corr * mask  # (N, B) - already in right shape!
-            idx = torch.argmax(abs_corr_masked, dim=0)  # (B,)
-            
-            # Update mask (vectorized) - set selected atoms to 0
-            mask[idx, batch_idx] = 0.0
-            
-            # Gather selected atoms
-            d_selected = D[:, idx]  # (M, B)
-            
-            # Compute coefficients using projection
-            numerator = (residual * d_selected).sum(dim=0)  # (B,)
-            denominator = (d_selected ** 2).sum(dim=0)  # (B,)
-            alpha = numerator / (denominator + self.epsilon)  # (B,)
-            
-            # Update coefficient matrix
-            coefficients[idx, batch_idx] = alpha
-            
-            # Update residual (not in-place to preserve gradients)
-            residual = residual - d_selected * alpha.unsqueeze(0)
-        
-        return coefficients
+    Supports multiple sparse coding algorithms (OMP, IHT, Top-K) and dictionary update methods:
+    - Backprop-only: Dictionary learned via gradients (fast, integrates with encoder/decoder)
+    - K-SVD: Classical SVD-based atom updates (high quality, interpretable)
+    - Online Learning: Fast gradient-like updates (good balance)
     
-    def forward(self, z_e):
-        """
-        Forward pass through the dictionary learning bottleneck.
-        
-        Args:
-            z_e: Input tensor of shape [batch_size, embedding_dim, height, width]
-            
-        Returns:
-            z_dl: latent representation reconstructed from the dictionary learning bottleneck
-            loss: loss from the dictionary learning bottleneck
-            coefficients: sparse coefficients
-        """
-        # z shape: [batch_size, embedding_dim, height, width]
-        z_e = z_e.contiguous()
-        batch_size, channels, height, width = z_e.shape
-        patch_h, patch_w = self.patch_size
-        if height % patch_h != 0 or width % patch_w != 0:
-            raise ValueError(
-                f"Feature map ({height}x{width}) must be divisible by patch_size {self.patch_size}"
-            )
-        # Extract non-overlapping patches using the same layout that PyTorch fold/unfold expect
-        patches = F.unfold(
-            z_e,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-        ).permute(2, 0, 1).contiguous()  # [num_patches_per_sample, batch_size, atom_dim]
-        patches_shape = (patches.size(0), patches.size(1), patches.size(2))
-        patch_tokens = patches.view(-1, self.atom_dim).t().contiguous()  # [atom_dim, batch_size * num_patches_per_sample]
-        
-        '''
-        Sparse coding stage
-        '''
-        # Run OMP in float32 to avoid AMP dtype mismatches; cast back after
-        orig_dtype = patch_tokens.dtype
-        with torch.amp.autocast('cuda', enabled=False):
-            patch_tokens_f32 = patch_tokens.to(torch.float32)
-            dictionary_f32 = self.dictionary.to(torch.float32)
-            atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(1e-10)
-            dict_for_omp = dictionary_f32 / atom_norms.unsqueeze(0)
-            dict_for_recon = dict_for_omp if self.normalize_atoms else dictionary_f32
-            
-            # Use BatchOMP to compute sparse coefficients
-            coefficients = self.batch_omp(patch_tokens_f32, dict_for_omp)
-            if not self.normalize_atoms:
-                coefficients = coefficients / atom_norms.unsqueeze(1)
-            z_dl_f32 = dict_for_recon @ coefficients
-
-        # Reshape flattened patch reconstructions back to feature maps
-        z_dl_patches = (
-            z_dl_f32.t()
-            .view(*patches_shape)
-            .permute(1, 2, 0)
-            .contiguous()
-        )  # [batch_size, atom_dim, num_patches_per_sample]
-        z_dl_nchw = F.fold(
-            z_dl_patches,
-            output_size=(height, width),
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-        )
-
-        z_dl = z_dl_nchw.to(orig_dtype)  # cast back to original dtype (could be fp16 under AMP)
-
-        # Compute the commitment loss
-        z_e_nhwc = z_e.permute(0, 2, 3, 1).contiguous()
-        z_dl_nhwc = z_dl.permute(0, 2, 3, 1).contiguous()
-        e_latent_loss = F.mse_loss(z_dl_nhwc.detach(), z_e_nhwc)
-        dl_latent_loss = F.mse_loss(z_dl_nhwc, z_e_nhwc.detach())
-
-        # Compute the total loss
-        loss = self.commitment_cost * e_latent_loss + dl_latent_loss
-
-        # Straight-through estimator
-        z_dl = z_e + (z_dl - z_e).detach()  # Allow gradients to flow back to encoder
-
-        return z_dl, loss, coefficients  # Return the reconstructed latent representation, loss, and sparse coefficients
-
-
-class KSVDDictionaryLearning(nn.Module):
-    """
-    K-SVD based Dictionary Learning Bottleneck.
-    
-    K-SVD is a classical dictionary learning algorithm that alternates between:
-    1. Sparse coding: Find sparse coefficients for given dictionary (using OMP)
-    2. Dictionary update: Update each atom and its coefficients using SVD
-    
-    The key difference from regular DL is that K-SVD updates atoms sequentially
-    using rank-1 SVD approximations, which can lead to better atom learning.
+    Key features:
+    - Always normalizes dictionary atoms for numerical stability
+    - Supports IHT (Iterative Hard Thresholding) for true sparse coding
+    - Patch-based processing for efficiency
+    - Straight-through estimator for gradient flow
     
     Reference: "K-SVD: An Algorithm for Designing Overcomplete Dictionaries 
     for Sparse Representation" by Aharon, Elad, and Bruckstein (2006)
@@ -319,7 +131,6 @@ class KSVDDictionaryLearning(nn.Module):
         sparsity_level=5,
         commitment_cost=0.25,
         ksvd_iterations=1,
-        normalize_atoms=True,
         patch_size=1,
         epsilon=1e-10,
         sparse_solver="omp",
@@ -329,14 +140,13 @@ class KSVDDictionaryLearning(nn.Module):
         dict_learning_rate=0.1,
         use_backprop_only=False,
     ):
-        super(KSVDDictionaryLearning, self).__init__()
+        super(DictionaryLearning, self).__init__()
 
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.sparsity_level = sparsity_level
         self.commitment_cost = commitment_cost
         self.ksvd_iterations = ksvd_iterations
-        self.normalize_atoms = normalize_atoms
         self.epsilon = epsilon
         self.sparse_solver = sparse_solver.lower()
         self.iht_iterations = iht_iterations
@@ -368,8 +178,8 @@ class KSVDDictionaryLearning(nn.Module):
             )
             self.enable_ksvd_update = True
             
-        if self.normalize_atoms and not self.use_backprop_only:
-            self._normalize_dictionary()
+        # Always normalize dictionary atoms at initialization
+        self._normalize_dictionary()
 
         # Online dictionary learning parameters (only used if not backprop_only)
         self.dict_learning_rate = dict_learning_rate
@@ -454,10 +264,13 @@ class KSVDDictionaryLearning(nn.Module):
 
     def topk_sparse_coding(self, X, D):
         """
-        Fast approximate sparse coding using top-k selection.
+        Fast approximate sparse coding using top-k selection with thresholding.
 
         Much faster than IHT/OMP: single matrix multiplication + top-k selection.
         Good approximation when dictionary atoms are well-learned.
+        
+        Now includes adaptive thresholding to prevent weak atoms from being selected,
+        reducing overfitting.
 
         Args:
             X: Input signals of shape (M, B)
@@ -477,12 +290,23 @@ class KSVDDictionaryLearning(nn.Module):
         abs_corr = torch.abs(correlations)
         topk_vals, topk_idx = torch.topk(abs_corr, self.sparsity_level, dim=0)
 
+        # Adaptive thresholding: only keep coefficients above a threshold
+        # relative to the maximum correlation per sample
+        max_corr = abs_corr.max(dim=0, keepdim=True)[0]  # (1, B)
+        threshold = 0.1 * max_corr  # Keep only atoms with >10% of max correlation
+        
         # Create sparse coefficient matrix
         coefficients = torch.zeros(N, B, device=device, dtype=X.dtype)
         batch_idx = torch.arange(B, device=device).unsqueeze(0).expand(self.sparsity_level, -1)
 
         # Gather original correlation values (with sign)
-        coefficients[topk_idx, batch_idx] = torch.gather(correlations, 0, topk_idx)
+        selected_corr = torch.gather(correlations, 0, topk_idx)
+        
+        # Apply threshold mask
+        threshold_mask = topk_vals > threshold
+        selected_corr = selected_corr * threshold_mask
+        
+        coefficients[topk_idx, batch_idx] = selected_corr
 
         return coefficients
     
@@ -500,35 +324,58 @@ class KSVDDictionaryLearning(nn.Module):
     def iterative_hard_thresholding(self, X, D):
         """
         Iterative Hard Thresholding (IHT) sparse coding.
+        
+        IHT is a proper sparse coding algorithm that iteratively:
+        1. Takes a gradient step to minimize reconstruction error
+        2. Hard-thresholds to maintain sparsity constraint
+        
+        This is true sparse coding (unlike top-k which is just selection).
 
         Args:
             X: Input signals of shape (M, B)
-            D: Dictionary of shape (M, N)
+            D: Dictionary of shape (M, N) with normalized columns
 
         Returns:
-            coefficients: (N, B)
+            coefficients: (N, B) sparse coefficient matrix
         """
         M, B = X.shape
         _, N = D.shape
         device = X.device
 
+        # Initialize coefficients to zero
         coefficients = torch.zeros(N, B, device=device, dtype=X.dtype)
         Dt = D.t()
 
+        # Compute step size from Lipschitz constant
         if self.iht_step_size is not None:
             step_size = self.iht_step_size
         else:
-            # Estimate Lipschitz constant via spectral norm of D and pick conservative step
-            try:
-                spectral = torch.linalg.norm(D, ord=2)
-            except RuntimeError:
-                spectral = torch.sqrt(torch.linalg.eigvals(D.t() @ D).real.max())
-            step_size = 1.0 / (spectral.pow(2) + self.epsilon)
+            # For normalized dictionary D, largest singular value is ~1
+            # L = ||D||_2^2 ≈ 1, so step_size = 1/L ≈ 1
+            # Use slightly smaller for stability
+            with torch.no_grad():
+                try:
+                    # Fast approximation: power iteration for largest eigenvalue
+                    v = torch.randn(N, 1, device=device, dtype=X.dtype)
+                    for _ in range(3):  # 3 iterations usually enough
+                        v = Dt @ (D @ v)
+                        v = v / (torch.linalg.norm(v) + self.epsilon)
+                    spectral_sq = (v.t() @ Dt @ D @ v).item()
+                    step_size = 0.9 / (spectral_sq + self.epsilon)  # Conservative
+                except:
+                    # Fallback: assume normalized dict has spectral norm ≈ 1
+                    step_size = 0.9
 
+        # IHT iterations
         for _ in range(self.iht_iterations):
+            # Compute residual: r = X - D*coefficients
             residual = X - D @ coefficients
+            
+            # Gradient step: coefficients += step_size * D^T * residual
             gradient = Dt @ residual
             coefficients = coefficients + step_size * gradient
+            
+            # Hard threshold: keep only top-k by magnitude
             coefficients = self._hard_threshold(coefficients)
 
         return coefficients
@@ -549,10 +396,10 @@ class KSVDDictionaryLearning(nn.Module):
                     self.dictionary.data[:, k] = torch.randn(
                         M, device=X.device, dtype=X.dtype
                     )
-                    if self.normalize_atoms:
-                        self.dictionary.data[:, k] /= (
-                            torch.linalg.norm(self.dictionary.data[:, k]) + self.epsilon
-                        )
+                    # Always normalize atoms
+                    self.dictionary.data[:, k] /= (
+                        torch.linalg.norm(self.dictionary.data[:, k]) + self.epsilon
+                    )
                     continue
 
                 current_atom = self.dictionary[:, k : k + 1]
@@ -574,8 +421,8 @@ class KSVDDictionaryLearning(nn.Module):
                 self.dictionary.data[:, k] = new_atom
                 coefficients[k, omega_k] = new_coeff
 
-            if self.normalize_atoms:
-                self._normalize_dictionary()
+            # Always normalize dictionary after K-SVD update
+            self._normalize_dictionary()
     
     def online_dict_update(self, X, coefficients):
         """
@@ -604,9 +451,8 @@ class KSVDDictionaryLearning(nn.Module):
             # Update all atoms at once
             self.dictionary.data += self.dict_learning_rate * gradient / usage_counts
             
-            # Normalize dictionary atoms if required
-            if self.normalize_atoms:
-                self._normalize_dictionary()
+            # Always normalize dictionary atoms after update
+            self._normalize_dictionary()
     
     def forward(self, z_e):
         """
@@ -642,48 +488,39 @@ class KSVDDictionaryLearning(nn.Module):
         # Store original dtype for consistency
         orig_dtype = patch_tokens.dtype
         
-        if self.use_backprop_only:
-            # Backprop-only mode: use full dictionary representation (no sparsity)
-            # This is much faster but gives up sparsity constraint
-            coefficients = torch.matmul(self.dictionary.t(), patch_tokens)  # [num_embeddings, batch_size * num_patches]
-            z_dl_f32 = torch.matmul(self.dictionary, coefficients)  # [atom_dim, batch_size * num_patches]
-            
-            # Convert back to original dtype
-            coefficients = coefficients.to(orig_dtype)
-        else:
-            # Original K-SVD sparse coding approach
-            # Sparse coding stage (OMP) - operate in float32 for numerical stability
-            orig_dtype = patch_tokens.dtype
-            with torch.amp.autocast('cuda', enabled=False):
-                patch_tokens_f32 = patch_tokens.to(torch.float32)
-                dictionary_f32 = self.dictionary.to(torch.float32)
+        # Always use sparse coding (IHT/OMP/TopK) - operate in float32 for numerical stability
+        with torch.amp.autocast('cuda', enabled=False):
+            patch_tokens_f32 = patch_tokens.to(torch.float32)
+            dictionary_f32 = self.dictionary.to(torch.float32)
 
-                atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(self.epsilon)
-                dict_normalized = dictionary_f32 / atom_norms.unsqueeze(0)
+            atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(self.epsilon)
+            dict_normalized = dictionary_f32 / atom_norms.unsqueeze(0)
 
-                coefficients = self._sparse_encode(patch_tokens_f32, dict_normalized)
+            # Sparse coding to get coefficients (always enforces sparsity)
+            coefficients = self._sparse_encode(patch_tokens_f32, dict_normalized)
 
-                if self.training and self.enable_ksvd_update:
-                    if self.use_online_learning:
+            # Dictionary update (only if NOT using backprop-only mode)
+            if self.training and self.enable_ksvd_update and not self.use_backprop_only:
+                if self.use_online_learning:
+                    with torch.no_grad():
+                        self.online_dict_update(patch_tokens_f32, coefficients.detach())
+                    dictionary_f32 = self.dictionary.to(torch.float32)
+                    atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(self.epsilon)
+                    dict_normalized = dictionary_f32 / atom_norms.unsqueeze(0)
+                    coefficients = self._sparse_encode(patch_tokens_f32, dict_normalized)
+                else:
+                    for _ in range(self.ksvd_iterations):
                         with torch.no_grad():
-                            self.online_dict_update(patch_tokens_f32, coefficients.detach())
+                            self.ksvd_update(patch_tokens_f32, coefficients.detach())
                         dictionary_f32 = self.dictionary.to(torch.float32)
                         atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(self.epsilon)
                         dict_normalized = dictionary_f32 / atom_norms.unsqueeze(0)
                         coefficients = self._sparse_encode(patch_tokens_f32, dict_normalized)
-                    else:
-                        for _ in range(self.ksvd_iterations):
-                            with torch.no_grad():
-                                self.ksvd_update(patch_tokens_f32, coefficients.detach())
-                            dictionary_f32 = self.dictionary.to(torch.float32)
-                            atom_norms = torch.linalg.norm(dictionary_f32, dim=0).clamp_min(self.epsilon)
-                            dict_normalized = dictionary_f32 / atom_norms.unsqueeze(0)
-                            coefficients = self._sparse_encode(patch_tokens_f32, dict_normalized)
 
-                dict_for_recon = dict_normalized if self.normalize_atoms else dictionary_f32
-                z_dl_f32 = dict_for_recon @ coefficients
+            # Always use normalized dictionary for reconstruction (numerical stability)
+            z_dl_f32 = dict_normalized @ coefficients
 
-                coefficients = coefficients.to(orig_dtype)
+            coefficients = coefficients.to(orig_dtype)
         
         # Reshape back to feature maps
         z_dl_patches = (
@@ -708,11 +545,13 @@ class KSVDDictionaryLearning(nn.Module):
         
         # Encoder commitment loss: encourages encoder to match reconstruction
         e_latent_loss = F.mse_loss(z_dl_nhwc.detach(), z_e_nhwc)
-        # Dictionary reconstruction loss: encourages good reconstruction (gradients unused since dict not learned via backprop)
+        # Dictionary reconstruction loss: encourages good reconstruction
         dl_latent_loss = F.mse_loss(z_dl_nhwc, z_e_nhwc.detach())
         loss = self.commitment_cost * e_latent_loss + dl_latent_loss
         
-        # Straight-through estimator: forward pass returns reconstruction, backward pass flows to encoder
-        z_q = z_e + (z_dl - z_e).detach()
+        # Straight-through estimator (same as VQ-VAE)
+        # Forward: uses z_dl (dictionary reconstruction)
+        # Backward: gradients copy through to encoder via z_e, and to decoder via the residual
+        z_dl = z_e + (z_dl - z_e).detach()
         
-        return z_q, loss, coefficients
+        return z_dl, loss, coefficients

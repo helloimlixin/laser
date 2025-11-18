@@ -21,7 +21,7 @@ for p in (str(ROOT), str(SRC)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from src.models.bottleneck import DictionaryLearning, VectorQuantizer, KSVDDictionaryLearning  # noqa: E402
+from src.models.bottleneck import VectorQuantizer, DictionaryLearning  # noqa: E402
 from src.data.celeba import CelebADataModule  # noqa: E402
 from src.data.config import DataConfig  # noqa: E402
 
@@ -167,7 +167,7 @@ def _to_rgb(img: torch.Tensor, denormalize: bool = False) -> torch.Tensor:
 # --------- Dictionary-learning tests ---------
 
 
-def _build_dictionary_learning(num_embeddings=32, embedding_dim=16, sparsity_level=3, normalize_atoms=True):
+def _build_dictionary_learning(num_embeddings=32, embedding_dim=16, sparsity_level=3):
     """Helper to create DictionaryLearning with standard params."""
     return DictionaryLearning(
         num_embeddings=num_embeddings,
@@ -175,7 +175,6 @@ def _build_dictionary_learning(num_embeddings=32, embedding_dim=16, sparsity_lev
         sparsity_level=sparsity_level,
         commitment_cost=0.25,
         decay=0.99,
-        normalize_atoms=normalize_atoms,
     )
 
 
@@ -218,7 +217,6 @@ def test_patch_dictionary_reconstructs_tiled_patterns():
         embedding_dim=1,
         sparsity_level=1,
         patch_size=patch_size,
-        normalize_atoms=False,
     )
     atom_dim = model.atom_dim
     with torch.no_grad():
@@ -652,9 +650,9 @@ def test_bottleneck_visualizations():
     vq = VectorQuantizer(num_embeddings=K, embedding_dim=C, commitment_cost=0.25, decay=0.0)
     vq.embedding.weight.data.copy_(codebook)
     
-    # DL at pixel level: disable normalization and use 4 atoms per pixel
+    # DL at pixel level: use 4 atoms per pixel
     # Sparsity=4 balances quality and interpretability
-    dl = _build_dictionary_learning(num_embeddings=K, embedding_dim=C, sparsity_level=4, normalize_atoms=False)
+    dl = _build_dictionary_learning(num_embeddings=K, embedding_dim=C, sparsity_level=4)
     dl.dictionary.data.copy_(codebook.t().contiguous())
     
     # Benchmark inference speed across different batch sizes
@@ -846,7 +844,6 @@ def test_patch_based_speed_comparison():
             num_embeddings=K, 
             embedding_dim=C, 
             sparsity_level=4,
-            normalize_atoms=False,
             patch_size=patch_size
         )
         
@@ -942,7 +939,6 @@ def test_visualize_codebook_embeddings():
         num_embeddings=K, 
         embedding_dim=C, 
         sparsity_level=4,
-        normalize_atoms=False,
         patch_size=1
     )
     dl.dictionary.data.copy_(codebook.t().contiguous())  # DL uses [C, K]
@@ -1133,13 +1129,12 @@ def test_visualize_codebook_embeddings():
 def test_ksvd_basic_shapes():
     """Test K-SVD output shapes and finite values."""
     torch.manual_seed(0)
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=32,
         embedding_dim=16,
         sparsity_level=3,
         commitment_cost=0.25,
         ksvd_iterations=1,
-        normalize_atoms=True,
     )
     
     z = torch.randn(2, 16, 4, 4, requires_grad=True)
@@ -1154,7 +1149,7 @@ def test_ksvd_basic_shapes():
 def test_ksvd_iht_solver_sparse_codes():
     """Ensure iterative hard thresholding produces sparse codes."""
     torch.manual_seed(11)
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=24,
         embedding_dim=8,
         sparsity_level=4,
@@ -1176,12 +1171,11 @@ def test_ksvd_iht_solver_sparse_codes():
 def test_ksvd_dictionary_update():
     """Test that K-SVD updates the dictionary during training."""
     torch.manual_seed(1)
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=16,
         embedding_dim=8,
         sparsity_level=3,
         ksvd_iterations=2,
-        normalize_atoms=True,
     )
     
     # Store initial dictionary
@@ -1196,16 +1190,15 @@ def test_ksvd_dictionary_update():
     dict_after = ksvd.dictionary.data
     assert not torch.allclose(dict_before, dict_after, atol=1e-6)
     
-    # Dictionary atoms should be normalized
-    if ksvd.normalize_atoms:
-        norms = torch.linalg.norm(dict_after, dim=0)
-        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
+    # Dictionary atoms should always be normalized
+    norms = torch.linalg.norm(dict_after, dim=0)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
 
 
 def test_ksvd_no_update_in_eval():
     """Test that K-SVD doesn't update dictionary in eval mode."""
     torch.manual_seed(2)
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=16,
         embedding_dim=8,
         sparsity_level=3,
@@ -1227,7 +1220,7 @@ def test_ksvd_no_update_in_eval():
 
 
 def test_ksvd_vs_regular_dl_comparison():
-    """Compare K-SVD with regular OMP-based dictionary learning."""
+    """Compare K-SVD mode with backprop-only mode."""
     torch.manual_seed(3)
     
     # Create synthetic data with known structure
@@ -1238,29 +1231,26 @@ def test_ksvd_vs_regular_dl_comparison():
     sparsity = 4
     
     # Initialize both with same dictionary
-    # K-SVD uses [atom_dim, num_embeddings] = [C, K]
-    # Regular DL uses [atom_dim, num_embeddings] = [C, K] too for pixel-level
     init_dict = torch.randn(C, K)
     init_dict = F.normalize(init_dict, dim=0)
     
-    # K-SVD model
-    ksvd = KSVDDictionaryLearning(
+    # K-SVD mode: uses K-SVD updates
+    ksvd = DictionaryLearning(
         num_embeddings=K,
         embedding_dim=C,
         sparsity_level=sparsity,
         ksvd_iterations=3,
-        normalize_atoms=True,
+        use_backprop_only=False,
     )
     ksvd.dictionary.data.copy_(init_dict)
     
-    # Regular DL model
+    # Backprop-only mode: dictionary learned via gradients
     dl = DictionaryLearning(
         num_embeddings=K,
         embedding_dim=C,
         sparsity_level=sparsity,
-        normalize_atoms=True,
+        use_backprop_only=True,
     )
-    # Regular DL also uses [atom_dim, num_embeddings] = [C, K] for pixel-level (patch_size=1)
     dl.dictionary.data.copy_(init_dict)
     
     # Train both models
@@ -1296,7 +1286,7 @@ def test_ksvd_patch_based():
     torch.manual_seed(4)
     
     patch_size = 2
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=16,
         embedding_dim=4,
         sparsity_level=3,
@@ -1325,12 +1315,11 @@ def test_ksvd_visualization():
     
     K = 16
     
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=K,
         embedding_dim=C,
         sparsity_level=4,
         ksvd_iterations=5,
-        normalize_atoms=True,
     )
     
     # Train for multiple iterations
@@ -1406,7 +1395,7 @@ def test_ksvd_convergence():
     B, C, H, W = 4, 8, 32, 32
     z = torch.randn(B, C, H, W)
     
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=32,
         embedding_dim=C,
         sparsity_level=5,
@@ -1455,12 +1444,11 @@ def test_ksvd_codebook_heatmaps():
     
     # Initialize K-SVD with k-means
     codebook = _kmeans_codebook(z, K)  # Returns [K, C]
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=K,
         embedding_dim=C,
         sparsity_level=5,
         ksvd_iterations=3,
-        normalize_atoms=True,
     )
     ksvd.dictionary.data.copy_(codebook.t().contiguous())  # K-SVD needs [C, K]
     
@@ -1570,17 +1558,15 @@ def test_ksvd_vq_dl_comparison_visualization():
         num_embeddings=K,
         embedding_dim=C,
         sparsity_level=4,
-        normalize_atoms=True,
     )
     dl.dictionary.data.copy_(codebook.t().contiguous())  # DL needs [C, K]
     
     # K-SVD
-    ksvd = KSVDDictionaryLearning(
+    ksvd = DictionaryLearning(
         num_embeddings=K,
         embedding_dim=C,
         sparsity_level=4,
         ksvd_iterations=3,
-        normalize_atoms=True,
     )
     ksvd.dictionary.data.copy_(codebook.t().contiguous())  # K-SVD needs [C, K]
     

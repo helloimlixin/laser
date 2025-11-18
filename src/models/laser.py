@@ -6,7 +6,7 @@ import torchvision
 
 from .encoder import Encoder
 from .decoder import Decoder
-from .bottleneck import KSVDDictionaryLearning
+from .bottleneck import DictionaryLearning
 from .lpips import LPIPS
 from .losses import multi_resolution_dct_loss, multi_resolution_gradient_loss
 
@@ -39,6 +39,7 @@ class LASER(pl.LightningModule):
             multi_res_grad_levels=3,
         use_online_learning=True,
         use_backprop_only=False,
+        sparsity_reg_weight=0.01,  # L1 regularization on coefficients
     ):
         """Initialize K-SVD VAE model.
 
@@ -63,6 +64,7 @@ class LASER(pl.LightningModule):
             multi_res_grad_weight: weight for edge-preserving gradient loss
             multi_res_grad_levels: number of pyramid levels for gradient loss
             use_backprop_only: whether to use only backprop for dictionary learning (much faster, no sparsity)
+            sparsity_reg_weight: L1 regularization weight on sparse coefficients
         """
         super(LASER, self).__init__()
 
@@ -77,6 +79,7 @@ class LASER(pl.LightningModule):
         self.mr_dct_levels = multi_res_dct_levels
         self.mr_grad_weight = multi_res_grad_weight
         self.mr_grad_levels = multi_res_grad_levels
+        self.sparsity_reg_weight = sparsity_reg_weight
 
         # Initialize encoder
         self.encoder = Encoder(
@@ -91,14 +94,13 @@ class LASER(pl.LightningModule):
                                         kernel_size=1,
                                         stride=1)
 
-        # Initialize K-SVD bottleneck
-        self.bottleneck = KSVDDictionaryLearning(
+        # Initialize Dictionary Learning bottleneck
+        self.bottleneck = DictionaryLearning(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             sparsity_level=sparsity_level,
             commitment_cost=commitment_cost,
             ksvd_iterations=ksvd_iterations,
-            normalize_atoms=True,
             patch_size=patch_size,
             use_online_learning=use_online_learning,
             use_backprop_only=use_backprop_only,
@@ -144,8 +146,8 @@ class LASER(pl.LightningModule):
             x: Input tensor [B, C, H, W]
 
         Returns:
-            z_dl: latent representation from K-SVD bottleneck
-            bottleneck_loss: loss from the K-SVD bottleneck
+            z_dl: latent representation from dictionary learning bottleneck
+            bottleneck_loss: loss from the dictionary learning bottleneck
             coefficients: sparse coefficients
         """
         z_e = self.encoder(x)
@@ -158,7 +160,7 @@ class LASER(pl.LightningModule):
         Decode latent representation to reconstruction.
 
         Args:
-            z_dl: latent representation from K-SVD bottleneck
+            z_dl: latent representation from dictionary learning bottleneck
 
         Returns:
             x_recon: reconstruction of the input
@@ -199,6 +201,9 @@ class LASER(pl.LightningModule):
         # Compute losses
         recon_loss = F.mse_loss(recon_raw, x)
         
+        # L1 regularization on sparse coefficients to encourage true sparsity
+        sparsity_loss = torch.abs(coefficients).mean()
+        
         # Perceptual loss - only compute during training for quality
         if self.lpips is not None and self.perceptual_weight > 0 and prefix == 'train':
             perceptual_loss = self.lpips(recon_raw, x).mean()
@@ -223,7 +228,8 @@ class LASER(pl.LightningModule):
             10 * bottleneck_loss +
             self.perceptual_weight * perceptual_loss +
             self.mr_dct_weight * mr_dct_loss +
-            self.mr_grad_weight * mr_grad_loss
+            self.mr_grad_weight * mr_grad_loss +
+            self.sparsity_reg_weight * sparsity_loss  # L1 penalty on coefficients
         )
         
         # Compute metrics on clamped/sanitized tensors
@@ -246,6 +252,7 @@ class LASER(pl.LightningModule):
         self.log(f'{prefix}/recon_loss', recon_loss, sync_dist=True)
         self.log(f'{prefix}/bottleneck_loss', bottleneck_loss, sync_dist=True)
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, sync_dist=True)
+        self.log(f'{prefix}/sparsity_loss', sparsity_loss, sync_dist=True)
         self.log(f'{prefix}/mr_dct_loss', mr_dct_loss, sync_dist=True)
         self.log(f'{prefix}/mr_grad_loss', mr_grad_loss, sync_dist=True)
         self.log(f'{prefix}/psnr', psnr, prog_bar=True, sync_dist=True)
@@ -369,10 +376,12 @@ class LASER(pl.LightningModule):
         if self.bottleneck.use_backprop_only:
             params += list(self.bottleneck.parameters())
 
-        optimizer = torch.optim.Adam(
+        # Add weight decay for regularization to prevent overfitting
+        optimizer = torch.optim.AdamW(
             params,
             lr=self.learning_rate,
-            betas=(self.beta, 0.999)
+            betas=(self.beta, 0.999),
+            weight_decay=1e-4  # L2 regularization
         )
 
         return optimizer

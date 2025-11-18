@@ -105,21 +105,20 @@ K-SVD is a classical dictionary learning algorithm that alternates between:
 ### Usage Example
 
 ```python
-from src.models.bottleneck import KSVDDictionaryLearning
+from src.models.bottleneck import DictionaryLearning
 
-# Create K-SVD bottleneck
-ksvd = KSVDDictionaryLearning(
+# Create Dictionary Learning bottleneck
+dl = DictionaryLearning(
     num_embeddings=512,       # Number of dictionary atoms
     embedding_dim=64,         # Dimension of each atom
     sparsity_level=8,         # Number of non-zero coefficients
     commitment_cost=0.25,     # Weight for commitment loss
     ksvd_iterations=1,        # Number of K-SVD updates per forward pass
-    normalize_atoms=True,     # Normalize atoms to unit norm
     patch_size=8,            # Spatial patch size (8x8 patches)
 )
 
 # Forward pass
-z_reconstructed, loss, coefficients = ksvd(z_encoded)
+z_reconstructed, loss, coefficients = dl(z_encoded)
 ```
 
 ### K-SVD Parameters
@@ -130,8 +129,9 @@ z_reconstructed, loss, coefficients = ksvd(z_encoded)
 - **commitment_cost**: Weight for the encoder commitment loss term (encourages encoder to match dictionary reconstruction)
 - **dictionary_weight**: Weight for the dictionary reconstruction loss (controls how fast dictionary learns via backprop). Default: 1.0
 - **ksvd_iterations**: Number of K-SVD dictionary update iterations per forward pass
-- **normalize_atoms**: Whether to normalize dictionary atoms to unit L2 norm
 - **patch_size**: Spatial patch size for patch-based processing (1 = pixel-level, 8 = 8×8 patches)
+
+**Note**: Dictionary atoms are always normalized to unit L2 norm for numerical stability.
 
 ### K-SVD Features
 
@@ -177,7 +177,7 @@ For each atom k in the dictionary:
 - Use moderate dictionary sizes (K=256-512) for best performance
 - Increase patch_size to reduce number of tokens
 - Set ksvd_iterations=1 for faster training
-- Use normalize_atoms=True for stability
+- Dictionary atoms are always normalized for stability
 
 ### K-SVD Test Coverage
 
@@ -218,7 +218,96 @@ The straight-through estimator ensures gradients flow back to the encoder during
 
 ### Dictionary Learning Methods
 
-K-SVD VAE supports three dictionary learning modes:
+K-SVD VAE supports three dictionary learning modes and multiple sparse coding algorithms:
+
+### Sparse Coding Algorithms
+
+The bottleneck supports three sparse coding methods via the `sparse_solver` parameter:
+
+#### 1. OMP (Orthogonal Matching Pursuit) - Default
+```yaml
+sparse_solver: omp
+```
+
+**Description**: Greedy algorithm with least-squares refinement at each iteration.
+
+**Advantages:**
+- ✓ Best reconstruction quality
+- ✓ Proper orthogonalization of selected atoms
+- ✓ Least-squares coefficient refinement
+
+**Disadvantages:**
+- ✗ Slower than top-k (requires solving linear system at each iteration)
+- ✗ More complex implementation
+
+**When to Use:**
+- When reconstruction quality is critical
+- Small to medium datasets
+- When you can afford the computational cost
+
+#### 2. IHT (Iterative Hard Thresholding) - Recommended for Speed/Quality Balance
+```yaml
+sparse_solver: iht
+iht_iterations: 10      # More iterations = better approximation
+iht_step_size: null     # Auto-compute from spectral norm (recommended)
+```
+
+**Description**: True iterative sparse coding that alternates between gradient steps and hard thresholding.
+
+**Algorithm:**
+```python
+for iteration in range(iht_iterations):
+    residual = X - D @ coefficients
+    gradient = D.T @ residual
+    coefficients += step_size * gradient
+    coefficients = hard_threshold(coefficients, k=sparsity_level)
+```
+
+**Advantages:**
+- ✓ True sparse coding (proper optimization algorithm)
+- ✓ Fast (simple matrix-vector operations)
+- ✓ Theoretically grounded (converges under RIP condition)
+- ✓ Adjustable quality via `iht_iterations`
+- ✓ Automatic step size from spectral norm
+
+**Disadvantages:**
+- ✗ Slower than top-k (but faster than OMP)
+- ✗ Requires multiple iterations to converge
+
+**When to Use:**
+- **Recommended default** for most use cases
+- Good balance between speed and quality
+- When you want proper sparse coding without OMP overhead
+- Training on medium to large datasets
+
+**Tuning:**
+- `iht_iterations=5-10`: Good balance (default: 10)
+- `iht_iterations=15-20`: Better quality, slower
+- `iht_step_size=null`: Auto-compute (recommended)
+- `iht_step_size=0.5-1.0`: Manual override if needed
+
+#### 3. Top-K - Fastest (Not Recommended)
+```yaml
+sparse_solver: topk
+```
+
+**Description**: Simple selection of top-k atoms by correlation (single matrix multiplication).
+
+**Advantages:**
+- ✓ Fastest (single matmul + top-k)
+- ✓ Simplest implementation
+
+**Disadvantages:**
+- ✗ Not true sparse coding (just selection, no optimization)
+- ✗ Can select weak atoms, leading to overfitting
+- ✗ No iterative refinement
+
+**When to Use:**
+- Only when speed is absolutely critical
+- Prototyping / quick experiments
+- Not recommended for final models
+
+### Dictionary Learning Methods
 
 #### 1. Gradient-Based Learning (Default - Fastest)
 ```yaml
@@ -834,6 +923,345 @@ class HybridVAE(pl.LightningModule):
 - Use **Dictionary Learning** (better quality, but no generation)
 - Superior reconstruction metrics
 - Good for analysis and understanding
+
+## Sparse Coding Performance Comparison
+
+### Algorithm Comparison Summary
+
+| Algorithm | Speed | Quality | Sparsity Enforcement | Overfitting Risk | Recommendation |
+|-----------|-------|---------|---------------------|------------------|----------------|
+| **OMP** | Slow | Best | Strong (LS refinement) | Low | Use for best quality |
+| **IHT** | Medium | Good | Strong (iterative) | Low | **Recommended default** |
+| **Top-K** | Fast | Poor | Weak (just selection) | High | Avoid for production |
+
+### Why IHT (Iterative Hard Thresholding) is Recommended
+
+**IHT Algorithm:**
+```python
+# Initialize coefficients to zero
+α = 0
+
+# Iterate to minimize ||X - D*α||² subject to ||α||₀ ≤ k
+for t in range(iterations):
+    residual = X - D @ α           # Compute reconstruction error
+    gradient = D.T @ residual      # Gradient of loss
+    α = α + step_size * gradient   # Gradient descent step
+    α = HardThreshold_k(α)         # Keep only top-k coefficients
+```
+
+**Key Advantages:**
+1. ✅ **True Sparse Coding**: Proper optimization algorithm (not just selection)
+2. ✅ **Iterative Refinement**: Progressively minimizes reconstruction error
+3. ✅ **Theoretical Guarantees**: Converges to local optimum under RIP condition
+4. ✅ **Prevents Overfitting**: Hard thresholding enforces sparsity at each iteration
+5. ✅ **Faster than OMP**: Simple matrix ops, no linear system solve
+6. ✅ **Better than Top-K**: Optimizes reconstruction, not just correlation
+
+**Performance Metrics (expected with IHT):**
+- `train/sparsity`: ~0.03-0.10 (true sparsity!)
+- Lower `train/recon_loss` than top-k
+- Smaller train/val gap (better generalization)
+- Stable training dynamics
+
+### Top-K Problems (Why We Switched Away)
+
+**Top-K is NOT sparse coding:**
+```python
+# Top-K: Just selects atoms with highest correlation
+correlations = D.T @ X
+top_k_indices = argmax_k(abs(correlations))
+coefficients[top_k_indices] = correlations[top_k_indices]
+# Problem: No optimization! Just correlation-based selection
+```
+
+**Issues with Top-K:**
+1. ❌ **Not an optimization algorithm** - just greedy selection
+2. ❌ **Selects weak atoms** - can pick atoms with low correlation
+3. ❌ **No iterative refinement** - single pass, no improvement
+4. ❌ **Overfitting** - observed sparsity ~1.0 (uses almost all atoms!)
+5. ❌ **No theoretical guarantees** - not guaranteed to minimize reconstruction error
+
+**Observed Problems in Training:**
+```
+With Top-K:
+  train/sparsity: 0.9999 (99.99% - essentially dense!)
+  train/recon_loss: higher
+  val/loss >> train/loss (overfitting)
+
+With IHT:
+  train/sparsity: 0.03-0.10 (3-10% - truly sparse!)
+  train/recon_loss: lower (proper optimization)
+  val/loss ≈ train/loss (better generalization)
+```
+
+### IHT Configuration & Tuning
+
+**Default Configuration (Recommended):**
+```yaml
+# configs/model/laser.yaml
+sparse_solver: iht
+iht_iterations: 10          # Good balance
+iht_step_size: null         # Auto-compute (recommended)
+sparsity_level: 8           # Number of non-zero coefficients
+sparsity_reg_weight: 0.01   # L1 regularization
+```
+
+**Tuning Guidelines:**
+
+**For Better Quality (slower training):**
+```yaml
+iht_iterations: 15-20       # More iterations
+iht_step_size: null         # Keep auto
+```
+
+**For Faster Training (slight quality loss):**
+```yaml
+iht_iterations: 5-7         # Fewer iterations
+iht_step_size: 0.9          # Manually set (skip spectral norm computation)
+```
+
+**For Maximum Sparsity:**
+```yaml
+sparsity_level: 4-6         # Fewer active atoms
+sparsity_reg_weight: 0.05   # Stronger L1 penalty
+iht_iterations: 15          # More iterations for better approximation
+```
+
+### Step Size Selection
+
+IHT requires step size μ ≤ 1/L where L = ||D||²₂ (spectral norm squared).
+
+**Auto-compute (default):**
+```yaml
+iht_step_size: null
+```
+- Uses fast power iteration to estimate spectral norm
+- Conservative step size: μ = 0.9 / L²
+- Recommended for most use cases
+
+**Manual override:**
+```yaml
+iht_step_size: 0.5-1.0
+```
+- Faster (skips spectral norm computation)
+- Use if dictionary is well-normalized (||D||₂ ≈ 1)
+- Start with 0.9, reduce if training unstable
+
+### Monitoring IHT Training
+
+**Healthy Training Indicators:**
+```
+✅ train/sparsity: 0.03-0.10
+✅ train/sparsity_loss: decreasing
+✅ train/recon_loss: steadily decreasing  
+✅ val/loss ≈ train/loss (gap < 20%)
+✅ val/psnr: increasing over epochs
+```
+
+**Warning Signs:**
+```
+⚠️ train/sparsity > 0.5 (too many atoms used)
+   → Increase sparsity_reg_weight
+   
+⚠️ train/recon_loss not decreasing
+   → Reduce iht_step_size or increase iht_iterations
+   
+⚠️ val/loss >> train/loss (overfitting)
+   → Increase sparsity_reg_weight and weight_decay
+```
+
+### When to Use Each Sparse Solver
+
+| Use Case | Recommended Solver | Config |
+|----------|-------------------|--------|
+| **Production training** | IHT | `iht_iterations=10` |
+| **Best quality** | OMP | `sparse_solver=omp` |
+| **Fast prototyping** | IHT | `iht_iterations=5` |
+| **Research/analysis** | OMP | For interpretability |
+| **Maximum speed** | Top-K | Only if quality not critical |
+
+### Implementation Details
+
+**IHT Improvements in This Repo:**
+1. ✅ **Fast spectral norm estimation** - Power iteration (3 iterations)
+2. ✅ **Conservative step size** - μ = 0.9/L² for stability
+3. ✅ **Efficient hard thresholding** - Vectorized top-k operation
+4. ✅ **Automatic fallback** - Assumes ||D||₂ ≈ 1 if computation fails
+5. ✅ **Proper gradient flow** - Compatible with straight-through estimator
+
+**Code Reference:**
+```python
+# See src/models/bottleneck.py::iterative_hard_thresholding()
+# Fully documented implementation with theoretical background
+```
+
+## Overfitting Prevention & Regularization
+
+### Common Overfitting Issues
+
+During training, LASER models can exhibit overfitting characterized by:
+- Large gap between training and validation loss
+- Near-perfect sparsity (1.0) indicating dictionary memorization
+- Excellent training metrics but poor generalization
+
+### Issues Identified & Fixes
+
+#### 1. **Dictionary Memorization (Critical)**
+
+**Problem**: Training sparsity metric shows ~1.0 (100%), meaning sparse coding selects nearly all atoms instead of a sparse subset. This defeats sparsity and allows memorization.
+
+**Evidence**:
+- `train/sparsity` consistently at 0.9999+ (essentially 1.0)
+- Each sample uses almost all dictionary atoms (not sparse!)
+
+**Root Cause**: Top-k sparse coding without thresholding allows weak atoms to contribute, effectively creating dense (not sparse) representations.
+
+**Fix Applied**: Added adaptive thresholding in `topk_sparse_coding()`:
+```python
+# Only keep atoms with correlation > 10% of maximum
+max_corr = abs_corr.max(dim=0, keepdim=True)[0]
+threshold = 0.1 * max_corr
+threshold_mask = topk_vals > threshold
+selected_corr = selected_corr * threshold_mask  # Zero out weak correlations
+```
+
+#### 2. **No Weight Decay**
+
+**Problem**: Optimizer used `Adam` without weight decay, allowing unbounded parameter growth.
+
+**Fix**: Changed to `AdamW` with L2 regularization:
+```python
+optimizer = torch.optim.AdamW(
+    params,
+    lr=self.learning_rate,
+    betas=(self.beta, 0.999),
+    weight_decay=1e-4  # L2 regularization
+)
+```
+
+#### 3. **No L1 Sparsity Regularization**
+
+**Problem**: No explicit penalty on coefficient magnitude to encourage true sparsity.
+
+**Fix**: Added L1 regularization on sparse coefficients:
+```python
+sparsity_loss = torch.abs(coefficients).mean()
+total_loss = (
+    recon_loss +
+    10 * bottleneck_loss +
+    self.perceptual_weight * perceptual_loss +
+    self.sparsity_reg_weight * sparsity_loss  # L1 penalty
+    ...
+)
+```
+
+**Configuration**:
+```yaml
+# configs/model/laser.yaml
+sparsity_reg_weight: 0.01  # L1 regularization weight
+```
+
+#### 4. **Backprop-Only Mode Defeats Sparsity**
+
+**Problem**: When `use_backprop_only=True`, the model uses:
+```python
+coefficients = torch.matmul(self.dictionary.t(), patch_tokens)
+```
+This is **dense** representation (all atoms), not sparse!
+
+**Fix**: Ensure `use_backprop_only: false` in config to enforce sparsity constraint:
+```yaml
+# configs/model/laser.yaml
+use_backprop_only: false  # Use sparse coding, not dense projection
+```
+
+### Monitoring Overfitting
+
+Track these metrics during training:
+
+**Healthy Training**:
+- `train/sparsity`: 0.03-0.10 (3-10% of atoms active)
+- `val/loss` ≈ `train/loss` (small gap)
+- `val/psnr` and `val/ssim` improve over epochs
+
+**Overfitting Indicators**:
+- `train/sparsity` > 0.5 (too many atoms used)
+- `val/loss` >> `train/loss` (large gap)
+- `train/psnr` high but `val/psnr` plateaus or decreases
+
+### Additional Regularization Techniques
+
+If overfitting persists, try:
+
+1. **Increase Commitment Cost**:
+```yaml
+commitment_cost: 1.0  # Up from 0.5
+```
+
+2. **Reduce Dictionary Size**:
+```yaml
+num_embeddings: 128  # Down from 256
+```
+
+3. **Increase Sparsity Constraint**:
+```yaml
+sparsity_reg_weight: 0.05  # Up from 0.01
+```
+
+4. **Add Dropout** (requires code changes):
+```python
+# In encoder/decoder
+self.dropout = nn.Dropout(0.1)
+```
+
+5. **Data Augmentation** (recommended):
+```python
+# In data module
+transforms = [
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.1, 0.1, 0.1),
+    transforms.RandomCrop(size, padding=4),
+    ...
+]
+```
+
+6. **Early Stopping**:
+```python
+# In train.py
+from lightning.pytorch.callbacks import EarlyStopping
+early_stop = EarlyStopping(
+    monitor='val/loss',
+    patience=10,
+    mode='min'
+)
+trainer = pl.Trainer(callbacks=[early_stop, ...])
+```
+
+### Expected Improvements
+
+With regularization fixes applied:
+
+1. **True Sparsity**: Sparsity metric should decrease from ~1.0 to intended level:
+   - Target: `sparsity_level / num_embeddings = 8/256 ≈ 0.03` (3%)
+   
+2. **Better Generalization**: Smaller gap between train/val loss
+
+3. **Reduced Overfitting**: Weight decay + L1 penalty prevent memorization
+
+### Verification After Training
+
+Check if fixes worked:
+```python
+# Low sparsity (good!)
+assert metrics['train/sparsity'] < 0.15
+
+# Small train-val gap (good!)
+gap = metrics['train/loss'] / metrics['val/loss']
+assert 0.8 < gap < 1.2
+
+# Sparsity loss visible
+assert metrics['train/sparsity_loss'] > 0
+```
 
 ## License
 

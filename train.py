@@ -19,7 +19,6 @@ os.environ.setdefault("DEEPSPEED_LOG_LEVEL", "warning")
 
 torch.set_float32_matmul_precision('medium')
 
-from src.models.dlvae import DLVAE
 from src.models.vqvae import VQVAE
 from src.models.laser import LASER
 from src.data.cifar10 import CIFAR10DataModule
@@ -75,24 +74,12 @@ def train(cfg: DictConfig):
     print(f"Embedding Dimensions: {cfg.model.embedding_dim}")
     print(f"Number of Residual Blocks: {cfg.model.num_residual_blocks}")
     print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
-    if cfg.model.type in ["dlvae", "laser"]:
+    if cfg.model.type == "laser":
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
         if hasattr(cfg.model, "patch_size"):
             print(f"Latent Patch Size: {cfg.model.patch_size}")
-        if cfg.model.type == "laser":
-            print(f"K-SVD Iterations: {getattr(cfg.model, 'ksvd_iterations', 2)}")
-        if cfg.model.type == "dlvae":
-            if getattr(cfg.model, "multi_res_dct_weight", 0.0) > 0:
-                print(f"Multi-res DCT: weight={cfg.model.multi_res_dct_weight}, levels={cfg.model.multi_res_dct_levels}")
-            if getattr(cfg.model, "multi_res_grad_weight", 0.0) > 0:
-                print(f"Multi-res Grad: weight={cfg.model.multi_res_grad_weight}, levels={cfg.model.multi_res_grad_levels}")
-            if getattr(cfg.model, "dictionary_ortho_weight", 0.0) > 0:
-                print(f"Dictionary Ortho Weight: {cfg.model.dictionary_ortho_weight}")
-            if hasattr(cfg.model, "omp_tolerance"):
-                print(f"OMP Tolerance: {cfg.model.omp_tolerance}")
-            if hasattr(cfg.model, "omp_debug"):
-                print(f"OMP Debug: {cfg.model.omp_debug}")
+        print(f"K-SVD Iterations: {getattr(cfg.model, 'ksvd_iterations', 2)}")
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -218,32 +205,7 @@ def train(cfg: DictConfig):
         return sample[:2].to('cpu')
     
     # Initialize model based on type
-    if cfg.model.type == "dlvae":
-        model_params = {
-            'in_channels': cfg.model.in_channels,
-            'num_hiddens': cfg.model.num_hiddens,
-            'num_embeddings': cfg.model.num_embeddings,
-            'embedding_dim': cfg.model.embedding_dim,
-            'num_residual_blocks': cfg.model.num_residual_blocks,
-            'num_residual_hiddens': cfg.model.num_residual_hiddens,
-            'commitment_cost': cfg.model.commitment_cost,
-            'decay': cfg.model.decay,
-            'perceptual_weight': cfg.model.perceptual_weight,
-            'learning_rate': cfg.train.learning_rate,
-            'beta': cfg.train.beta,
-            'compute_fid': cfg.model.compute_fid,
-            'sparsity_level': cfg.model.sparsity_level,
-            'omp_tolerance': getattr(cfg.model, 'omp_tolerance', 1e-7),
-            'omp_debug': getattr(cfg.model, 'omp_debug', False),
-            'patch_size': getattr(cfg.model, 'patch_size', 1),
-            'multi_res_dct_weight': getattr(cfg.model, 'multi_res_dct_weight', 0.0),
-            'multi_res_dct_levels': getattr(cfg.model, 'multi_res_dct_levels', 3),
-            'multi_res_grad_weight': getattr(cfg.model, 'multi_res_grad_weight', 0.0),
-            'multi_res_grad_levels': getattr(cfg.model, 'multi_res_grad_levels', 3),
-            'dictionary_ortho_weight': getattr(cfg.model, 'dictionary_ortho_weight', 0.0),
-        }
-        model = DLVAE(**model_params)
-    elif cfg.model.type == "laser":
+    if cfg.model.type == "laser":
         model_params = {
             'in_channels': cfg.model.in_channels,
             'num_hiddens': cfg.model.num_hiddens,
@@ -325,7 +287,7 @@ def train(cfg: DictConfig):
             num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
         except Exception:
             num_devices = 1
-        if cfg.model.type in ("dlvae", "vqvae") and num_devices and num_devices > 1:
+        if cfg.model.type == "vqvae" and num_devices and num_devices > 1:
             strategy_cfg = "ddp"
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,

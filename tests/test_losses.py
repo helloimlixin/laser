@@ -38,7 +38,7 @@ def test_multi_resolution_gradient_loss_detects_edge_difference():
 
 
 def test_dictionary_orthogonality_loss_zero_for_orthonormal_atoms():
-    bottleneck = DictionaryLearning(num_embeddings=2, embedding_dim=2, patch_size=1, normalize_atoms=False)
+    bottleneck = DictionaryLearning(num_embeddings=2, embedding_dim=2, patch_size=1)
     with torch.no_grad():
         bottleneck.dictionary.copy_(torch.eye(2))
     loss = bottleneck.orthogonality_loss()
@@ -46,7 +46,7 @@ def test_dictionary_orthogonality_loss_zero_for_orthonormal_atoms():
 
 
 def test_dictionary_orthogonality_loss_detects_correlated_atoms():
-    bottleneck = DictionaryLearning(num_embeddings=2, embedding_dim=2, patch_size=1, normalize_atoms=False)
+    bottleneck = DictionaryLearning(num_embeddings=2, embedding_dim=2, patch_size=1)
     twin_atom = torch.tensor([[1.0, 1.0],
                               [0.0, 0.0]])
     with torch.no_grad():

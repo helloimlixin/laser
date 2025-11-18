@@ -1,28 +1,159 @@
+# Model type: laser (K-SVD Dictionary Learning VAE)
+# Other options: vqvae, dlvae
 type: laser
+
+# Number of input image channels
+# Options: 3 (RGB), 1 (grayscale)
 in_channels: 3
-num_hiddens: 128
-num_embeddings: 512
+
+# Number of hidden units in encoder/decoder
+# Typical range: 32-256
+# Higher = more capacity, slower training
+num_hiddens: 64
+
+# Dictionary size (number of atoms/embeddings)
+# Typical range: 128-1024
+# Higher = more expressive, slower sparse coding
+num_embeddings: 256
+
+# Dimension of each dictionary atom
+# Should match encoder output channels
+# Typical range: 32-128
 embedding_dim: 64
+
+# Sparsity level (max number of non-zero coefficients per signal)
+# Must be < num_embeddings
+# Typical range: 4-32
+# Lower = more sparse (better generalization, lower quality)
+# Higher = less sparse (better quality, risk of overfitting)
 sparsity_level: 8
-patch_size: 8  # Smaller patches for speed (4×4 = atom_dim 1024 vs 8×8 = 4096)
+
+# Spatial patch size for patch-based dictionary learning
+# Options: 1 (pixel-level), 2, 4, 8, 16, or tuple (h, w)
+# 1 = best quality, slowest
+# 4-8 = good balance
+# 16+ = fastest, lower quality
+patch_size: 8
+
+# Number of residual blocks in encoder/decoder
+# Typical range: 2-6
+# Higher = more capacity, deeper network
 num_residual_blocks: 2
-num_residual_hiddens: 64
-commitment_cost: 0.25
-ksvd_iterations: 1  # Enable K-SVD dictionary updates
-dictionary_update_frequency: 0  # Update every step
-use_online_learning: true  # Use fast online learning instead of SVD
-dict_learning_rate: 0.3  # Learning rate for online dictionary updates
-sparse_solver: topk  # Fast top-k sparse coding (single matmul + top-k, no iterations)
-iht_iterations: 1  # Only used if sparse_solver=iht
-iht_step_size: null  # Only used if sparse_solver=iht
-use_backprop_only: true  # Use only backprop for dictionary learning (much faster, no sparsity constraint)
+
+# Number of hidden units in residual blocks
+# Typical range: 16-128
+num_residual_hiddens: 32
+
+# Commitment cost (weight for encoder loss term)
+# Typical range: 0.1-1.0
+# Higher = encoder forced to match dictionary reconstruction more closely
+commitment_cost: 0.5
+
+# Number of K-SVD dictionary update iterations per forward pass
+# Options: 0 (disabled), 1-5
+# 0 = gradient-based learning only
+# 1-2 = fast K-SVD updates
+# 3-5 = better atoms, slower
+ksvd_iterations: 0  # Disabled when using backprop-only mode
+
+# Dictionary update frequency (update every N training steps)
+# Options: 0 (every step), 1-10 (every N steps)
+# 0 = update every step (recommended)
+dictionary_update_frequency: 0
+
+# Use online dictionary learning instead of K-SVD
+# Options: true (fast online updates), false (classical K-SVD)
+# true = faster, good for large datasets
+# false = higher quality atoms, better for small datasets
+use_online_learning: false  # Disabled when using backprop-only mode
+
+# Learning rate for online dictionary updates
+# Only used if use_online_learning=true
+# Typical range: 0.1-0.5
+# Higher = faster dictionary adaptation
+dict_learning_rate: 0.3
+
+# Sparse coding algorithm
+# Options: 'omp' (best quality), 'iht' (recommended), 'topk' (fastest, not recommended)
+# omp = Orthogonal Matching Pursuit (slow, best quality)
+# iht = Iterative Hard Thresholding (fast, good quality, RECOMMENDED)
+# topk = Top-K selection (fastest, poor quality, overfitting risk)
+sparse_solver: iht
+
+# Number of IHT iterations
+# Only used if sparse_solver='iht'
+# Typical range: 5-20
+# 5-7 = fast, slight quality loss
+# 10 = good balance (recommended)
+# 15-20 = best quality, slower
+iht_iterations: 10
+
+# IHT step size (1/Lipschitz constant)
+# Only used if sparse_solver='iht'
+# Options: null (auto-compute, recommended), 0.5-1.0 (manual)
+# null = automatically computed from spectral norm
+# 0.9 = good manual default for normalized dictionaries
+iht_step_size: null
+
+# Use backprop-only mode (dense representation, no sparsity)
+# Options: true (dense, fast but no sparsity), false (sparse, RECOMMENDED)
+# true = dictionary learned via gradients (smoother updates, may help overfitting)
+# false = dictionary updated via K-SVD/online learning
+# NOTE: When true, IHT still used for sparse coding! Only dictionary update changes.
+use_backprop_only: true
+
+# L1 regularization weight on sparse coefficients
+# Typical range: 0.0-0.1
+# 0.0 = no regularization
+# 0.01 = mild regularization (recommended)
+# 0.05-0.1 = strong regularization (max sparsity)
+# Increase this if still overfitting with backprop-only mode
+sparsity_reg_weight: 0.02  # Increased from 0.01 for stronger regularization
+
+# Perceptual loss weight (LPIPS)
+# Typical range: 0.0-2.0
+# 0.0 = no perceptual loss
+# 0.5-1.0 = good balance (recommended)
+# Higher = better perceptual quality, slower training
 perceptual_weight: 0.5
+
+# Learning rate for encoder/decoder/dictionary (if use_backprop_only=true)
+# Typical range: 1e-4 to 1e-3
+# 1e-4 = stable, slower
+# 1e-3 = faster, may be unstable
 learning_rate: 1e-3
+
+# Beta1 parameter for Adam/AdamW optimizer
+# Typical range: 0.5-0.99
+# 0.9 = standard default
 beta: 0.9
+
+# Compute FID (Frechet Inception Distance) during testing
+# Options: true (slower, comprehensive), false (faster)
 compute_fid: false
+
+# Log reconstruction images to W&B every N steps
+# Typical range: 100-1000
+# Lower = more frequent logging, larger logs
 log_images_every_n_steps: 500
+
+# Multi-resolution DCT loss weight
+# Typical range: 0.0-1.0
+# 0.0 = disabled
+# 0.5 = recommended for high-frequency detail preservation
 multi_res_dct_weight: 0.5
+
+# Number of pyramid levels for multi-resolution DCT loss
+# Typical range: 2-4
 multi_res_dct_levels: 3
+
+# Multi-resolution gradient loss weight
+# Typical range: 0.0-1.0
+# 0.0 = disabled
+# 0.5 = recommended for edge preservation
 multi_res_grad_weight: 0.5
+
+# Number of pyramid levels for multi-resolution gradient loss
+# Typical range: 2-4
 multi_res_grad_levels: 3
 
