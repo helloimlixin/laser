@@ -26,14 +26,14 @@ embedding_dim: 64
 # Typical range: 4-32
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
-sparsity_level: 8
+sparsity_level: 32
 
 # Spatial patch size for patch-based dictionary learning
 # Options: 1 (pixel-level), 2, 4, 8, 16, or tuple (h, w)
 # 1 = best quality, slowest
 # 4-8 = good balance
 # 16+ = fastest, lower quality
-patch_size: 8
+patch_size: 16
 
 # Number of residual blocks in encoder/decoder
 # Typical range: 2-6
@@ -78,7 +78,7 @@ dict_learning_rate: 0.3
 # omp = Orthogonal Matching Pursuit (slow, best quality)
 # iht = Iterative Hard Thresholding (fast, good quality, RECOMMENDED)
 # topk = Top-K selection (fastest, poor quality, overfitting risk)
-sparse_solver: omp
+sparse_solver: topk
 
 # Number of IHT iterations
 # Only used if sparse_solver='iht'
