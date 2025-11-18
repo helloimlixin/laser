@@ -1,19 +1,17 @@
 # LASER: Learnable Adaptive Structured Embedding Representation
 
-This repository provides three autoencoder baselines for image reconstruction:
+This repository provides autoencoder models with dictionary learning for image reconstruction:
 
-- **Vector Quantized VAE (VQ-VAE)** — discrete latent codes with a learnable codebook.
-- **Dictionary Learning VAE (DL-VAE)** — sparse dictionary bottleneck trained with Batch OMP.
-- **K-SVD VAE (K-SVD-VAE)** — dictionary learning with K-SVD updates (classical SVD-based algorithm).
-
-Generation utilities have been removed for now so you can focus on training and evaluating reconstructions only.
+- **LASER (Learnable Adaptive Structured Embedding Representation)** — Dictionary learning VAE with IHT/K-SVD sparse coding and flexible dictionary update strategies.
+- **VQ-VAE (Vector Quantized VAE)** — Baseline model with discrete latent codes and a learnable codebook.
 
 ## Features
 
-- 🚀 Choice of bottlenecks: vector quantization, gradient-based dictionary learning, or K-SVD
+- 🚀 Advanced dictionary learning with multiple sparse coding algorithms (IHT, OMP, Top-K)
 - ⚡ GPU-friendly implementation with AMP-aware sparse coding
-- 📊 Reconstruction quality metrics: MSE, PSNR, SSIM, optional LPIPS/FID
+- 📊 Comprehensive metrics: MSE, PSNR, SSIM, LPIPS, FID
 - 🔧 Modular architecture powered by PyTorch Lightning and Hydra
+- 🎯 Multiple dictionary update strategies: backprop-only, K-SVD, online learning
 
 ## Installation
 
@@ -35,24 +33,29 @@ pip install -r requirements.txt
 ```
 ├── configs/                # Hydra configuration files
 │   ├── checkpoint/         # Checkpoint configurations
-│   ├── data/               # Dataset configurations
-│   ├── model/              # Model configurations
+│   ├── data/               # Dataset configurations (CIFAR-10, CelebA, Imagenette2)
+│   ├── model/              # Model configurations (LASER, VQ-VAE)
 │   ├── train/              # Training configurations
 │   ├── wandb/              # W&B logging configurations
 │   └── config.yaml         # Main configuration
 ├── src/
 │   ├── data/               # Data modules
 │   │   ├── cifar10.py
+│   │   ├── celeba.py
 │   │   ├── imagenette2.py
 │   │   └── config.py
 │   ├── models/
-│   │   ├── bottleneck.py   # VQ and dictionary bottlenecks
+│   │   ├── bottleneck.py   # Dictionary learning and VQ bottlenecks
 │   │   ├── decoder.py
-│   │   ├── dlvae.py
 │   │   ├── encoder.py
+│   │   ├── laser.py        # LASER model
+│   │   ├── vqvae.py        # VQ-VAE baseline
 │   │   ├── lpips.py
-│   │   └── vqvae.py
-└── train.py                # Main training script
+│   │   └── losses.py
+│   └── visualizations/     # Visualization utilities
+├── tests/                  # Unit tests
+├── train.py                # Main training script
+└── test.py                 # Testing script
 ```
 
 ## Usage
@@ -60,47 +63,66 @@ pip install -r requirements.txt
 ### Training
 
 ```bash
-# Train VQ-VAE
+# Train LASER with IHT sparse coding
+python train.py model=laser data=cifar10
+
+# Train LASER on CelebA
+python train.py model=laser data=celeba
+
+# Train VQ-VAE baseline
 python train.py model=vqvae data=cifar10
 
-# Train DL-VAE
-python train.py model=dlvae data=cifar10
-
-# Train LASER
-python train.py model=laser data=cifar10
+# Override config parameters
+python train.py model=laser data=celeba train.max_epochs=50 model.sparsity_level=16
 ```
 
-### Running Tests
+### Testing
 
 ```bash
-pytest tests/test_dlvae.py -q
+# Run model tests
+pytest tests/test_bottleneck.py -v
+pytest tests/test_encoder.py -v
+pytest tests/test_decoder.py -v
+
+# Test LASER model
+python test.py --checkpoint path/to/checkpoint.ckpt --dataset celeba
 ```
 
 ## Configuration
 
-All configuration is managed through Hydra. Adjust the YAML files under `configs/` or override settings directly from the command line, e.g.
+All configuration is managed through Hydra. Adjust the YAML files under `configs/` or override settings directly from the command line:
 
 ```bash
-python train.py model=dlvae data=celeba train.max_epochs=50
+# Override specific parameters
+python train.py model=laser data=celeba train.max_epochs=100 model.sparsity_level=8
+
+# Use different sparse coding algorithm
+python train.py model=laser model.sparse_solver=iht model.iht_iterations=10
+
+# Enable online dictionary learning
+python train.py model=laser model.use_online_learning=true model.use_backprop_only=false
 ```
 
-## K-SVD Dictionary Learning
+## LASER: Dictionary Learning Architecture
 
 ### Overview
 
-K-SVD is a classical dictionary learning algorithm that alternates between:
+LASER (Learnable Adaptive Structured Embedding Representation) is a dictionary learning VAE that supports multiple sparse coding algorithms and dictionary update strategies. It alternates between:
 1. **Sparse Coding**: Find sparse coefficients using Orthogonal Matching Pursuit (OMP)
 2. **Dictionary Update**: Update each atom sequentially using rank-1 SVD approximations
 
-### Key Differences from Gradient-based DL
+### Comparison: Dictionary Learning Modes
 
-| Aspect | K-SVD | Gradient-based DL |
-|--------|-------|-------------------|
-| Dictionary Update | SVD-based, direct update | Gradient descent with backprop |
-| Gradients | No gradients on dictionary | Full gradient computation |
-| Convergence | Often faster for small problems | Scales better with large datasets |
-| Atom Quality | High-quality, orthogonal atoms | Depends on learning rate & optimization |
-| Training Mode | Dictionary updates in forward pass | Standard PyTorch training loop |
+LASER supports different dictionary learning strategies:
+
+| Aspect | K-SVD Mode | Backprop-only Mode | Online Learning Mode |
+|--------|------------|-------------------|---------------------|
+| Dictionary Update | SVD-based, direct update | Gradient descent with backprop | Fast gradient-like updates |
+| Gradients | No gradients on dictionary | Full gradient computation | No gradients on dictionary |
+| Convergence | Often faster for small problems | Scales better with large datasets | Good balance |
+| Atom Quality | High-quality, orthogonal atoms | Depends on learning rate & optimization | Good quality with fast updates |
+| Training Mode | Dictionary updates in forward pass | Standard PyTorch training loop | Updates in forward pass |
+| Best For | Interpretability, small datasets | Large-scale training | Fast iteration, good quality |
 
 ### Usage Example
 
@@ -133,13 +155,22 @@ z_reconstructed, loss, coefficients = dl(z_encoded)
 
 **Note**: Dictionary atoms are always normalized to unit L2 norm for numerical stability.
 
-### K-SVD Features
+### Sparse Coding Algorithms
 
-1. **Batched OMP Sparse Coding**: Efficient vectorized Orthogonal Matching Pursuit
-2. **SVD-based Dictionary Update**: Sequential atom updates using rank-1 approximations
+LASER supports three sparse coding methods:
+
+1. **IHT (Iterative Hard Thresholding)**: True sparse coding with iterative optimization
+2. **OMP (Orthogonal Matching Pursuit)**: Greedy selection with least-squares refinement  
+3. **Top-K**: Fast approximate sparse coding (single matrix multiplication)
+
+### Dictionary Learning Features
+
+1. **Multiple Sparse Coding Algorithms**: Choose between IHT, OMP, or Top-K
+2. **Flexible Dictionary Updates**: Backprop-only, K-SVD, or online learning
 3. **Patch-based Processing**: Reduces computational complexity by processing spatial patches
-4. **Automatic Atom Reinitialization**: Prevents dead atoms by reinitializing unused ones
+4. **Automatic Atom Normalization**: All atoms normalized to unit L2 norm for stability
 5. **Training/Eval Mode Support**: Dictionary updates enabled in training, frozen in eval
+6. **L1 Sparsity Regularization**: Encourages true sparsity in coefficients
 
 ### Dictionary Update Process
 
@@ -179,13 +210,19 @@ For each atom k in the dictionary:
 - Set ksvd_iterations=1 for faster training
 - Dictionary atoms are always normalized for stability
 
-### K-SVD Test Coverage
+### Test Coverage
 
 ```bash
-# Run K-SVD tests
+# Run dictionary learning tests
 pytest tests/test_bottleneck.py::test_ksvd_basic -v
-pytest tests/test_bottleneck.py::test_ksvd_training -v
-pytest tests/test_bottleneck.py::test_ksvd_patches -v
+pytest tests/test_bottleneck.py::test_dictionary_learning_shapes -v
+pytest tests/test_bottleneck.py::test_iht_sparse_coding -v
+
+# Run LASER model tests
+pytest tests/test_laser.py -v
+
+# Run all tests
+pytest tests/ -v
 ```
 
 ### LASER Architecture
@@ -435,7 +472,7 @@ python train.py model=laser data=cifar10
 # CelebA (256×256 images)
 python train.py model=laser data=celeba
 
-# ImageNette2 (256×256 images)
+# Imagenette2 (256×256 images)
 python train.py model=laser data=imagenette2
 ```
 
@@ -445,19 +482,9 @@ Override specific parameters:
 python train.py model=laser data=celeba \
     model.num_embeddings=256 \
     model.sparsity_level=16 \
-    model.ksvd_iterations=2 \
-    model.patch_size=4
+    model.sparse_solver=iht \
+    model.patch_size=8
 ```
-
-#### Key Differences from DLVAE
-
-| Aspect | Regular DLVAE | LASER |
-|--------|---------------|-----------|
-| Dictionary Update | Gradient descent | SVD-based direct update |
-| Convergence | Slower, needs many epochs | Faster, updates in forward pass |
-| Gradients | Full backprop through dictionary | No gradients on dictionary |
-| Training Mode | Dictionary learned via gradients | Dictionary updated via K-SVD |
-| Best For | Large-scale datasets | Smaller datasets, interpretability |
 
 #### Logged Metrics
 
@@ -466,9 +493,10 @@ The following metrics are tracked during training:
 - **Loss metrics**: `train/loss`, `val/loss` (total loss)
 - **Component losses**: 
   - `train/recon_loss`, `val/recon_loss` (MSE reconstruction)
-  - `train/ksvd_loss`, `val/ksvd_loss` (K-SVD bottleneck loss)
+  - `train/bottleneck_loss`, `val/bottleneck_loss` (dictionary learning bottleneck loss)
   - `train/perceptual_loss`, `val/perceptual_loss` (LPIPS)
-  - `train/mr_dct_loss`, `val/mr_dct_loss` (multi-resolution DCT)
+  - `train/sparsity_loss`, `val/sparsity_loss` (L1 regularization on coefficients)
+  - `train/mr_dct_loss`, `val/mr_dct_loss` (multi-resolution DCT, if enabled)
   - `train/mr_grad_loss`, `val/mr_grad_loss` (multi-resolution gradient)
 - **Quality metrics**: 
   - `train/psnr`, `val/psnr` (Peak Signal-to-Noise Ratio)
