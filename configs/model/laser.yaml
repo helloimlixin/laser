@@ -78,7 +78,7 @@ dict_learning_rate: 0.3
 # omp = Orthogonal Matching Pursuit (slow, best quality)
 # iht = Iterative Hard Thresholding (fast, good quality, RECOMMENDED)
 # topk = Top-K selection (fastest, poor quality, overfitting risk)
-sparse_solver: iht
+sparse_solver: omp
 
 # Number of IHT iterations
 # Only used if sparse_solver='iht'

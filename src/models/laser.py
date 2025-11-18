@@ -277,10 +277,21 @@ class LASER(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step."""
+        # Control dictionary updates based on update frequency
         # Enable K-SVD/online updates only if not using backprop-only mode
-        # In backprop-only mode, dictionary is updated via standard backprop
+        # and if we're at the right step according to dictionary_update_frequency
         if not self.bottleneck.use_backprop_only:
-            self.bottleneck.enable_ksvd_update = True
+            if self.dictionary_update_frequency == 0:
+                # Update every step
+                self.bottleneck.enable_ksvd_update = True
+            else:
+                # Update only every N steps
+                current_step = self.global_step
+                should_update = (current_step % self.dictionary_update_frequency) == 0
+                self.bottleneck.enable_ksvd_update = should_update
+        else:
+            # In backprop-only mode, never use K-SVD updates
+            self.bottleneck.enable_ksvd_update = False
 
         loss, recon, x = self.compute_metrics(batch, prefix='train')
 
