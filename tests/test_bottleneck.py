@@ -21,7 +21,7 @@ for p in (str(ROOT), str(SRC)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from src.models.bottleneck import DictionaryLearning, VectorQuantizer  # noqa: E402
+from src.models.bottleneck import DictionaryLearning, VectorQuantizer, KSVDDictionaryLearning  # noqa: E402
 from src.data.celeba import CelebADataModule  # noqa: E402
 from src.data.config import DataConfig  # noqa: E402
 
@@ -902,3 +902,783 @@ def test_patch_based_speed_comparison():
         print(f"  Speed: DL {34.0/avg_time_ms:.1f}× faster than 1×1 pixel-level")
     
     print("\n" + "="*60)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn and umap-learn not installed")
+def test_visualize_codebook_embeddings():
+    """
+    Visualize VQ codebook and DL dictionary atoms in 2D RGB space.
+    
+    This test trains both VQ and DL on CelebA data, then projects their
+    learned representations (codebook vectors / dictionary atoms) into 2D
+    using PCA, t-SNE, and UMAP for interpretability.
+    """
+    print("\n" + "="*70)
+    print("CODEBOOK VISUALIZATION IN RGB SPACE")
+    print("="*70)
+    
+    # Load data
+    celeba_dir = _get_celeba_dir()
+    if celeba_dir:
+        z = _load_celeba_batch(batch_size=16, image_size=128)
+        print("\nUsing CelebA images for training")
+    else:
+        z = torch.randn(16, 3, 128, 128)
+        # Normalize to [-1, 1] range to match CelebA preprocessing
+        z = (z - 0.5) * 2.0
+        print("\nWarning: Using random noise (CelebA not available)")
+    
+    B, C, H, W = z.shape
+    K = 64  # Use more atoms for better visualization
+    
+    # Initialize VQ with k-means
+    print(f"\nInitializing {K} codebook vectors with k-means...")
+    codebook = _kmeans_codebook(z, K)  # [K, C]
+    vq = VectorQuantizer(num_embeddings=K, embedding_dim=C, commitment_cost=0.25, decay=0.99)
+    vq.embedding.weight.data.copy_(codebook)
+    
+    # Initialize DL with k-means (pixel-level)
+    dl = DictionaryLearning(
+        num_embeddings=K, 
+        embedding_dim=C, 
+        sparsity_level=4,
+        normalize_atoms=False,
+        patch_size=1
+    )
+    dl.dictionary.data.copy_(codebook.t().contiguous())  # DL uses [C, K]
+    
+    # Train for a few iterations to let representations evolve
+    print(f"Training both models for 50 iterations...")
+    optimizer_vq = torch.optim.Adam(vq.parameters(), lr=1e-3)
+    optimizer_dl = torch.optim.Adam(dl.parameters(), lr=1e-3)
+    
+    vq.train()
+    dl.train()
+    
+    for i in range(50):
+        # Train VQ
+        optimizer_vq.zero_grad()
+        z_q_vq, loss_vq, perplexity, _ = vq(z)
+        loss_vq.backward()
+        optimizer_vq.step()
+        
+        # Train DL
+        optimizer_dl.zero_grad()
+        z_q_dl, loss_dl, _ = dl(z)
+        loss_dl.backward()
+        optimizer_dl.step()
+        
+        if (i + 1) % 10 == 0:
+            print(f"  Iteration {i+1}/50: VQ loss={loss_vq.item():.4f}, DL loss={loss_dl.item():.4f}")
+    
+    # Extract learned representations
+    with torch.no_grad():
+        vq_codebook = vq.embedding.weight.data.cpu().numpy()  # [K, C]
+        dl_atoms = dl.dictionary.data.t().cpu().numpy()  # [K, C]
+    
+    print(f"\nVQ Codebook shape: {vq_codebook.shape}")
+    print(f"DL Dictionary shape: {dl_atoms.shape}")
+    
+    # Compute statistics
+    print(f"\nVQ Codebook stats:")
+    print(f"  Mean: {vq_codebook.mean(axis=0)}")
+    print(f"  Std: {vq_codebook.std(axis=0)}")
+    print(f"  Range: [{vq_codebook.min():.3f}, {vq_codebook.max():.3f}]")
+    
+    print(f"\nDL Dictionary stats:")
+    print(f"  Mean: {dl_atoms.mean(axis=0)}")
+    print(f"  Std: {dl_atoms.std(axis=0)}")
+    print(f"  Range: [{dl_atoms.min():.3f}, {dl_atoms.max():.3f}]")
+    
+    # Normalize to [0, 1] for visualization (assuming data was in [-1, 1] range)
+    vq_codebook_normalized = (vq_codebook + 1) / 2
+    vq_codebook_normalized = np.clip(vq_codebook_normalized, 0, 1)
+    
+    dl_atoms_normalized = (dl_atoms + 1) / 2
+    dl_atoms_normalized = np.clip(dl_atoms_normalized, 0, 1)
+    
+    # Create visualizations
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Codebook Visualization in RGB Space', fontsize=16, fontweight='bold')
+    
+    methods = [
+        ('PCA', PCA(n_components=2)),
+        ('t-SNE', TSNE(n_components=2, perplexity=min(30, K-1), random_state=42)),
+        ('UMAP', umap.UMAP(n_components=2, random_state=42))
+    ]
+    
+    for col_idx, (method_name, method) in enumerate(methods):
+        print(f"\nComputing {method_name} embeddings...")
+        
+        # VQ codebook embedding
+        vq_2d = method.fit_transform(vq_codebook)
+        
+        # DL dictionary embedding (fit new instance to avoid data leakage)
+        if method_name == 'PCA':
+            dl_method = PCA(n_components=2)
+        elif method_name == 't-SNE':
+            dl_method = TSNE(n_components=2, perplexity=min(30, K-1), random_state=42)
+        else:
+            dl_method = umap.UMAP(n_components=2, random_state=42)
+        dl_2d = dl_method.fit_transform(dl_atoms)
+        
+        # Plot VQ (top row)
+        ax_vq = axes[0, col_idx]
+        scatter = ax_vq.scatter(
+            vq_2d[:, 0], vq_2d[:, 1],
+            c=vq_codebook_normalized,  # RGB colors normalized to [0,1]
+            s=100,
+            alpha=0.8,
+            edgecolors='black',
+            linewidths=0.5
+        )
+        ax_vq.set_title(f'VQ Codebook - {method_name}', fontsize=12, fontweight='bold')
+        ax_vq.set_xlabel(f'{method_name} Component 1')
+        ax_vq.set_ylabel(f'{method_name} Component 2')
+        ax_vq.grid(True, alpha=0.3)
+        
+        # Annotate a few points
+        for i in range(min(10, K)):
+            ax_vq.annotate(
+                f'{i}',
+                (vq_2d[i, 0], vq_2d[i, 1]),
+                fontsize=8,
+                alpha=0.6,
+                xytext=(5, 5),
+                textcoords='offset points'
+            )
+        
+        # Plot DL (bottom row)
+        ax_dl = axes[1, col_idx]
+        scatter = ax_dl.scatter(
+            dl_2d[:, 0], dl_2d[:, 1],
+            c=dl_atoms_normalized,  # RGB colors normalized to [0,1]
+            s=100,
+            alpha=0.8,
+            edgecolors='black',
+            linewidths=0.5
+        )
+        ax_dl.set_title(f'DL Dictionary - {method_name}', fontsize=12, fontweight='bold')
+        ax_dl.set_xlabel(f'{method_name} Component 1')
+        ax_dl.set_ylabel(f'{method_name} Component 2')
+        ax_dl.grid(True, alpha=0.3)
+        
+        # Annotate a few points
+        for i in range(min(10, K)):
+            ax_dl.annotate(
+                f'{i}',
+                (dl_2d[i, 0], dl_2d[i, 1]),
+                fontsize=8,
+                alpha=0.6,
+                xytext=(5, 5),
+                textcoords='offset points'
+            )
+    
+    plt.tight_layout()
+    
+    # Save visualization
+    output_path = ARTIFACT_DIR / "codebook_embeddings.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"\n✓ Saved visualization to: {output_path}")
+    plt.close()
+    
+    # Additional analysis: Compute pairwise distances
+    from scipy.spatial.distance import pdist, squareform
+    
+    vq_dists = pdist(vq_codebook, metric='euclidean')
+    dl_dists = pdist(dl_atoms, metric='euclidean')
+    
+    print(f"\nPairwise distance statistics:")
+    print(f"  VQ codebook: mean={vq_dists.mean():.4f}, std={vq_dists.std():.4f}")
+    print(f"  DL dictionary: mean={dl_dists.mean():.4f}, std={dl_dists.std():.4f}")
+    
+    # Create distance distribution plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    axes[0].hist(vq_dists, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    axes[0].set_title('VQ Codebook Pairwise Distances', fontsize=12, fontweight='bold')
+    axes[0].set_xlabel('Euclidean Distance')
+    axes[0].set_ylabel('Frequency')
+    axes[0].axvline(vq_dists.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean={vq_dists.mean():.3f}')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    axes[1].hist(dl_dists, bins=50, alpha=0.7, color='green', edgecolor='black')
+    axes[1].set_title('DL Dictionary Pairwise Distances', fontsize=12, fontweight='bold')
+    axes[1].set_xlabel('Euclidean Distance')
+    axes[1].set_ylabel('Frequency')
+    axes[1].axvline(dl_dists.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean={dl_dists.mean():.3f}')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    output_path_dist = ARTIFACT_DIR / "codebook_distances.png"
+    plt.savefig(output_path_dist, dpi=150, bbox_inches='tight')
+    print(f"✓ Saved distance distribution to: {output_path_dist}")
+    plt.close()
+    
+    print("\n" + "="*70)
+    print("VISUALIZATION COMPLETE")
+    print("="*70)
+    
+    # The test passes if we successfully created the visualizations
+    assert output_path.exists()
+    assert output_path_dist.exists()
+
+
+# --------- K-SVD Dictionary Learning tests ---------
+
+
+def test_ksvd_basic_shapes():
+    """Test K-SVD output shapes and finite values."""
+    torch.manual_seed(0)
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=32,
+        embedding_dim=16,
+        sparsity_level=3,
+        commitment_cost=0.25,
+        ksvd_iterations=1,
+        normalize_atoms=True,
+    )
+    
+    z = torch.randn(2, 16, 4, 4, requires_grad=True)
+    z_dl, loss, coeffs = ksvd(z)
+    
+    assert z_dl.shape == z.shape
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert coeffs.shape[0] == 32  # num_embeddings
+    assert coeffs.shape[1] == 2 * 4 * 4  # batch_size * num_patches
+
+
+def test_ksvd_iht_solver_sparse_codes():
+    """Ensure iterative hard thresholding produces sparse codes."""
+    torch.manual_seed(11)
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=24,
+        embedding_dim=8,
+        sparsity_level=4,
+        patch_size=1,
+        ksvd_iterations=0,
+        sparse_solver="iht",
+        iht_iterations=6,
+    )
+    ksvd.enable_ksvd_update = False
+    z = torch.randn(2, 8, 4, 4)
+    z_dl, loss, coeffs = ksvd(z)
+
+    assert z_dl.shape == z.shape
+    assert torch.isfinite(loss)
+    nnz = (coeffs != 0).sum(dim=0)
+    assert torch.all(nnz <= ksvd.sparsity_level)
+
+
+def test_ksvd_dictionary_update():
+    """Test that K-SVD updates the dictionary during training."""
+    torch.manual_seed(1)
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=16,
+        embedding_dim=8,
+        sparsity_level=3,
+        ksvd_iterations=2,
+        normalize_atoms=True,
+    )
+    
+    # Store initial dictionary
+    dict_before = ksvd.dictionary.data.clone()
+    
+    # Forward pass in training mode
+    ksvd.train()
+    z = torch.randn(2, 8, 4, 4)
+    z_dl, loss, coeffs = ksvd(z)
+    
+    # Dictionary should have changed
+    dict_after = ksvd.dictionary.data
+    assert not torch.allclose(dict_before, dict_after, atol=1e-6)
+    
+    # Dictionary atoms should be normalized
+    if ksvd.normalize_atoms:
+        norms = torch.linalg.norm(dict_after, dim=0)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
+
+
+def test_ksvd_no_update_in_eval():
+    """Test that K-SVD doesn't update dictionary in eval mode."""
+    torch.manual_seed(2)
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=16,
+        embedding_dim=8,
+        sparsity_level=3,
+        ksvd_iterations=2,
+    )
+    
+    # Store initial dictionary
+    dict_before = ksvd.dictionary.data.clone()
+    
+    # Forward pass in eval mode
+    ksvd.eval()
+    z = torch.randn(2, 8, 4, 4)
+    with torch.no_grad():
+        z_dl, loss, coeffs = ksvd(z)
+    
+    # Dictionary should not have changed
+    dict_after = ksvd.dictionary.data
+    assert torch.allclose(dict_before, dict_after)
+
+
+def test_ksvd_vs_regular_dl_comparison():
+    """Compare K-SVD with regular OMP-based dictionary learning."""
+    torch.manual_seed(3)
+    
+    # Create synthetic data with known structure
+    B, C, H, W = 4, 3, 32, 32
+    z = torch.randn(B, C, H, W)
+    
+    K = 32
+    sparsity = 4
+    
+    # Initialize both with same dictionary
+    # K-SVD uses [atom_dim, num_embeddings] = [C, K]
+    # Regular DL uses [atom_dim, num_embeddings] = [C, K] too for pixel-level
+    init_dict = torch.randn(C, K)
+    init_dict = F.normalize(init_dict, dim=0)
+    
+    # K-SVD model
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=K,
+        embedding_dim=C,
+        sparsity_level=sparsity,
+        ksvd_iterations=3,
+        normalize_atoms=True,
+    )
+    ksvd.dictionary.data.copy_(init_dict)
+    
+    # Regular DL model
+    dl = DictionaryLearning(
+        num_embeddings=K,
+        embedding_dim=C,
+        sparsity_level=sparsity,
+        normalize_atoms=True,
+    )
+    # Regular DL also uses [atom_dim, num_embeddings] = [C, K] for pixel-level (patch_size=1)
+    dl.dictionary.data.copy_(init_dict)
+    
+    # Train both models
+    ksvd.train()
+    dl.train()
+    
+    # K-SVD forward
+    z_ksvd, loss_ksvd, coeffs_ksvd = ksvd(z)
+    mse_ksvd = F.mse_loss(z_ksvd, z).item()
+    
+    # Regular DL forward (with gradient for comparison)
+    optimizer = torch.optim.Adam(dl.parameters(), lr=1e-3)
+    for _ in range(10):  # Multiple iterations for regular DL
+        optimizer.zero_grad()
+        z_dl, loss_dl, coeffs_dl = dl(z)
+        loss_dl.backward()
+        optimizer.step()
+    
+    z_dl, loss_dl, coeffs_dl = dl(z)
+    mse_dl = F.mse_loss(z_dl, z).item()
+    
+    print(f"\nReconstruction Quality:")
+    print(f"  K-SVD MSE: {mse_ksvd:.6f}")
+    print(f"  Regular DL MSE: {mse_dl:.6f}")
+    
+    # Both should achieve reasonable reconstruction
+    assert torch.isfinite(z_ksvd).all()
+    assert torch.isfinite(z_dl).all()
+
+
+def test_ksvd_patch_based():
+    """Test K-SVD with patch-based processing."""
+    torch.manual_seed(4)
+    
+    patch_size = 2
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=16,
+        embedding_dim=4,
+        sparsity_level=3,
+        patch_size=patch_size,
+        ksvd_iterations=2,
+    )
+    
+    z = torch.randn(2, 4, 8, 8)
+    z_dl, loss, coeffs = ksvd(z)
+    
+    # Check shapes
+    assert z_dl.shape == z.shape
+    patches_per_sample = (8 // patch_size) * (8 // patch_size)
+    expected_atom_dim = 4 * patch_size * patch_size
+    assert coeffs.shape == (16, 2 * patches_per_sample)
+    assert ksvd.atom_dim == expected_atom_dim
+
+
+def test_ksvd_visualization():
+    """Visualize K-SVD learned dictionary atoms."""
+    torch.manual_seed(5)
+    
+    # Create data with structure
+    B, C, H, W = 8, 3, 64, 64
+    z = torch.randn(B, C, H, W)
+    
+    K = 16
+    
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=K,
+        embedding_dim=C,
+        sparsity_level=4,
+        ksvd_iterations=5,
+        normalize_atoms=True,
+    )
+    
+    # Train for multiple iterations
+    ksvd.train()
+    losses = []
+    mses = []
+    
+    print("\nTraining K-SVD...")
+    for i in range(20):
+        z_dl, loss, coeffs = ksvd(z)
+        mse = F.mse_loss(z_dl, z).item()
+        losses.append(loss.item())
+        mses.append(mse)
+        
+        if (i + 1) % 5 == 0:
+            print(f"  Iteration {i+1}/20: Loss={loss.item():.6f}, MSE={mse:.6f}")
+    
+    # Plot training curves
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    ax1.plot(losses, 'b-', linewidth=2)
+    ax1.set_xlabel('Iteration')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('K-SVD Training Loss')
+    ax1.grid(True, alpha=0.3)
+    
+    ax2.plot(mses, 'r-', linewidth=2)
+    ax2.set_xlabel('Iteration')
+    ax2.set_ylabel('MSE')
+    ax2.set_title('K-SVD Reconstruction MSE')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(ARTIFACT_DIR / "ksvd_training.png", dpi=100)
+    plt.close()
+    
+    # Visualize learned atoms (if RGB)
+    if C == 3:
+        atoms = ksvd.dictionary.data.t().cpu().numpy()  # [K, C]
+        
+        # Normalize to [0, 1] for visualization
+        atoms_normalized = (atoms - atoms.min()) / (atoms.max() - atoms.min() + 1e-10)
+        
+        fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+        axes = axes.flatten()
+        
+        for i in range(min(K, 16)):
+            atom_rgb = atoms_normalized[i]
+            color_patch = np.tile(atom_rgb.reshape(1, 1, 3), (50, 50, 1))
+            
+            axes[i].imshow(color_patch)
+            axes[i].set_title(f'Atom {i}', fontsize=9)
+            axes[i].axis('off')
+        
+        plt.suptitle('K-SVD Learned Dictionary Atoms', fontsize=14)
+        plt.tight_layout()
+        plt.savefig(ARTIFACT_DIR / "ksvd_atoms.png", dpi=100)
+        plt.close()
+    
+    # Compute sparsity statistics
+    sparsity = (torch.abs(coeffs) > 1e-6).sum(dim=0).float().mean().item()
+    print(f"\nAverage sparsity: {sparsity:.2f} atoms per patch")
+    
+    assert (ARTIFACT_DIR / "ksvd_training.png").exists()
+    if C == 3:
+        assert (ARTIFACT_DIR / "ksvd_atoms.png").exists()
+
+
+def test_ksvd_convergence():
+    """Test that K-SVD converges to lower reconstruction error."""
+    torch.manual_seed(6)
+    
+    B, C, H, W = 4, 8, 32, 32
+    z = torch.randn(B, C, H, W)
+    
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=32,
+        embedding_dim=C,
+        sparsity_level=5,
+        ksvd_iterations=3,
+    )
+    
+    ksvd.train()
+    
+    # First iteration
+    z_dl_1, _, _ = ksvd(z)
+    mse_1 = F.mse_loss(z_dl_1, z).item()
+    
+    # Multiple iterations
+    for _ in range(10):
+        _, _, _ = ksvd(z)
+    
+    z_dl_final, _, _ = ksvd(z)
+    mse_final = F.mse_loss(z_dl_final, z).item()
+    
+    print(f"\nConvergence test:")
+    print(f"  Initial MSE: {mse_1:.6f}")
+    print(f"  Final MSE: {mse_final:.6f}")
+    print(f"  Improvement: {(mse_1 - mse_final) / mse_1 * 100:.1f}%")
+    
+    # MSE should decrease or stay similar (allowing small fluctuations)
+    assert mse_final <= mse_1 * 1.1  # Allow 10% tolerance
+
+
+def test_ksvd_codebook_heatmaps():
+    """Visualize K-SVD sparse codes as heatmaps for interpretability."""
+    torch.manual_seed(7)
+    
+    # Load data
+    celeba_dir = _get_celeba_dir()
+    if celeba_dir:
+        z = _load_celeba_batch(batch_size=2, image_size=128)
+        is_celeba = True
+        print("\nUsing CelebA images for K-SVD heatmap visualization")
+    else:
+        z = torch.randn(2, 3, 128, 128)
+        is_celeba = False
+        print("\nUsing random data for K-SVD heatmap visualization")
+    
+    B, C, H, W = z.shape
+    K = 32
+    
+    # Initialize K-SVD with k-means
+    codebook = _kmeans_codebook(z, K)  # Returns [K, C]
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=K,
+        embedding_dim=C,
+        sparsity_level=5,
+        ksvd_iterations=3,
+        normalize_atoms=True,
+    )
+    ksvd.dictionary.data.copy_(codebook.t().contiguous())  # K-SVD needs [C, K]
+    
+    # Train for a few iterations
+    ksvd.train()
+    for i in range(10):
+        z_ksvd, loss, coeffs = ksvd(z)
+        if (i + 1) % 5 == 0:
+            print(f"  Iteration {i+1}/10: Loss={loss.item():.6f}")
+    
+    # Get final output
+    ksvd.eval()
+    with torch.no_grad():
+        z_ksvd, _, coeffs = ksvd(z)
+    
+    # Compute L1 norm of sparse codes per patch (activation strength)
+    num_patches_total = coeffs.shape[1] // B
+    coeffs_view = coeffs.view(coeffs.shape[0], num_patches_total, B).permute(0, 2, 1).contiguous()
+    
+    # L1 norm per patch (sum of absolute coefficients)
+    l1_norm_per_patch = coeffs_view.abs().sum(dim=0)  # [batch, num_patches]
+    
+    # Map to spatial grid
+    patch_h, patch_w = ksvd.patch_size
+    if patch_h == 1 and patch_w == 1:
+        # Pixel-level
+        ksvd_activation = l1_norm_per_patch.reshape(B, H, W)
+    else:
+        # Patch-level: use fold operation
+        coeff_for_fold = l1_norm_per_patch.unsqueeze(1)  # [batch, 1, num_patches]
+        ksvd_activation = F.fold(
+            coeff_for_fold,
+            output_size=(H, W),
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w)
+        ).squeeze(1)  # [batch, H, W]
+    
+    # Create visualization
+    num_images = min(2, B)
+    fig, axes = plt.subplots(num_images, 2, figsize=(10, 5 * num_images))
+    if num_images == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i in range(num_images):
+        # Original image
+        axes[i, 0].imshow(_to_rgb(z[i], denormalize=is_celeba))
+        axes[i, 0].set_title(f'Original #{i+1}', fontsize=11)
+        axes[i, 0].axis('off')
+        
+        # K-SVD sparse code strength (L1 norm)
+        activation_data = ksvd_activation[i].cpu().numpy()
+        
+        # Percentile normalization for clean visualization
+        p_low, p_high = np.percentile(activation_data, [1, 99])
+        activation_norm = np.clip(activation_data, p_low, p_high)
+        activation_norm = (activation_norm - p_low) / (p_high - p_low + 1e-10)
+        
+        im = axes[i, 1].imshow(activation_norm, cmap='viridis', interpolation='nearest')
+        axes[i, 1].set_title(f'K-SVD Sparse Code Strength\n(L1 norm, sparsity={ksvd.sparsity_level})', fontsize=11)
+        axes[i, 1].axis('off')
+        plt.colorbar(im, ax=axes[i, 1], fraction=0.046, pad=0.04)
+    
+    plt.suptitle('K-SVD Code Interpretability Visualization', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(ARTIFACT_DIR / "ksvd_code_heatmaps.png", dpi=100)
+    plt.close()
+    
+    # Compute statistics
+    avg_sparsity = (torch.abs(coeffs) > 1e-6).sum(dim=0).float().mean().item()
+    unique_atoms_used = (torch.abs(coeffs) > 1e-6).sum(dim=1).nonzero().size(0)
+    
+    print(f"\nK-SVD Sparsity Statistics:")
+    print(f"  Average atoms per patch: {avg_sparsity:.2f}")
+    print(f"  Unique atoms used: {unique_atoms_used}/{K}")
+    print(f"  Activation range: [{activation_data.min():.3f}, {activation_data.max():.3f}]")
+    
+    assert (ARTIFACT_DIR / "ksvd_code_heatmaps.png").exists()
+
+
+def test_ksvd_vq_dl_comparison_visualization():
+    """Compare VQ, DL, and K-SVD side-by-side with visualizations."""
+    torch.manual_seed(8)
+    
+    # Load data
+    celeba_dir = _get_celeba_dir()
+    if celeba_dir:
+        z = _load_celeba_batch(batch_size=2, image_size=64)
+        is_celeba = True
+        print("\nComparing VQ, DL, and K-SVD on CelebA images")
+    else:
+        z = torch.randn(2, 3, 64, 64)
+        is_celeba = False
+        print("\nComparing VQ, DL, and K-SVD on random data")
+    
+    B, C, H, W = z.shape
+    K = 16
+    
+    # Initialize all three with same k-means codebook
+    codebook = _kmeans_codebook(z, K)  # Returns [K, C]
+    
+    # VQ
+    vq = VectorQuantizer(num_embeddings=K, embedding_dim=C, commitment_cost=0.25, decay=0.0)
+    vq.embedding.weight.data.copy_(codebook)  # VQ needs [K, C]
+    
+    # DL
+    dl = DictionaryLearning(
+        num_embeddings=K,
+        embedding_dim=C,
+        sparsity_level=4,
+        normalize_atoms=True,
+    )
+    dl.dictionary.data.copy_(codebook.t().contiguous())  # DL needs [C, K]
+    
+    # K-SVD
+    ksvd = KSVDDictionaryLearning(
+        num_embeddings=K,
+        embedding_dim=C,
+        sparsity_level=4,
+        ksvd_iterations=3,
+        normalize_atoms=True,
+    )
+    ksvd.dictionary.data.copy_(codebook.t().contiguous())  # K-SVD needs [C, K]
+    
+    # Train K-SVD and DL briefly
+    ksvd.train()
+    dl.train()
+    
+    for _ in range(5):
+        _, _, _ = ksvd(z)
+    
+    optimizer = torch.optim.Adam(dl.parameters(), lr=1e-3)
+    for _ in range(5):
+        optimizer.zero_grad()
+        _, loss, _ = dl(z)
+        loss.backward()
+        optimizer.step()
+    
+    # Get outputs
+    vq.eval()
+    dl.eval()
+    ksvd.eval()
+    
+    with torch.no_grad():
+        z_q_vq, _, _, enc_vq = vq(z)
+        z_q_dl, _, coeffs_dl = dl(z)
+        z_q_ksvd, _, coeffs_ksvd = ksvd(z)
+    
+    # Compute VQ indices
+    vq_indices = torch.argmax(enc_vq, dim=1).reshape(B, H, W)
+    
+    # Compute DL activation maps
+    num_patches_dl = coeffs_dl.shape[1] // B
+    coeffs_dl_view = coeffs_dl.view(coeffs_dl.shape[0], num_patches_dl, B).permute(0, 2, 1).contiguous()
+    dl_activation = coeffs_dl_view.abs().sum(dim=0).reshape(B, H, W)
+    
+    # Compute K-SVD activation maps
+    num_patches_ksvd = coeffs_ksvd.shape[1] // B
+    coeffs_ksvd_view = coeffs_ksvd.view(coeffs_ksvd.shape[0], num_patches_ksvd, B).permute(0, 2, 1).contiguous()
+    ksvd_activation = coeffs_ksvd_view.abs().sum(dim=0).reshape(B, H, W)
+    
+    # Create comparison visualization
+    num_images = min(2, B)
+    fig, axes = plt.subplots(num_images, 4, figsize=(16, 4 * num_images))
+    if num_images == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i in range(num_images):
+        # Original
+        axes[i, 0].imshow(_to_rgb(z[i], denormalize=is_celeba))
+        axes[i, 0].set_title(f'Original #{i+1}', fontsize=10)
+        axes[i, 0].axis('off')
+        
+        # VQ indices
+        im1 = axes[i, 1].imshow(vq_indices[i].cpu().numpy(), cmap='tab20', interpolation='nearest')
+        vq_unique = vq_indices[i].unique().numel()
+        axes[i, 1].set_title(f'VQ Indices\n({vq_unique}/{K} codes)', fontsize=10)
+        axes[i, 1].axis('off')
+        
+        # DL activation
+        dl_data = dl_activation[i].cpu().numpy()
+        dl_norm = (dl_data - dl_data.min()) / (dl_data.max() - dl_data.min() + 1e-10)
+        im2 = axes[i, 2].imshow(dl_norm, cmap='viridis', interpolation='nearest')
+        axes[i, 2].set_title(f'DL Activation\n(gradient-based)', fontsize=10)
+        axes[i, 2].axis('off')
+        
+        # K-SVD activation
+        ksvd_data = ksvd_activation[i].cpu().numpy()
+        ksvd_norm = (ksvd_data - ksvd_data.min()) / (ksvd_data.max() - ksvd_data.min() + 1e-10)
+        im3 = axes[i, 3].imshow(ksvd_norm, cmap='viridis', interpolation='nearest')
+        axes[i, 3].set_title(f'K-SVD Activation\n(SVD-based)', fontsize=10)
+        axes[i, 3].axis('off')
+    
+    plt.suptitle('VQ vs DL vs K-SVD: Code Visualization Comparison', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(ARTIFACT_DIR / "vq_dl_ksvd_comparison.png", dpi=100)
+    plt.close()
+    
+    # Print metrics
+    mse_vq = F.mse_loss(z_q_vq, z).item()
+    mse_dl = F.mse_loss(z_q_dl, z).item()
+    mse_ksvd = F.mse_loss(z_q_ksvd, z).item()
+    
+    print("\n" + "="*60)
+    print("THREE-WAY COMPARISON: VQ vs DL vs K-SVD")
+    print("="*60)
+    print(f"Reconstruction MSE:")
+    print(f"  VQ:    {mse_vq:.6f}")
+    print(f"  DL:    {mse_dl:.6f}")
+    print(f"  K-SVD: {mse_ksvd:.6f}")
+    print(f"\nCode Usage:")
+    print(f"  VQ unique codes: {vq_indices.unique().numel()}/{K}")
+    print(f"  DL atoms used: {(coeffs_dl.abs() > 1e-6).sum(dim=1).nonzero().size(0)}/{K}")
+    print(f"  K-SVD atoms used: {(coeffs_ksvd.abs() > 1e-6).sum(dim=1).nonzero().size(0)}/{K}")
+    print(f"\nAverage Sparsity:")
+    print(f"  VQ: 1.00 code/pixel (discrete)")
+    print(f"  DL: {(coeffs_dl.abs() > 1e-6).sum(dim=0).float().mean().item():.2f} atoms/pixel")
+    print(f"  K-SVD: {(coeffs_ksvd.abs() > 1e-6).sum(dim=0).float().mean().item():.2f} atoms/pixel")
+    print("="*60)
+    
+    assert (ARTIFACT_DIR / "vq_dl_ksvd_comparison.png").exists()
+

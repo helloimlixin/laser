@@ -1,0 +1,28 @@
+type: laser
+in_channels: 3
+num_hiddens: 128
+num_embeddings: 512
+embedding_dim: 64
+sparsity_level: 8
+patch_size: 8  # Smaller patches for speed (4×4 = atom_dim 1024 vs 8×8 = 4096)
+num_residual_blocks: 2
+num_residual_hiddens: 64
+commitment_cost: 0.25
+ksvd_iterations: 1  # Enable K-SVD dictionary updates
+dictionary_update_frequency: 0  # Update every step
+use_online_learning: true  # Use fast online learning instead of SVD
+dict_learning_rate: 0.3  # Learning rate for online dictionary updates
+sparse_solver: topk  # Fast top-k sparse coding (single matmul + top-k, no iterations)
+iht_iterations: 1  # Only used if sparse_solver=iht
+iht_step_size: null  # Only used if sparse_solver=iht
+use_backprop_only: true  # Use only backprop for dictionary learning (much faster, no sparsity constraint)
+perceptual_weight: 0.5
+learning_rate: 1e-3
+beta: 0.9
+compute_fid: false
+log_images_every_n_steps: 500
+multi_res_dct_weight: 0.5
+multi_res_dct_levels: 3
+multi_res_grad_weight: 0.5
+multi_res_grad_levels: 3
+

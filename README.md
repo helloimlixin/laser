@@ -1,15 +1,16 @@
 # LASER: Learnable Adaptive Structured Embedding Representation
 
-This repository provides two autoencoder baselines for image reconstruction:
+This repository provides three autoencoder baselines for image reconstruction:
 
 - **Vector Quantized VAE (VQ-VAE)** — discrete latent codes with a learnable codebook.
 - **Dictionary Learning VAE (DL-VAE)** — sparse dictionary bottleneck trained with Batch OMP.
+- **K-SVD VAE (K-SVD-VAE)** — dictionary learning with K-SVD updates (classical SVD-based algorithm).
 
 Generation utilities have been removed for now so you can focus on training and evaluating reconstructions only.
 
 ## Features
 
-- 🚀 Choice of bottlenecks: vector quantization or dictionary learning
+- 🚀 Choice of bottlenecks: vector quantization, gradient-based dictionary learning, or K-SVD
 - ⚡ GPU-friendly implementation with AMP-aware sparse coding
 - 📊 Reconstruction quality metrics: MSE, PSNR, SSIM, optional LPIPS/FID
 - 🔧 Modular architecture powered by PyTorch Lightning and Hydra
@@ -60,10 +61,13 @@ pip install -r requirements.txt
 
 ```bash
 # Train VQ-VAE
-python train.py model.type=vqvae data=cifar10
+python train.py model=vqvae data=cifar10
 
 # Train DL-VAE
-python train.py model.type=dlvae data=cifar10
+python train.py model=dlvae data=cifar10
+
+# Train LASER
+python train.py model=laser data=cifar10
 ```
 
 ### Running Tests
@@ -77,8 +81,381 @@ pytest tests/test_dlvae.py -q
 All configuration is managed through Hydra. Adjust the YAML files under `configs/` or override settings directly from the command line, e.g.
 
 ```bash
-python train.py model.type=dlvae data=celeba train.max_epochs=50
+python train.py model=dlvae data=celeba train.max_epochs=50
 ```
+
+## K-SVD Dictionary Learning
+
+### Overview
+
+K-SVD is a classical dictionary learning algorithm that alternates between:
+1. **Sparse Coding**: Find sparse coefficients using Orthogonal Matching Pursuit (OMP)
+2. **Dictionary Update**: Update each atom sequentially using rank-1 SVD approximations
+
+### Key Differences from Gradient-based DL
+
+| Aspect | K-SVD | Gradient-based DL |
+|--------|-------|-------------------|
+| Dictionary Update | SVD-based, direct update | Gradient descent with backprop |
+| Gradients | No gradients on dictionary | Full gradient computation |
+| Convergence | Often faster for small problems | Scales better with large datasets |
+| Atom Quality | High-quality, orthogonal atoms | Depends on learning rate & optimization |
+| Training Mode | Dictionary updates in forward pass | Standard PyTorch training loop |
+
+### Usage Example
+
+```python
+from src.models.bottleneck import KSVDDictionaryLearning
+
+# Create K-SVD bottleneck
+ksvd = KSVDDictionaryLearning(
+    num_embeddings=512,       # Number of dictionary atoms
+    embedding_dim=64,         # Dimension of each atom
+    sparsity_level=8,         # Number of non-zero coefficients
+    commitment_cost=0.25,     # Weight for commitment loss
+    ksvd_iterations=1,        # Number of K-SVD updates per forward pass
+    normalize_atoms=True,     # Normalize atoms to unit norm
+    patch_size=8,            # Spatial patch size (8x8 patches)
+)
+
+# Forward pass
+z_reconstructed, loss, coefficients = ksvd(z_encoded)
+```
+
+### K-SVD Parameters
+
+- **num_embeddings**: Number of atoms in the dictionary (codebook size)
+- **embedding_dim**: Dimensionality of each atom (typically matches input channels)
+- **sparsity_level**: Maximum number of non-zero coefficients per signal
+- **commitment_cost**: Weight for the encoder commitment loss term (encourages encoder to match dictionary reconstruction)
+- **dictionary_weight**: Weight for the dictionary reconstruction loss (controls how fast dictionary learns via backprop). Default: 1.0
+- **ksvd_iterations**: Number of K-SVD dictionary update iterations per forward pass
+- **normalize_atoms**: Whether to normalize dictionary atoms to unit L2 norm
+- **patch_size**: Spatial patch size for patch-based processing (1 = pixel-level, 8 = 8×8 patches)
+
+### K-SVD Features
+
+1. **Batched OMP Sparse Coding**: Efficient vectorized Orthogonal Matching Pursuit
+2. **SVD-based Dictionary Update**: Sequential atom updates using rank-1 approximations
+3. **Patch-based Processing**: Reduces computational complexity by processing spatial patches
+4. **Automatic Atom Reinitialization**: Prevents dead atoms by reinitializing unused ones
+5. **Training/Eval Mode Support**: Dictionary updates enabled in training, frozen in eval
+
+### Dictionary Update Process
+
+For each atom k in the dictionary:
+```
+1. Find signals using atom k: ω_k = {i : |α_k,i| > ε}
+2. Compute error without atom k: E_k = X - D·α + d_k·α_k
+3. Restrict E_k to signals using k: E_k^ω
+4. Perform SVD: E_k^ω ≈ u·σ·v^T
+5. Update atom and coefficients: d_k ← u[:,0], α_k[ω_k] ← σ[0]·v[:,0]
+```
+
+### Numerical Stability
+
+- SVD computations performed in float32 for stability
+- Epsilon values prevent division by zero
+- Atom normalization for stable sparse coding
+- Graceful handling of SVD failures
+
+### Performance Considerations
+
+**Advantages:**
+- No gradient computation overhead for dictionary
+- Often converges faster than gradient-based methods
+- Produces high-quality, interpretable atoms
+- Direct control over atom updates
+
+**Limitations:**
+- SVD computation can be expensive for large dictionaries
+- Not fully differentiable (uses straight-through estimator)
+- Sequential atom updates don't parallelize as well
+- Memory usage scales with batch size × num_patches
+
+**Recommendations:**
+- Use moderate dictionary sizes (K=256-512) for best performance
+- Increase patch_size to reduce number of tokens
+- Set ksvd_iterations=1 for faster training
+- Use normalize_atoms=True for stability
+
+### K-SVD Test Coverage
+
+```bash
+# Run K-SVD tests
+pytest tests/test_bottleneck.py::test_ksvd_basic -v
+pytest tests/test_bottleneck.py::test_ksvd_training -v
+pytest tests/test_bottleneck.py::test_ksvd_patches -v
+```
+
+### LASER Architecture
+
+```python
+from src.models.laser import LASER
+
+# Initialize LASER
+model = LASER(
+    in_channels=3,
+    num_hiddens=128,
+    num_embeddings=512,
+    embedding_dim=64,
+    sparsity_level=8,
+    num_residual_blocks=2,
+    num_residual_hiddens=64,
+    commitment_cost=0.25,
+    learning_rate=1e-4,
+    ksvd_iterations=1,
+    patch_size=8,  # 8x8 spatial patches
+)
+
+# Forward pass
+x_recon, loss, coeffs = model(x)
+```
+
+The straight-through estimator ensures gradients flow back to the encoder during training, while the dictionary can be updated either:
+1. **Via K-SVD/Online Learning**: Direct updates using SVD or gradient-like online learning (no gradients)
+2. **Via Backpropagation**: Gradient-based learning controlled by `dictionary_weight` parameter
+
+### Dictionary Learning Methods
+
+K-SVD VAE supports three dictionary learning modes:
+
+#### 1. Gradient-Based Learning (Default - Fastest)
+```yaml
+# configs/model/laser.yaml
+use_online_learning: false
+ksvd_iterations: 0
+dictionary_weight: 5.0  # Higher = faster dictionary updates
+```
+
+**Loss Formula:**
+```python
+loss = commitment_cost * e_latent_loss + dictionary_weight * dl_latent_loss
+loss = 0.25 * encoder_loss + 5.0 * dictionary_loss
+```
+
+Where:
+- `e_latent_loss` (encoder commitment): MSE(encoder_output, dictionary_reconstruction.detach()) - gradients flow to encoder
+- `dl_latent_loss` (dictionary reconstruction): MSE(dictionary_reconstruction, encoder_output.detach()) - gradients flow to dictionary
+
+**Key Parameters:**
+- `dictionary_weight`: Controls dictionary learning speed (default: 1.0, recommended: 2.0-10.0)
+  - Higher values → stronger gradients → faster dictionary adaptation
+  - Lower values → slower, more stable dictionary learning
+  - Similar to VQ-VAE's codebook loss weight (typically 1.0)
+
+**Advantages:**
+- ✓ Fastest training (no SVD computation)
+- ✓ Full integration with PyTorch autograd
+- ✓ Scales well with large dictionaries
+- ✓ Easy to tune via `dictionary_weight`
+
+**When to Use:**
+- Large-scale datasets (ImageNet, etc.)
+- Large dictionaries (K > 512)
+- When speed is critical
+- When you want standard gradient-based optimization
+
+#### 2. Online Dictionary Learning
+```yaml
+use_online_learning: true
+ksvd_iterations: 0
+dict_learning_rate: 0.5  # Higher = faster updates
+```
+
+Fast vectorized updates similar to online SGD for dictionaries:
+```python
+gradient = residual @ coefficients.T
+dictionary += dict_learning_rate * gradient / usage_counts
+```
+
+**Advantages:**
+- ✓ Fast (vectorized, no SVD)
+- ✓ Direct dictionary control
+- ✓ No gradient computation overhead
+
+**When to Use:**
+- Medium-scale datasets
+- When you want control over dictionary updates separate from encoder
+- Moderate dictionary sizes (K=256-512)
+
+#### 3. K-SVD Updates (Classical)
+```yaml
+use_online_learning: false
+ksvd_iterations: 2
+```
+
+Classical K-SVD with SVD-based atom refinement.
+
+**Advantages:**
+- ✓ High-quality atoms
+- ✓ Often faster convergence on small datasets
+
+**Disadvantages:**
+- ✗ Slower (SVD computation)
+- ✗ Sequential atom updates
+
+**When to Use:**
+- Small datasets (CIFAR-10, MNIST)
+- When interpretability is critical
+- Research/analysis of dictionary structure
+
+### Tuning Dictionary Learning Speed
+
+For gradient-based learning, control update speed via `dictionary_weight`:
+
+```bash
+# Slow, stable dictionary learning
+python train.py model=laser model.dictionary_weight=1.0
+
+# Moderate speed (recommended starting point)
+python train.py model=laser model.dictionary_weight=5.0
+
+# Fast dictionary adaptation
+python train.py model=laser model.dictionary_weight=10.0
+```
+
+**Effect on Training:**
+- Higher `dictionary_weight` → Dictionary adapts faster to encoder outputs
+- Lower `dictionary_weight` → More stable but slower dictionary learning
+- Balance with `commitment_cost` (encoder side) for best results
+
+**Comparison with VQ-VAE:**
+```python
+# VQ-VAE loss (for reference)
+loss = q_latent_loss + commitment_cost * e_latent_loss
+loss = 1.0 * codebook_loss + 0.25 * encoder_loss
+
+# K-SVD VAE loss (gradient-based)
+loss = commitment_cost * e_latent_loss + dictionary_weight * dl_latent_loss
+loss = 0.25 * encoder_loss + 5.0 * dictionary_loss
+```
+
+With `dictionary_weight=5.0`, the dictionary receives **5× stronger learning signal** than VQ-VAE's codebook!
+
+### K-SVD Training Guide
+
+#### Training Commands
+
+Train K-SVD VAE on different datasets:
+
+```bash
+# CIFAR-10 (32×32 images)
+python train.py model=laser data=cifar10
+
+# CelebA (256×256 images)
+python train.py model=laser data=celeba
+
+# ImageNette2 (256×256 images)
+python train.py model=laser data=imagenette2
+```
+
+Override specific parameters:
+
+```bash
+python train.py model=laser data=celeba \
+    model.num_embeddings=256 \
+    model.sparsity_level=16 \
+    model.ksvd_iterations=2 \
+    model.patch_size=4
+```
+
+#### Key Differences from DLVAE
+
+| Aspect | Regular DLVAE | LASER |
+|--------|---------------|-----------|
+| Dictionary Update | Gradient descent | SVD-based direct update |
+| Convergence | Slower, needs many epochs | Faster, updates in forward pass |
+| Gradients | Full backprop through dictionary | No gradients on dictionary |
+| Training Mode | Dictionary learned via gradients | Dictionary updated via K-SVD |
+| Best For | Large-scale datasets | Smaller datasets, interpretability |
+
+#### Logged Metrics
+
+The following metrics are tracked during training:
+
+- **Loss metrics**: `train/loss`, `val/loss` (total loss)
+- **Component losses**: 
+  - `train/recon_loss`, `val/recon_loss` (MSE reconstruction)
+  - `train/ksvd_loss`, `val/ksvd_loss` (K-SVD bottleneck loss)
+  - `train/perceptual_loss`, `val/perceptual_loss` (LPIPS)
+  - `train/mr_dct_loss`, `val/mr_dct_loss` (multi-resolution DCT)
+  - `train/mr_grad_loss`, `val/mr_grad_loss` (multi-resolution gradient)
+- **Quality metrics**: 
+  - `train/psnr`, `val/psnr` (Peak Signal-to-Noise Ratio)
+  - `train/ssim`, `val/ssim` (Structural Similarity Index)
+- **Sparsity**: `train/sparsity`, `val/sparsity` (average number of active atoms)
+
+#### Tips for Best Results
+
+1. **Start Small**: Begin with fewer atoms (256-512) and moderate sparsity (8-16)
+
+2. **Tune K-SVD Iterations**: 
+   - 1-2 iterations for speed
+   - 3-5 iterations for quality
+
+3. **Patch Size**:
+   - Use 1 (pixel-level) for best quality but slower training
+   - Use 4-8 for faster training on large images with some quality trade-off
+
+4. **Perceptual Loss**: Essential for good visual quality
+   - Set to 0.5-1.0 for best results
+
+5. **Monitor Sparsity**: Should stay around `sparsity_level / num_embeddings`
+   - If too high: increase commitment_cost
+   - If too low: decrease commitment_cost
+
+#### Troubleshooting
+
+**Dictionary atoms not being used**
+- Solution: Increase `ksvd_iterations` or decrease `sparsity_level`
+
+**Training is slow**
+- Solutions:
+  - Reduce `ksvd_iterations` to 1
+  - Increase `patch_size` to 4 or 8
+  - Reduce `num_embeddings`
+
+**Poor reconstruction quality**
+- Solutions:
+  - Increase `sparsity_level`
+  - Increase `num_embeddings`
+  - Increase `perceptual_weight`
+  - Decrease `patch_size` to 1 (pixel-level)
+
+**Validation loss not improving (overfitting)**
+- Solutions:
+  - Reduce dictionary update frequency
+  - Increase encoder/decoder capacity
+  - Use data augmentation
+  - Lower `patch_size` for finer granularity
+
+**SVD errors during training**
+- Solution: This is handled internally with try-except. If it persists, reduce learning rate to stabilize encoder outputs.
+
+#### Evaluation
+
+After training, load and evaluate checkpoints:
+
+```python
+from src.models.laser import LASER
+
+# Load checkpoint
+model = LASER.load_from_checkpoint('outputs/checkpoints/run_xxx/last.ckpt')
+model.eval()
+
+# Run inference
+with torch.no_grad():
+    recon, loss, coeffs = model(images)
+```
+
+### Additional References
+
+- Y. C. Pati, R. Rezaiifar and P. S. Krishnaprasad, "Orthogonal matching pursuit: Recursive function approximation with applications to wavelet decomposition," Asilomar Conference on Signals, Systems and Computers, 1993.
+
+### References
+
+M. Aharon, M. Elad and A. Bruckstein, "K-SVD: An Algorithm for Designing Overcomplete Dictionaries for Sparse Representation," in IEEE Transactions on Signal Processing, vol. 54, no. 11, pp. 4311-4322, Nov. 2006.
 
 ## Bottleneck Visualizations
 
@@ -335,6 +712,128 @@ pytest tests/test_bottleneck.py::test_bottleneck_visualizations -v
 cp tests/artifacts/bottleneck/*.png img/
 cp tests/artifacts/codebook_embeddings/*.png img/
 ```
+
+## Generation Capabilities
+
+### VQ-VAE for Generation ✅ (RECOMMENDED)
+
+VQ-VAE is **ideal for generation** because it produces discrete codes:
+
+```
+Image → Encoder → VQ (discrete codes) → Decoder → Image
+                      ↓
+                [42, 17, 8, 103, ...]  # Discrete sequence
+                      ↓
+           Transformer/Diffusion Model ✅
+```
+
+**Advantages:**
+- ✅ Clean discrete token sequence (like text)
+- ✅ Standard transformer architecture works out-of-the-box
+- ✅ Easy to train autoregressive/diffusion models
+- ✅ Well-established (DALL-E, Parti, Imagen use VQ-style tokenization)
+- ✅ Can use any sequence model (GPT, BERT, diffusion)
+
+**Example:**
+```python
+# Encode images to discrete codes
+indices, H, W = vqvae.encode_to_indices(images)  # [B, H*W]
+
+# Train transformer on code sequences
+transformer = GPT(vocab_size=512, ...)
+transformer.fit(indices)
+
+# Generate new images
+new_codes = transformer.generate(temperature=1.0)
+new_images = vqvae.decode_from_indices(new_codes, H, W)
+```
+
+### Dictionary Learning for Generation ❌ (NOT RECOMMENDED)
+
+Dictionary learning produces **continuous sparse coefficients**, which are hard to model:
+
+```
+Image → Encoder → Sparse Coding → Dictionary → Decoder
+                       ↓
+          [0.3, 0, -0.2, 0, ..., 0.5]  # Continuous sparse vector
+                       ↓
+           ??? How to model this ???
+```
+
+**Challenges:**
+- ❌ Continuous sparse vectors (not discrete tokens)
+- ❌ Hard to model with transformers (need regression, not classification)
+- ❌ No clear "token" concept for sequence modeling
+- ❌ Sparsity constraint complicates generation
+- ❌ Each patch has K continuous values (e.g., 8 coefficients)
+
+**Why it's harder:**
+```python
+# VQ-VAE: Predict 1 discrete code per location
+logits = transformer(previous_codes)  # Shape: [B, seq_len, vocab_size]
+next_code = logits.argmax(dim=-1)  # Easy!
+
+# Dictionary Learning: Predict K continuous coefficients per location
+coeffs = model(previous_coeffs)  # Shape: [B, seq_len, K]
+# Need to:
+# 1. Predict K values (regression)
+# 2. Maintain sparsity (only K non-zero)
+# 3. Select which atoms to use (combinatorial problem)
+# Much harder!
+```
+
+### What Dictionary Learning IS Good For
+
+Dictionary Learning excels at:
+- ✅ **Reconstruction quality**: Superior MSE/PSNR for same codebook size
+- ✅ **Compression**: Better rate-distortion tradeoff
+- ✅ **Feature extraction**: Interpretable sparse features
+- ✅ **Analysis**: Understanding data structure
+- ✅ **Denoising/Inpainting**: Non-generative tasks
+
+### Hybrid Approach: Dictionary + VQ (FUTURE WORK)
+
+For best of both worlds, you could add VQ on top of sparse codes:
+
+```
+Image → Encoder → Sparse Coding → VQ Layer → Discrete Codes → Decoder
+                       ↓              ↓
+                Sparse features   Discrete tokens
+                (Better quality)  (Easy generation)
+```
+
+This would give:
+1. Dictionary learning benefits (better reconstruction)
+2. Discrete codes for easy generation
+3. Standard transformer training
+
+**Implementation sketch:**
+```python
+class HybridVAE(pl.LightningModule):
+    def __init__(self):
+        self.encoder = Encoder(...)
+        self.sparse_coding = DictionaryLearning(...)
+        self.vq_on_codes = VectorQuantizer(...)  # VQ the sparse codes
+        self.decoder = Decoder(...)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        sparse_coeffs = self.sparse_coding(z)  # Continuous sparse
+        discrete_codes = self.vq_on_codes(sparse_coeffs)  # Discrete!
+        return self.decoder(discrete_codes)
+```
+
+### Recommendation
+
+**For generation tasks:**
+- Use **VQ-VAE** (discrete codes → easy transformer training)
+- Train autoregressive/diffusion model on codes
+- Standard, proven approach
+
+**For reconstruction/compression only:**
+- Use **Dictionary Learning** (better quality, but no generation)
+- Superior reconstruction metrics
+- Good for analysis and understanding
 
 ## License
 

@@ -5,7 +5,7 @@ from typing import Optional, Tuple, Union, List
 
 import lightning as pl
 import torch
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torchvision.transforms as transforms
@@ -17,17 +17,27 @@ IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
 
 class FlatImageDataset(Dataset):
-    def __init__(self, root: Union[str, Path], transform=None):
+    def __init__(
+        self,
+        root: Union[str, Path],
+        transform=None,
+        paths: Optional[List[Path]] = None,
+    ):
         self.root = Path(root)
         self.transform = transform
-        image_paths: List[Path] = []
-        for path in self.root.rglob('*'):
-            if path.is_file() and path.suffix.lower() in IMG_EXTENSIONS:
-                image_paths.append(path)
-        image_paths.sort()
-        if not image_paths:
-            raise RuntimeError(f'No images found under {self.root}')
-        self.image_paths = image_paths
+        if paths is not None:
+            if not paths:
+                raise RuntimeError("No image paths provided for dataset subset.")
+            self.image_paths = [Path(p) for p in paths]
+        else:
+            image_paths: List[Path] = []
+            for path in self.root.rglob('*'):
+                if path.is_file() and path.suffix.lower() in IMG_EXTENSIONS:
+                    image_paths.append(path)
+            image_paths.sort()
+            if not image_paths:
+                raise RuntimeError(f'No images found under {self.root}')
+            self.image_paths = image_paths
         self._placeholder_size = (64, 64)  # used only as a last-resort fallback
 
     def __len__(self) -> int:
@@ -121,12 +131,14 @@ class CelebADataModule(pl.LightningDataModule):
         else:
             resize_to = tuple(image_size)  # type: ignore[arg-type]
 
-        train_transforms = transforms.Compose([
-            transforms.Resize(resize_to),
-            transforms.RandomHorizontalFlip() if augment else transforms.Lambda(lambda x: x),
+        train_ops = [transforms.Resize(resize_to)]
+        if augment:
+            train_ops.append(transforms.RandomHorizontalFlip())
+        train_ops.extend([
             transforms.ToTensor(),
             transforms.Normalize(self.config.mean, self.config.std),
         ])
+        train_transforms = transforms.Compose(train_ops)
 
         eval_transforms = transforms.Compose([
             transforms.Resize(resize_to),
@@ -134,27 +146,43 @@ class CelebADataModule(pl.LightningDataModule):
             transforms.Normalize(self.config.mean, self.config.std),
         ])
 
-        full_dataset = FlatImageDataset(data_dir, transform=train_transforms)
-
-        # Simple split: 90% train, 5% val, 5% test
-        num_items = len(full_dataset)
+        base_dataset = FlatImageDataset(data_dir, transform=None)
+        num_items = len(base_dataset)
         num_train = int(0.90 * num_items)
         num_val = int(0.05 * num_items)
         num_test = num_items - num_train - num_val
 
-        train_dataset, val_dataset, test_dataset = random_split(
-            full_dataset,
-            lengths=[num_train, num_val, num_test],
-            generator=torch.Generator().manual_seed(42),
+        if num_items < 3:
+            raise RuntimeError("CelebA dataset must contain at least three images for train/val/test splits.")
+
+        generator = torch.Generator().manual_seed(42)
+        indices = torch.randperm(num_items, generator=generator)
+        train_idx = indices[:num_train]
+        val_idx = indices[num_train:num_train + num_val]
+        test_idx = indices[num_train + num_val:]
+
+        def _gather_paths(idxs: torch.Tensor) -> List[Path]:
+            return [base_dataset.image_paths[i] for i in idxs.tolist()]
+
+        train_paths = _gather_paths(train_idx)
+        val_paths = _gather_paths(val_idx)
+        test_paths = _gather_paths(test_idx)
+
+        self.train_dataset = FlatImageDataset(
+            data_dir,
+            transform=train_transforms,
+            paths=train_paths,
         )
-
-        # Override transforms for val/test
-        val_dataset.dataset.transform = eval_transforms  # type: ignore[attr-defined]
-        test_dataset.dataset.transform = eval_transforms  # type: ignore[attr-defined]
-
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.test_dataset = test_dataset
+        self.val_dataset = FlatImageDataset(
+            data_dir,
+            transform=eval_transforms,
+            paths=val_paths,
+        )
+        self.test_dataset = FlatImageDataset(
+            data_dir,
+            transform=eval_transforms,
+            paths=test_paths,
+        )
     def train_dataloader(self):
         return self._build_loader(
             dataset=self.train_dataset,

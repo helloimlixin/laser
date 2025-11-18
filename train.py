@@ -21,6 +21,7 @@ torch.set_float32_matmul_precision('medium')
 
 from src.models.dlvae import DLVAE
 from src.models.vqvae import VQVAE
+from src.models.laser import LASER
 from src.data.cifar10 import CIFAR10DataModule
 from src.data.config import DataConfig
 from src.data.imagenette2 import Imagenette2DataModule
@@ -74,21 +75,24 @@ def train(cfg: DictConfig):
     print(f"Embedding Dimensions: {cfg.model.embedding_dim}")
     print(f"Number of Residual Blocks: {cfg.model.num_residual_blocks}")
     print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
-    if cfg.model.type == "dlvae":
+    if cfg.model.type in ["dlvae", "laser"]:
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
         if hasattr(cfg.model, "patch_size"):
             print(f"Latent Patch Size: {cfg.model.patch_size}")
-        if getattr(cfg.model, "multi_res_dct_weight", 0.0) > 0:
-            print(f"Multi-res DCT: weight={cfg.model.multi_res_dct_weight}, levels={cfg.model.multi_res_dct_levels}")
-        if getattr(cfg.model, "multi_res_grad_weight", 0.0) > 0:
-            print(f"Multi-res Grad: weight={cfg.model.multi_res_grad_weight}, levels={cfg.model.multi_res_grad_levels}")
-        if getattr(cfg.model, "dictionary_ortho_weight", 0.0) > 0:
-            print(f"Dictionary Ortho Weight: {cfg.model.dictionary_ortho_weight}")
-        if hasattr(cfg.model, "omp_tolerance"):
-            print(f"OMP Tolerance: {cfg.model.omp_tolerance}")
-        if hasattr(cfg.model, "omp_debug"):
-            print(f"OMP Debug: {cfg.model.omp_debug}")
+        if cfg.model.type == "laser":
+            print(f"K-SVD Iterations: {getattr(cfg.model, 'ksvd_iterations', 2)}")
+        if cfg.model.type == "dlvae":
+            if getattr(cfg.model, "multi_res_dct_weight", 0.0) > 0:
+                print(f"Multi-res DCT: weight={cfg.model.multi_res_dct_weight}, levels={cfg.model.multi_res_dct_levels}")
+            if getattr(cfg.model, "multi_res_grad_weight", 0.0) > 0:
+                print(f"Multi-res Grad: weight={cfg.model.multi_res_grad_weight}, levels={cfg.model.multi_res_grad_levels}")
+            if getattr(cfg.model, "dictionary_ortho_weight", 0.0) > 0:
+                print(f"Dictionary Ortho Weight: {cfg.model.dictionary_ortho_weight}")
+            if hasattr(cfg.model, "omp_tolerance"):
+                print(f"OMP Tolerance: {cfg.model.omp_tolerance}")
+            if hasattr(cfg.model, "omp_debug"):
+                print(f"OMP Debug: {cfg.model.omp_debug}")
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -119,7 +123,7 @@ def train(cfg: DictConfig):
     if configured_monitor:
         monitor_key = configured_monitor
     else:
-        monitor_key = "val/loss_epoch"
+        monitor_key = "val/loss"
     monitor_mode = getattr(cfg.checkpoint, "mode", "min")
     filename_template = getattr(cfg.checkpoint, "filename", f"{cfg.model.type}-{{epoch:03d}}")
 
@@ -239,6 +243,28 @@ def train(cfg: DictConfig):
             'dictionary_ortho_weight': getattr(cfg.model, 'dictionary_ortho_weight', 0.0),
         }
         model = DLVAE(**model_params)
+    elif cfg.model.type == "laser":
+        model_params = {
+            'in_channels': cfg.model.in_channels,
+            'num_hiddens': cfg.model.num_hiddens,
+            'num_embeddings': cfg.model.num_embeddings,
+            'embedding_dim': cfg.model.embedding_dim,
+            'num_residual_blocks': cfg.model.num_residual_blocks,
+            'num_residual_hiddens': cfg.model.num_residual_hiddens,
+            'commitment_cost': cfg.model.commitment_cost,
+            'perceptual_weight': cfg.model.perceptual_weight,
+            'learning_rate': cfg.train.learning_rate,
+            'beta': cfg.train.beta,
+            'compute_fid': cfg.model.compute_fid,
+            'sparsity_level': cfg.model.sparsity_level,
+            'ksvd_iterations': getattr(cfg.model, 'ksvd_iterations', 2),
+            'patch_size': getattr(cfg.model, 'patch_size', 1),
+            'multi_res_dct_weight': getattr(cfg.model, 'multi_res_dct_weight', 0.0),
+            'multi_res_dct_levels': getattr(cfg.model, 'multi_res_dct_levels', 3),
+            'multi_res_grad_weight': getattr(cfg.model, 'multi_res_grad_weight', 0.0),
+            'multi_res_grad_levels': getattr(cfg.model, 'multi_res_grad_levels', 3),
+        }
+        model = LASER(**model_params)
     elif cfg.model.type == "vqvae":
         model_params = {
             'in_channels': cfg.model.in_channels,
@@ -285,9 +311,9 @@ def train(cfg: DictConfig):
     # Add EarlyStopping only if configured
     if getattr(cfg.train, "early_stopping_patience", None):
         callbacks.insert(1, EarlyStopping(
-            monitor="val/loss_epoch",
+            monitor=monitor_key,
             patience=cfg.train.early_stopping_patience,
-            mode="min"
+            mode=monitor_mode
         ))
 
     # Initialize trainer
