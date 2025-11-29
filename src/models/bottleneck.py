@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -131,6 +133,7 @@ class DictionaryLearning(nn.Module):
         sparsity_level=5,
         commitment_cost=0.25,
         ksvd_iterations=1,
+        decay=None,
         patch_size=1,
         epsilon=1e-10,
         sparse_solver="omp",
@@ -139,7 +142,32 @@ class DictionaryLearning(nn.Module):
         use_online_learning=True,
         dict_learning_rate=0.1,
         use_backprop_only=False,
+        tolerance=None,
+        omp_debug=False,
     ):
+        """
+        Args:
+            num_embeddings: Number of dictionary atoms (dictionary size)
+            embedding_dim: Channel dimension of encoder output (NOT full atom dimension!)
+            sparsity_level: Max non-zero coefficients per patch
+            commitment_cost: Weight for encoder commitment loss
+            ksvd_iterations: Number of K-SVD iterations per forward pass
+            decay: Deprecated EMA decay parameter (accepted for compatibility)
+            patch_size: Spatial patch size (int or tuple). Determines actual atom dimension.
+            epsilon: Small constant for numerical stability
+            sparse_solver: 'omp', 'iht', or 'topk'
+            iht_iterations: Number of IHT iterations (if sparse_solver='iht')
+            iht_step_size: IHT step size (None=auto)
+            use_online_learning: Use online learning instead of K-SVD
+            dict_learning_rate: Learning rate for online updates
+            use_backprop_only: Learn dictionary via gradients only (no K-SVD/online)
+            tolerance: Optional OMP residual tolerance (legacy parameter)
+            omp_debug: Enable verbose logging for OMP (legacy parameter)
+        
+        Note:
+            The actual dictionary atom dimension is: embedding_dim × patch_size²
+            E.g., embedding_dim=64, patch_size=4 → atom_dim=1024
+        """
         super(DictionaryLearning, self).__init__()
 
         self.num_embeddings = num_embeddings
@@ -151,6 +179,14 @@ class DictionaryLearning(nn.Module):
         self.sparse_solver = sparse_solver.lower()
         self.iht_iterations = iht_iterations
         self.iht_step_size = iht_step_size
+        self.omp_tolerance = tolerance
+        self.omp_debug = omp_debug
+        self.decay = decay
+        if decay not in (None, 0):
+            warnings.warn(
+                "DictionaryLearning no longer uses the `decay` parameter; it is ignored.",
+                stacklevel=2,
+            )
         
         if isinstance(patch_size, int):
             self.patch_size = (patch_size, patch_size)
@@ -159,6 +195,9 @@ class DictionaryLearning(nn.Module):
                 raise ValueError("patch_size must be an int or a tuple of two ints")
             self.patch_size = tuple(int(p) for p in patch_size)
         self.patch_area = self.patch_size[0] * self.patch_size[1]
+        
+        # IMPORTANT: atom_dim is the ACTUAL dictionary atom dimension
+        # It's embedding_dim × patch_area (much larger than embedding_dim when patch_size > 1)
         self.atom_dim = self.embedding_dim * self.patch_area
         
         # Use backprop-only mode for faster training
@@ -216,6 +255,13 @@ class DictionaryLearning(nn.Module):
 
         for k in range(self.sparsity_level):
             residual = X - torch.matmul(D, coefficients)
+            if self.omp_tolerance is not None:
+                residual_norm = torch.linalg.norm(residual, dim=0)
+                if torch.all(residual_norm <= self.omp_tolerance):
+                    if self.omp_debug:
+                        max_norm = residual_norm.max().item()
+                        print(f"[BatchOMP] Early stop at iter {k} with max residual {max_norm:.4e}")
+                    break
             correlations = torch.matmul(D.t(), residual)
             correlations = correlations.masked_fill(selected_mask, 0.0)
 
@@ -468,22 +514,35 @@ class DictionaryLearning(nn.Module):
         """
         z_e = z_e.contiguous()
         batch_size, channels, height, width = z_e.shape
+        orig_height, orig_width = height, width
+        original_z_e = z_e
         patch_h, patch_w = self.patch_size
-        
-        if height % patch_h != 0 or width % patch_w != 0:
-            raise ValueError(
-                f"Feature map ({height}x{width}) must be divisible by patch_size {self.patch_size}"
-            )
-        
-        # Extract patches
+        stride = self.patch_size
+
+        # Mirror the reference implementation by padding to make patch tiling well-defined
+        pad_h = (patch_h - (height % patch_h)) % patch_h
+        pad_w = (patch_w - (width % patch_w)) % patch_w
+        z_e_padded = z_e
+        if pad_h or pad_w:
+            z_e_padded = F.pad(z_e, (0, pad_w, 0, pad_h))
+            height = orig_height + pad_h
+            width = orig_width + pad_w
+
+        # Extract patches using the same unfolding/reshaping strategy as the provided code
         patches = F.unfold(
-            z_e,
+            z_e_padded,
             kernel_size=self.patch_size,
-            stride=self.patch_size,
+            stride=stride,
         ).permute(2, 0, 1).contiguous()  # [num_patches, batch_size, atom_dim]
-        
-        patches_shape = (patches.size(0), patches.size(1), patches.size(2))
-        patch_tokens = patches.view(-1, self.atom_dim).t().contiguous()  # [atom_dim, batch_size * num_patches]
+
+        patches_shape = patches.shape
+        patches_nchw = patches.view(
+            patches_shape[0] * patches_shape[1],
+            channels,
+            patch_h,
+            patch_w,
+        ).contiguous()
+        patch_tokens = patches_nchw.view(-1, self.atom_dim).t().contiguous()  # [atom_dim, batch_size * num_patches]
         
         # Store original dtype for consistency
         orig_dtype = patch_tokens.dtype
@@ -536,11 +595,14 @@ class DictionaryLearning(nn.Module):
             kernel_size=self.patch_size,
             stride=self.patch_size,
         )
+        if pad_h or pad_w:
+            z_dl_nchw = z_dl_nchw[:, :, :orig_height, :orig_width]
+            z_e_padded = z_e_padded[:, :, :orig_height, :orig_width]
         
         z_dl = z_dl_nchw.to(orig_dtype)
         
         # Compute losses for monitoring and encoder training
-        z_e_nhwc = z_e.permute(0, 2, 3, 1).contiguous()
+        z_e_nhwc = original_z_e.permute(0, 2, 3, 1).contiguous()
         z_dl_nhwc = z_dl.permute(0, 2, 3, 1).contiguous()
         
         # Encoder commitment loss: encourages encoder to match reconstruction
@@ -552,6 +614,6 @@ class DictionaryLearning(nn.Module):
         # Straight-through estimator (same as VQ-VAE)
         # Forward: uses z_dl (dictionary reconstruction)
         # Backward: gradients copy through to encoder via z_e, and to decoder via the residual
-        z_dl = z_e + (z_dl - z_e).detach()
+        z_dl = original_z_e + (z_dl - original_z_e).detach()
         
         return z_dl, loss, coefficients

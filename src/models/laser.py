@@ -238,7 +238,7 @@ class LASER(pl.LightningModule):
         # Total loss
         total_loss = (
             recon_loss +
-            10 * bottleneck_loss +
+            bottleneck_loss +
             self.perceptual_weight * perceptual_loss +
             self.mr_dct_weight * mr_dct_loss +
             self.mr_grad_weight * mr_grad_loss +

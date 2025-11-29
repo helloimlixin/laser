@@ -3,7 +3,7 @@ dirpath: ${output_dir}/checkpoints
 # Keep filename simple and robust; include epoch. You can override to add metrics.
 filename: "${model.type}-{epoch:03d}"
 # Monitor key defaults will be chosen per model type in code unless overridden here.
-# For VQVAE/DLVAE: "val/loss_epoch"
+# For VQVAE/LASER: "val/loss_epoch"
 monitor: ""
 mode: "min"
 save_top_k: 3

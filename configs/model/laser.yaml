@@ -1,5 +1,5 @@
 # Model type: laser (K-SVD Dictionary Learning VAE)
-# Other options: vqvae, dlvae
+# Other options: vqvae
 type: laser
 
 # Number of input image channels
@@ -9,31 +9,36 @@ in_channels: 3
 # Number of hidden units in encoder/decoder
 # Typical range: 32-256
 # Higher = more capacity, slower training
-num_hiddens: 64
+num_hiddens: 128
 
 # Dictionary size (number of atoms/embeddings)
 # Typical range: 128-1024
 # Higher = more expressive, slower sparse coding
-num_embeddings: 256
+num_embeddings: 512
 
-# Dimension of each dictionary atom
+# Channel dimension of encoder output (NOT the full atom dimension!)
 # Should match encoder output channels
 # Typical range: 32-128
+# NOTE: The actual dictionary atom dimension = embedding_dim × patch_size²
+#       With embedding_dim=64 and patch_size=4: atom_dim = 64 × 16 = 1024
 embedding_dim: 64
 
-# Sparsity level (max number of non-zero coefficients per signal)
+# Spatial patch size for patch-based dictionary learning
+# Options: 1 (pixel-level), 2, 4, 8, 16, or tuple (h, w)
+# 1 = pixel-level (atom_dim = embedding_dim), best quality, slowest
+# 4 = patch-level (atom_dim = embedding_dim × 16), good balance
+# 8 = patch-level (atom_dim = embedding_dim × 64), faster, lower quality
+# 16+ = large patches, fastest, lower quality
+# IMPORTANT: Larger patches = longer dictionary atoms = more parameters
+patch_size: 4
+
+# Sparsity level (max number of non-zero coefficients per signal/patch)
 # Must be < num_embeddings
 # Typical range: 4-32
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
-sparsity_level: 32
-
-# Spatial patch size for patch-based dictionary learning
-# Options: 1 (pixel-level), 2, 4, 8, 16, or tuple (h, w)
-# 1 = best quality, slowest
-# 4-8 = good balance
-# 16+ = fastest, lower quality
-patch_size: 16
+# With patch_size > 1: each patch gets its own sparse representation
+sparsity_level: 8
 
 # Number of residual blocks in encoder/decoder
 # Typical range: 2-6
@@ -47,7 +52,7 @@ num_residual_hiddens: 32
 # Commitment cost (weight for encoder loss term)
 # Typical range: 0.1-1.0
 # Higher = encoder forced to match dictionary reconstruction more closely
-commitment_cost: 0.5
+commitment_cost: 0.1
 
 # Number of K-SVD dictionary update iterations per forward pass
 # Options: 0 (disabled), 1-5
@@ -58,27 +63,30 @@ ksvd_iterations: 1
 
 # Dictionary update frequency (update every N training steps)
 # Options: 0 (every step), 1+ (every N steps)
-# 0 = update every step (recommended)
+# 0 = update every step (slowest, most stable)
+# 10-20 = good balance between speed and stability
+# Large values (100+) cause sudden dictionary changes → loss spikes
 dictionary_update_frequency: 100
 
 # Use online dictionary learning instead of K-SVD
 # Options: true (fast online updates), false (classical K-SVD)
 # true = faster, good for large datasets
 # false = higher quality atoms, better for small datasets
-use_online_learning: false
+use_online_learning: true
 
 # Learning rate for online dictionary updates
 # Only used if use_online_learning=true
-# Typical range: 0.1-0.5
+# Typical range: 0.01-0.1 (CRITICAL: much lower for patch_size=1!)
 # Higher = faster dictionary adaptation
-dict_learning_rate: 0.3
+# 0.3 was causing training instability - reduced to 0.05 for stability
+dict_learning_rate: 0.05
 
 # Sparse coding algorithm
 # Options: 'omp' (best quality), 'iht' (recommended), 'topk' (fastest, not recommended)
 # omp = Orthogonal Matching Pursuit (slow, best quality)
 # iht = Iterative Hard Thresholding (fast, good quality, RECOMMENDED)
 # topk = Top-K selection (fastest, poor quality, overfitting risk)
-sparse_solver: topk
+sparse_solver: omp
 
 # Number of IHT iterations
 # Only used if sparse_solver='iht'
@@ -115,6 +123,7 @@ sparsity_reg_weight: 0.02  # Increased from 0.01 for stronger regularization
 # 0.0 = no perceptual loss
 # 0.5-1.0 = good balance (recommended)
 # Higher = better perceptual quality, slower training
+# TEMPORARILY DISABLED: VGG16 causes OOM with DDP
 perceptual_weight: 0.5
 
 # Learning rate for encoder/decoder/dictionary (if use_backprop_only=true)
