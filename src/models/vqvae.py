@@ -277,7 +277,7 @@ class VQVAE(pl.LightningModule):
         # Existing FID handling
         if self.test_fid is not None:
             fid_score = self.test_fid.compute()
-            self.log('test/fid', fid_score)
+            self.log('test/fid', fid_score, sync_dist=True)
             self.test_fid.reset()
 
         return metrics
@@ -357,7 +357,6 @@ if __name__ == "__main__":
     vqvae = VQVAE(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32, num_embeddings=1024, embedding_dim=32, commitment_cost=0.25, decay=0.99, perceptual_weight=0.1, learning_rate=1e-4, beta=1.0, compute_fid=True)
     x = torch.randn(4, 3, 256, 256)  # batch_size x 3 x 256 x 256
     print(vqvae(x).shape)  # batch_size x 3 x 256 x 256
-
 
 
 

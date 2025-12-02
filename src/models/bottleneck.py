@@ -204,18 +204,15 @@ class DictionaryLearning(nn.Module):
         self.use_backprop_only = use_backprop_only
         
         # Initialize dictionary with random atoms
-        if self.use_backprop_only:
-            # For backprop-only: make dictionary trainable and skip K-SVD updates
-            self.dictionary = nn.Parameter(
-                torch.randn(self.atom_dim, num_embeddings), requires_grad=True
-            )
-            self.enable_ksvd_update = False
-        else:
-            # Original K-SVD approach: dictionary not trainable, updated via K-SVD
-            self.dictionary = nn.Parameter(
-                torch.randn(self.atom_dim, num_embeddings), requires_grad=False
-            )
-            self.enable_ksvd_update = True
+        # Always make the dictionary trainable so optimizers can update it
+        # Tests expect gradients to flow to the dictionary even when K-SVD/online
+        # updates are enabled.
+        self.dictionary = nn.Parameter(
+            torch.randn(self.atom_dim, num_embeddings), requires_grad=True
+        )
+        # Keep K-SVD/online updates optional for users that want them in addition
+        # to gradient-based learning.
+        self.enable_ksvd_update = not self.use_backprop_only
             
         # Always normalize dictionary atoms at initialization
         self._normalize_dictionary()
@@ -617,3 +614,14 @@ class DictionaryLearning(nn.Module):
         z_dl = original_z_e + (z_dl - original_z_e).detach()
         
         return z_dl, loss, coefficients
+
+    def orthogonality_loss(self):
+        """
+        Penalize correlated atoms; zero when dictionary columns are orthonormal.
+        """
+        with torch.no_grad():
+            self._normalize_dictionary()
+        D = self.dictionary
+        gram = D.t() @ D
+        eye = torch.eye(self.num_embeddings, device=gram.device, dtype=gram.dtype)
+        return ((gram - eye) ** 2).mean()

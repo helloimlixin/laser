@@ -260,18 +260,19 @@ class LASER(pl.LightningModule):
         # Compute sparsity
         sparsity = (coefficients.abs() > 1e-6).float().mean()
         
-        # Log metrics
-        self.log(f'{prefix}/loss', total_loss, prog_bar=True, sync_dist=True)
-        self.log(f'{prefix}/recon_loss', recon_loss, sync_dist=True)
-        self.log(f'{prefix}/bottleneck_loss', bottleneck_loss, sync_dist=True)
-        self.log(f'{prefix}/perceptual_loss', perceptual_loss, sync_dist=True)
-        self.log(f'{prefix}/sparsity_loss', sparsity_loss, sync_dist=True)
-        self.log(f'{prefix}/mr_dct_loss', mr_dct_loss, sync_dist=True)
-        self.log(f'{prefix}/mr_grad_loss', mr_grad_loss, sync_dist=True)
-        self.log(f'{prefix}/psnr', psnr, prog_bar=True, sync_dist=True)
+        # Log metrics; explicitly set on_step/on_epoch to avoid Lightning warnings in DDP
+        log_kwargs = dict(on_step=prefix == 'train', on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
+        self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
+        self.log(f'{prefix}/bottleneck_loss', bottleneck_loss, **log_kwargs)
+        self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
+        self.log(f'{prefix}/sparsity_loss', sparsity_loss, **log_kwargs)
+        self.log(f'{prefix}/mr_dct_loss', mr_dct_loss, **log_kwargs)
+        self.log(f'{prefix}/mr_grad_loss', mr_grad_loss, **log_kwargs)
+        self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
         if prefix != 'train':
-            self.log(f'{prefix}/ssim', ssim, prog_bar=True, sync_dist=True)
-        self.log(f'{prefix}/sparsity', sparsity, sync_dist=True)
+            self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
+        self.log(f'{prefix}/sparsity', sparsity, **log_kwargs)
         
         return total_loss, recon_vis, x_vis
 

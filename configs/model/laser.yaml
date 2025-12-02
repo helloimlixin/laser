@@ -30,7 +30,7 @@ embedding_dim: 64
 # 8 = patch-level (atom_dim = embedding_dim × 64), faster, lower quality
 # 16+ = large patches, fastest, lower quality
 # IMPORTANT: Larger patches = longer dictionary atoms = more parameters
-patch_size: 4
+patch_size: 2
 
 # Sparsity level (max number of non-zero coefficients per signal/patch)
 # Must be < num_embeddings
@@ -38,7 +38,7 @@ patch_size: 4
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
 # With patch_size > 1: each patch gets its own sparse representation
-sparsity_level: 8
+sparsity_level: 16
 
 # Number of residual blocks in encoder/decoder
 # Typical range: 2-6
@@ -52,7 +52,7 @@ num_residual_hiddens: 32
 # Commitment cost (weight for encoder loss term)
 # Typical range: 0.1-1.0
 # Higher = encoder forced to match dictionary reconstruction more closely
-commitment_cost: 0.1
+commitment_cost: 0.25
 
 # Number of K-SVD dictionary update iterations per forward pass
 # Options: 0 (disabled), 1-5
@@ -79,7 +79,7 @@ use_online_learning: true
 # Typical range: 0.01-0.1 (CRITICAL: much lower for patch_size=1!)
 # Higher = faster dictionary adaptation
 # 0.3 was causing training instability - reduced to 0.05 for stability
-dict_learning_rate: 0.05
+dict_learning_rate: 0.03
 
 # Sparse coding algorithm
 # Options: 'omp' (best quality), 'iht' (recommended), 'topk' (fastest, not recommended)
@@ -116,7 +116,7 @@ use_backprop_only: false
 # 0.01 = mild regularization (recommended)
 # 0.05-0.1 = strong regularization (max sparsity)
 # Increase this if still overfitting with backprop-only mode
-sparsity_reg_weight: 0.02  # Increased from 0.01 for stronger regularization
+sparsity_reg_weight: 0.5 # Increased from 0.01 for stronger regularization
 
 # Perceptual loss weight (LPIPS)
 # Typical range: 0.0-2.0
@@ -130,7 +130,7 @@ perceptual_weight: 0.5
 # Typical range: 1e-4 to 1e-3
 # 1e-4 = stable, slower
 # 1e-3 = faster, may be unstable
-learning_rate: 1e-3
+learning_rate: 1e-4
 
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99

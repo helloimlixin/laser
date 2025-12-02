@@ -14,6 +14,10 @@ import torch
 import torch.nn.functional as F
 import torchvision
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:n_jobs value 1 overridden.*random_state"
+)
+
 # Ensure project sources are importable
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -174,7 +178,6 @@ def _build_dictionary_learning(num_embeddings=32, embedding_dim=16, sparsity_lev
         embedding_dim=embedding_dim,
         sparsity_level=sparsity_level,
         commitment_cost=0.25,
-        decay=0.99,
     )
 
 
@@ -1667,4 +1670,3 @@ def test_ksvd_vq_dl_comparison_visualization():
     print("="*60)
     
     assert (ARTIFACT_DIR / "vq_dl_ksvd_comparison.png").exists()
-
