@@ -505,10 +505,10 @@ class VectorQuantizer(nn.Module):
         flat_inputs = z.view(-1, self.embedding_dim)
         num_vectors = flat_inputs.size(0)
 
-        embeddings = self.embedding.weight
-        emb_norm_sq = (embeddings ** 2).sum(dim=1)
+        embeddings = self.embedding.weight  # [K, D]
 
-        # Chunked nearest neighbour search
+        # Always use chunked nearest neighbour search to limit peak memory and avoid large matmuls.
+        emb_norm_sq = (embeddings ** 2).sum(dim=1)
         chunk_size = 32768
         indices_list = []
         for start in range(0, num_vectors, chunk_size):
@@ -1646,8 +1646,7 @@ class DictionaryLearning(nn.Module):
         """
         Reconstruct a latent feature map from discrete pattern indices.
 
-        Assumes non-overlapping patches (patch_stride == patch_size). For overlapping
-        stride, extend this to use the Hann blending path from the forward pass.
+        Supports overlapping patches using the configured `patch_stride`.
 
         Args:
             pattern_indices: LongTensor [B, num_patches]
@@ -1660,14 +1659,16 @@ class DictionaryLearning(nn.Module):
 
         B, num_patches = pattern_indices.shape
 
-        # Infer grid (assume square). This matches training for stride=patch_size.
+        # Infer square grid of patches
         grid = int(math.sqrt(num_patches))
         if grid * grid != num_patches:
             raise ValueError(f"num_patches={num_patches} is not a perfect square; generation reshape is ambiguous")
 
         patch_h, patch_w = self.patch_size
-        latent_h = grid * patch_h
-        latent_w = grid * patch_w
+        stride_h, stride_w = self.patch_stride
+        # Reconstruct latent spatial size for arbitrary stride: (n-1)*stride + patch
+        latent_h = (grid - 1) * stride_h + patch_h
+        latent_w = (grid - 1) * stride_w + patch_w
 
         # Decode patterns to sparse codes: [num_atoms, B*num_patches]
         # Switch back to patch-major flattening expected by the dictionary

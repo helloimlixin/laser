@@ -37,7 +37,7 @@ patch_size: 8
 
 # Patch stride; default is equal to patch_size (no overlap).
 # Set to patch_size / 2 for 50% overlap (e.g., stride=4 when patch_size=8).
-patch_stride: 8
+patch_stride: 4
 
 # Patch flattening order: 'channel_first' (C,H,W) or 'spatial_first' (H,W,C)
 # spatial_first groups channel info together, may help with high-dim patches
