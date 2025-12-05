@@ -49,6 +49,10 @@ def train(cfg: DictConfig):
     Args:
         cfg: Hydra configuration object containing model and training parameters
     """
+    ckpt_path = getattr(cfg, "ckpt_path", None)
+    if ckpt_path:
+        print(f"\nResume checkpoint: {ckpt_path}")
+
     # Print detailed experiment configuration
     print("\n" + "="*50)
     print("EXPERIMENT CONFIGURATION")
@@ -218,6 +222,7 @@ def train(cfg: DictConfig):
             'learning_rate': cfg.train.learning_rate,
             'beta': cfg.train.beta,
             'compute_fid': cfg.model.compute_fid,
+            'bottleneck_loss_weight': getattr(cfg.model, 'bottleneck_loss_weight', 0.5),
             'sparsity_level': cfg.model.sparsity_level,
             'ksvd_iterations': getattr(cfg.model, 'ksvd_iterations', 1),
             'dictionary_update_frequency': getattr(cfg.model, 'dictionary_update_frequency', 0),
@@ -227,12 +232,24 @@ def train(cfg: DictConfig):
             'sparse_solver': getattr(cfg.model, 'sparse_solver', 'omp'),
             'iht_iterations': getattr(cfg.model, 'iht_iterations', 10),
             'iht_step_size': getattr(cfg.model, 'iht_step_size', None),
+            'fista_alpha': getattr(cfg.model, 'fista_alpha', 0.1),
+            'fista_tolerance': getattr(cfg.model, 'fista_tolerance', 1e-3),
+            'fista_max_steps': getattr(cfg.model, 'fista_max_steps', 50),
             'sparsity_reg_weight': getattr(cfg.model, 'sparsity_reg_weight', 0.01),
             'patch_size': getattr(cfg.model, 'patch_size', 1),
+            'patch_stride': getattr(cfg.model, 'patch_stride', None),
             'multi_res_dct_weight': getattr(cfg.model, 'multi_res_dct_weight', 0.0),
             'multi_res_dct_levels': getattr(cfg.model, 'multi_res_dct_levels', 3),
             'multi_res_grad_weight': getattr(cfg.model, 'multi_res_grad_weight', 0.0),
             'multi_res_grad_levels': getattr(cfg.model, 'multi_res_grad_levels', 3),
+            'per_pixel_sparse_coding': getattr(cfg.model, 'per_pixel_sparse_coding', False),
+            'patch_flatten_order': getattr(cfg.model, 'patch_flatten_order', 'channel_first'),
+            # Pattern quantization for autoregressive generation
+            'use_pattern_quantizer': getattr(cfg.model, 'use_pattern_quantizer', False),
+            'num_patterns': getattr(cfg.model, 'num_patterns', 2048),
+            'pattern_commitment_cost': getattr(cfg.model, 'pattern_commitment_cost', 0.25),
+            'pattern_ema_decay': getattr(cfg.model, 'pattern_ema_decay', 0.99),
+            'pattern_temperature': getattr(cfg.model, 'pattern_temperature', 1.0),
         }
         model = LASER(**model_params)
     elif cfg.model.type == "vqvae":
@@ -316,7 +333,7 @@ def train(cfg: DictConfig):
     )
 
     # Train and test model (use PyTorch defaults for matmul precision to avoid API mixing)
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
     # Run test on a single device to avoid DistributedSampler duplications
     test_trainer = pl.Trainer(
         accelerator=('gpu' if (cfg.train.accelerator == 'gpu' and torch.cuda.is_available()) else 'cpu'),

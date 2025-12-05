@@ -14,14 +14,17 @@ num_hiddens: 128
 # Dictionary size (number of atoms/embeddings)
 # Typical range: 128-1024
 # Higher = more expressive, slower sparse coding
-num_embeddings: 512
+# For overcomplete dictionary: num_embeddings > atom_dim
+# With patch_size=8 and embedding_dim=16: atom_dim=1024, so need >1024
+num_embeddings: 2048
 
 # Channel dimension of encoder output (NOT the full atom dimension!)
 # Should match encoder output channels
-# Typical range: 32-128
+# Typical range: 16-128
 # NOTE: The actual dictionary atom dimension = embedding_dim × patch_size²
-#       With embedding_dim=64 and patch_size=4: atom_dim = 64 × 16 = 1024
-embedding_dim: 64
+#       With embedding_dim=16 and patch_size=4: atom_dim = 16 × 16 = 256
+# Higher values = more expressive atoms, better reconstruction quality
+embedding_dim: 16
 
 # Spatial patch size for patch-based dictionary learning
 # Options: 1 (pixel-level), 2, 4, 8, 16, or tuple (h, w)
@@ -30,7 +33,15 @@ embedding_dim: 64
 # 8 = patch-level (atom_dim = embedding_dim × 64), faster, lower quality
 # 16+ = large patches, fastest, lower quality
 # IMPORTANT: Larger patches = longer dictionary atoms = more parameters
-patch_size: 2
+patch_size: 8
+
+# Patch stride; default is equal to patch_size (no overlap).
+# Set to patch_size / 2 for 50% overlap (e.g., stride=4 when patch_size=8).
+patch_stride: 8
+
+# Patch flattening order: 'channel_first' (C,H,W) or 'spatial_first' (H,W,C)
+# spatial_first groups channel info together, may help with high-dim patches
+patch_flatten_order: spatial_first
 
 # Sparsity level (max number of non-zero coefficients per signal/patch)
 # Must be < num_embeddings
@@ -38,6 +49,10 @@ patch_size: 2
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
 # With patch_size > 1: each patch gets its own sparse representation
+# For 1024-dim patches, need higher sparsity (~3% density)
+bottleneck_loss_weight: 1.0
+
+# Lower sparsity to ease coding when using backprop-only dictionary learning
 sparsity_level: 16
 
 # Number of residual blocks in encoder/decoder
@@ -54,47 +69,51 @@ num_residual_hiddens: 32
 # Higher = encoder forced to match dictionary reconstruction more closely
 commitment_cost: 0.25
 
+# Weight applied to bottleneck loss inside total loss
+# Lower to prevent bottleneck term from dominating total objective
 # Number of K-SVD dictionary update iterations per forward pass
 # Options: 0 (disabled), 1-5
 # 0 = gradient-based learning only
 # 1-2 = fast K-SVD updates
 # 3-5 = better atoms, slower
-ksvd_iterations: 1
+ksvd_iterations: 0
 
 # Dictionary update frequency (update every N training steps)
 # Options: 0 (every step), 1+ (every N steps)
 # 0 = update every step (slowest, most stable)
 # 10-20 = good balance between speed and stability
 # Large values (100+) cause sudden dictionary changes → loss spikes
-dictionary_update_frequency: 100
+dictionary_update_frequency: 0
 
 # Use online dictionary learning instead of K-SVD
 # Options: true (fast online updates), false (classical K-SVD)
-# true = faster, good for large datasets
+# true = faster, smoother updates, good for large datasets (RECOMMENDED with IHT)
 # false = higher quality atoms, better for small datasets
 use_online_learning: true
 
 # Learning rate for online dictionary updates
 # Only used if use_online_learning=true
-# Typical range: 0.01-0.1 (CRITICAL: much lower for patch_size=1!)
-# Higher = faster dictionary adaptation
-# 0.3 was causing training instability - reduced to 0.05 for stability
-dict_learning_rate: 0.03
+# Typical range: 0.001-0.01
+# Lower = more stable, slower adaptation
+# Higher = faster adaptation, may oscillate
+dict_learning_rate: 0.005
 
 # Sparse coding algorithm
-# Options: 'omp' (best quality), 'iht' (recommended), 'topk' (fastest, not recommended)
+# Options: 'omp', 'iht', 'topk', 'lista', 'fista'
 # omp = Orthogonal Matching Pursuit (slow, best quality)
-# iht = Iterative Hard Thresholding (fast, good quality, RECOMMENDED)
+# iht = Iterative Hard Thresholding (fast, good quality)
+# fista = FISTA with soft-thresholding + momentum (fast, convex L1)
 # topk = Top-K selection (fastest, poor quality, overfitting risk)
+# lista = Learned ISTA (fast, learns optimal thresholds, RECOMMENDED)
 sparse_solver: omp
 
 # Number of IHT iterations
 # Only used if sparse_solver='iht'
 # Typical range: 5-20
 # 5-7 = fast, slight quality loss
-# 10 = good balance (recommended)
+# 10 = good balance
 # 15-20 = best quality, slower
-iht_iterations: 10
+iht_iterations: 15
 
 # IHT step size (1/Lipschitz constant)
 # Only used if sparse_solver='iht'
@@ -102,6 +121,33 @@ iht_iterations: 10
 # null = automatically computed from spectral norm
 # 0.9 = good manual default for normalized dictionaries
 iht_step_size: null
+
+# FISTA parameters (only used if sparse_solver='fista')
+# L1 shrinkage strength (higher = sparser codes)
+fista_alpha: 0.1
+# Convergence tolerance for FISTA iterations
+fista_tolerance: 0.001
+# Maximum FISTA iterations (useful cap for stability)
+fista_max_steps: 50
+
+# LISTA parameters (only used if sparse_solver='lista')
+# Number of LISTA layers (unrolled iterations)
+# Typical range: 3-10
+# 3-5 = fast, good quality (recommended)
+# 7-10 = better quality, slower
+lista_layers: 5
+
+# Whether to share weights across LISTA layers (tied LISTA)
+# true = smaller model, faster, slightly lower quality
+# false = untied LISTA, more expressive (recommended)
+lista_tied_weights: false
+
+# Initial soft threshold for LISTA
+# Typical range: 0.05-0.2
+# Lower = more coefficients retained initially
+# Higher = sparser codes initially
+# The thresholds are learned, so this is just initialization
+lista_initial_threshold: 0.1
 
 # Use backprop-only mode (dictionary learned via gradients instead of K-SVD)
 # Options: true (gradient-based), false (K-SVD/online learning)
@@ -116,7 +162,7 @@ use_backprop_only: false
 # 0.01 = mild regularization (recommended)
 # 0.05-0.1 = strong regularization (max sparsity)
 # Increase this if still overfitting with backprop-only mode
-sparsity_reg_weight: 0.5 # Increased from 0.01 for stronger regularization
+sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regularization
 
 # Perceptual loss weight (LPIPS)
 # Typical range: 0.0-2.0
@@ -130,7 +176,7 @@ perceptual_weight: 0.5
 # Typical range: 1e-4 to 1e-3
 # 1e-4 = stable, slower
 # 1e-3 = faster, may be unstable
-learning_rate: 1e-4
+learning_rate: 4e-4
 
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99
@@ -139,18 +185,18 @@ beta: 0.9
 
 # Compute FID (Frechet Inception Distance) during testing
 # Options: true (slower, comprehensive), false (faster)
-compute_fid: false
+compute_fid: true
 
 # Log reconstruction images to W&B every N steps
 # Typical range: 100-1000
 # Lower = more frequent logging, larger logs
-log_images_every_n_steps: 500
+log_images_every_n_steps: 100
 
 # Multi-resolution DCT loss weight
 # Typical range: 0.0-1.0
 # 0.0 = disabled
 # 0.5 = recommended for high-frequency detail preservation
-multi_res_dct_weight: 0.5
+multi_res_dct_weight: 0.0
 
 # Number of pyramid levels for multi-resolution DCT loss
 # Typical range: 2-4
@@ -160,9 +206,47 @@ multi_res_dct_levels: 3
 # Typical range: 0.0-1.0
 # 0.0 = disabled
 # 0.5 = recommended for edge preservation
-multi_res_grad_weight: 0.5
+multi_res_grad_weight: 0.0
 
 # Number of pyramid levels for multi-resolution gradient loss
 # Typical range: 2-4
 multi_res_grad_levels: 3
 
+# Dictionary orthogonality loss weight
+# Encourages decorrelated dictionary atoms for better sparse coding
+# Typical range: 0.0-0.1
+# 0.0 = disabled
+# 0.01 = mild decorrelation (recommended)
+# 0.05-0.1 = strong decorrelation (may hurt reconstruction)
+orthogonality_weight: 0.01
+
+# =============================================================================
+# Pattern Quantization for Autoregressive Generation
+# =============================================================================
+# Enable pattern quantization to map sparse codes to discrete tokens.
+# This reduces token sequence length from (num_patches × sparsity) to num_patches.
+# For 128×128 images with patch_size=8: 16 tokens instead of 512 tokens.
+# Options: true (enable), false (disable, default)
+use_pattern_quantizer: true
+
+# Number of discrete patterns (vocabulary size for autoregressive model)
+# Typical range: 1024-8192
+# Higher = more expressive, larger model
+# Should be >= num_embeddings for good coverage
+num_patterns: 2048
+
+# Commitment cost for pattern matching (encourages codes to match patterns)
+# Typical range: 0.1-1.0
+# 0.25 = good default (same as VQ-VAE)
+pattern_commitment_cost: 0.25
+
+# EMA decay for pattern updates (higher = slower, more stable)
+# Typical range: 0.9-0.999
+# 0.99 = good default
+pattern_ema_decay: 0.99
+
+# Temperature for pattern matching (lower = harder assignment)
+# Typical range: 0.1-2.0
+# 1.0 = standard cosine similarity
+# 0.5 = sharper (more confident assignments)
+pattern_temperature: 1.0

@@ -1,0 +1,73 @@
+# AR Transformer Training Configuration
+# Usage: python train_ar.py laser_ckpt=/path/to/laser.ckpt
+
+# =============================================================================
+# Required: Path to pretrained LASER checkpoint with pattern quantization
+# =============================================================================
+laser_ckpt: ???  # Must be provided via command line
+
+# =============================================================================
+# General Settings
+# =============================================================================
+seed: 42
+output_dir: outputs/ar
+
+# =============================================================================
+# AR Transformer Model Configuration
+# =============================================================================
+ar:
+  # Vocabulary size (should match num_patterns from LASER)
+  vocab_size: 2048
+
+  # Sequence length (number of patches per image)
+  seq_len: 16
+
+  # Model architecture
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  d_ff: 2048
+  dropout: 0.1
+
+  # Special tokens
+  use_bos: true
+  use_eos: false
+
+  # Training
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 50000
+
+# =============================================================================
+# AR Training Configuration
+# =============================================================================
+train_ar:
+  batch_size: 256
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  val_check_interval: 0.25
+
+# =============================================================================
+# Dataset Configuration (same as LASER training)
+# =============================================================================
+data:
+  dataset: cifar10
+  data_dir: ./data
+  batch_size: 64  # For pattern extraction
+  num_workers: 4
+  image_size: 128
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+
+# =============================================================================
+# Wandb Logging
+# =============================================================================
+wandb:
+  project: laser-ar
+  name: ar_transformer
+  save_dir: outputs/wandb

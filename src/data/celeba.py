@@ -1,4 +1,5 @@
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union, List
@@ -44,11 +45,12 @@ class FlatImageDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, index: int):
-        # Robust image loading: retry a few nearby indices if an image fails
+        # Robust image loading: skip over unreadable images instead of injecting black placeholders
         num_items = len(self.image_paths)
         attempts = 0
+        failures = []
         last_exc = None
-        while attempts < 5:
+        while attempts < 10:
             path = self.image_paths[index % num_items]
             try:
                 with Image.open(path) as img:
@@ -57,19 +59,16 @@ class FlatImageDataset(Dataset):
                     img = self.transform(img)
                 return img, 0
             except Exception as exc:
+                failures.append(str(path))
                 last_exc = exc
                 index += 1
                 attempts += 1
                 continue
-        # Last-resort fallback: return a black image of nominal size (transforms will resize/normalize)
-        try:
-            img = Image.new('RGB', self._placeholder_size, (0, 0, 0))
-            if self.transform is not None:
-                img = self.transform(img)
-            return img, 0
-        except Exception:
-            # Re-raise the original exception if even placeholder fails (should be extremely rare)
-            raise last_exc
+        warnings.warn(
+            f"Failed to load images after {attempts} attempts. "
+            f"Last error on {failures[-1] if failures else 'unknown'}: {last_exc}"
+        )
+        raise RuntimeError(f"Unrecoverable image loading failure for: {failures}") from last_exc
 
 
 class CelebADataModule(pl.LightningDataModule):

@@ -1,0 +1,87 @@
+# Autoregressive Transformer Configuration
+# For training on pattern indices from LASER model
+
+# Model type
+type: ar_transformer
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+
+# Vocabulary size (should match num_patterns from LASER config)
+vocab_size: 2048
+
+# Sequence length (number of patches per image)
+# For 128x128 images with patch_size=8: (128/8) * (128/8) / 4 = 16 patches
+# For 32x32 latent with patch_size=8: (32/8) * (32/8) = 16 patches
+seq_len: 16
+
+# Model dimension
+# Typical range: 256-1024
+# 512 = good balance for this task
+d_model: 512
+
+# Number of attention heads
+# Should divide d_model evenly
+# 8 heads = 64 dim per head
+n_heads: 8
+
+# Number of transformer layers
+# Typical range: 4-12
+# 6-8 = good for this sequence length
+n_layers: 6
+
+# Feed-forward hidden dimension
+# Usually 4x d_model
+d_ff: 2048
+
+# Dropout rate
+# Typical range: 0.0-0.2
+# 0.1 = standard for transformers
+dropout: 0.1
+
+# =============================================================================
+# Special Tokens
+# =============================================================================
+
+# Use BOS (beginning of sequence) token
+# Recommended: true for unconditional generation
+use_bos: true
+
+# Use EOS (end of sequence) token
+# Not needed for fixed-length sequences
+use_eos: false
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+
+# Peak learning rate
+# Typical range: 1e-4 to 3e-4
+learning_rate: 3e-4
+
+# Weight decay for AdamW
+# Typical range: 0.01-0.1
+weight_decay: 0.01
+
+# Linear warmup steps
+# Typical: 1000-5000 for small datasets
+warmup_steps: 1000
+
+# Total training steps for cosine decay schedule
+# Set based on dataset size and epochs
+max_steps: 50000
+
+# =============================================================================
+# Generation Configuration (for sampling)
+# =============================================================================
+
+# Default temperature for sampling
+# 1.0 = standard, <1 = sharper, >1 = more random
+default_temperature: 1.0
+
+# Default top-k for sampling (null = disabled)
+default_top_k: null
+
+# Default top-p (nucleus) for sampling (null = disabled)
+default_top_p: 0.9
