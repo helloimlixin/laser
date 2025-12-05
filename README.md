@@ -781,7 +781,7 @@ Using larger patches dramatically reduces computation by processing fewer tokens
 
 ### Codebook Visualization in RGB Space
 
-To understand how VQ and DL learn different representations, we can visualize their codebooks/dictionaries in 2D using dimensionality reduction:
+To understand how VQ and DL learn different representations, we can visualize their codebooks in 2D using dimensionality reduction:
 
 ![Codebook Embeddings](img/codebook_embeddings.png)
 
@@ -1017,7 +1017,7 @@ With Top-K:
   val/loss >> train/loss (overfitting)
 
 With IHT:
-  train/sparsity: 0.03-0.10 (3-10% - truly sparse!)
+  train/sparsity: 0.03-0.10
   train/recon_loss: lower (proper optimization)
   val/loss ≈ train/loss (better generalization)
 ```
@@ -1096,31 +1096,6 @@ iht_step_size: 0.5-1.0
    
 ⚠️ val/loss >> train/loss (overfitting)
    → Increase sparsity_reg_weight and weight_decay
-```
-
-### When to Use Each Sparse Solver
-
-| Use Case | Recommended Solver | Config |
-|----------|-------------------|--------|
-| **Production training** | IHT | `iht_iterations=10` |
-| **Best quality** | OMP | `sparse_solver=omp` |
-| **Fast prototyping** | IHT | `iht_iterations=5` |
-| **Research/analysis** | OMP | For interpretability |
-| **Maximum speed** | Top-K | Only if quality not critical |
-
-### Implementation Details
-
-**IHT Improvements in This Repo:**
-1. ✅ **Fast spectral norm estimation** - Power iteration (3 iterations)
-2. ✅ **Conservative step size** - μ = 0.9/L² for stability
-3. ✅ **Efficient hard thresholding** - Vectorized top-k operation
-4. ✅ **Automatic fallback** - Assumes ||D||₂ ≈ 1 if computation fails
-5. ✅ **Proper gradient flow** - Compatible with straight-through estimator
-
-**Code Reference:**
-```python
-# See src/models/bottleneck.py::iterative_hard_thresholding()
-# Fully documented implementation with theoretical background
 ```
 
 ## Overfitting Prevention & Regularization
@@ -1291,6 +1266,52 @@ assert 0.8 < gap < 1.2
 assert metrics['train/sparsity_loss'] > 0
 ```
 
-## License
+## AR Pipeline: Extracting Sparse Codes and K-means Quantization
 
-MIT
+To prepare data for AR/ImageGPT training using LASER:
+
+1. **Extract Sparse Codes from LASER Encoder/Bottleneck**
+
+Run the following script to extract and save sparse codes for each image:
+
+```bash
+python scripts/extract_sparse_codes.py \
+  --encoder_ckpt path/to/encoder.pth \
+  --bottleneck_ckpt path/to/bottleneck.pth \
+  --data_dir path/to/images \
+  --output_dir outputs/sparse_codes/celeba/ \
+  --batch_size 32 \
+  --num_workers 4 \
+  --device cuda
+```
+- This will save a `.pt` file of sparse codes for each image in the output directory.
+
+2. **Run K-means Quantization on Sparse Codes**
+
+After extracting all sparse codes, run k-means to assign a discrete token to each patch:
+
+```bash
+python scripts/kmeans_quantize_sparse_codes.py \
+  --sparse_codes_dir outputs/sparse_codes/celeba/ \
+  --output_dir outputs/ar_tokens/celeba/ \
+  --num_clusters 2048
+```
+- This will save a `_tokens.pt` file for each image, containing the cluster index (token) for each patch.
+
+3. **Use Token Files for AR Training**
+
+- Use the generated token files in `outputs/ar_tokens/celeba/` as input for AR/ImageGPT training.
+- During VAE/LASER training, quantization is disabled; only use sparse codes for reconstruction.
+
+4. **Train AR/ImageGPT Model Using K-means Quantized Tokens**
+
+After generating the token files, launch AR/ImageGPT training with:
+
+```bash
+python train_ar.py \
+  ar_tokens_dir=outputs/ar_tokens/celeba/ \
+  laser_ckpt=outputs/checkpoints/run_xxxxxxxx/laser/last.ckpt \
+  data.dataset=celeba
+```
+- Replace `run_xxxxxxxx` with your actual LASER checkpoint run directory.
+- Make sure your AR training script is set up to load token files from `ar_tokens_dir`.

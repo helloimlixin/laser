@@ -37,7 +37,7 @@ patch_size: 8
 
 # Patch stride; default is equal to patch_size (no overlap).
 # Set to patch_size / 2 for 50% overlap (e.g., stride=4 when patch_size=8).
-patch_stride: 4
+patch_stride: 8
 
 # Patch flattening order: 'channel_first' (C,H,W) or 'spatial_first' (H,W,C)
 # spatial_first groups channel info together, may help with high-dim patches
@@ -53,7 +53,7 @@ patch_flatten_order: spatial_first
 bottleneck_loss_weight: 1.0
 
 # Lower sparsity to ease coding when using backprop-only dictionary learning
-sparsity_level: 16
+sparsity_level: 8
 
 # Number of residual blocks in encoder/decoder
 # Typical range: 2-6

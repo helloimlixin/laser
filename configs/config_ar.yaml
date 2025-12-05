@@ -20,7 +20,7 @@ ar:
   vocab_size: 2048
 
   # Sequence length (number of patches per image)
-  seq_len: 16
+  seq_len: 256
 
   # Model architecture
   d_model: 512

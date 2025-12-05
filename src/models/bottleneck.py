@@ -120,13 +120,15 @@ class SparsePatternQuantizer(nn.Module):
             sparse_patterns.scatter_(0, topk_idx, self.patterns.gather(0, topk_idx))
             self.patterns.data = sparse_patterns
 
-    def forward(self, sparse_codes: torch.Tensor):
+    def forward(self, sparse_codes: torch.Tensor, use_kmeans: bool = False):
         """
         Quantize sparse codes to discrete pattern indices.
 
         Args:
             sparse_codes: Sparse coefficient matrix [num_atoms, num_samples]
                          where num_samples = batch_size * num_patches
+
+            use_kmeans: If True, run k-means quantization (for AR training init only)
 
         Returns:
             pattern_indices: Discrete pattern indices [num_samples]
@@ -138,22 +140,32 @@ class SparsePatternQuantizer(nn.Module):
         num_atoms, num_samples = sparse_codes.shape
         device = sparse_codes.device
 
-        # Initialize patterns from first batch
-        if self.use_ema and not self.initialized and self.training:
-            self._initialize_patterns_from_data(sparse_codes.detach())
 
-        # Normalize for cosine similarity (more robust than L2 for sparse vectors)
-        codes_norm = F.normalize(sparse_codes.t(), dim=1, eps=1e-8)  # [num_samples, num_atoms]
-        patterns_norm = F.normalize(self.patterns.t(), dim=1, eps=1e-8)  # [num_patterns, num_atoms]
+        if use_kmeans:
+            # Only run during AR pattern extraction/training initialization
+            pattern_indices, centers = self.kmeans_quantize(sparse_codes, self.num_patterns)
+            quantized_codes = centers[pattern_indices].t()  # [num_atoms, num_samples]
+            # No pattern loss or EMA update for k-means quantization
+            pattern_loss = torch.tensor(0.0, device=device)
+            info = {'kmeans': True, 'perplexity': torch.tensor(0.0, device=device)}
+            return pattern_indices, quantized_codes, pattern_loss, info
+        else:
+            # Initialize patterns from first batch
+            if self.use_ema and not self.initialized and self.training:
+                self._initialize_patterns_from_data(sparse_codes.detach())
 
-        # Compute similarities: [num_samples, num_patterns]
-        similarities = codes_norm @ patterns_norm.t() / self.temperature
+            # Normalize for cosine similarity (more robust than L2 for sparse vectors)
+            codes_norm = F.normalize(sparse_codes.t(), dim=1, eps=1e-8)  # [num_samples, num_atoms]
+            patterns_norm = F.normalize(self.patterns.t(), dim=1, eps=1e-8)  # [num_patterns, num_atoms]
 
-        # Find nearest pattern (hard assignment)
-        pattern_indices = similarities.argmax(dim=1)  # [num_samples]
+            # Compute similarities: [num_samples, num_patterns]
+            similarities = codes_norm @ patterns_norm.t() / self.temperature
 
-        # Get quantized codes from patterns
-        quantized_codes = self.patterns[:, pattern_indices]  # [num_atoms, num_samples]
+            # Find nearest pattern (hard assignment)
+            pattern_indices = similarities.argmax(dim=1)  # [num_samples]
+
+            # Get quantized codes from patterns
+            quantized_codes = self.patterns[:, pattern_indices]  # [num_atoms, num_samples]
 
         # Compute losses
         # Commitment loss: encourages sparse codes to stay close to assigned patterns

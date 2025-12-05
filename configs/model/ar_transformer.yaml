@@ -12,9 +12,8 @@ type: ar_transformer
 vocab_size: 2048
 
 # Sequence length (number of patches per image)
-# For 128x128 images with patch_size=8: (128/8) * (128/8) / 4 = 16 patches
-# For 32x32 latent with patch_size=8: (32/8) * (32/8) = 16 patches
-seq_len: 16
+# For 128x128 images with patch_size=8, patch_stride=4: ((128-8)//4+1)^2 = 961 patches
+seq_len: 256
 
 # Model dimension
 # Typical range: 256-1024
