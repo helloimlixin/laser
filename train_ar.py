@@ -25,6 +25,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Ri
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from lightning.pytorch.loggers import WandbLogger
 from datetime import datetime
+import math
 
 torch.set_float32_matmul_precision('medium')
 
@@ -104,8 +105,8 @@ def train_ar(cfg: DictConfig):
     # Verify pattern quantization is enabled
     if not laser_model.use_pattern_quantizer:
         raise ValueError(
-            "LASER model doesn't have pattern quantization enabled. "
-            "Train LASER with use_pattern_quantizer=True first."
+            "LASER bottleneck quantization is disabled. Use the external sparse-code "
+            "+ k-means quantization pipeline to create patterns before AR training."
         )
 
     print(f"LASER model loaded. Pattern vocab size: {laser_model.bottleneck.num_patterns}")
@@ -134,6 +135,29 @@ def train_ar(cfg: DictConfig):
         cache=True,
         device='cuda' if torch.cuda.is_available() else 'cpu',
     )
+
+    # Infer AR sequence length from LASER bottleneck + image size to avoid mismatches
+    def _to_tuple(val):
+        if isinstance(val, (list, tuple)):
+            return int(val[0]), int(val[1])
+        return int(val), int(val)
+
+    patch_h, patch_w = _to_tuple(laser_model.hparams.patch_size)
+    patch_stride_cfg = getattr(laser_model.hparams, "patch_stride", None)
+    stride_h, stride_w = _to_tuple(patch_stride_cfg) if patch_stride_cfg is not None else (patch_h, patch_w)
+    latent_h = math.ceil(cfg.data.image_size / 4)
+    latent_w = math.ceil(cfg.data.image_size / 4)
+    pad_h = (patch_h - (latent_h % patch_h)) % patch_h
+    pad_w = (patch_w - (latent_w % patch_w)) % patch_w
+    padded_h = latent_h + pad_h
+    padded_w = latent_w + pad_w
+    n_h = (padded_h - patch_h) // stride_h + 1
+    n_w = (padded_w - patch_w) // stride_w + 1
+    expected_seq_len = n_h * n_w
+
+    if cfg.ar.seq_len != expected_seq_len:
+        print(f"Adjusting AR seq_len from {cfg.ar.seq_len} to {expected_seq_len} to match patch grid ({n_h}x{n_w})")
+        cfg.ar.seq_len = expected_seq_len
 
     # Initialize AR Transformer
     print("\nInitializing AR Transformer...")

@@ -134,8 +134,8 @@ class LASER(pl.LightningModule):
                                         kernel_size=1,
                                         stride=1)
 
-        # Store pattern quantization flag
-        self.use_pattern_quantizer = use_pattern_quantizer
+        # Pattern quantization disabled inside bottleneck; handled externally if needed
+        self.use_pattern_quantizer = False
 
         # Initialize Dictionary Learning bottleneck
         self.bottleneck = DictionaryLearning(
@@ -160,8 +160,8 @@ class LASER(pl.LightningModule):
             patch_stride=patch_stride,
             per_pixel_sparse_coding=per_pixel_sparse_coding,
             patch_flatten_order=patch_flatten_order,
-            # Pattern quantization for autoregressive generation
-            use_pattern_quantizer=use_pattern_quantizer,
+            # Pattern quantization disabled in bottleneck
+            use_pattern_quantizer=False,
             num_patterns=num_patterns,
             pattern_commitment_cost=pattern_commitment_cost,
             pattern_ema_decay=pattern_ema_decay,
@@ -232,12 +232,8 @@ class LASER(pl.LightningModule):
         z_e = self.encoder(x)
         z_e = self.pre_bottleneck(z_e)
 
-        if self.use_pattern_quantizer:
-            z_dl, bottleneck_loss, coefficients, pattern_indices, pattern_info = self.bottleneck(z_e)
-            return z_dl, bottleneck_loss, coefficients, pattern_indices, pattern_info
-        else:
-            z_dl, bottleneck_loss, coefficients = self.bottleneck(z_e)
-            return z_dl, bottleneck_loss, coefficients
+        z_dl, bottleneck_loss, coefficients = self.bottleneck(z_e)
+        return z_dl, bottleneck_loss, coefficients
 
     def decode(self, z_dl):
         """
@@ -268,16 +264,10 @@ class LASER(pl.LightningModule):
         z = self.encoder(x)
         z = self.pre_bottleneck(z)
 
-        if self.use_pattern_quantizer:
-            z_dl, bottleneck_loss, coefficients, pattern_indices, pattern_info = self.bottleneck(z)
-            z_dl = self.post_bottleneck(z_dl)
-            recon = self.decoder(z_dl)
-            return recon, bottleneck_loss, coefficients, pattern_indices, pattern_info
-        else:
-            z_dl, bottleneck_loss, coefficients = self.bottleneck(z)
-            z_dl = self.post_bottleneck(z_dl)
-            recon = self.decoder(z_dl)
-            return recon, bottleneck_loss, coefficients
+        z_dl, bottleneck_loss, coefficients = self.bottleneck(z)
+        z_dl = self.post_bottleneck(z_dl)
+        recon = self.decoder(z_dl)
+        return recon, bottleneck_loss, coefficients
 
     def compute_metrics(self, batch, prefix='train'):
         """Compute metrics for a batch."""
@@ -285,13 +275,9 @@ class LASER(pl.LightningModule):
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
 
         # Forward pass - handle pattern quantization
-        forward_output = self(x)
-        if self.use_pattern_quantizer:
-            recon_raw, bottleneck_loss, coefficients, pattern_indices, pattern_info = forward_output
-        else:
-            recon_raw, bottleneck_loss, coefficients = forward_output
-            pattern_indices = None
-            pattern_info = None
+        recon_raw, bottleneck_loss, coefficients = self(x)
+        pattern_indices = None
+        pattern_info = None
 
         # Keep raw tensors for loss; create sanitized copies for metrics/visualization only
         recon_vis = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
@@ -300,6 +286,15 @@ class LASER(pl.LightningModule):
         # Compute losses
         recon_loss = F.mse_loss(recon_raw, x)
         sparsity_loss = coefficients.abs().mean()
+        # Basic stats for debug/monitoring
+        input_mean = x.mean()
+        input_std = x.std()
+        recon_mean = recon_raw.mean()
+        recon_std = recon_raw.std()
+        if hasattr(self.bottleneck, "_last_diag"):
+            diag = self.bottleneck._last_diag
+        else:
+            diag = {}
         
         # Perceptual loss - only compute during training for quality
         if self.lpips is not None and self.perceptual_weight > 0 and prefix == 'train':
@@ -377,6 +372,15 @@ class LASER(pl.LightningModule):
         self.log(f'{prefix}/sparsity_loss', sparsity_loss, **log_kwargs)
         self.log(f'{prefix}/orthogonality_loss', ortho_loss, **log_kwargs)
         self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
+        self.log(f'{prefix}/input_mean', input_mean, **log_kwargs)
+        self.log(f'{prefix}/input_std', input_std, **log_kwargs)
+        self.log(f'{prefix}/recon_mean', recon_mean, **log_kwargs)
+        self.log(f'{prefix}/recon_std', recon_std, **log_kwargs)
+        if diag:
+            self.log(f'{prefix}/dict_norm_max', diag.get("dict_norm_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/dict_norm_min', diag.get("dict_norm_min", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/coeff_norm_max', diag.get("coeff_norm_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/coeff_norm_mean', diag.get("coeff_norm_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
         if prefix != 'train':
             self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/sparsity', sparsity, **log_kwargs)
@@ -387,13 +391,6 @@ class LASER(pl.LightningModule):
             self.log(f'{prefix}/e_latent_loss', last_losses['e_latent_loss'], **log_kwargs)
             self.log(f'{prefix}/dl_latent_loss', last_losses['dl_latent_loss'], **log_kwargs)
             self.log(f'{prefix}/pattern_loss', last_losses['pattern_loss'], **log_kwargs)
-
-        # Log pattern quantization metrics if enabled
-        if self.use_pattern_quantizer and pattern_info is not None:
-            self.log(f'{prefix}/pattern_perplexity', pattern_info['perplexity'], **log_kwargs)
-            self.log(f'{prefix}/pattern_commitment_loss', pattern_info['commitment_loss'], **log_kwargs)
-            self.log(f'{prefix}/pattern_codebook_loss', pattern_info['codebook_loss'], **log_kwargs)
-            self.log(f'{prefix}/pattern_usage', pattern_info['pattern_usage'], **log_kwargs)
 
         # Occasional diagnostic logging to catch outlier batches
         if prefix == 'train' and (self.global_step % self.diag_log_interval == 0):
@@ -459,16 +456,15 @@ class LASER(pl.LightningModule):
         
         # Update FID if enabled
         if self.test_fid is not None:
-            # Denormalize to [0, 1]
-            x_01 = (x + 1.0) / 2.0
-            recon_01 = (recon + 1.0) / 2.0
-            
-            # Convert to uint8 [0, 255]
-            x_uint8 = (x_01 * 255).clamp(0, 255).to(torch.uint8)
-            recon_uint8 = (recon_01 * 255).clamp(0, 255).to(torch.uint8)
-            
-            self.test_fid.update(x_uint8, real=True)
-            self.test_fid.update(recon_uint8, real=False)
+            # Ensure the TorchMetrics module lives on the same device as the current rank
+            fid_device = x.device
+            self.test_fid = self.test_fid.to(fid_device)
+            x_fid = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
+            recon_fid = torch.nan_to_num(recon.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
+            x_fid = ((x_fid + 1.0) / 2.0).clamp_(0.0, 1.0).to(fid_device, dtype=torch.float32)
+            recon_fid = ((recon_fid + 1.0) / 2.0).clamp_(0.0, 1.0).to(fid_device, dtype=torch.float32)
+            self.test_fid.update(x_fid, real=True)
+            self.test_fid.update(recon_fid, real=False)
         
         # Log images periodically
         if batch_idx % self.log_images_every_n_steps == 0:
@@ -637,12 +633,7 @@ class LASER(pl.LightningModule):
         with torch.no_grad():
             z = self.encoder(x)
             z = self.pre_bottleneck(z)
-            # Handle both with and without pattern quantization
-            bottleneck_output = self.bottleneck(z)
-            if self.use_pattern_quantizer:
-                z_dl, _, coefficients, _, _ = bottleneck_output
-            else:
-                z_dl, _, coefficients = bottleneck_output
+            z_dl, _, coefficients = self.bottleneck(z)
             latent_rgb = self._latent_rgb_projection(z_dl)
             heatmaps = self._sparse_heatmaps(coefficients, (x.shape[0], x.shape[2], x.shape[3]))
         log_payload = {}
@@ -666,3 +657,10 @@ class LASER(pl.LightningModule):
     def on_validation_epoch_end(self):
         super().on_validation_epoch_end()
         self._log_val_latent_visuals()
+
+    def on_test_start(self):
+        super().on_test_start()
+        if self.test_fid is not None:
+            # Align metric buffers with the rank's device and clear any stale states
+            self.test_fid = self.test_fid.to(self.device)
+            self.test_fid.reset()

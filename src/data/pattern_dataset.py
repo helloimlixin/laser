@@ -56,6 +56,9 @@ class PatternDataset(Dataset):
 
         if cache and laser_model is not None:
             self._cache_patterns(batch_size, show_progress)
+        elif not cache and laser_model is not None:
+            self.laser_model.to(self.device)
+            self.laser_model.eval()
 
     def _cache_patterns(self, batch_size: int, show_progress: bool):
         """Pre-extract all pattern indices and cache them."""
@@ -98,20 +101,10 @@ class PatternDataset(Dataset):
     @torch.no_grad()
     def _extract_patterns(self, images: torch.Tensor) -> torch.Tensor:
         """Extract pattern indices from images using LASER model."""
-        # Forward through LASER
-        outputs = self.laser_model(images)
-
-        # outputs format with pattern quantization:
-        # (recon, bottleneck_loss, coefficients, pattern_indices, pattern_info)
-        if isinstance(outputs, tuple) and len(outputs) >= 4:
-            pattern_indices = outputs[3]  # [B, num_patches]
-        else:
-            raise ValueError(
-                "LASER model output doesn't contain pattern indices. "
-                "Make sure use_pattern_quantizer=True in the model config."
-            )
-
-        return pattern_indices
+        raise ValueError(
+            "Pattern quantization is disabled in the LASER bottleneck. "
+            "Use the external sparse-code extraction + k-means quantization pipeline instead."
+        )
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -139,6 +132,7 @@ class PatternDataset(Dataset):
         image = image.unsqueeze(0).to(self.device)
 
         # Extract pattern
+        self.laser_model.to(self.device)
         self.laser_model.eval()
         pattern_indices = self._extract_patterns(image)
 

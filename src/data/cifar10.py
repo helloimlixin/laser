@@ -30,24 +30,32 @@ class CIFAR10DataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         """Setup datasets"""
-        # Define transforms
+        # Define transforms; respect configured image_size (default 32)
+        image_size = self.config.image_size if isinstance(self.config.image_size, int) else int(self.config.image_size[0])
+        resize = [] if image_size == 32 else [transforms.Resize((image_size, image_size), antialias=True)]
         if self.config.augment:
-            train_transform = transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(self.config.mean, self.config.std)
-            ])
+            train_transform = transforms.Compose(
+                resize + [
+                    transforms.RandomCrop(32, padding=4) if image_size == 32 else transforms.RandomCrop(image_size, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(self.config.mean, self.config.std),
+                ]
+            )
         else:
-            train_transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(self.config.mean, self.config.std)
-            ])
+            train_transform = transforms.Compose(
+                resize + [
+                    transforms.ToTensor(),
+                    transforms.Normalize(self.config.mean, self.config.std),
+                ]
+            )
         
-        test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(self.config.mean, self.config.std)
-        ])
+        test_transform = transforms.Compose(
+            resize + [
+                transforms.ToTensor(),
+                transforms.Normalize(self.config.mean, self.config.std),
+            ]
+        )
         
         # Setup training data
         self.cifar_train = CIFAR10(

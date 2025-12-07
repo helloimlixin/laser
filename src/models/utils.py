@@ -64,3 +64,25 @@ class ResidualBlock(nn.Module):
         out = F.relu(out, inplace=False)
         
         return out
+
+
+class ResidualStack(nn.Module):
+    """Stack of residual blocks followed by a ReLU."""
+
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                ResidualBlock(
+                    in_channels=in_channels,
+                    num_hiddens=num_hiddens,
+                    num_residual_hiddens=num_residual_hiddens,
+                )
+                for _ in range(num_residual_layers)
+            ]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return F.relu(x, inplace=False)

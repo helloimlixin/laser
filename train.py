@@ -334,7 +334,16 @@ def train(cfg: DictConfig):
 
     # Train and test model (use PyTorch defaults for matmul precision to avoid API mixing)
     trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
-    # Run test on a single device to avoid DistributedSampler duplications
+
+    # Ensure all ranks finish training before launching the single-GPU test pass
+    if getattr(trainer, "strategy", None) and hasattr(trainer.strategy, "barrier"):
+        trainer.strategy.barrier()
+
+    # Only launch the dedicated test trainer on global rank zero to avoid
+    # spawning another distributed job (which breaks FID reduction).
+    if not trainer.is_global_zero:
+        return
+
     test_trainer = pl.Trainer(
         accelerator=('gpu' if (cfg.train.accelerator == 'gpu' and torch.cuda.is_available()) else 'cpu'),
         devices=1,

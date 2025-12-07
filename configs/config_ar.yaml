@@ -20,7 +20,8 @@ ar:
   vocab_size: 2048
 
   # Sequence length (number of patches per image)
-  seq_len: 256
+  # Default assumes 128x128 images, encoder downsample x4, patch_size=8/patch_stride=8 → 4x4=16 tokens
+  seq_len: 16
 
   # Model architecture
   d_model: 512
