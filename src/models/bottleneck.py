@@ -103,6 +103,129 @@ class VectorQuantizer(nn.Module):
         
         return quantized, loss, perplexity, encodings
 
+
+class VectorQuantizerEMA(nn.Module):
+    """Vector Quantizer implementation for VQ-VAE with EMA updates, where we use exponential
+    moving average to update the codebook embedding vectors instead of auxiliary loss, which
+    has the advantage that the embedding updates are independent of the choice of optimizer
+    for the encoder, decoder, and other parts of the architecture. This is a more stable way
+    to update the codebook embedding vectors, which proves to have better convergence during
+    training for most cases.
+    """
+
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25, ema_decay=0.99, epsilon=1e-10):
+        """
+        Constructor of the VectorQuantizerEMA class.
+
+        Args:
+            num_embeddings: number of discrete codebook embeddings, denoted as K
+            embedding_dim: dimensionality of each embedding vector, denoted as D
+            commitment_cost: weight for the commitment loss term, default is 0.25 as in the original VQ-VAE paper
+            ema_decay: decay rate for the exponential moving average of the codebook embedding vectors
+            epsilon: small constant for numerical stability
+        """
+        super(VectorQuantizerEMA, self).__init__()
+
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim) # codebook embeddings, shape [K, D]
+        self.embedding.weight.data.normal_()
+        self.commitment_cost = commitment_cost
+
+        self.register_buffer('ema_cluster_size', torch.zeros(num_embeddings))
+        self._ema_w = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
+        self._ema_w.data.normal_()
+
+        self.ema_decay = ema_decay
+        self.epsilon = epsilon
+
+    def forward(self, z_e: torch.Tensor):
+        """
+        Args:
+            z_e: input tensor of shape [B, C, H, W] from the encoder
+
+        Returns:
+            Tuple of (quantized tensor, loss, perplexity, one-hot encodings)
+        """
+        if z_e.shape[1] != self.embedding_dim:
+            raise ValueError(
+                f"Expected channel dim {self.embedding_dim} but received {z_e.shape[1]}"
+            )
+
+        # permute to [B, H, W, C] for convenience and flatten to [N, C]
+        z_e = z_e.permute(0, 2, 3, 1).contiguous()
+        ze_shape = z_e.shape
+
+        # flatten input z_e to [N, C]
+        ze_flat = z_e.view(-1, self.embedding_dim)
+
+        # compute distances between latent feature vectors and codebook embedding vectors
+        # the distance matrix looks like
+        #
+        #   [[d(ze_1, e_1), d(ze_1, e_2), ..., d(ze_1, e_K)],
+        #    [d(ze_2, e_1), d(ze_2, e_2), ..., d(ze_2, e_K)],
+        #    ...
+        #    [d(ze_N, e_1), d(ze_N, e_2), ..., d(ze_N, e_K)]]
+        #
+        # where d(ze, e) = ||ze - e||^2 is the squared Euclidean distance, N = B x H x W and K is the
+        # number of codebook embedding vectors. The formula of
+        # the squared Euclidean distance is thus expanded to:
+        # d(ze, e) = ||ze||^2 + ||e||^2 - 2 * ze^T * e
+        distances = (
+            torch.sum(ze_flat ** 2, dim=1, keepdim=True)
+            + torch.sum(self.embedding.weight ** 2, dim=1)
+            - 2 * torch.matmul(ze_flat, self.embedding.weight.t())
+        )
+
+        # derive the encoding indices
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(
+            encoding_indices.shape[0],
+            self.num_embeddings,
+            device=z_e.device,
+            dtype=z_e.dtype,
+        )
+
+        # create one-hot encodings with the scatter_ method, with dimension [N, K]
+        encodings.scatter_(1, encoding_indices, 1)
+
+        # quantize and unflatten
+        quantized = torch.matmul(encodings, self.embedding.weight).view(ze_shape) # [B, H, W, C]
+
+        # use EMA to update the codebook embedding vectors
+        if self.training:
+            self.ema_cluster_size = self.ema_cluster_size * self.ema_decay + \
+                (1 - self.ema_decay) * torch.sum(encodings, dim=0)
+
+            # Laplace smoothing of the cluster size
+            n = torch.sum(self.ema_cluster_size.data)
+            self.ema_cluster_size = (
+                (self.ema_cluster_size + self.epsilon)
+                / (n + self.num_embeddings * self.epsilon) * n
+            )
+
+            dw = torch.matmul(encodings.t(), ze_flat)
+            self._ema_w = nn.Parameter(self._ema_w * self.ema_decay + (1 - self.ema_decay) * dw)
+            self.embedding.weight = nn.Parameter(self._ema_w / self.ema_cluster_size.unsqueeze(1))
+
+        # loss now only consists of the commitment loss for the encoder
+        e_latent_loss = F.mse_loss(quantized.detach(), z_e)
+        loss = self.commitment_cost * e_latent_loss
+
+        # use straight-through estimator
+        quantized = z_e + (quantized - z_e).detach()
+
+        # reshape quantized back to [B, C, H, W]
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()
+
+        # compute average probability of each codebook entry by simply averaging the one-hot encodings
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        return quantized, loss, perplexity, encodings
+
+
 class DictionaryLearning(nn.Module):
     """
     Dictionary Learning Bottleneck with sparse coding and flexible dictionary updates.

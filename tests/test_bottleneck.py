@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 import matplotlib
 
@@ -20,8 +21,8 @@ for path_str in (str(ROOT), str(SRC)):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-# Import the freshly-implemented VectorQuantizer (non-EMA) for focused testing.
-from src.models.bottleneck import VectorQuantizer
+# Import the freshly-implemented VectorQuantizer (non-EMA) and VectorQuantizerEMA for focused testing.
+from src.models.bottleneck import VectorQuantizer, VectorQuantizerEMA
 
 # Directory to store visualization artifacts emitted by the tests below.
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "vq"
@@ -270,5 +271,225 @@ def test_vq_training_loop_generates_gif():
     assert recon_history[-1] < recon_history[0]
 
     gif_path = ARTIFACT_DIR / "vq_training.gif"
+    _write_gif(frames, gif_path, duration=0.5)
+    assert gif_path.exists()
+
+
+def test_vq_ema_basic_shapes(sample_latents):
+    """EMA variant: Quantized outputs keep spatial shape and produce finite stats."""
+
+    # Instantiate EMA VQ with 32 codes and matching embedding dimension.
+    vq_ema = VectorQuantizerEMA(num_embeddings=32, embedding_dim=16, commitment_cost=0.25, ema_decay=0.99)
+    # Run the forward pass to obtain quantized values, auxiliary loss, perplexity, and encodings.
+    z_q, loss, perplexity, encodings = vq_ema(sample_latents)
+
+    # Quantized tensor should match the latent shape exactly (straight-through estimator makes it so).
+    assert z_q.shape == sample_latents.shape
+    # One-hot encodings must be N×K where N is the flattened spatial size.
+    assert encodings.shape == (
+        sample_latents.shape[0] * sample_latents.shape[2] * sample_latents.shape[3],
+        32,
+    )
+    # Loss value must be scalar and finite to be meaningful for optimization.
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    # Perplexity serves as a utilization metric; it should also be finite scalar.
+    assert perplexity.ndim == 0 and torch.isfinite(perplexity)
+
+
+def test_vq_ema_backward_updates_encoder_only(sample_latents):
+    """EMA variant: Backward pass only hits encoder latents, codebook updates via EMA."""
+
+    # Use a smaller codebook to simplify gradient reasoning.
+    vq_ema = VectorQuantizerEMA(num_embeddings=8, embedding_dim=16, commitment_cost=0.25, ema_decay=0.99)
+    # Capture outputs for the current mini batch.
+    z_q, loss, _, _ = vq_ema(sample_latents)
+
+    # Compose a simple scalar objective to force autograd traversal.
+    (z_q.mean() + loss).backward()
+
+    # Encoder latents require gradients so training the encoder stays viable.
+    assert sample_latents.grad is not None and torch.isfinite(sample_latents.grad).all()
+    # The embedding table itself does NOT accumulate gradients when EMA is enabled.
+    assert vq_ema.embedding.weight.grad is None
+
+
+def test_vq_ema_codebook_selection():
+    """EMA variant: Exact matches in the codebook should round-trip through the quantizer."""
+
+    # Deterministic RNG state for constructing the toy example below.
+    torch.manual_seed(2)
+    # Build an EMA VQ module whose codebook dimension aligns with our tiny latent volume.
+    vq_ema = VectorQuantizerEMA(num_embeddings=3, embedding_dim=4, commitment_cost=0.25, ema_decay=0.99)
+    vq_ema.eval()
+
+    # Use identity rows as the codebook so index expectations are obvious.
+    weight = torch.eye(4)[:3]
+    vq_ema.embedding.weight.data.copy_(weight)
+
+    # Predefine which code each spatial site should map to for test readability.
+    idx_map = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    # Allocate the latent tensor we will populate with matching code vectors.
+    z = torch.zeros(1, 4, 2, 3)
+    for i in range(2):
+        for j in range(3):
+            # Fill each site with the corresponding code vector so quantization becomes identity.
+            z[0, :, i, j] = weight[idx_map[i, j]]
+
+    # Feed through the EMA VQ module and inspect the quantized output plus one-hot encodings.
+    z_q, _, _, encodings = vq_ema(z)
+    # Quantized result should match the crafted input exactly, within numerical tolerance.
+    assert torch.allclose(z_q, z, atol=1e-6)
+    # One-hot argmax indices should reproduce the idx_map layout precisely.
+    assert torch.equal(torch.argmax(encodings, dim=1).view(2, 3), idx_map)
+
+
+def test_vq_ema_channel_mismatch_error():
+    """EMA variant: Forward should fail fast when encoder channels disagree with embedding_dim."""
+
+    # Instantiate an EMA VQ module expecting 8-channel latents.
+    vq_ema = VectorQuantizerEMA(num_embeddings=4, embedding_dim=8, commitment_cost=0.25, ema_decay=0.99)
+    # Craft a latent tensor with only 4 channels to trigger the validation path.
+    bad_latent = torch.randn(1, 4, 2, 2)
+
+    # A ValueError with the provided message fragment should be raised.
+    with pytest.raises(ValueError, match="Expected channel dim"):
+        vq_ema(bad_latent)
+
+
+def test_vq_ema_updates_codebook_during_training(sample_latents):
+    """EMA variant: Codebook should be updated via EMA during training mode."""
+
+    # Create EMA VQ and capture initial codebook state.
+    vq_ema = VectorQuantizerEMA(num_embeddings=8, embedding_dim=16, commitment_cost=0.25, ema_decay=0.5)
+    initial_weights = vq_ema.embedding.weight.data.clone()
+
+    # Ensure we're in training mode.
+    vq_ema.train()
+    # Run forward pass to trigger EMA updates.
+    vq_ema(sample_latents)
+
+    # Codebook should have been updated via EMA.
+    assert not torch.equal(vq_ema.embedding.weight.data, initial_weights)
+
+
+def test_vq_ema_no_updates_during_eval(sample_latents):
+    """EMA variant: Codebook should NOT be updated during evaluation mode."""
+
+    # Create EMA VQ and capture initial codebook state.
+    vq_ema = VectorQuantizerEMA(num_embeddings=8, embedding_dim=16, commitment_cost=0.25, ema_decay=0.5)
+    initial_weights = vq_ema.embedding.weight.data.clone()
+
+    # Ensure we're in evaluation mode.
+    vq_ema.eval()
+    # Run forward pass - should not trigger EMA updates.
+    vq_ema(sample_latents)
+
+    # Codebook should remain unchanged.
+    assert torch.equal(vq_ema.embedding.weight.data, initial_weights)
+
+
+def test_vq_ema_cluster_size_initialization():
+    """EMA variant: Cluster sizes should be properly initialized to zeros."""
+
+    vq_ema = VectorQuantizerEMA(num_embeddings=16, embedding_dim=8, commitment_cost=0.25, ema_decay=0.99)
+
+    # Cluster sizes should start at zero.
+    assert torch.all(vq_ema._buffers['ema_cluster_size'] == 0.0)
+    # EMA weights should be initialized.
+    assert hasattr(vq_ema, '_ema_w')
+    assert vq_ema._ema_w.shape == (16, 8)
+
+
+def test_vq_ema_decay_parameter_effect():
+    """EMA variant: Different decay values should produce different update behaviors."""
+
+    torch.manual_seed(42)
+    latents = torch.randn(2, 8, 4, 4)
+
+    # Create two EMA VQs with different decay rates.
+    vq_slow = VectorQuantizerEMA(num_embeddings=4, embedding_dim=8, commitment_cost=0.25, ema_decay=0.99)
+    vq_fast = VectorQuantizerEMA(num_embeddings=4, embedding_dim=8, commitment_cost=0.25, ema_decay=0.5)
+
+    # Both should start with same random initialization.
+    vq_fast.embedding.weight.data.copy_(vq_slow.embedding.weight.data)
+    vq_fast._ema_w.data.copy_(vq_slow._ema_w.data)
+
+    # Run training steps.
+    vq_slow.train()
+    vq_fast.train()
+    vq_slow(latents)
+    vq_fast(latents)
+
+    # Different decay rates should lead to different final codebooks.
+    assert not torch.allclose(vq_slow.embedding.weight.data, vq_fast.embedding.weight.data, atol=1e-4)
+
+
+def test_vq_ema_visualizations():
+    """EMA variant: Smoke-test helper visualizations that summarize EMA VQ behavior on random latents."""
+
+    # Use RGB-like latents to make heatmaps visually intuitive.
+    torch.manual_seed(5)
+    latents = torch.randn(4, 3, 16, 16)
+
+    # Build a modest codebook so usage plots remain readable.
+    vq_ema = VectorQuantizerEMA(num_embeddings=16, embedding_dim=3, commitment_cost=0.25, ema_decay=0.99)
+
+    with torch.no_grad():
+        z_q, _, _, encodings = vq_ema(latents)
+
+    # Derive code selection counts from the one-hot encodings tensor.
+    indices = torch.argmax(encodings, dim=1)
+    usage_counts = torch.bincount(indices, minlength=vq_ema.num_embeddings).cpu().numpy()
+
+    # Emit histogram summarizing code utilization.
+    usage_path = ARTIFACT_DIR / "vq_ema_code_usage.png"
+    _plot_code_usage_histogram(usage_counts, usage_path)
+
+    # Visualize the first sample's channel-0 activation before/after quantization.
+    heatmap_path = ARTIFACT_DIR / "vq_ema_latent_vs_quantized.png"
+    _plot_latent_vs_quantized_heatmaps(latents[0], z_q[0], heatmap_path)
+
+    # Ensure the artifacts exist so CI surfaces failures if plotting breaks.
+    assert usage_path.exists()
+    assert heatmap_path.exists()
+
+
+def test_vq_ema_training_loop_generates_gif():
+    """EMA variant: Run a tiny training loop to ensure encoder adapts and codebook updates via EMA."""
+
+    torch.manual_seed(11)
+    latents = torch.randn(4, 3, 16, 16)
+    vq_ema = VectorQuantizerEMA(num_embeddings=32, embedding_dim=3, commitment_cost=0.25, ema_decay=0.99)
+
+    # For EMA VQ, we only optimize the encoder-like parameters (simulated here with a simple linear layer)
+    encoder_sim = nn.Linear(3, 3)  # Simulate encoder that maps to latent space
+    optimizer = torch.optim.Adam([encoder_sim.weight, encoder_sim.bias], lr=1e-2)
+
+    recon_history = []
+    frames = []
+    total_steps = 1000
+
+    for step in range(total_steps):
+        optimizer.zero_grad()
+        # Simulate encoder forward pass
+        z_e = encoder_sim(latents.view(-1, 3)).view(latents.shape)
+        z_q, loss_vq, _, _ = vq_ema(z_e)
+        recon_loss = torch.nn.functional.mse_loss(z_q, latents)
+        total_loss = recon_loss + loss_vq
+        total_loss.backward()
+        optimizer.step()
+
+        recon_history.append(recon_loss.detach().item())
+
+        # Capture a frame at regular intervals to visualize convergence over time.
+        if step % 10 == 0 or step == total_steps - 1:
+            frames.append(
+                _render_latent_comparison_frame(latents[0], z_q[0], step_label=f"step {step}")
+            )
+
+    # Reconstruction error should decrease as both encoder and codebook adapt.
+    assert recon_history[-1] < recon_history[0]
+
+    gif_path = ARTIFACT_DIR / "vq_ema_training.gif"
     _write_gif(frames, gif_path, duration=0.5)
     assert gif_path.exists()
