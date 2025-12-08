@@ -22,7 +22,7 @@ for path_str in (str(ROOT), str(SRC)):
         sys.path.insert(0, path_str)
 
 # Import the freshly-implemented VectorQuantizer (non-EMA) and VectorQuantizerEMA for focused testing.
-from src.models.bottleneck import VectorQuantizer, VectorQuantizerEMA
+from src.models.bottleneck import VectorQuantizer, VectorQuantizerEMA, DictionaryLearning
 
 # Directory to store visualization artifacts emitted by the tests below.
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "vq"
@@ -493,3 +493,54 @@ def test_vq_ema_training_loop_generates_gif():
     gif_path = ARTIFACT_DIR / "vq_ema_training.gif"
     _write_gif(frames, gif_path, duration=0.5)
     assert gif_path.exists()
+
+def test_dictionary_learning_forward_shapes():
+    """DictionaryLearning: Output shapes and loss."""
+    torch.manual_seed(42)
+    # [B, C, H, W]
+    x = torch.randn(2, 4, 8, 8)
+    
+    # Init DL: patch_size=2 -> atom_dim = 4 * 2 * 2 = 16
+    dl = DictionaryLearning(
+        num_embeddings=32, 
+        embedding_dim=4, 
+        patch_size=2,
+        sparsity_level=2,
+        sparse_solver='omp'
+    )
+    
+    z_dl, loss, coeffs = dl(x)
+    
+    # Shapes
+    assert z_dl.shape == x.shape
+    assert torch.isfinite(loss)
+    # coeffs: [atom_dim, B*L] -> [16, 2 * (4*4)] = [16, 32] ?? 
+    # Wait, batch_omp returns [num_embeddings, B*L].
+    # Let's check the code:
+    # signals = patches_flat.t() [atom_dim, N]
+    # coeffs = self.batch_omp(signals, self.dictionary) -> [num_embeddings, N]
+    # So coeffs should be [32, 32] in this case where L = (8/2)*(8/2) = 16 per image. Total N=32.
+    
+    # 8x8 image, patch=2, stride=2 -> 4x4 patches = 16 patches per image.
+    # Batch=2 -> 32 patches total.
+    # num_embeddings = 32.
+    assert coeffs.shape == (32, 2 * 16)
+    
+def test_dictionary_learning_sparsity():
+    """DictionaryLearning: Check if coefficients are actually sparse."""
+    torch.manual_seed(42)
+    x = torch.randn(1, 4, 8, 8)
+    dl = DictionaryLearning(
+        num_embeddings=32, 
+        embedding_dim=4, 
+        patch_size=2,
+        sparsity_level=3,
+        sparse_solver='omp'
+    )
+    
+    _, _, coeffs = dl(x)
+    
+    # Check max non-zeros per column
+    # coeffs is [num_embeddings, N]
+    non_zeros = (coeffs.abs() > 1e-6).sum(dim=0)
+    assert non_zeros.max() <= 3

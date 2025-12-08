@@ -404,10 +404,306 @@ class DictionaryLearning(nn.Module):
         # Always normalize dictionary atoms at initialization
         self._normalize_dictionary()
 
-        # Online dictionary learning disabled
-        self.dict_learning_rate = 0.0
+    def _normalize_dictionary(self):
+        """Normalize dictionary atoms to unit norm."""
+        with torch.no_grad():
+            # Avoid division by zero
+            self.dictionary.data = F.normalize(self.dictionary.data, p=2, dim=0)
+
+    def _patchify(self, x):
+        """
+        Extract patches from input tensor.
+        
+        Args:
+            x: Input tensor [B, C, H, W]
+            
+        Returns:
+            patches: Flattened patches [B*L, atom_dim] where L is number of patches
+            output_size: Tuple (h_out, w_out) representing spatial dimensions of patches
+        """
+        B, C, H, W = x.shape
+        
+        # Unfold extracts sliding local blocks from a batched input tensor
+        # Output: [B, C*ph*pw, L] where L is total number of patches
+        patches = F.unfold(x, kernel_size=self.patch_size, stride=self.patch_stride)
+        
+        # Transpose to [B, L, atom_dim] -> [B*L, atom_dim]
+        # atom_dim = C * ph * pw
+        patches = patches.transpose(1, 2).reshape(-1, patches.shape[1])
+        
+        # Calculate output spatial dimensions
+        h_out = (H - self.patch_size[0]) // self.patch_stride[0] + 1
+        w_out = (W - self.patch_size[1]) // self.patch_stride[1] + 1
+        
+        return patches, (h_out, w_out)
+
+    def _unpatchify(self, patches, output_size, original_size):
+        """
+        Reconstruct tensor from patches using fold.
+        
+        Args:
+            patches: Flattened patches [B*L, atom_dim]
+            output_size: Tuple (h_out, w_out)
+            original_size: Tuple (B, C, H, W)
+            
+        Returns:
+            x_recon: Reconstructed tensor [B, C, H, W]
+        """
+        B, C, H, W = original_size
+        h_out, w_out = output_size
+        L = h_out * w_out
+        
+        # Reshape to [B, L, atom_dim] -> [B, atom_dim, L]
+        patches = patches.view(B, L, -1).transpose(1, 2)
+        
+        # Fold combines an array of sliding local blocks into a large containing tensor
+        x_recon = F.fold(
+            patches, 
+            output_size=(H, W), 
+            kernel_size=self.patch_size, 
+            stride=self.patch_stride
+        )
+        
+        # If we have overlapping patches, fold sums them up.
+        # We need to divide by the number of overlaps to get the average.
+        if self.patch_stride != self.patch_size:
+            ones = torch.ones_like(x_recon)
+            # Create a count map by folding ones
+            count_patches = F.unfold(ones, kernel_size=self.patch_size, stride=self.patch_stride)
+            count_map = F.fold(
+                count_patches,
+                output_size=(H, W),
+                kernel_size=self.patch_size,
+                stride=self.patch_stride
+            )
+            x_recon = x_recon / count_map
+            
+        return x_recon
+
+    def forward(self, x):
+        """
+        Forward pass for Dictionary Learning Bottleneck.
+        
+        Args:
+            x: Input tensor [B, C, H, W]
+            
+        Returns:
+            z_dl: Reconstructed/Approximated tensor [B, C, H, W]
+            loss: Reconstruction loss
+            coefficients: Sparse coefficients [atom_dim, B*L] (transposed for consistency)
+        """
+        B, C, H, W = x.shape
+        
+        # 1. Normalize dictionary to ensure valid sparse coding
+        self._normalize_dictionary()
+        
+        # 2. Extract patches: [N, atom_dim] where N = B * L
+        patches_flat, spatial_dims = self._patchify(x)
+        
+        # 3. Sparse Coding
+        # We need to pass (atom_dim, N) to batch_omp if it expects signals as columns
+        # batch_omp signature: X [M, B], D [M, N] -> X is signals, D is dictionary
+        # Here our signals are patches_flat.T [atom_dim, N]
+        # Dictionary is self.dictionary [atom_dim, num_embeddings]
+        
+        signals = patches_flat.t() # [atom_dim, N]
+        
+        # Solve for sparse coefficients: alpha [num_embeddings, N]
+        # Note: batch_omp returns [num_embeddings, N]
+        coeffs = self.batch_omp(signals, self.dictionary)
+        
+        # 4. Reconstruction
+        # recovered = D * alpha -> [atom_dim, num_embeddings] @ [num_embeddings, N] = [atom_dim, N]
+        recon_patches_flat = torch.matmul(self.dictionary, coeffs).t() # [N, atom_dim]
+        
+        # 5. Unpatchify to reconstruct the image
+        x_recon = self._unpatchify(recon_patches_flat, spatial_dims, (B, C, H, W))
+        
+        # 6. Compute Loss (MSE between input and reconstruction)
+        loss = F.mse_loss(x_recon, x)
+        
+        # 7. Gradient Flow (Straight-Through Estimator)
+        # This allows gradients to flow back to the encoder even though OMP is non-differentiable
+        # x_out = x + (x_recon - x).detach()
+        # But wait, if use_backprop_only is True, we might want gradients to flow through D directly 
+        # via the reconstruction if we were just doing matmul.
+        # But OMP selection IS non-differentiable.
+        # The standard VQ-VAE trick:
+        z_dl = x + (x_recon - x).detach()
+        
+        # However, for dictionary learning, we often want to learn D via gradients on specific loss terms
+        # If we use STE, D doesn't get gradients from the reconstruction loss of later layers 
+        # acting on z_dl, because (x_recon - x) is detached!
+        
+        # If we want D to be learned via backprop from the reconstruction loss, we should NOT detach d_recon 
+        # with respect to D, only with respect to selection indices (which is implicit).
+        # But coeffs are constant w.r.t our auto-diff because OMP is not differentiable step-by-step 
+        # in this implementation (it uses torch.linalg functions not unrolled).
+        
+        # If we want to learn D via backprop, we need: x_recon = D * coeffs.
+        # Coeffs are "fixed" from the forward pass perspective. 
+        # So x_recon depends on D.
+        # If we pass z_dl = x + (x_recon - x).detach(), then z_dl = x. Gradient doesn't see D.
+        
+        # Correct STE for VQ: z_q = z_e + (z_q - z_e).detach()
+        # This means forwards is z_q, backward is z_e. This skips the quantization step for gradient.
+        # This is for learning the ENCODER.
+        
+        # For learning the DICTIONARY (Codebook):
+        # In VQ-VAE: Loss = ||sg[z_e] - e|| + ...
+        
+        # validation of the 'use_backprop_only' flag:
+        if self.use_backprop_only:
+            # If we want to update D via backprop, we must allow gradients to flow through x_recon to D.
+            # But we still need STE for the Encoder to get gradients from Decoder.
+            # 
+            # Proposed flow:
+            # Out = x_recon (grad flows to D, but blocked to coeffs/encoder?)
+            # 
+            # If we strictly use STE as: out = x + (x_recon - x).detach()
+            # Then dL/dx_recon = 0. D gets no gradient.
+            #
+            # Alternative: out = x_recon
+            # Then dL/dx_recon = dL/dout. D gets gradient.
+            # But dL/dx (to encoder) depends on d(coeffs)/dx which OMP doesn't provide.
+            
+            # Compromise:
+            # We return x_recon. 
+            # Encoder gets gradient 0 roughly (or we need to approximate d(coeffs)/dx).
+            # This is hard.
+            
+            # Let's stick to the VQ-VAE recipe which is:
+            # 1. Commitment loss (force encoder to match dictionary): ||x.detach() - x_recon||
+            # 2. Codebook loss (force dictionary to match encoder): ||x - x_recon.detach()|| (EMA handles this mostly)
+            # 
+            # But here we assume coefficients adapt to x.
+            # x ~= D * alpha.
+            # We want to minimize ||x - D*alpha||.
+            # 
+            # If we return z_dl = x_recon, then encoder path is broken.
+            # If we return z_dl = x + (x_recon - x).detach(), then D path is broken.
+            
+            # Let's do:
+            # z_dl = x + (x_recon - x).detach()
+            # This is good for Encoder-Decoder training (treated as identity bottleneck with noise).
+            # 
+            # But D needs to upgrade.
+            # We can add an auxiliary loss for D:
+            # loss_dict = ||x.detach() - D * coeffs.detach()||^2 ?? No, D * coeffs matches x.
+            
+            # Actually, `loss` computed above IS ||x - x_recon||.
+            # If we add `loss` to the total loss, and `x_recon` has grad to D (because `x_recon = D @ coeffs`),
+            # then minimizing `loss` updates D.
+            # 
+            # So:
+            # z_dl = x + (x_recon - x).detach() -> passes input through for downstream, "skipping" the bottleneck for gradient
+            # But we return `loss` which is added to global loss.
+            # `loss` = MSE(x_recon, x).
+            # `x_recon` depends on D. `x` is from encoder.
+            # So `loss` backprops to D.
+            pass
+
+        # Use STE for the output to preserve gradients for valid encoder training
+        z_dl = x + (x_recon - x).detach()
+        
+        return z_dl, loss, coeffs
+
 
     def batch_omp(self, X, D):
+        """
+        Batched Orthogonal Matching Pursuit adapted from amzn/sparse-vqvae utils/pyomp.py.
+
+        Args:
+            X: Input signals of shape (M, B)
+            D: Dictionary of shape (M, N) with normalized columns.
+
+        Returns:
+            coefficients: Sparse coefficient matrix of shape (N, B)
+        """
+        M, B = X.shape
+        _, N = D.shape
+        k_max = self.sparsity_level
+        tol = self.omp_tolerance if self.omp_tolerance is not None else 1e-7
+
+        dictionary_t = D.t()
+        # Gram with small jitter to stabilize Cholesky updates
+        diag_eps = 1e-5
+        G = dictionary_t @ D
+        G = G + diag_eps * torch.eye(N, device=X.device, dtype=X.dtype)
+        eps = torch.norm(X, dim=0)  # residual norms
+        h_bar = (dictionary_t @ X).t()  # (B, N)
+
+        h = h_bar.clone()
+        x = torch.zeros_like(h_bar)
+        # Progressive Cholesky factors per batch element
+        L = torch.ones(B, 1, 1, device=X.device, dtype=X.dtype)
+        I = torch.ones(B, 0, device=X.device, dtype=torch.long)
+        I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
+        delta = torch.zeros(B, device=X.device, dtype=X.dtype)
+
+        def _update_logical(logical, to_add):
+            running_idx = torch.arange(to_add.shape[0], device=to_add.device)
+            logical[running_idx, to_add] = True
+
+        k = 0
+        batch_idx = torch.arange(B, device=X.device)
+        while k < k_max and eps.max() > tol:
+            k += 1
+
+            # Select next atom per batch
+            index = (h * (~I_logic).float()).abs().argmax(dim=1)
+            _update_logical(I_logic, index)
+            expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, B).t()
+
+            if k > 1:
+                # Cholesky update for each batch element
+                G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(B, k - 1, 1)
+                # Solve L w = G_stack for w (lower triangular)
+                try:
+                    w = torch.linalg.solve_triangular(L, G_stack, upper=False)
+                except AttributeError:
+                    w = torch.triangular_solve(G_stack, L, upper=False).solution
+                w = w.view(B, 1, k - 1)
+                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=diag_eps))
+
+                # Build new L = [[L, 0], [w, w_corner]]
+                k_zeros = torch.zeros(B, k - 1, 1, device=X.device, dtype=X.dtype)
+                L = torch.cat(
+                    (
+                        torch.cat((L, k_zeros), dim=2),
+                        torch.cat((w, w_corner), dim=2),
+                    ),
+                    dim=1,
+                )
+
+            I = torch.cat([I, index.unsqueeze(1)], dim=1)
+
+            # Solve for coefficients on active set via Cholesky solve
+            h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(B, k, 1)
+            try:
+                x_stack = torch.cholesky_solve(h_stack, L)
+            except AttributeError:
+                x_stack = torch.linalg.cholesky_solve(h_stack, L)
+            x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack.squeeze(-1)
+
+            beta = x[batch_idx.unsqueeze(1), I[batch_idx]].unsqueeze(1).bmm(G[I[batch_idx], :]).squeeze(1)
+            h = h_bar - beta
+
+            new_delta = (x * beta).sum(dim=1)
+            eps = eps + delta - new_delta
+            delta = new_delta
+
+            # NaN/inf guard: break early if instability detected
+            if not torch.isfinite(x).all() or not torch.isfinite(L).all() or not torch.isfinite(eps).all():
+                break
+
+            if self.omp_debug and k % 1 == 0:
+                print(
+                    f"OMP step {k}, residual max={eps.max().item():.4f}, below tol={(eps < tol).float().mean().item():.4f}"
+                )
+
+        return x.t()
+
         """
         Batched Orthogonal Matching Pursuit adapted from amzn/sparse-vqvae utils/pyomp.py.
 
