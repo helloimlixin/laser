@@ -544,3 +544,88 @@ def test_dictionary_learning_sparsity():
     # coeffs is [num_embeddings, N]
     non_zeros = (coeffs.abs() > 1e-6).sum(dim=0)
     assert non_zeros.max() <= 3
+
+def test_dl_visualizations():
+    """DictionaryLearning: Smoke-test helper visualizations on random latents."""
+    torch.manual_seed(5)
+    # [B, C, H, W] - use 3 channels for RGB-like visualization
+    latents = torch.randn(4, 3, 16, 16)
+    
+    # Init DL: patch_size=2 -> atom_dim = 3 * 2 * 2 = 12
+    dl = DictionaryLearning(
+        num_embeddings=16, 
+        embedding_dim=3, 
+        patch_size=2,
+        sparsity_level=3,
+        sparse_solver='omp'
+    )
+    
+    with torch.no_grad():
+        z_dl, _, coeffs = dl(latents)
+        
+    # coeffs: [num_embeddings, N]
+    # Count usage per atom (sum of non-zero occurrences)
+    usage_counts = (coeffs.abs() > 1e-6).float().sum(dim=1).cpu().numpy()
+    
+    # Emit histogram
+    usage_path = ARTIFACT_DIR / "dl_atom_usage.png"
+    plt.figure(figsize=(6, 3))
+    plt.bar(np.arange(len(usage_counts)), usage_counts, color="tab:orange")
+    plt.xlabel("Atom index")
+    plt.ylabel("Selections")
+    plt.title("Dictionary Atom Usage")
+    plt.tight_layout()
+    plt.savefig(usage_path, dpi=120)
+    plt.close()
+    
+    # Visualize reconstruction
+    heatmap_path = ARTIFACT_DIR / "dl_latent_vs_reconstruction.png"
+    _plot_latent_vs_quantized_heatmaps(latents[0], z_dl[0], heatmap_path)
+
+    assert usage_path.exists()
+    assert heatmap_path.exists()
+
+def test_dl_training_loop_generates_gif():
+    """DictionaryLearning: Run a tiny training loop to ensure dictionary adapts."""
+    torch.manual_seed(12)
+    latents = torch.randn(4, 3, 16, 16)
+    
+    dl = DictionaryLearning(
+        num_embeddings=32, 
+        embedding_dim=3, 
+        patch_size=2, # atom_dim = 12
+        sparsity_level=3,
+        sparse_solver='omp',
+        use_backprop_only=True # Enable gradient-based dictionary updates
+    )
+    
+    # Optimizer for dictionary parameters
+    optimizer = torch.optim.Adam(dl.parameters(), lr=1e-2)
+    
+    recon_history = []
+    frames = []
+    total_steps = 1000
+    
+    for step in range(total_steps):
+        optimizer.zero_grad()
+        # Forward pass
+        z_dl, recon_loss, _ = dl(latents)
+        
+        # We minimize the reconstruction loss directly passed from forward
+        # (which is MSE(z_dl_recon, latents))
+        recon_loss.backward()
+        optimizer.step()
+        
+        recon_history.append(recon_loss.item())
+        
+        if step % 10 == 0 or step == total_steps - 1:
+            frames.append(
+                _render_latent_comparison_frame(latents[0], z_dl[0], step_label=f"step {step}")
+            )
+            
+    # Reconstruction error should decrease as dictionary adapts to the specific signals
+    assert recon_history[-1] < recon_history[0]
+    
+    gif_path = ARTIFACT_DIR / "dl_training.gif"
+    _write_gif(frames, gif_path, duration=0.5)
+    assert gif_path.exists()
