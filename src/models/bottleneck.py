@@ -480,7 +480,7 @@ class DictionaryLearning(nn.Module):
             
         return x_recon
 
-    def forward(self, x):
+    def forward(self, z_e):
         """
         Forward pass for Dictionary Learning Bottleneck.
         
@@ -492,13 +492,13 @@ class DictionaryLearning(nn.Module):
             loss: Reconstruction loss
             coefficients: Sparse coefficients [atom_dim, B*L] (transposed for consistency)
         """
-        B, C, H, W = x.shape
+        B, C, H, W = z_e.shape
         
         # 1. Normalize dictionary to ensure valid sparse coding
         self._normalize_dictionary()
         
         # 2. Extract patches: [N, atom_dim] where N = B * L
-        patches_flat, spatial_dims = self._patchify(x)
+        patches_flat, spatial_dims = self._patchify(z_e)
         
         # 3. Sparse Coding
         # We need to pass (atom_dim, N) to batch_omp if it expects signals as columns
@@ -517,10 +517,10 @@ class DictionaryLearning(nn.Module):
         recon_patches_flat = torch.matmul(self.dictionary, coeffs).t() # [N, atom_dim]
         
         # 5. Unpatchify to reconstruct the image
-        x_recon = self._unpatchify(recon_patches_flat, spatial_dims, (B, C, H, W))
+        z_dl = self._unpatchify(recon_patches_flat, spatial_dims, (B, C, H, W))
         
         # 6. Compute Loss (MSE between input and reconstruction)
-        loss = F.mse_loss(x_recon, x)
+        loss = F.mse_loss(z_dl, z_e.detach()) + self.commitment_cost * F.mse_loss(z_dl.detach(), z_e)
         
         # 7. Gradient Flow (Straight-Through Estimator)
         # This allows gradients to flow back to the encoder even though OMP is non-differentiable
@@ -529,7 +529,7 @@ class DictionaryLearning(nn.Module):
         # via the reconstruction if we were just doing matmul.
         # But OMP selection IS non-differentiable.
         # The standard VQ-VAE trick:
-        z_dl = x + (x_recon - x).detach()
+        # z_dl = z_e + (z_dl - z_e).detach()
         
         # However, for dictionary learning, we often want to learn D via gradients on specific loss terms
         # If we use STE, D doesn't get gradients from the reconstruction loss of later layers 
@@ -604,7 +604,7 @@ class DictionaryLearning(nn.Module):
             pass
 
         # Use STE for the output to preserve gradients for valid encoder training
-        z_dl = x + (x_recon - x).detach()
+        z_dl = z_e + (z_dl - z_e).detach()
         
         return z_dl, loss, coeffs
 
