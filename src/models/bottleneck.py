@@ -403,6 +403,10 @@ class DictionaryLearning(nn.Module):
 
         # Always normalize dictionary atoms at initialization
         self._normalize_dictionary()
+        
+        # Track initialization status and usage stats
+        self.register_buffer("is_initialized", torch.tensor(0, dtype=torch.uint8))
+        self.register_buffer("atom_usage_ema", torch.ones(num_embeddings))
 
     def _normalize_dictionary(self):
         """Normalize dictionary atoms to unit norm."""
@@ -494,11 +498,30 @@ class DictionaryLearning(nn.Module):
         """
         B, C, H, W = z_e.shape
         
-        # 1. Normalize dictionary to ensure valid sparse coding
-        self._normalize_dictionary()
-        
         # 2. Extract patches: [N, atom_dim] where N = B * L
         patches_flat, spatial_dims = self._patchify(z_e)
+        
+        # Data-driven initialization on first batch
+        if self.training and not self.is_initialized:
+            with torch.no_grad():
+                # Flatten patches to [N, atom_dim]
+                # Randomly select num_embeddings patches
+                n_patches = patches_flat.shape[0]
+                if n_patches >= self.num_embeddings:
+                    indices = torch.randperm(n_patches)[:self.num_embeddings]
+                    init_atoms = patches_flat[indices]
+                else:
+                    # If fewer patches than atoms, repeat with noise
+                    indices = torch.randint(0, n_patches, (self.num_embeddings,))
+                    init_atoms = patches_flat[indices] + 0.01 * torch.randn(self.num_embeddings, self.atom_dim, device=z_e.device)
+                
+                # Transpose to [atom_dim, num_embeddings] and normalize
+                self.dictionary.data.copy_(init_atoms.t())
+                self._normalize_dictionary()
+                self.is_initialized.fill_(1)
+        
+        # 1. Normalize dictionary to ensure valid sparse coding
+        self._normalize_dictionary()
         
         # 3. Sparse Coding
         # We need to pass (atom_dim, N) to batch_omp if it expects signals as columns
@@ -516,6 +539,39 @@ class DictionaryLearning(nn.Module):
         # recovered = D * alpha -> [atom_dim, num_embeddings] @ [num_embeddings, N] = [atom_dim, N]
         recon_patches_flat = torch.matmul(self.dictionary, coeffs).t() # [N, atom_dim]
         
+        # Dead Atom Revival (Training Only)
+        if self.training:
+            with torch.no_grad():
+                # Usage: fraction of patches where atom is non-zero
+                current_usage = (coeffs.abs() > 1e-5).float().mean(dim=1) # [K]
+                self.atom_usage_ema = 0.99 * self.atom_usage_ema + 0.01 * current_usage
+                
+                # Identify dead atoms (< 0.1% usage)
+                dead_mask = self.atom_usage_ema < 1e-3
+                n_dead = dead_mask.sum().item()
+                
+                if n_dead > 0:
+                    # Compute patch errors
+                    err = (patches_flat - recon_patches_flat).norm(dim=1) # [N]
+                    
+                    # Select patches with high error
+                    n_candidates = min(n_dead * 4, patches_flat.size(0))
+                    _, top_indices = torch.topk(err, k=n_candidates)
+                    
+                    # Randomly sample from top error patches
+                    rand_subset = torch.randperm(n_candidates)[:n_dead]
+                    replacement_indices = top_indices[rand_subset]
+                    
+                    replacements = patches_flat[replacement_indices]
+                    # Normalize
+                    replacements = replacements / (replacements.norm(dim=1, keepdim=True) + 1e-8)
+                    
+                    # Replace dead atoms (D is [atom_dim, num_embeddings])
+                    self.dictionary.data[:, dead_mask] = replacements.t()
+                    
+                    # Reset EMA for revived atoms
+                    self.atom_usage_ema[dead_mask] = self.atom_usage_ema.mean()
+
         # 5. Unpatchify to reconstruct the image
         z_dl = self._unpatchify(recon_patches_flat, spatial_dims, (B, C, H, W))
         
@@ -610,100 +666,6 @@ class DictionaryLearning(nn.Module):
 
 
     def batch_omp(self, X, D):
-        """
-        Batched Orthogonal Matching Pursuit adapted from amzn/sparse-vqvae utils/pyomp.py.
-
-        Args:
-            X: Input signals of shape (M, B)
-            D: Dictionary of shape (M, N) with normalized columns.
-
-        Returns:
-            coefficients: Sparse coefficient matrix of shape (N, B)
-        """
-        M, B = X.shape
-        _, N = D.shape
-        k_max = self.sparsity_level
-        tol = self.omp_tolerance if self.omp_tolerance is not None else 1e-7
-
-        dictionary_t = D.t()
-        # Gram with small jitter to stabilize Cholesky updates
-        diag_eps = 1e-5
-        G = dictionary_t @ D
-        G = G + diag_eps * torch.eye(N, device=X.device, dtype=X.dtype)
-        eps = torch.norm(X, dim=0)  # residual norms
-        h_bar = (dictionary_t @ X).t()  # (B, N)
-
-        h = h_bar.clone()
-        x = torch.zeros_like(h_bar)
-        # Progressive Cholesky factors per batch element
-        L = torch.ones(B, 1, 1, device=X.device, dtype=X.dtype)
-        I = torch.ones(B, 0, device=X.device, dtype=torch.long)
-        I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
-        delta = torch.zeros(B, device=X.device, dtype=X.dtype)
-
-        def _update_logical(logical, to_add):
-            running_idx = torch.arange(to_add.shape[0], device=to_add.device)
-            logical[running_idx, to_add] = True
-
-        k = 0
-        batch_idx = torch.arange(B, device=X.device)
-        while k < k_max and eps.max() > tol:
-            k += 1
-
-            # Select next atom per batch
-            index = (h * (~I_logic).float()).abs().argmax(dim=1)
-            _update_logical(I_logic, index)
-            expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, B).t()
-
-            if k > 1:
-                # Cholesky update for each batch element
-                G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(B, k - 1, 1)
-                # Solve L w = G_stack for w (lower triangular)
-                try:
-                    w = torch.linalg.solve_triangular(L, G_stack, upper=False)
-                except AttributeError:
-                    w = torch.triangular_solve(G_stack, L, upper=False).solution
-                w = w.view(B, 1, k - 1)
-                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=diag_eps))
-
-                # Build new L = [[L, 0], [w, w_corner]]
-                k_zeros = torch.zeros(B, k - 1, 1, device=X.device, dtype=X.dtype)
-                L = torch.cat(
-                    (
-                        torch.cat((L, k_zeros), dim=2),
-                        torch.cat((w, w_corner), dim=2),
-                    ),
-                    dim=1,
-                )
-
-            I = torch.cat([I, index.unsqueeze(1)], dim=1)
-
-            # Solve for coefficients on active set via Cholesky solve
-            h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(B, k, 1)
-            try:
-                x_stack = torch.cholesky_solve(h_stack, L)
-            except AttributeError:
-                x_stack = torch.linalg.cholesky_solve(h_stack, L)
-            x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack.squeeze(-1)
-
-            beta = x[batch_idx.unsqueeze(1), I[batch_idx]].unsqueeze(1).bmm(G[I[batch_idx], :]).squeeze(1)
-            h = h_bar - beta
-
-            new_delta = (x * beta).sum(dim=1)
-            eps = eps + delta - new_delta
-            delta = new_delta
-
-            # NaN/inf guard: break early if instability detected
-            if not torch.isfinite(x).all() or not torch.isfinite(L).all() or not torch.isfinite(eps).all():
-                break
-
-            if self.omp_debug and k % 1 == 0:
-                print(
-                    f"OMP step {k}, residual max={eps.max().item():.4f}, below tol={(eps < tol).float().mean().item():.4f}"
-                )
-
-        return x.t()
-
         """
         Batched Orthogonal Matching Pursuit adapted from amzn/sparse-vqvae utils/pyomp.py.
 
