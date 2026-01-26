@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
 import torchvision
-from torchmetrics.functional.text import perplexity
 
 from .encoder import Encoder
 from .decoder import Decoder
@@ -112,10 +111,10 @@ class VQVAE(pl.LightningModule):
         with torch.no_grad():
             z = self.encoder(x)
             z = self.pre_bottleneck(z)
-            # VectorQuantizer returns (z_q, loss, perplexity, indices)
-            _, _, _, enc = self.vector_quantizer(z)
+            # VectorQuantizer returns (z_q, loss, perplexity, encodings)
+            _, _, _, encodings = self.vector_quantizer(z)
             B, _, H_z, W_z = z.shape
-            indices = enc.view(B, H_z * W_z).long()
+            indices = torch.argmax(encodings, dim=1).view(B, H_z * W_z)
         return indices, H_z, W_z
 
     def decode_from_indices(self, indices, H_z, W_z):
@@ -168,7 +167,7 @@ class VQVAE(pl.LightningModule):
     def forward(self, x):
         z = self.encoder(x)
         z = self.pre_bottleneck(z)
-        z_q, vq_loss, perplexity, encodings = self.vector_quantizer(z)
+        z_q, vq_loss, perplexity, _ = self.vector_quantizer(z)
         z_q = self.post_bottleneck(z_q)
         recon = self.decoder(z_q)
 
@@ -357,7 +356,5 @@ if __name__ == "__main__":
     vqvae = VQVAE(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32, num_embeddings=1024, embedding_dim=32, commitment_cost=0.25, decay=0.99, perceptual_weight=0.1, learning_rate=1e-4, beta=1.0, compute_fid=True)
     x = torch.randn(4, 3, 256, 256)  # batch_size x 3 x 256 x 256
     print(vqvae(x).shape)  # batch_size x 3 x 256 x 256
-
-
 
 
