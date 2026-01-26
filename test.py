@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Quick sanity check for K-SVD VAE model."""
+"""Quick sanity check for LASER model."""
 
 import sys
 from pathlib import Path
@@ -13,12 +13,12 @@ for p in (str(ROOT), str(SRC)):
 import torch
 from src.models.laser import LASER
 
-print("="*60)
-print("K-SVD VAE SANITY CHECK")
-print("="*60)
+print("=" * 60)
+print("LASER SANITY CHECK")
+print("=" * 60)
 
 # Create model
-print("\n1. Creating K-SVD VAE model...")
+print("\n1. Creating LASER model...")
 model = LASER(
     in_channels=3,
     num_hiddens=128,
@@ -30,7 +30,6 @@ model = LASER(
     commitment_cost=0.25,
     learning_rate=1e-4,
     beta=0.9,
-    ksvd_iterations=2,
     perceptual_weight=1.0,
     patch_size=1,
 )
@@ -56,19 +55,8 @@ print("\n3. Testing reconstruction quality...")
 mse = torch.nn.functional.mse_loss(recon, x).item()
 print(f"✓ MSE: {mse:.6f}")
 
-# Test training mode
-print("\n4. Testing training mode (K-SVD updates)...")
-model.train()
-dict_before = model.bottleneck.dictionary.data.clone()
-
-recon, bottleneck_loss, coeffs = model(x)
-
-dict_after = model.bottleneck.dictionary.data
-dict_changed = not torch.allclose(dict_before, dict_after, atol=1e-6)
-print(f"✓ Dictionary updated: {dict_changed}")
-
 # Test compute_metrics
-print("\n5. Testing compute_metrics...")
+print("\n4. Testing compute_metrics...")
 model.eval()
 batch = (x,)
 loss, recon_vis, x_vis = model.compute_metrics(batch, prefix='test')
@@ -76,7 +64,7 @@ print(f"✓ Metrics computed")
 print(f"   Total loss: {loss.item():.6f}")
 
 # Count parameters
-print("\n6. Model statistics...")
+print("\n5. Model statistics...")
 total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"   Total parameters: {total_params:,}")

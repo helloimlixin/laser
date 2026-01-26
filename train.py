@@ -78,12 +78,11 @@ def train(cfg: DictConfig):
     print(f"Embedding Dimensions: {cfg.model.embedding_dim}")
     print(f"Number of Residual Blocks: {cfg.model.num_residual_blocks}")
     print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
-    if cfg.model.type == "laser":
-        print(f"Dictionary Size: {cfg.model.num_embeddings}")
-        print(f"Sparsity: {cfg.model.sparsity_level}")
-        if hasattr(cfg.model, "patch_size"):
-            print(f"Latent Patch Size: {cfg.model.patch_size}")
-        print(f"K-SVD Iterations: {getattr(cfg.model, 'ksvd_iterations', 2)}")
+        if cfg.model.type == "laser":
+            print(f"Dictionary Size: {cfg.model.num_embeddings}")
+            print(f"Sparsity: {cfg.model.sparsity_level}")
+            if hasattr(cfg.model, "patch_size"):
+                print(f"Latent Patch Size: {cfg.model.patch_size}")
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -224,8 +223,6 @@ def train(cfg: DictConfig):
             'compute_fid': cfg.model.compute_fid,
             'bottleneck_loss_weight': getattr(cfg.model, 'bottleneck_loss_weight', 0.5),
             'sparsity_level': cfg.model.sparsity_level,
-            'ksvd_iterations': getattr(cfg.model, 'ksvd_iterations', 1),
-            'dictionary_update_frequency': getattr(cfg.model, 'dictionary_update_frequency', 0),
             'use_online_learning': getattr(cfg.model, 'use_online_learning', False),
             'use_backprop_only': getattr(cfg.model, 'use_backprop_only', False),
             'dict_learning_rate': getattr(cfg.model, 'dict_learning_rate', 0.1),

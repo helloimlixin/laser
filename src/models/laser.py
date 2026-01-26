@@ -32,8 +32,6 @@ class LASER(pl.LightningModule):
             learning_rate,
             beta,
             bottleneck_loss_weight=0.5,
-            ksvd_iterations=1,
-            dictionary_update_frequency=0,
             perceptual_weight=1.0,
             compute_fid=False,
             patch_size=1,
@@ -64,6 +62,7 @@ class LASER(pl.LightningModule):
             pattern_commitment_cost=0.25,
             pattern_ema_decay=0.99,
             pattern_temperature=1.0,
+            **kwargs,
     ):
         """Initialize LASER model.
 
@@ -79,8 +78,6 @@ class LASER(pl.LightningModule):
             learning_rate: Learning rate for encoder/decoder
             beta: Beta parameter for Adam optimizer
             bottleneck_loss_weight: Weight for bottleneck loss term in total loss
-            ksvd_iterations: Number of K-SVD dictionary update iterations per forward pass
-            dictionary_update_frequency: Update dictionary every N training steps (0 = every step)
             perceptual_weight: Weight for perceptual loss
             compute_fid: Whether to compute FID
             patch_size: Spatial patch size (int or tuple) encoded per dictionary token
@@ -88,8 +85,8 @@ class LASER(pl.LightningModule):
             multi_res_dct_levels: number of pyramid levels for DCT loss
             multi_res_grad_weight: weight for edge-preserving gradient loss
             multi_res_grad_levels: number of pyramid levels for gradient loss
-            use_online_learning: whether to use online dictionary learning (vs K-SVD)
-            use_backprop_only: whether to use only backprop for dictionary learning (no K-SVD/online)
+            use_online_learning: whether to use online dictionary learning
+            use_backprop_only: whether to use only backprop for dictionary learning
             dict_learning_rate: learning rate for online dictionary updates
             sparse_solver: sparse coding algorithm ('omp', 'iht', 'topk', 'lista')
             iht_iterations: number of IHT iterations (if using IHT)
@@ -111,7 +108,6 @@ class LASER(pl.LightningModule):
         self.beta = beta
         self.perceptual_weight = perceptual_weight
         self.log_images_every_n_steps = 100
-        self.dictionary_update_frequency = dictionary_update_frequency
         self.compute_fid = compute_fid
         self.mr_dct_weight = multi_res_dct_weight
         self.mr_dct_levels = multi_res_dct_levels
@@ -143,7 +139,6 @@ class LASER(pl.LightningModule):
             embedding_dim=embedding_dim,
             sparsity_level=sparsity_level,
             commitment_cost=commitment_cost,
-            ksvd_iterations=ksvd_iterations,
             patch_size=patch_size,
             use_online_learning=use_online_learning,
             use_backprop_only=use_backprop_only,
@@ -413,22 +408,6 @@ class LASER(pl.LightningModule):
         # Prevent unused dictionary gradients from accumulating when not optimized via backprop
         if not self.bottleneck.use_backprop_only:
             self.bottleneck.dictionary.grad = None
-
-        # Control dictionary updates based on update frequency
-        # Enable K-SVD/online updates only if not using backprop-only mode
-        # and if we're at the right step according to dictionary_update_frequency
-        if not self.bottleneck.use_backprop_only:
-            if self.dictionary_update_frequency == 0:
-                # Update every step
-                self.bottleneck.enable_ksvd_update = True
-            else:
-                # Update only every N steps
-                current_step = self.global_step
-                should_update = (current_step % self.dictionary_update_frequency) == 0
-                self.bottleneck.enable_ksvd_update = should_update
-        else:
-            # In backprop-only mode, never use K-SVD updates
-            self.bottleneck.enable_ksvd_update = False
 
         loss, recon, x = self.compute_metrics(batch, prefix='train')
 

@@ -1,4 +1,4 @@
-# Model type: laser (K-SVD Dictionary Learning VAE)
+# Model type: laser (Dictionary Learning VAE)
 # Other options: vqvae
 type: laser
 
@@ -71,10 +71,8 @@ commitment_cost: 0.25
 
 # Weight applied to bottleneck loss inside total loss
 # Lower to prevent bottleneck term from dominating total objective
-ksvd_iterations: 0
-dictionary_update_frequency: 0
 
-# Dictionary learning: backprop-only, no K-SVD/online updates
+# Dictionary learning: backprop-only, no online updates
 use_online_learning: false
 dict_learning_rate: 0.0
 
