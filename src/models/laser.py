@@ -40,7 +40,6 @@ class LASER(pl.LightningModule):
             multi_res_grad_weight=0.0,
             multi_res_grad_levels=3,
             use_online_learning=False,
-            use_backprop_only=False,
             dict_learning_rate=1e-3,
             sparse_solver='omp',
             iht_iterations=10,
@@ -80,13 +79,12 @@ class LASER(pl.LightningModule):
             bottleneck_loss_weight: Weight for bottleneck loss term in total loss
             perceptual_weight: Weight for perceptual loss
             compute_fid: Whether to compute FID
-            patch_size: Spatial patch size (int or tuple) encoded per dictionary token
+            patch_size: Deprecated (per-pixel only); retained for config compatibility
             multi_res_dct_weight: weight for DCT-based high-frequency loss
             multi_res_dct_levels: number of pyramid levels for DCT loss
             multi_res_grad_weight: weight for edge-preserving gradient loss
             multi_res_grad_levels: number of pyramid levels for gradient loss
             use_online_learning: whether to use online dictionary learning
-            use_backprop_only: whether to use only backprop for dictionary learning
             dict_learning_rate: learning rate for online dictionary updates
             sparse_solver: sparse coding algorithm ('omp', 'iht', 'topk', 'lista')
             iht_iterations: number of IHT iterations (if using IHT)
@@ -98,7 +96,7 @@ class LASER(pl.LightningModule):
             fista_tolerance: convergence tolerance for FISTA
             fista_max_steps: max iterations for FISTA
             sparsity_reg_weight: L1 regularization weight on sparse coefficients
-            patch_stride: optional patch stride (defaults to patch_size; use patch_size/2 for 50% overlap)
+            patch_stride: Deprecated (per-pixel only); retained for config compatibility
             orthogonality_weight: weight for dictionary orthogonality loss (decorrelates atoms)
         """
         super(LASER, self).__init__()
@@ -141,7 +139,6 @@ class LASER(pl.LightningModule):
             commitment_cost=commitment_cost,
             patch_size=patch_size,
             use_online_learning=use_online_learning,
-            use_backprop_only=use_backprop_only,
             dict_learning_rate=dict_learning_rate,
             sparse_solver=sparse_solver,
             iht_iterations=iht_iterations,
@@ -405,10 +402,6 @@ class LASER(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step."""
-        # Prevent unused dictionary gradients from accumulating when not optimized via backprop
-        if not self.bottleneck.use_backprop_only:
-            self.bottleneck.dictionary.grad = None
-
         loss, recon, x = self.compute_metrics(batch, prefix='train')
 
         # Log images periodically
@@ -517,10 +510,9 @@ class LASER(pl.LightningModule):
         ]
 
         # Give the dictionary its own (typically higher) LR and no weight decay
-        if self.bottleneck.use_backprop_only:
-            dict_params = list(self.bottleneck.parameters())
-            dict_lr = getattr(self.bottleneck, "dict_learning_rate", self.learning_rate)
-            param_groups.append({"params": dict_params, "lr": dict_lr, "weight_decay": 0.0})
+        dict_params = list(self.bottleneck.parameters())
+        dict_lr = getattr(self.bottleneck, "dict_learning_rate", self.learning_rate)
+        param_groups.append({"params": dict_params, "lr": dict_lr, "weight_decay": 0.0})
 
         optimizer = torch.optim.AdamW(
             param_groups,
