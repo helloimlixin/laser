@@ -693,6 +693,7 @@ class Stage1LightningModule(pl.LightningModule):
         out_dir: str,
         fid_num_samples: int = 1024,
         fid_feature: int = 2048,
+        fid_compute_batch_size: int = 32,
     ):
         super().__init__()
         self.ae = ae
@@ -703,13 +704,29 @@ class Stage1LightningModule(pl.LightningModule):
         self._val_vis = None
         self.fid_num_samples = max(0, int(fid_num_samples))
         self.fid_feature = int(fid_feature)
+        self.fid_compute_batch_size = max(1, int(fid_compute_batch_size))
         self._fid_real = []
         self._fid_fake = []
         self._fid_seen = 0
         self._fid_warned_unavailable = False
+        self._fid_metric = None
+        self._fid_metric_feature = None
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.ae.parameters(), lr=self.lr)
+
+    def _get_or_create_fid_metric(self, feature: int):
+        feat = int(feature)
+        if self._fid_metric is None or self._fid_metric_feature != feat:
+            self._fid_metric = FrechetInceptionDistance(
+                feature=feat,
+                sync_on_compute=False,
+            ).to(self.device)
+            self._fid_metric_feature = feat
+        else:
+            self._fid_metric = self._fid_metric.to(self.device)
+        self._fid_metric.reset()
+        return self._fid_metric
 
     def on_validation_epoch_start(self):
         self._fid_real = []
@@ -806,16 +823,21 @@ class Stage1LightningModule(pl.LightningModule):
             and self._fid_fake
         ):
             with torch.no_grad():
-                fid_metric = FrechetInceptionDistance(
-                    feature=self.fid_feature,
-                    sync_on_compute=False,
-                ).to(self.device)
-                real = torch.cat(self._fid_real, dim=0).to(self.device)
-                fake = torch.cat(self._fid_fake, dim=0).to(self.device)
-                fid_metric.update(real, real=True)
-                fid_metric.update(fake, real=False)
+                fid_metric = self._get_or_create_fid_metric(self.fid_feature)
+                for real_cpu, fake_cpu in zip(self._fid_real, self._fid_fake):
+                    bs = int(self.fid_compute_batch_size)
+                    for start in range(0, real_cpu.size(0), bs):
+                        end = start + bs
+                        real_chunk = real_cpu[start:end].to(self.device)
+                        fake_chunk = fake_cpu[start:end].to(self.device)
+                        fid_metric.update(real_chunk, real=True)
+                        fid_metric.update(fake_chunk, real=False)
                 fid_value = fid_metric.compute().detach()
+                fid_metric.reset()
             self.log("stage1/fid", fid_value, on_epoch=True, prog_bar=True, sync_dist=True)
+            self._fid_real = []
+            self._fid_fake = []
+            self._fid_seen = 0
 
 
 class Stage2LightningModule(pl.LightningModule):
@@ -852,6 +874,8 @@ class Stage2LightningModule(pl.LightningModule):
         self._fid_warned_unavailable = False
         self._fid_warned_adjusted_feature = False
         self._fid_warned_compute_failed = False
+        self._fid_metric = None
+        self._fid_metric_feature = None
 
         self.ae_for_decode.eval()
         for p in self.ae_for_decode.parameters():
@@ -859,6 +883,19 @@ class Stage2LightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.transformer.parameters(), lr=self.lr)
+
+    def _get_or_create_fid_metric(self, feature: int):
+        feat = int(feature)
+        if self._fid_metric is None or self._fid_metric_feature != feat:
+            self._fid_metric = FrechetInceptionDistance(
+                feature=feat,
+                sync_on_compute=False,
+            ).to(self.device)
+            self._fid_metric_feature = feat
+        else:
+            self._fid_metric = self._fid_metric.to(self.device)
+        self._fid_metric.reset()
+        return self._fid_metric
 
     def training_step(self, batch, batch_idx):
         (tok_flat,) = batch
@@ -985,13 +1022,11 @@ class Stage2LightningModule(pl.LightningModule):
         fake_u8 = seeded_u8[:n].to(self.device)
 
         try:
-            fid_metric = FrechetInceptionDistance(
-                feature=effective_feature,
-                sync_on_compute=False,
-            ).to(self.device)
+            fid_metric = self._get_or_create_fid_metric(effective_feature)
             fid_metric.update(real_u8, real=True)
             fid_metric.update(fake_u8, real=False)
             fid_value = float(fid_metric.compute().detach().cpu().item())
+            fid_metric.reset()
         except Exception as exc:
             if not self._fid_warned_compute_failed:
                 print(f"[Stage2] FID compute failed at step {step}: {exc}")
@@ -1264,6 +1299,7 @@ def main():
     parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for stage-2 token precompute loader.")
     parser.add_argument("--fid_num_samples", type=int, default=1024, help="Number of validation images for stage-1 FID.")
     parser.add_argument("--fid_feature", type=int, default=192, help="Inception feature dims for stage-1 FID.")
+    parser.add_argument("--fid_compute_batch_size", type=int, default=32, help="Mini-batch size for stage-1 FID feature extraction.")
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_project", type=str, default="laser-scratch")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -1485,6 +1521,7 @@ def main():
             out_dir=stage1_dir,
             fid_num_samples=args.fid_num_samples,
             fid_feature=args.fid_feature,
+            fid_compute_batch_size=args.fid_compute_batch_size,
         )
         stage1_trainer = pl.Trainer(
             accelerator="gpu",
