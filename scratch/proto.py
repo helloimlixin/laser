@@ -18,6 +18,7 @@ import argparse
 import math
 import os
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -26,10 +27,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
+from lightning.pytorch.loggers import WandbLogger
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
 from torchvision import datasets, transforms, utils
 from tqdm import tqdm
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+except Exception:
+    FrechetInceptionDistance = None
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 
 # -----------------------------
@@ -610,15 +620,48 @@ class RQTransformerPrior(nn.Module):
 # Training helpers
 # -----------------------------
 
+def _make_image_grid(x: torch.Tensor, nrow: int = 8) -> torch.Tensor:
+    """Build image grid tensor from a batch in [-1, 1]."""
+    x = x.detach().cpu().clamp(-1, 1)
+    x = (x + 1.0) / 2.0
+    return utils.make_grid(x, nrow=nrow)
+
+
 def save_image_grid(x: torch.Tensor, path: str, nrow: int = 8):
     """
     Save a grid of images. Expects x in [-1,1] (we'll map to [0,1]).
     """
-    x = x.detach().cpu().clamp(-1, 1)
-    x = (x + 1.0) / 2.0
-    grid = utils.make_grid(x, nrow=nrow)
+    grid = _make_image_grid(x, nrow=nrow)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     utils.save_image(grid, path)
+
+
+def _resolve_wandb_logger(logger_obj):
+    if isinstance(logger_obj, WandbLogger):
+        return logger_obj
+    for lg in getattr(logger_obj, "loggers", []):
+        if isinstance(lg, WandbLogger):
+            return lg
+    return None
+
+
+def log_image_grid_wandb(
+    logger_obj,
+    key: str,
+    x: torch.Tensor,
+    step: int,
+    nrow: int = 8,
+    caption: Optional[str] = None,
+) -> bool:
+    wb_logger = _resolve_wandb_logger(logger_obj)
+    if wb_logger is None or wandb is None:
+        return False
+
+    grid = _make_image_grid(x, nrow=nrow)
+    grid_np = grid.permute(1, 2, 0).mul(255).clamp(0, 255).byte().numpy()
+    wb_image = wandb.Image(grid_np, caption=caption) if caption else wandb.Image(grid_np)
+    wb_logger.experiment.log({key: wb_image}, step=int(step))
+    return True
 
 
 class Stage2TokenDataModule(pl.LightningDataModule):
@@ -648,6 +691,8 @@ class Stage1LightningModule(pl.LightningModule):
         lr: float,
         bottleneck_weight: float,
         out_dir: str,
+        fid_num_samples: int = 1024,
+        fid_feature: int = 2048,
     ):
         super().__init__()
         self.ae = ae
@@ -656,9 +701,20 @@ class Stage1LightningModule(pl.LightningModule):
         self.out_dir = out_dir
         self.best_val = float("inf")
         self._val_vis = None
+        self.fid_num_samples = max(0, int(fid_num_samples))
+        self.fid_feature = int(fid_feature)
+        self._fid_real = []
+        self._fid_fake = []
+        self._fid_seen = 0
+        self._fid_warned_unavailable = False
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.ae.parameters(), lr=self.lr)
+
+    def on_validation_epoch_start(self):
+        self._fid_real = []
+        self._fid_fake = []
+        self._fid_seen = 0
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
@@ -683,32 +739,83 @@ class Stage1LightningModule(pl.LightningModule):
         recon, b_loss, _ = self.ae(x)
         recon_loss = F.mse_loss(recon, x)
         loss = recon_loss + self.bottleneck_weight * b_loss
+        psnr = -10.0 * torch.log10(torch.clamp(recon_loss.detach(), min=1e-8))
         self.log("stage1/val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
+        self.log("stage1/val_psnr", psnr, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
 
         if batch_idx == 0 and self.trainer.is_global_zero:
             self._val_vis = (x[:64].detach(), recon[:64].detach())
+
+        if (not self.trainer.sanity_checking) and self.fid_num_samples > 0:
+            if FrechetInceptionDistance is None:
+                if self.trainer.is_global_zero and not self._fid_warned_unavailable:
+                    print("[Stage1] FID unavailable: torchmetrics.image.fid not installed.")
+                    self._fid_warned_unavailable = True
+            elif self._fid_seen < self.fid_num_samples:
+                keep = min(x.size(0), self.fid_num_samples - self._fid_seen)
+                if keep > 0:
+                    real_u8 = ((x[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
+                    fake_u8 = ((recon[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
+                    self._fid_real.append(real_u8)
+                    self._fid_fake.append(fake_u8)
+                    self._fid_seen += keep
         return loss
 
     def on_validation_epoch_end(self):
-        if not self.trainer.is_global_zero:
-            return
-        os.makedirs(self.out_dir, exist_ok=True)
-        cur = self.trainer.callback_metrics.get("stage1/val_loss")
-        if cur is None:
-            return
-        cur_val = float(cur.detach().cpu().item())
+        if self.trainer.is_global_zero and not self.trainer.sanity_checking:
+            os.makedirs(self.out_dir, exist_ok=True)
+            cur = self.trainer.callback_metrics.get("stage1/val_loss")
+            if cur is not None:
+                cur_val = float(cur.detach().cpu().item())
 
-        torch.save(self.ae.state_dict(), os.path.join(self.out_dir, "ae_last.pt"))
-        if cur_val < self.best_val:
-            self.best_val = cur_val
-            torch.save(self.ae.state_dict(), os.path.join(self.out_dir, "ae_best.pt"))
+                torch.save(self.ae.state_dict(), os.path.join(self.out_dir, "ae_last.pt"))
+                if cur_val < self.best_val:
+                    self.best_val = cur_val
+                    torch.save(self.ae.state_dict(), os.path.join(self.out_dir, "ae_best.pt"))
 
-        if self._val_vis is not None:
-            x_vis, recon_vis = self._val_vis
-            epoch = int(self.current_epoch + 1)
-            save_image_grid(x_vis, os.path.join(self.out_dir, f"stage1_epoch{epoch:03d}_real.png"))
-            save_image_grid(recon_vis, os.path.join(self.out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
-            self._val_vis = None
+            if self._val_vis is not None:
+                x_vis, recon_vis = self._val_vis
+                epoch = int(self.current_epoch + 1)
+                log_step = int(self.global_step)
+                logged_real = log_image_grid_wandb(
+                    self.logger,
+                    key="stage1/real",
+                    x=x_vis,
+                    step=log_step,
+                    caption=f"epoch={epoch} real",
+                )
+                logged_recon = log_image_grid_wandb(
+                    self.logger,
+                    key="stage1/recon",
+                    x=recon_vis,
+                    step=log_step,
+                    caption=f"epoch={epoch} recon",
+                )
+                if not (logged_real and logged_recon):
+                    save_image_grid(x_vis, os.path.join(self.out_dir, f"stage1_epoch{epoch:03d}_real.png"))
+                    save_image_grid(recon_vis, os.path.join(self.out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
+                self._val_vis = None
+
+        if (
+            not self.trainer.sanity_checking
+            and
+            self.fid_num_samples > 0
+            and FrechetInceptionDistance is not None
+            and self._fid_seen > 0
+            and self._fid_real
+            and self._fid_fake
+        ):
+            with torch.no_grad():
+                fid_metric = FrechetInceptionDistance(
+                    feature=self.fid_feature,
+                    sync_on_compute=False,
+                ).to(self.device)
+                real = torch.cat(self._fid_real, dim=0).to(self.device)
+                fake = torch.cat(self._fid_fake, dim=0).to(self.device)
+                fid_metric.update(real, real=True)
+                fid_metric.update(fake, real=False)
+                fid_value = fid_metric.compute().detach()
+            self.log("stage1/fid", fid_value, on_epoch=True, prog_bar=True, sync_dist=True)
 
 
 class Stage2LightningModule(pl.LightningModule):
@@ -724,6 +831,10 @@ class Stage2LightningModule(pl.LightningModule):
         D: int,
         sample_every_steps: int = 200,
         sample_batch_size: int = 8,
+        fid_real_images: Optional[torch.Tensor] = None,
+        fid_num_samples: int = 64,
+        fid_feature: int = 2048,
+        fid_every_n_epochs: int = 1,
     ):
         super().__init__()
         self.transformer = transformer
@@ -734,6 +845,13 @@ class Stage2LightningModule(pl.LightningModule):
         self.H, self.W, self.D = int(H), int(W), int(D)
         self.sample_every_steps = int(sample_every_steps)
         self.sample_batch_size = int(sample_batch_size)
+        self.fid_real_images = fid_real_images
+        self.fid_num_samples = max(0, int(fid_num_samples))
+        self.fid_feature = int(fid_feature)
+        self.fid_every_n_epochs = max(1, int(fid_every_n_epochs))
+        self._fid_warned_unavailable = False
+        self._fid_warned_adjusted_feature = False
+        self._fid_warned_compute_failed = False
 
         self.ae_for_decode.eval()
         for p in self.ae_for_decode.parameters():
@@ -782,10 +900,16 @@ class Stage2LightningModule(pl.LightningModule):
             self._sample_and_save(step=self.global_step)
 
     def on_train_epoch_end(self):
-        if not self.trainer.is_global_zero:
-            return
-        os.makedirs(self.out_dir, exist_ok=True)
-        torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, "transformer_last.pt"))
+        world_size = int(getattr(self.trainer, "world_size", 1))
+        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
+            self.trainer.strategy.barrier()
+
+        if self.trainer.is_global_zero:
+            os.makedirs(self.out_dir, exist_ok=True)
+            torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, "transformer_last.pt"))
+
+        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
+            self.trainer.strategy.barrier()
 
     @torch.no_grad()
     def _sample_and_save(self, step: int):
@@ -801,8 +925,79 @@ class Stage2LightningModule(pl.LightningModule):
         )
         tokens_gen = flat_gen.view(-1, self.H, self.W, self.D)
         imgs = self.ae_for_decode.decode_from_tokens(tokens_gen.to(self.device))
-        save_image_grid(imgs, os.path.join(self.out_dir, f"stage2_step{step:06d}_samples.png"))
+        logged = log_image_grid_wandb(
+            self.logger,
+            key="stage2/samples",
+            x=imgs,
+            step=step,
+            caption=f"step={step}",
+        )
+        if not logged:
+            save_image_grid(imgs, os.path.join(self.out_dir, f"stage2_step{step:06d}_samples.png"))
+        self._compute_and_log_fid(step=step, initial_fake_imgs=imgs)
         print(f"[Stage2] sampling done at step {step}")
+        self.transformer.train()
+
+    @torch.no_grad()
+    def _compute_and_log_fid(self, step: int, initial_fake_imgs: Optional[torch.Tensor] = None):
+        if self.fid_num_samples <= 0:
+            return
+        epoch = int(self.current_epoch + 1)
+        if (epoch % self.fid_every_n_epochs) != 0:
+            return
+        if FrechetInceptionDistance is None:
+            if not self._fid_warned_unavailable:
+                print("[Stage2] FID unavailable: torchmetrics.image.fid not installed.")
+                self._fid_warned_unavailable = True
+            return
+        if self.fid_real_images is None or self.fid_real_images.numel() == 0:
+            return
+        if initial_fake_imgs is None or initial_fake_imgs.numel() == 0:
+            return
+
+        seeded_u8 = ((initial_fake_imgs.detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
+        n = min(
+            self.fid_num_samples,
+            int(self.fid_real_images.shape[0]),
+            int(seeded_u8.size(0)),
+        )
+        if n <= 0:
+            return
+
+        effective_feature = self.fid_feature
+        valid_features = [64, 192, 768, 2048]
+        if effective_feature not in valid_features:
+            effective_feature = 64
+        if n < effective_feature:
+            adjusted_feature = 64
+            if adjusted_feature != effective_feature and not self._fid_warned_adjusted_feature:
+                print(
+                    f"[Stage2] adjusting FID feature from {effective_feature} "
+                    f"to {adjusted_feature} for n={n}."
+                )
+                self._fid_warned_adjusted_feature = True
+            effective_feature = adjusted_feature
+
+        self.transformer.eval()
+        self.ae_for_decode.eval()
+
+        real_u8 = self.fid_real_images[:n].to(self.device)
+        fake_u8 = seeded_u8[:n].to(self.device)
+
+        try:
+            fid_metric = FrechetInceptionDistance(
+                feature=effective_feature,
+                sync_on_compute=False,
+            ).to(self.device)
+            fid_metric.update(real_u8, real=True)
+            fid_metric.update(fake_u8, real=False)
+            fid_value = float(fid_metric.compute().detach().cpu().item())
+        except Exception as exc:
+            if not self._fid_warned_compute_failed:
+                print(f"[Stage2] FID compute failed at step {step}: {exc}")
+                self._fid_warned_compute_failed = True
+            fid_value = -1.0
+        self.log("stage2/fid", fid_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False, rank_zero_only=True)
         self.transformer.train()
 
 
@@ -908,6 +1103,32 @@ def precompute_tokens(
     if max_items is not None:
         tokens_flat = tokens_flat[:max_items]
     return tokens_flat, H, W, D
+
+
+@torch.no_grad()
+def collect_real_images_uint8(
+    loader: DataLoader,
+    max_items: int,
+) -> Optional[torch.Tensor]:
+    """Collect real images as uint8 tensors for FID reference."""
+    if max_items <= 0:
+        return None
+
+    images = []
+    seen = 0
+    for x, _ in tqdm(loader, desc="[Stage2] collect FID real images"):
+        keep = min(x.size(0), max_items - seen)
+        if keep <= 0:
+            break
+        real_u8 = ((x[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
+        images.append(real_u8)
+        seen += keep
+        if seen >= max_items:
+            break
+
+    if not images:
+        return None
+    return torch.cat(images, dim=0)
 
 
 def train_stage2_transformer(
@@ -1023,6 +1244,14 @@ def main():
     parser.add_argument("--stage2_batch_size", type=int, default=16)
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
+    parser.add_argument(
+        "--stage2_fid_num_samples",
+        type=int,
+        default=None,
+        help="Number of images used for stage-2 FID (default: stage2_sample_batch_size).",
+    )
+    parser.add_argument("--stage2_fid_feature", type=int, default=64, help="Inception feature dims for stage-2 FID.")
+    parser.add_argument("--stage2_fid_every_n_epochs", type=int, default=1, help="Log stage-2 FID every N epochs.")
     parser.add_argument("--stage2_devices", type=int, default=2, help="Number of GPUs for Lightning stage-2 training.")
     parser.add_argument("--stage2_precision", type=str, default="32-true", help="Lightning precision, e.g. 32-true or 16-mixed.")
     parser.add_argument("--stage2_strategy", type=str, default="ddp_fork", choices=["ddp", "ddp_fork", "auto"])
@@ -1033,8 +1262,18 @@ def main():
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument("--token_subset", type=int, default=50000, help="Use only first N tokens/images for speed (<=50000).")
     parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for stage-2 token precompute loader.")
+    parser.add_argument("--fid_num_samples", type=int, default=1024, help="Number of validation images for stage-1 FID.")
+    parser.add_argument("--fid_feature", type=int, default=192, help="Inception feature dims for stage-1 FID.")
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_project", type=str, default="laser-scratch")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_name", type=str, default=None, help="Base run name (stage suffix added automatically).")
+    parser.add_argument("--wandb_group", type=str, default=None, help="Group runs for stage1/stage2 in W&B.")
+    parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
     args = parser.parse_args()
+    if args.stage2_fid_num_samples is None:
+        args.stage2_fid_num_samples = int(args.stage2_sample_batch_size)
     if args.image_size is None:
         args.image_size = 64 if args.dataset == "celeba" else 32
     if args.data_dir is None:
@@ -1056,6 +1295,32 @@ def main():
     os.makedirs(stage1_dir, exist_ok=True)
     os.makedirs(stage2_dir, exist_ok=True)
     token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
+    run_base_name = args.wandb_name or f"sparse_dict_rq_{args.dataset}_{args.image_size}"
+    if "LASER_WANDB_GROUP" in os.environ:
+        wandb_group = os.environ["LASER_WANDB_GROUP"]
+    else:
+        wandb_group = args.wandb_group or f"{run_base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.environ["LASER_WANDB_GROUP"] = wandb_group
+
+    def _build_wandb_logger(stage_tag: str):
+        if args.wandb_mode == "disabled":
+            return False
+        local_rank = os.environ.get("LOCAL_RANK")
+        if local_rank not in (None, "0"):
+            return False
+        try:
+            return WandbLogger(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=f"{run_base_name}_{stage_tag}",
+                group=wandb_group,
+                save_dir=args.wandb_dir,
+                offline=(args.wandb_mode == "offline"),
+                log_model=False,
+            )
+        except Exception as exc:
+            print(f"[WandB] logger init failed ({exc}); continuing without W&B.")
+            return False
 
     def _build_ae() -> SparseDictAE:
         return SparseDictAE(
@@ -1083,7 +1348,14 @@ def main():
         else:
             raise FileNotFoundError(f"Stage-1 checkpoint not found at {best_path}")
 
-    def _run_stage2_lightning(tokens_flat: torch.Tensor, H: int, W: int, D: int, ae_model: SparseDictAE):
+    def _run_stage2_lightning(
+        tokens_flat: torch.Tensor,
+        H: int,
+        W: int,
+        D: int,
+        ae_model: SparseDictAE,
+        fid_real_images: Optional[torch.Tensor],
+    ):
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-2 Lightning multi-GPU training requires CUDA.")
         if torch.cuda.device_count() < args.stage2_devices:
@@ -1124,6 +1396,10 @@ def main():
             D=D,
             sample_every_steps=args.stage2_sample_every_steps,
             sample_batch_size=args.stage2_sample_batch_size,
+            fid_real_images=fid_real_images,
+            fid_num_samples=args.stage2_fid_num_samples,
+            fid_feature=args.stage2_fid_feature,
+            fid_every_n_epochs=args.stage2_fid_every_n_epochs,
         )
 
         effective_strategy = (args.stage2_strategy if args.stage2_devices > 1 else "auto")
@@ -1136,7 +1412,7 @@ def main():
             devices=args.stage2_devices,
             strategy=effective_strategy,
             max_epochs=args.stage2_epochs,
-            logger=False,
+            logger=_build_wandb_logger("stage2"),
             enable_checkpointing=False,
             gradient_clip_val=1.0,
             precision=args.stage2_precision,
@@ -1155,9 +1431,17 @@ def main():
             cache = torch.load(token_cache_path, map_location="cpu")
         tokens_flat = cache["tokens_flat"]
         H, W, D = cache["shape"]
+        fid_real_images = cache.get("fid_real_images")
         ae = _build_ae()
         _load_best_ae_weights(ae)
-        _run_stage2_lightning(tokens_flat=tokens_flat, H=H, W=W, D=D, ae_model=ae)
+        _run_stage2_lightning(
+            tokens_flat=tokens_flat,
+            H=H,
+            W=W,
+            D=D,
+            ae_model=ae,
+            fid_real_images=fid_real_images,
+        )
         return
 
     # Normalize to [-1, 1]
@@ -1199,13 +1483,15 @@ def main():
             lr=args.stage1_lr,
             bottleneck_weight=args.bottleneck_weight,
             out_dir=stage1_dir,
+            fid_num_samples=args.fid_num_samples,
+            fid_feature=args.fid_feature,
         )
         stage1_trainer = pl.Trainer(
             accelerator="gpu",
             devices=args.stage1_devices,
             strategy=(args.stage1_strategy if args.stage1_devices > 1 else "auto"),
             max_epochs=args.stage1_epochs,
-            logger=False,
+            logger=_build_wandb_logger("stage1"),
             enable_checkpointing=False,
             gradient_clip_val=args.grad_clip,
             precision=args.stage1_precision,
@@ -1231,10 +1517,28 @@ def main():
         persistent_workers=(args.token_num_workers > 0),
     )
     tokens_flat, H, W, D = precompute_tokens(ae, token_loader, encode_device, max_items=min(args.token_subset, len(train_set)))
+    fid_real_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+    fid_real_images = collect_real_images_uint8(
+        fid_real_loader,
+        max_items=args.stage2_fid_num_samples,
+    )
     ae = ae.cpu()
     print(f"[Stage2] token dataset: {tokens_flat.shape}   (H={H}, W={W}, D={D})")
 
-    torch.save({"tokens_flat": tokens_flat, "shape": (H, W, D)}, token_cache_path)
+    torch.save(
+        {
+            "tokens_flat": tokens_flat,
+            "shape": (H, W, D),
+            "fid_real_images": fid_real_images,
+        },
+        token_cache_path,
+    )
     # Re-exec into a clean process before launching stage-2 DDP.
     # This avoids hangs from initializing two different DDP trainers in one process.
     # Also clear stale DDP env from stage-1 so stage-2 can launch all ranks.
