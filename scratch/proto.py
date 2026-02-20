@@ -177,8 +177,8 @@ class DictionaryLearningTokenized(nn.Module):
         num_embeddings: int = 256,
         embedding_dim: int = 64,
         sparsity_level: int = 4,
-        n_bins: int = 33,
-        coef_max: float = 2.0,
+        n_bins: int = 129,
+        coef_max: float = 3.0,
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
     ):
@@ -391,8 +391,8 @@ class SparseDictAE(nn.Module):
         num_embeddings: int = 256,
         sparsity_level: int = 4,
         commitment_cost: float = 0.25,
-        n_bins: int = 33,
-        coef_max: float = 2.0,
+        n_bins: int = 129,
+        coef_max: float = 3.0,
         out_tanh: bool = True,
     ):
         super().__init__()
@@ -664,6 +664,19 @@ def log_image_grid_wandb(
     return True
 
 
+def log_scalar_wandb(
+    logger_obj,
+    key: str,
+    value: float,
+    step: int,
+) -> bool:
+    wb_logger = _resolve_wandb_logger(logger_obj)
+    if wb_logger is None or wandb is None:
+        return False
+    wb_logger.experiment.log({key: float(value)}, step=int(step))
+    return True
+
+
 class Stage2TokenDataModule(pl.LightningDataModule):
     def __init__(self, tokens_flat: torch.Tensor, batch_size: int, num_workers: int = 2):
         super().__init__()
@@ -694,6 +707,9 @@ class Stage1LightningModule(pl.LightningModule):
         fid_num_samples: int = 1024,
         fid_feature: int = 2048,
         fid_compute_batch_size: int = 32,
+        lr_schedule: str = "cosine",
+        warmup_epochs: int = 1,
+        min_lr_ratio: float = 0.1,
     ):
         super().__init__()
         self.ae = ae
@@ -705,6 +721,9 @@ class Stage1LightningModule(pl.LightningModule):
         self.fid_num_samples = max(0, int(fid_num_samples))
         self.fid_feature = int(fid_feature)
         self.fid_compute_batch_size = max(1, int(fid_compute_batch_size))
+        self.lr_schedule = str(lr_schedule)
+        self.warmup_epochs = max(0, int(warmup_epochs))
+        self.min_lr_ratio = float(max(0.0, min(min_lr_ratio, 1.0)))
         self._fid_real = []
         self._fid_fake = []
         self._fid_seen = 0
@@ -713,7 +732,39 @@ class Stage1LightningModule(pl.LightningModule):
         self._fid_metric_feature = None
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.ae.parameters(), lr=self.lr)
+        opt = torch.optim.Adam(self.ae.parameters(), lr=self.lr)
+        if self.lr_schedule != "cosine":
+            return opt
+
+        max_epochs = 1
+        if getattr(self, "_trainer", None) is not None:
+            max_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1)
+        max_epochs = max(1, max_epochs)
+        warmup_epochs = min(self.warmup_epochs, max_epochs - 1)
+        min_ratio = self.min_lr_ratio
+
+        def lr_lambda(epoch: int) -> float:
+            # Lightning steps epoch schedulers once per epoch; use 1-indexed step count.
+            step_idx = int(epoch) + 1
+            if warmup_epochs > 0 and step_idx <= warmup_epochs:
+                return 0.1 + 0.9 * (step_idx / float(max(1, warmup_epochs)))
+
+            decay_steps = max(1, max_epochs - warmup_epochs)
+            decay_idx = min(max(step_idx - warmup_epochs, 0), decay_steps)
+            t = decay_idx / float(decay_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * t))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def _get_or_create_fid_metric(self, feature: int):
         feat = int(feature)
@@ -857,6 +908,9 @@ class Stage2LightningModule(pl.LightningModule):
         fid_num_samples: int = 64,
         fid_feature: int = 2048,
         fid_every_n_epochs: int = 1,
+        lr_schedule: str = "cosine",
+        warmup_epochs: int = 1,
+        min_lr_ratio: float = 0.1,
     ):
         super().__init__()
         self.transformer = transformer
@@ -871,6 +925,9 @@ class Stage2LightningModule(pl.LightningModule):
         self.fid_num_samples = max(0, int(fid_num_samples))
         self.fid_feature = int(fid_feature)
         self.fid_every_n_epochs = max(1, int(fid_every_n_epochs))
+        self.lr_schedule = str(lr_schedule)
+        self.warmup_epochs = max(0, int(warmup_epochs))
+        self.min_lr_ratio = float(max(0.0, min(min_lr_ratio, 1.0)))
         self._fid_warned_unavailable = False
         self._fid_warned_adjusted_feature = False
         self._fid_warned_compute_failed = False
@@ -882,7 +939,39 @@ class Stage2LightningModule(pl.LightningModule):
             p.requires_grad_(False)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.transformer.parameters(), lr=self.lr)
+        opt = torch.optim.Adam(self.transformer.parameters(), lr=self.lr)
+        if self.lr_schedule != "cosine":
+            return opt
+
+        max_epochs = 1
+        if getattr(self, "_trainer", None) is not None:
+            max_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1)
+        max_epochs = max(1, max_epochs)
+        warmup_epochs = min(self.warmup_epochs, max_epochs - 1)
+        min_ratio = self.min_lr_ratio
+
+        def lr_lambda(epoch: int) -> float:
+            # Lightning steps epoch schedulers once per epoch; use 1-indexed step count.
+            step_idx = int(epoch) + 1
+            if warmup_epochs > 0 and step_idx <= warmup_epochs:
+                return 0.1 + 0.9 * (step_idx / float(max(1, warmup_epochs)))
+
+            decay_steps = max(1, max_epochs - warmup_epochs)
+            decay_idx = min(max(step_idx - warmup_epochs, 0), decay_steps)
+            t = decay_idx / float(decay_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * t))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def _get_or_create_fid_metric(self, feature: int):
         feat = int(feature)
@@ -1032,7 +1121,14 @@ class Stage2LightningModule(pl.LightningModule):
                 print(f"[Stage2] FID compute failed at step {step}: {exc}")
                 self._fid_warned_compute_failed = True
             fid_value = -1.0
-        self.log("stage2/fid", fid_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False, rank_zero_only=True)
+        logged = log_scalar_wandb(
+            self.logger,
+            key="stage2/fid",
+            value=fid_value,
+            step=step,
+        )
+        if not logged:
+            self.log("stage2/fid", fid_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False, rank_zero_only=True)
         self.transformer.train()
 
 
@@ -1255,6 +1351,9 @@ def main():
     # Stage-1 (AE)
     parser.add_argument("--stage1_epochs", type=int, default=5)
     parser.add_argument("--stage1_lr", type=float, default=2e-4)
+    parser.add_argument("--stage1_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--stage1_warmup_epochs", type=int, default=1)
+    parser.add_argument("--stage1_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -1269,13 +1368,16 @@ def main():
     parser.add_argument("--embedding_dim", type=int, default=64)
     parser.add_argument("--num_atoms", type=int, default=128)      # dictionary size K
     parser.add_argument("--sparsity_level", type=int, default=3)   # stack depth D
-    parser.add_argument("--n_bins", type=int, default=33)
-    parser.add_argument("--coef_max", type=float, default=2.0)
+    parser.add_argument("--n_bins", type=int, default=129, help="Coefficient quantization bins (higher = lower quantization error, larger vocab).")
+    parser.add_argument("--coef_max", type=float, default=3.0, help="Coefficient clipping range for quantization in [-coef_max, coef_max].")
     parser.add_argument("--commitment_cost", type=float, default=0.25)
 
     # Stage-2 (Transformer)
     parser.add_argument("--stage2_epochs", type=int, default=10)
     parser.add_argument("--stage2_lr", type=float, default=3e-4)
+    parser.add_argument("--stage2_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--stage2_warmup_epochs", type=int, default=1)
+    parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--stage2_batch_size", type=int, default=16)
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
@@ -1436,6 +1538,9 @@ def main():
             fid_num_samples=args.stage2_fid_num_samples,
             fid_feature=args.stage2_fid_feature,
             fid_every_n_epochs=args.stage2_fid_every_n_epochs,
+            lr_schedule=args.stage2_lr_schedule,
+            warmup_epochs=args.stage2_warmup_epochs,
+            min_lr_ratio=args.stage2_min_lr_ratio,
         )
 
         effective_strategy = (args.stage2_strategy if args.stage2_devices > 1 else "auto")
@@ -1522,6 +1627,9 @@ def main():
             fid_num_samples=args.fid_num_samples,
             fid_feature=args.fid_feature,
             fid_compute_batch_size=args.fid_compute_batch_size,
+            lr_schedule=args.stage1_lr_schedule,
+            warmup_epochs=args.stage1_warmup_epochs,
+            min_lr_ratio=args.stage1_min_lr_ratio,
         )
         stage1_trainer = pl.Trainer(
             accelerator="gpu",
