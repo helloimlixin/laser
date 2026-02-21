@@ -1,4 +1,3 @@
-
 """
 cifar10_sparse_dict_rqtransformer.py
 
@@ -7,7 +6,12 @@ A minimal, end-to-end "RQ-VAE-ish" pipeline using:
   - Dictionary-learning bottleneck with batched OMP sparse coding (LASER-style)
   - Option A tokenization: token = atom_id * n_bins + coef_bin
   - A simple "RQTransformer prior" (GPT-style causal transformer) over (H,W,D) stacks
-  - CIFAR-10 quick test
+  - CIFAR-10 / CelebA quick test
+
+NEW: High-res friendly random cropping during data loading
+  - Decode high-res images on CPU
+  - Random crop to a fixed crop_size BEFORE sending to GPU
+  - Keeps GPU memory bounded by crop_size (not original image resolution)
 
 Run:
   python cifar10_sparse_dict_rqtransformer.py --stage1_epochs 5 --stage2_epochs 10
@@ -80,6 +84,7 @@ class FlatImageDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, 0
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels: int, num_hiddens: int, num_residual_hiddens: int):
@@ -1132,74 +1137,6 @@ class Stage2LightningModule(pl.LightningModule):
         self.transformer.train()
 
 
-def train_stage1_ae(
-    ae: SparseDictAE,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    lr: float,
-    bottleneck_weight: float,
-    grad_clip: float,
-    out_dir: str,
-):
-    opt = torch.optim.Adam(ae.parameters(), lr=lr)
-    best_val = float("inf")
-
-    for epoch in range(1, epochs + 1):
-        ae.train()
-        pbar = tqdm(train_loader, desc=f"[Stage1] epoch {epoch}/{epochs}")
-        running = 0.0
-        for x, _ in pbar:
-            x = x.to(device)
-            recon, b_loss, _ = ae(x)
-            recon_loss = F.mse_loss(recon, x)
-            loss = recon_loss + bottleneck_weight * b_loss
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(ae.parameters(), grad_clip)
-            opt.step()
-
-            # Optional: keep dictionary columns bounded (helps stability)
-            with torch.no_grad():
-                ae.bottleneck.dictionary.copy_(F.normalize(ae.bottleneck.dictionary, p=2, dim=0, eps=ae.bottleneck.epsilon))
-
-            running += loss.item()
-            pbar.set_postfix(loss=loss.item(), recon=recon_loss.item(), b=b_loss.item())
-
-        # Validation
-        ae.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for x, _ in val_loader:
-                x = x.to(device)
-                recon, b_loss, _ = ae(x)
-                recon_loss = F.mse_loss(recon, x)
-                loss = recon_loss + bottleneck_weight * b_loss
-                val_loss += loss.item() * x.size(0)
-        val_loss /= len(val_loader.dataset)
-
-        print(f"[Stage1] epoch {epoch} val_loss={val_loss:.6f}")
-
-        # Save recon sample
-        x_vis, _ = next(iter(val_loader))
-        x_vis = x_vis.to(device)[:64]
-        with torch.no_grad():
-            recon_vis, _, _ = ae(x_vis)
-        save_image_grid(x_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_real.png"))
-        save_image_grid(recon_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
-
-        # Save best ckpt
-        os.makedirs(out_dir, exist_ok=True)
-        ckpt_path = os.path.join(out_dir, "ae_last.pt")
-        torch.save(ae.state_dict(), ckpt_path)
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(ae.state_dict(), os.path.join(out_dir, "ae_best.pt"))
-
-
 @torch.no_grad()
 def precompute_tokens(
     ae: SparseDictAE,
@@ -1262,91 +1199,27 @@ def collect_real_images_uint8(
     return torch.cat(images, dim=0)
 
 
-def train_stage2_transformer(
-    transformer: RQTransformerPrior,
-    token_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    lr: float,
-    pad_token_id: int,
-    out_dir: str,
-    ae_for_decode: SparseDictAE,
-    H: int,
-    W: int,
-    D: int,
-    sample_every_steps: int = 200,
-    sample_batch_size: int = 8,
-):
-    opt = torch.optim.Adam(transformer.parameters(), lr=lr)
-    vocab = transformer.cfg.vocab_size
-    bos = transformer.bos_token_id
-    global_step = 0
-
-    for epoch in range(1, epochs + 1):
-        transformer.train()
-        pbar = tqdm(token_loader, desc=f"[Stage2] epoch {epoch}/{epochs}")
-        running = 0.0
-
-        for (tok_flat,) in pbar:
-            tok_flat = tok_flat.to(device).long()  # [B, T]
-            B = tok_flat.size(0)
-
-            # Prepend BOS: [B, 1+T]
-            seq = torch.cat([torch.full((B, 1), bos, device=device, dtype=torch.long), tok_flat], dim=1)
-            x_in = seq[:, :-1]
-            y = seq[:, 1:]
-
-            logits = transformer(x_in)  # [B, L, vocab]
-            loss = F.cross_entropy(
-                logits.reshape(-1, vocab),
-                y.reshape(-1),
-                ignore_index=pad_token_id
-            )
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
-            opt.step()
-            global_step += 1
-
-            running += loss.item()
-            pbar.set_postfix(loss=loss.item())
-
-            if sample_every_steps > 0 and (global_step % sample_every_steps == 0):
-                transformer.eval()
-                ae_for_decode.eval()
-                print(f"[Stage2] sampling at step {global_step} (batch_size={sample_batch_size})...")
-                with torch.no_grad():
-                    flat_gen = transformer.generate(
-                        batch_size=sample_batch_size,
-                        temperature=1.0,
-                        top_k=256,
-                        show_progress=True,
-                        progress_desc=f"[Stage2] sample step {global_step}",
-                    )  # [B, T]
-                    tokens_gen = flat_gen.view(-1, H, W, D)
-                    imgs = ae_for_decode.decode_from_tokens(tokens_gen.to(device))
-                save_image_grid(imgs, os.path.join(out_dir, f"stage2_step{global_step:06d}_samples.png"))
-                print(f"[Stage2] sampling done at step {global_step}")
-                transformer.train()
-
-        print(f"[Stage2] epoch {epoch} train_loss={running/len(token_loader):.6f}")
-
-        os.makedirs(out_dir, exist_ok=True)
-        torch.save(transformer.state_dict(), os.path.join(out_dir, "transformer_last.pt"))
-
-
 # -----------------------------
 # Main
 # -----------------------------
 
 def main():
+    ORIG_CVD = os.environ.get("CUDA_VISIBLE_DEVICES")
+    ORIG_NVD = os.environ.get("NVIDIA_VISIBLE_DEVICES")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "celeba"])
     parser.add_argument("--data_dir", type=str, default=None, help="Root directory for dataset files.")
-    parser.add_argument("--image_size", type=int, default=None, help="Training image size (HxW).")
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+
+    # High-res friendly cropping controls
+    parser.add_argument("--crop_size", type=int, default=None,
+                        help="Final training crop size fed to the model (controls GPU memory).")
+    parser.add_argument("--load_size", type=int, default=None,
+                        help="Optional resize before cropping (CPU-side). Common: 256/320 for crop 128/160.")
+    parser.add_argument("--crop_mode", type=str, default="rrc", choices=["rrc", "rcrop"],
+                        help="rrc=RandomResizedCrop, rcrop=Resize+RandomCrop.")
 
     # Stage-1 (AE)
     parser.add_argument("--stage1_epochs", type=int, default=5)
@@ -1410,14 +1283,23 @@ def main():
     parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
     args = parser.parse_args()
+
     if args.stage2_fid_num_samples is None:
         args.stage2_fid_num_samples = int(args.stage2_sample_batch_size)
-    if args.image_size is None:
-        args.image_size = 64 if args.dataset == "celeba" else 32
+
+    # Defaults for crop/load sizes
+    if args.crop_size is None:
+        args.crop_size = 64 if args.dataset == "celeba" else 32
+    if args.load_size is None:
+        args.load_size = 256 if args.dataset == "celeba" else args.crop_size
+
+    # The model only ever sees crop_size x crop_size (controls GPU memory).
+    args.image_size = int(args.crop_size)
+
     if args.data_dir is None:
         args.data_dir = "../../data/celeba" if args.dataset == "celeba" else "./data"
     if args.out_dir is None:
-        args.out_dir = f"./runs/sparse_dict_rq_{args.dataset}_{args.image_size}"
+        args.out_dir = f"./runs/sparse_dict_rq_{args.dataset}_crop{args.crop_size}"
 
     pl.seed_everything(args.seed, workers=True)
     torch.manual_seed(args.seed)
@@ -1426,14 +1308,15 @@ def main():
     torch.set_float32_matmul_precision("medium")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    print(f"[Data] dataset={args.dataset} data_dir={args.data_dir} image_size={args.image_size}")
+    print(f"[Data] dataset={args.dataset} data_dir={args.data_dir}")
+    print(f"[Data] crop_mode={args.crop_mode} load_size={args.load_size} crop_size={args.crop_size} (GPU-bounded)")
 
     stage1_dir = os.path.join(args.out_dir, "stage1")
     stage2_dir = os.path.join(args.out_dir, "stage2")
     os.makedirs(stage1_dir, exist_ok=True)
     os.makedirs(stage2_dir, exist_ok=True)
     token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
-    run_base_name = args.wandb_name or f"sparse_dict_rq_{args.dataset}_{args.image_size}"
+    run_base_name = args.wandb_name or f"sparse_dict_rq_{args.dataset}_crop{args.crop_size}"
     if "LASER_WANDB_GROUP" in os.environ:
         wandb_group = os.environ["LASER_WANDB_GROUP"]
     else:
@@ -1585,12 +1468,36 @@ def main():
         )
         return
 
-    # Normalize to [-1, 1]
-    tfm = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+    # -----------------------------
+    # Transforms: CPU-side crop to bounded size BEFORE GPU
+    # -----------------------------
+    normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    if args.crop_mode == "rrc":
+        # Good default: bounded output size, with scale/aspect jitter
+        tfm = transforms.Compose([
+            transforms.RandomResizedCrop(
+                size=args.crop_size,
+                scale=(0.5, 1.0),
+                ratio=(0.75, 1.33),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            normalize,
+        ])
+    else:
+        # Literal: resize then random crop
+        tfm = transforms.Compose([
+            transforms.Resize(
+                size=args.load_size,
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            ),
+            transforms.RandomCrop(args.crop_size),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            normalize,
+        ])
+
     if args.dataset == "cifar10":
         train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=tfm)
         val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=tfm)
@@ -1685,8 +1592,6 @@ def main():
         token_cache_path,
     )
     # Re-exec into a clean process before launching stage-2 DDP.
-    # This avoids hangs from initializing two different DDP trainers in one process.
-    # Also clear stale DDP env from stage-1 so stage-2 can launch all ranks.
     os.environ["LASER_DDP_PHASE"] = "stage2"
     for k in (
         "LOCAL_RANK",
@@ -1700,7 +1605,15 @@ def main():
         "MASTER_PORT",
     ):
         os.environ.pop(k, None)
+
     print("[Stage2] restarting process for clean DDP launch...")
+
+    # Restore GPU visibility env vars (stage1 DDP may have altered them)
+    if ORIG_CVD is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ORIG_CVD
+    if ORIG_NVD is not None:
+        os.environ["NVIDIA_VISIBLE_DEVICES"] = ORIG_NVD
+
     os.execv(sys.executable, [sys.executable, __file__, *sys.argv[1:]])
 
     print("Done.")
