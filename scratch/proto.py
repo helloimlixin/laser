@@ -429,8 +429,8 @@ class DictionaryLearningTokenized(nn.Module):
         dictionary = self._normalize_dict().t()  # [num_embeddings, C]
         support = support.to(torch.long)
         coeffs = coeffs.to(dictionary.dtype)
-        support_flat = support.view(-1, D)
-        coeffs_flat = coeffs.view(-1, D)
+        support_flat = support.reshape(-1, D)
+        coeffs_flat = coeffs.reshape(-1, D)
         atoms = dictionary[support_flat]  # [B*H*W, D, C]
         recon_flat = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)  # [N, C]
         return recon_flat.view(B, H, W, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
@@ -813,7 +813,11 @@ class RQTransformerPrior(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.atom_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if self.predict_coefficients:
-            self.coeff_head = nn.Linear(cfg.d_model, 1)
+            self.coeff_head = nn.Sequential(
+                nn.Linear(cfg.d_model, cfg.d_model // 2),
+                nn.GELU(),
+                nn.Linear(cfg.d_model // 2, cfg.vocab_size),
+            )
 
         # Precompute position ids for [BOS] + optional context + current patch tokens.
         # For context tokens, repeat the local (spatial, depth) pattern per patch.
@@ -887,7 +891,7 @@ class RQTransformerPrior(nn.Module):
 
         h = self.ln_f(h)
         atom_logits = self.atom_head(h)
-        coeff = self.coeff_head(h).squeeze(-1) if self.predict_coefficients else None
+        coeff = self.coeff_head(h) if self.predict_coefficients else None
         return atom_logits, coeff, new_kv_cache
 
     @torch.no_grad()
@@ -945,9 +949,6 @@ class RQTransformerPrior(nn.Module):
                 kv_cache=kv_cache, start_pos=start_pos,
             )
 
-            if self.predict_coefficients:
-                coeffs.append(coeff_pred[:, -1])
-
             logits = atom_logits[:, -1, :]
             logits[:, special_ids] = float("-inf")
             logits = logits / max(temperature, 1e-8)
@@ -959,6 +960,10 @@ class RQTransformerPrior(nn.Module):
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
+
+            if self.predict_coefficients:
+                c = coeff_pred[:, -1, :].gather(-1, nxt).squeeze(-1)
+                coeffs.append(c)
 
         if self.predict_coefficients:
             coeff_flat = torch.stack(coeffs, dim=1)
@@ -1778,7 +1783,8 @@ class Stage2LightningModule(pl.LightningModule):
                 y.reshape(-1),
                 ignore_index=self.pad_token_id,
             )
-            coeff_loss = F.mse_loss(coeff_pred.reshape(-1), coeff_flat.to(logits.device).reshape(-1))
+            coeff_for_target = coeff_pred.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+            coeff_loss = F.smooth_l1_loss(coeff_for_target.reshape(-1), coeff_flat.to(logits.device).reshape(-1))
             loss = atom_loss + self.coeff_loss_weight * coeff_loss
             self.log(
                 "train/coeff_loss",
@@ -1897,9 +1903,6 @@ class Stage2LightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def _sample_sliding_window_batch(self, step: int, batch_size: int) -> torch.Tensor:
-        if self.predict_coefficients:
-            raise NotImplementedError("Sliding-window sampling is only supported in quantized-token mode.")
-
         B = int(batch_size)
         bos_id = int(self.transformer.bos_token_id)
         win_tokens = int(self.H * self.W * self.D)
@@ -1924,6 +1927,10 @@ class Stage2LightningModule(pl.LightningModule):
             return self._decode_generated_batch(gen)
         full_tokens = int(self.sample_latent_h * self.sample_latent_w * self.D)
         generated = torch.zeros((B, full_h, full_w, self.D), dtype=torch.long, device=self.device)
+        generated_coeffs = (
+            torch.zeros((B, full_h, full_w, self.D), dtype=torch.float32, device=self.device)
+            if self.predict_coefficients else None
+        )
         bos = torch.full((B, 1), bos_id, dtype=torch.long, device=self.device)
 
         tqdm_disable = str(os.environ.get("TQDM_DISABLE", "")).strip().lower() in {"1", "true", "yes", "on"}
@@ -1936,16 +1943,11 @@ class Stage2LightningModule(pl.LightningModule):
         )
 
         def _earliest_overlapping_start(coord: int, window: int, full: int, stride: int) -> int:
-            """
-            Choose the earliest stride-aligned window start that still contains `coord`.
-            This maximizes already-generated local context and reduces block-boundary seams.
-            """
             max_start = int(full - window)
             low = max(0, int(coord - window + 1))
             high = min(int(coord), max_start)
             start = ((low + stride - 1) // stride) * stride
             if start > high:
-                # Fallback for degenerate stride/window combinations.
                 start = min((int(coord) // stride) * stride, max_start)
             return int(max(0, min(start, max_start)))
 
@@ -1966,7 +1968,7 @@ class Stage2LightningModule(pl.LightningModule):
             window_flat = generated[:, h0 : h0 + self.H, w0 : w0 + self.W, :].contiguous().view(B, win_tokens)
             ctx = window_flat[:, :local_t]
             seq = torch.cat([bos, ctx], dim=1)
-            logits, _, _ = self.transformer(seq, patch_pos_ids=None)
+            logits, coeff_pred, _ = self.transformer(seq, patch_pos_ids=None)
             logits = logits[:, -1, :] / self.sample_temperature
             logits = self._apply_sampling_constraints(logits)
             if self.sample_top_k is not None:
@@ -1978,7 +1980,16 @@ class Stage2LightningModule(pl.LightningModule):
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1).squeeze(1)
             generated[:, y, x, depth_idx] = nxt
+            if self.predict_coefficients and coeff_pred is not None:
+                c = coeff_pred[:, -1, :].gather(-1, nxt.unsqueeze(-1)).squeeze(-1)
+                generated_coeffs[:, y, x, depth_idx] = c.clamp(
+                    -self.transformer.cfg.coeff_max, self.transformer.cfg.coeff_max
+                )
 
+        if self.predict_coefficients:
+            return self.ae_for_decode.decode_from_atoms_and_coeffs(
+                generated.to(self.device), generated_coeffs.to(self.device)
+            )
         return self.ae_for_decode.decode_from_tokens(generated.to(self.device))
 
     @torch.no_grad()
@@ -2439,6 +2450,12 @@ def main():
     parser.add_argument("--stage1_precision", type=str, default="32-true", help="Lightning precision for stage-1.")
     parser.add_argument("--stage1_strategy", type=str, default="ddp", choices=["ddp", "auto"])
     parser.add_argument(
+        "--stage1_init_ckpt",
+        type=str,
+        default=None,
+        help="Optional path to stage-1 AE state_dict (.pt) used to warm-start stage-1 training.",
+    )
+    parser.add_argument(
         "--stage1_val_vis_batch_size",
         type=int,
         default=32,
@@ -2483,6 +2500,7 @@ def main():
     parser.add_argument("--stage2_warmup_epochs", type=int, default=1)
     parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--stage2_batch_size", type=int, default=16)
+    parser.add_argument("--stage2_grad_accum", type=int, default=4, help="Gradient accumulation steps for stage-2.")
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=32)
     parser.add_argument(
@@ -2582,15 +2600,15 @@ def main():
     parser.add_argument("--stage2_devices", type=int, default=2, help="Number of GPUs for Lightning stage-2 training.")
     parser.add_argument("--stage2_precision", type=str, default="32-true", help="Lightning precision, e.g. 32-true or 16-mixed.")
     parser.add_argument("--stage2_strategy", type=str, default="ddp_fork", choices=["ddp", "ddp_fork", "auto"])
-    parser.add_argument("--tf_d_model", type=int, default=256)
+    parser.add_argument("--tf_d_model", type=int, default=384)
     parser.add_argument("--tf_heads", type=int, default=8)
-    parser.add_argument("--tf_layers", type=int, default=6)
-    parser.add_argument("--tf_ff", type=int, default=1024)
+    parser.add_argument("--tf_layers", type=int, default=8)
+    parser.add_argument("--tf_ff", type=int, default=1536)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument(
         "--stage2_coeff_loss_weight",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Coefficient regression loss weight when using continuous coefficients.",
     )
     parser.add_argument("--token_subset", type=int, default=50000, help="Use only first N tokens/images for speed (<=50000).")
@@ -2723,16 +2741,19 @@ def main():
             out_tanh=True,
         )
 
+    def _load_ae_weights(ae_model: SparseDictAE, ckpt_path: str, tag: str = "Stage1"):
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"{tag} checkpoint not found at {ckpt_path}")
+        try:
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            state_dict = torch.load(ckpt_path, map_location="cpu")
+        ae_model.load_state_dict(state_dict)
+        print(f"[{tag}] loaded AE weights from {ckpt_path}")
+
     def _load_best_ae_weights(ae_model: SparseDictAE):
         best_path = os.path.join(stage1_dir, "ae_best.pt")
-        if os.path.exists(best_path):
-            try:
-                state_dict = torch.load(best_path, map_location="cpu", weights_only=True)
-            except TypeError:
-                state_dict = torch.load(best_path, map_location="cpu")
-            ae_model.load_state_dict(state_dict)
-        else:
-            raise FileNotFoundError(f"Stage-1 checkpoint not found at {best_path}")
+        _load_ae_weights(ae_model, best_path, tag="Stage1")
 
     def _run_stage2_lightning(
         tokens_flat: torch.Tensor,
@@ -2762,11 +2783,6 @@ def main():
             raise ValueError("patch_pos_flat is required for patch context training.")
         if sample_latent_shape is not None and patch_grid_shape is not None:
             raise ValueError("sample_latent_shape and patch_grid_shape cannot both be set.")
-        if sample_latent_shape is not None and (not quantize_sparse_coeffs) and args.stage2_sample_every_steps > 0:
-            raise NotImplementedError(
-                "Sliding-window sampling currently supports quantized-token mode only. "
-                "Set --stage2_sample_every_steps 0 to train in coefficient-regression mode."
-            )
 
         stage2_dm = Stage2TokenDataModule(
             tokens_flat=tokens_flat,
@@ -2818,7 +2834,15 @@ def main():
                     stage2_state = torch.load(stage2_last_path, map_location="cpu", weights_only=True)
                 except TypeError:
                     stage2_state = torch.load(stage2_last_path, map_location="cpu")
-                transformer.load_state_dict(stage2_state, strict=False)
+                model_state = transformer.state_dict()
+                filtered = {
+                    k: v for k, v in stage2_state.items()
+                    if k in model_state and model_state[k].shape == v.shape
+                }
+                skipped = set(stage2_state.keys()) - set(filtered.keys())
+                transformer.load_state_dict(filtered, strict=False)
+                if skipped:
+                    print(f"[Stage2] skipped {len(skipped)} incompatible keys: {sorted(skipped)}")
                 print(f"[Stage2] resumed transformer weights from {stage2_last_path}")
         stage2_module = Stage2LightningModule(
             transformer=transformer,
@@ -2880,6 +2904,7 @@ def main():
             precision=args.stage2_precision,
             log_every_n_steps=10,
             deterministic=False,
+            accumulate_grad_batches=args.stage2_grad_accum,
         )
         trainer.fit(stage2_module, datamodule=stage2_dm)
 
@@ -3006,6 +3031,8 @@ def main():
         )
 
     ae = _build_ae()
+    if args.stage1_init_ckpt:
+        _load_ae_weights(ae, args.stage1_init_ckpt, tag="Stage1 init")
     if args.stage1_epochs > 0:
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-1 Lightning multi-GPU training requires CUDA.")
