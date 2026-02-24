@@ -17,6 +17,7 @@ This is intentionally compact and hackable, not "best possible" training.
 import argparse
 import math
 import os
+import socket
 import subprocess
 import sys
 from datetime import datetime
@@ -63,6 +64,57 @@ def _disable_lightning_cuda_matmul_capability_probe():
 
 
 _disable_lightning_cuda_matmul_capability_probe()
+
+
+def _pick_free_tcp_port(excluded_ports: Optional[set[int]] = None) -> int:
+    excluded = excluded_ports or set()
+    for _ in range(32):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("0.0.0.0", 0))
+            port = int(sock.getsockname()[1])
+            if port in excluded:
+                continue
+            return port
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    raise RuntimeError("Unable to allocate a free TCP port for DDP rendezvous.")
+
+
+def _ensure_free_master_port_for_ddp(stage_tag: str) -> None:
+    # Only the launcher process should pick the rendezvous port.
+    # Worker processes must inherit a stable value.
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    local_rank = None
+    if local_rank_raw is not None:
+        try:
+            local_rank = int(local_rank_raw)
+        except ValueError:
+            # Treat malformed LOCAL_RANK as launcher context and proceed.
+            local_rank = None
+    if local_rank is not None and local_rank != 0:
+        return
+
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_ADDR", master_addr)
+
+    raw_port = os.environ.get("MASTER_PORT")
+    excluded_ports: set[int] = set()
+    if raw_port is not None:
+        try:
+            excluded_ports.add(int(raw_port))
+        except ValueError:
+            pass
+
+    # Always choose a fresh rendezvous port for this launch to avoid stale/fixed-port collisions.
+    selected_port = _pick_free_tcp_port(excluded_ports=excluded_ports)
+    os.environ["MASTER_PORT"] = str(selected_port)
+    if raw_port is None:
+        print(f"[{stage_tag}] MASTER_PORT not set; selected free port {selected_port}.")
+    else:
+        print(f"[{stage_tag}] overriding MASTER_PORT={raw_port!r}; selected free port {selected_port}.")
 
 
 # -----------------------------
@@ -459,7 +511,7 @@ class DictionaryLearningTokenized(nn.Module):
 
         # Ordered coefficients: x is dense over atoms; gather along support I
         batch_idx = torch.arange(batch_size, device=x.device)[:, None]
-        coeffs_ordered = x[batch_idx, I].squeeze(1)  # [B, K]
+        coeffs_ordered = x[batch_idx, I]  # [B, K]
 
         return I, coeffs_ordered
 
@@ -643,21 +695,23 @@ class SparseDictAE(nn.Module):
 # -----------------------------
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, max_seq_len: int):
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
-        assert d_model % n_heads == 0
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_dropout = nn.Dropout(dropout)
+        self.dropout = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
-        self.register_buffer("causal_mask", mask.view(1, 1, max_seq_len, max_seq_len))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -665,23 +719,27 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = attn.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=2)
+            v = torch.cat([kv_cache[1], v], dim=2)
+        new_kv = (k, v)
 
-        out = attn @ v
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=(kv_cache is None and T > 1),
+            dropout_p=(self.dropout if self.training else 0.0),
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.out_proj(out)
         out = self.resid_dropout(out)
-        return out
+        return out, new_kv
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, max_seq_len: int):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_seq_len)
+        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -691,10 +749,15 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        attn_out, new_kv = self.attn(self.ln1(x), kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, new_kv
 
 
 @dataclass
@@ -744,7 +807,7 @@ class RQTransformerPrior(nn.Module):
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, self.max_len)
+            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
             for _ in range(cfg.n_layers)
         ])
         self.ln_f = nn.LayerNorm(cfg.d_model)
@@ -771,24 +834,27 @@ class RQTransformerPrior(nn.Module):
         self,
         x: torch.Tensor,
         patch_pos_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        kv_cache: Optional[list] = None,
+        start_pos: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], list]:
         """
         Args:
-            x: [B, L] tokens, L <= max_len
+            x: [B, L] tokens
+            patch_pos_ids: patch position ids, [B] or [B, L]
+            kv_cache: list of per-layer (K, V) caches for incremental decoding
+            start_pos: position offset into the precomputed spatial/depth/type ids
         Returns:
-            If predict_coefficients=False:
-                logits: [B, L, vocab]
-            If predict_coefficients=True:
-                atom_logits: [B, L, vocab], coeff: [B, L]
+            atom_logits: [B, L, vocab]
+            coeff: [B, L] or None
+            new_kv_cache: list of per-layer (K, V) caches
         """
         B, L = x.shape
-        if L > self.max_len:
-            raise ValueError(f"Got L={L}, but max_len={self.max_len}")
+        pos_end = start_pos + L
 
         tok = self.token_emb(x)
-        sp = self.spatial_emb(self._spatial_ids[:L])
-        dp = self.depth_emb(self._depth_ids[:L])
-        tp = self.type_emb(self._type_ids[:L])
+        sp = self.spatial_emb(self._spatial_ids[start_pos:pos_end])
+        dp = self.depth_emb(self._depth_ids[start_pos:pos_end])
+        tp = self.type_emb(self._type_ids[start_pos:pos_end])
 
         h = tok + sp.unsqueeze(0) + dp.unsqueeze(0) + tp.unsqueeze(0)
         if self.patch_pos_emb is not None:
@@ -813,16 +879,16 @@ class RQTransformerPrior(nn.Module):
                 )
         h = self.drop(h)
 
-        for block in self.blocks:
-            h = block(h)
+        new_kv_cache = []
+        for i, block in enumerate(self.blocks):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
+            h, new_kv = block(h, kv_cache=layer_cache)
+            new_kv_cache.append(new_kv)
 
         h = self.ln_f(h)
         atom_logits = self.atom_head(h)
-        if not self.predict_coefficients:
-            return atom_logits
-
-        coeff = self.coeff_head(h).squeeze(-1)
-        return atom_logits, coeff
+        coeff = self.coeff_head(h).squeeze(-1) if self.predict_coefficients else None
+        return atom_logits, coeff, new_kv_cache
 
     @torch.no_grad()
     def generate(
@@ -835,7 +901,7 @@ class RQTransformerPrior(nn.Module):
         patch_pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Unconditional generation.
+        Autoregressive generation with KV-cache.
         Returns:
             If predict_coefficients=False:
                 flat_tokens: [B, H*W*D] (without BOS)
@@ -854,7 +920,11 @@ class RQTransformerPrior(nn.Module):
                 raise ValueError(
                     f"patch_pos_ids must have shape [batch_size], got {tuple(patch_pos_ids.shape)}"
                 )
+        special_ids = torch.tensor(
+            [self.bos_token_id, self.pad_token_id], device=device,
+        )
         coeffs: list[torch.Tensor] = []
+        kv_cache = None
         steps = tqdm(
             range(T),
             desc=(progress_desc or "[Stage2] sampling tokens"),
@@ -863,20 +933,24 @@ class RQTransformerPrior(nn.Module):
             disable=(not show_progress),
         )
         for _ in steps:
-            out = self(seq, patch_pos_ids=patch_pos_ids)
-            if self.predict_coefficients:
-                atom_logits, coeff_step = out
-                coeff_step = coeff_step[:, -1]
+            if kv_cache is None:
+                inp = seq
+                start_pos = 0
             else:
-                atom_logits = out
+                inp = seq[:, -1:]
+                start_pos = seq.size(1) - 1
+
+            atom_logits, coeff_pred, kv_cache = self(
+                inp, patch_pos_ids=patch_pos_ids,
+                kv_cache=kv_cache, start_pos=start_pos,
+            )
+
             if self.predict_coefficients:
-                # Keep atom predictions in [0, num_atoms) so decode is well-defined.
-                special_ids = torch.tensor(
-                    [self.bos_token_id, self.pad_token_id],
-                    device=atom_logits.device,
-                )
-                atom_logits[:, :, special_ids] = float("-inf")
-            logits = atom_logits[:, -1, :] / max(temperature, 1e-8)
+                coeffs.append(coeff_pred[:, -1])
+
+            logits = atom_logits[:, -1, :]
+            logits[:, special_ids] = float("-inf")
+            logits = logits / max(temperature, 1e-8)
             if top_k is not None and top_k > 0:
                 v, ix = torch.topk(logits, top_k, dim=-1)
                 mask = torch.full_like(logits, float("-inf"))
@@ -885,8 +959,6 @@ class RQTransformerPrior(nn.Module):
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
-            if self.predict_coefficients:
-                coeffs.append(coeff_step)
 
         if self.predict_coefficients:
             coeff_flat = torch.stack(coeffs, dim=1)
@@ -1305,7 +1377,7 @@ class Stage1LightningModule(pl.LightningModule):
             return opt
 
         max_epochs = 1
-        if getattr(self, "_trainer", None) is not None:
+        if self.trainer is not None:
             max_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1)
         max_epochs = max(1, max_epochs)
         warmup_epochs = min(self.warmup_epochs, max_epochs - 1)
@@ -1499,8 +1571,10 @@ class Stage2LightningModule(pl.LightningModule):
         D: int,
         sample_every_steps: int = 200,
         sample_batch_size: int = 8,
-        sample_temperature: float = 0.9,
-        sample_top_k: int = 128,
+        sample_micro_batch_size: int = 8,
+        sample_temperature: float = 0.8,
+        sample_top_k: int = 64,
+        sample_coef_extreme_penalty: float = 0.0,
         sample_image_size: Optional[int] = None,
         sample_latent_shape: Optional[Tuple[int, int]] = None,
         sample_window_stride_latent: int = 1,
@@ -1528,8 +1602,10 @@ class Stage2LightningModule(pl.LightningModule):
         self.H, self.W, self.D = int(H), int(W), int(D)
         self.sample_every_steps = int(sample_every_steps)
         self.sample_batch_size = int(sample_batch_size)
+        self.sample_micro_batch_size = max(1, int(sample_micro_batch_size))
         self.sample_temperature = max(float(sample_temperature), 1e-8)
         self.sample_top_k = None if int(sample_top_k) <= 0 else int(sample_top_k)
+        self.sample_coef_extreme_penalty = max(0.0, float(sample_coef_extreme_penalty))
         self.sample_image_size = (
             None
             if sample_image_size is None or int(sample_image_size) <= 0
@@ -1551,6 +1627,25 @@ class Stage2LightningModule(pl.LightningModule):
         self.patch_context_patches = max(0, int(patch_context_patches))
         self.use_patch_positions = bool(getattr(self.transformer.cfg, "num_patch_positions", 0) > 0)
         self.context_tokens = int(getattr(self.transformer.cfg, "context_tokens", 0))
+        self._sample_quantized_vocab_tokens = 0
+        self._sample_n_bins = 0
+        bottleneck = getattr(self.ae_for_decode, "bottleneck", None)
+        if bottleneck is not None and bool(getattr(bottleneck, "quantize_sparse_coeffs", False)):
+            num_atoms = int(getattr(bottleneck, "num_embeddings", 0))
+            n_bins = int(getattr(bottleneck, "n_bins", 0))
+            if num_atoms > 0 and n_bins > 1:
+                self._sample_quantized_vocab_tokens = int(num_atoms * n_bins)
+                self._sample_n_bins = int(n_bins)
+        if self.sample_coef_extreme_penalty > 0.0 and self._sample_quantized_vocab_tokens > 0:
+            center = 0.5 * float(self._sample_n_bins - 1)
+            denom = max(center, 1.0)
+            token_ids = torch.arange(self._sample_quantized_vocab_tokens, dtype=torch.long)
+            bin_ids = torch.remainder(token_ids, self._sample_n_bins).float()
+            dist = (bin_ids - center).abs() / denom
+            sample_coef_penalty = self.sample_coef_extreme_penalty * (dist ** 2)
+        else:
+            sample_coef_penalty = torch.empty(0, dtype=torch.float32)
+        self.register_buffer("_sample_coef_penalty", sample_coef_penalty, persistent=False)
         self.fid_real_images = fid_real_images
         self.fid_num_samples = max(0, int(fid_num_samples))
         self.fid_feature = int(fid_feature)
@@ -1574,7 +1669,7 @@ class Stage2LightningModule(pl.LightningModule):
             return opt
 
         max_epochs = 1
-        if getattr(self, "_trainer", None) is not None:
+        if self.trainer is not None:
             max_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1)
         max_epochs = max(1, max_epochs)
         warmup_epochs = min(self.warmup_epochs, max_epochs - 1)
@@ -1676,9 +1771,8 @@ class Stage2LightningModule(pl.LightningModule):
 
         x_in = seq[:, :-1]
 
-        out = self.transformer(x_in, patch_pos_ids=patch_pos_for_x)
+        logits, coeff_pred, _ = self.transformer(x_in, patch_pos_ids=patch_pos_for_x)
         if self.predict_coefficients:
-            logits, coeff_pred = out
             atom_loss = F.cross_entropy(
                 logits.reshape(-1, self.transformer.cfg.vocab_size),
                 y.reshape(-1),
@@ -1697,11 +1791,11 @@ class Stage2LightningModule(pl.LightningModule):
             )
         else:
             atom_loss = F.cross_entropy(
-                out.reshape(-1, self.transformer.cfg.vocab_size),
+                logits.reshape(-1, self.transformer.cfg.vocab_size),
                 y.reshape(-1),
                 ignore_index=self.pad_token_id,
             )
-            coeff_loss = torch.tensor(0.0, device=out.device, dtype=out.dtype)
+            coeff_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
             loss = atom_loss
         self.log(
             "train/atom_loss",
@@ -1719,33 +1813,49 @@ class Stage2LightningModule(pl.LightningModule):
         self.ae_for_decode.to(self.device)
         self.ae_for_decode.eval()
 
+    def _dist_initialized(self) -> bool:
+        return bool(torch.distributed.is_available() and torch.distributed.is_initialized())
+
+    def _dist_barrier(self) -> None:
+        if self._dist_initialized():
+            torch.distributed.barrier()
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if self.sample_every_steps <= 0:
             return
         if self.global_step <= 0 or (self.global_step % self.sample_every_steps) != 0:
             return
-        world_size = int(getattr(self.trainer, "world_size", 1))
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
+
+        if self._dist_initialized():
             # Keep ranks synchronized while rank0 generates/saves.
-            self.trainer.strategy.barrier()
+            self._dist_barrier()
+            sample_error_flag = torch.zeros(1, dtype=torch.int32, device=self.device)
             if self.trainer.is_global_zero:
-                self._sample_and_save(step=self.global_step)
-            self.trainer.strategy.barrier()
+                try:
+                    self._sample_and_save(step=self.global_step)
+                except Exception as exc:
+                    sample_error_flag.fill_(1)
+                    print(f"[Stage2] sampling failed at step {self.global_step}: {exc}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            print(f"[rank {self.global_rank}] entering post-sample sync (step {self.global_step})", flush=True)
+            torch.distributed.all_reduce(sample_error_flag, op=torch.distributed.ReduceOp.MAX)
+            self._dist_barrier()
+            print(f"[rank {self.global_rank}] post-sample sync done (step {self.global_step})", flush=True)
+            if int(sample_error_flag.item()) != 0:
+                raise RuntimeError(f"Stage-2 sampling failed at step {self.global_step} on at least one rank.")
             return
         if self.trainer.is_global_zero:
             self._sample_and_save(step=self.global_step)
 
     def on_train_epoch_end(self):
-        world_size = int(getattr(self.trainer, "world_size", 1))
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            self.trainer.strategy.barrier()
+        self._dist_barrier()
 
         if self.trainer.is_global_zero:
             os.makedirs(self.out_dir, exist_ok=True)
             torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, "transformer_last.pt"))
 
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            self.trainer.strategy.barrier()
+        self._dist_barrier()
 
     def _maybe_resize_samples(self, imgs: torch.Tensor) -> torch.Tensor:
         if self.sample_image_size is None:
@@ -1759,6 +1869,23 @@ class Stage2LightningModule(pl.LightningModule):
             align_corners=False,
         )
 
+    def _apply_sampling_constraints(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Apply token constraints before multinomial sampling:
+        - ban BOS/PAD content sampling
+        - optionally downweight extreme coefficient bins in quantized-token mode
+        """
+        if 0 <= int(self.transformer.bos_token_id) < int(logits.size(-1)):
+            logits[:, int(self.transformer.bos_token_id)] = float("-inf")
+        if 0 <= int(self.pad_token_id) < int(logits.size(-1)):
+            logits[:, int(self.pad_token_id)] = float("-inf")
+
+        if self._sample_coef_penalty.numel() > 0:
+            cutoff = min(int(self._sample_coef_penalty.numel()), int(logits.size(-1)))
+            if cutoff > 0:
+                logits[:, :cutoff] = logits[:, :cutoff] - self._sample_coef_penalty[:cutoff].to(logits.dtype).unsqueeze(0)
+        return logits
+
     def _decode_generated_batch(self, gen) -> torch.Tensor:
         if self.predict_coefficients:
             flat_gen, coeff_gen = gen
@@ -1769,13 +1896,12 @@ class Stage2LightningModule(pl.LightningModule):
         return self.ae_for_decode.decode_from_tokens(tokens_gen.to(self.device))
 
     @torch.no_grad()
-    def _sample_sliding_window_batch(self, step: int) -> torch.Tensor:
+    def _sample_sliding_window_batch(self, step: int, batch_size: int) -> torch.Tensor:
         if self.predict_coefficients:
             raise NotImplementedError("Sliding-window sampling is only supported in quantized-token mode.")
 
-        B = self.sample_batch_size
+        B = int(batch_size)
         bos_id = int(self.transformer.bos_token_id)
-        pad_id = int(self.pad_token_id)
         win_tokens = int(self.H * self.W * self.D)
         full_h = int(self.sample_latent_h)
         full_w = int(self.sample_latent_w)
@@ -1783,16 +1909,30 @@ class Stage2LightningModule(pl.LightningModule):
             raise ValueError(
                 f"Sliding window {(self.H, self.W)} must fit within full latent {(full_h, full_w)}"
             )
+        # Fast path: when window == full latent field, use the transformer's
+        # cached autoregressive sampler directly (much faster than per-step
+        # re-encoding full context in the generic sliding-window loop).
+        if self.H == full_h and self.W == full_w:
+            gen = self.transformer.generate(
+                batch_size=B,
+                temperature=self.sample_temperature,
+                top_k=self.sample_top_k,
+                show_progress=False,
+                progress_desc=f"[Stage2] sample step {step}",
+                patch_pos_ids=None,
+            )
+            return self._decode_generated_batch(gen)
         full_tokens = int(self.sample_latent_h * self.sample_latent_w * self.D)
         generated = torch.zeros((B, full_h, full_w, self.D), dtype=torch.long, device=self.device)
         bos = torch.full((B, 1), bos_id, dtype=torch.long, device=self.device)
-        special_ids = torch.tensor([bos_id, pad_id], dtype=torch.long, device=self.device)
 
+        tqdm_disable = str(os.environ.get("TQDM_DISABLE", "")).strip().lower() in {"1", "true", "yes", "on"}
         steps = tqdm(
             range(full_tokens),
             desc=f"[Stage2] sliding-window sample step {step}",
             leave=False,
             dynamic_ncols=True,
+            disable=tqdm_disable,
         )
 
         def _earliest_overlapping_start(coord: int, window: int, full: int, stride: int) -> int:
@@ -1826,9 +1966,9 @@ class Stage2LightningModule(pl.LightningModule):
             window_flat = generated[:, h0 : h0 + self.H, w0 : w0 + self.W, :].contiguous().view(B, win_tokens)
             ctx = window_flat[:, :local_t]
             seq = torch.cat([bos, ctx], dim=1)
-            logits = self.transformer(seq, patch_pos_ids=None)[:, -1, :]
-            logits[:, special_ids] = float("-inf")
-            logits = logits / self.sample_temperature
+            logits, _, _ = self.transformer(seq, patch_pos_ids=None)
+            logits = logits[:, -1, :] / self.sample_temperature
+            logits = self._apply_sampling_constraints(logits)
             if self.sample_top_k is not None:
                 k = min(self.sample_top_k, int(logits.size(-1)))
                 v, ix = torch.topk(logits, k, dim=-1)
@@ -1846,13 +1986,14 @@ class Stage2LightningModule(pl.LightningModule):
         self,
         patch_idx: int,
         prev_patch_tokens: list[torch.Tensor],
+        batch_size: int,
         temperature: float = 1.0,
         top_k: Optional[int] = 256,
     ) -> torch.Tensor:
         if self.predict_coefficients:
             raise NotImplementedError("Patch-context sampling is only supported in quantized-token mode.")
         T = self.H * self.W * self.D
-        B = self.sample_batch_size
+        B = int(batch_size)
         bos = torch.full((B, 1), self.transformer.bos_token_id, dtype=torch.long, device=self.device)
 
         ctx_needed = self.patch_context_patches
@@ -1880,9 +2021,26 @@ class Stage2LightningModule(pl.LightningModule):
             else:
                 patch_pos_seq = None
 
+        kv_cache = None
+        nxt_patch_pos = (
+            torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
+            if self.use_patch_positions else None
+        )
         for _ in range(T):
-            out = self.transformer(seq, patch_pos_ids=patch_pos_seq)
-            logits = out[:, -1, :] / max(temperature, 1e-8)
+            if kv_cache is None:
+                inp = seq
+                start_pos = 0
+                pp = patch_pos_seq
+            else:
+                inp = seq[:, -1:]
+                start_pos = seq.size(1) - 1
+                pp = nxt_patch_pos
+
+            atom_logits, _, kv_cache = self.transformer(
+                inp, patch_pos_ids=pp, kv_cache=kv_cache, start_pos=start_pos,
+            )
+            logits = atom_logits[:, -1, :] / max(temperature, 1e-8)
+            logits = self._apply_sampling_constraints(logits)
             if top_k is not None and top_k > 0:
                 k = min(int(top_k), int(logits.size(-1)))
                 v, ix = torch.topk(logits, k, dim=-1)
@@ -1892,14 +2050,11 @@ class Stage2LightningModule(pl.LightningModule):
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
-            if patch_pos_seq is not None:
-                nxt_patch = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-                patch_pos_seq = torch.cat([patch_pos_seq, nxt_patch], dim=1)
 
         return seq[:, -T:]
 
     @torch.no_grad()
-    def _sample_patch_grid_batch(self, step: int) -> torch.Tensor:
+    def _sample_patch_grid_batch(self, step: int, batch_size: int) -> torch.Tensor:
         total_patches = self.patch_grid_h * self.patch_grid_w
         generated_patch_tokens: list[torch.Tensor] = []
         patch_batches = []
@@ -1908,6 +2063,7 @@ class Stage2LightningModule(pl.LightningModule):
                 patch_tokens = self._generate_patch_tokens_with_context(
                     patch_idx=patch_idx,
                     prev_patch_tokens=generated_patch_tokens,
+                    batch_size=batch_size,
                     temperature=self.sample_temperature,
                     top_k=self.sample_top_k,
                 )
@@ -1919,13 +2075,13 @@ class Stage2LightningModule(pl.LightningModule):
                 patch_pos_ids = None
                 if self.use_patch_positions:
                     patch_pos_ids = torch.full(
-                        (self.sample_batch_size,),
+                        (int(batch_size),),
                         patch_idx,
                         dtype=torch.long,
                         device=self.device,
                     )
                 gen_patch = self.transformer.generate(
-                    batch_size=self.sample_batch_size,
+                    batch_size=int(batch_size),
                     temperature=self.sample_temperature,
                     top_k=self.sample_top_k,
                     show_progress=False,
@@ -1952,6 +2108,22 @@ class Stage2LightningModule(pl.LightningModule):
         )
 
     @torch.no_grad()
+    def _sample_raw_images(self, step: int, batch_size: int) -> torch.Tensor:
+        if self.use_sliding_window_sampling:
+            return self._sample_sliding_window_batch(step=step, batch_size=batch_size)
+        if self.patch_grid_h > 1 or self.patch_grid_w > 1:
+            return self._sample_patch_grid_batch(step=step, batch_size=batch_size)
+        gen = self.transformer.generate(
+            batch_size=int(batch_size),
+            temperature=self.sample_temperature,
+            top_k=self.sample_top_k,
+            show_progress=True,
+            progress_desc=f"[Stage2] sample step {step}",
+            patch_pos_ids=None,
+        )
+        return self._decode_generated_batch(gen)
+
+    @torch.no_grad()
     def _sample_and_save(self, step: int):
         self.transformer.eval()
         self.ae_for_decode.eval()
@@ -1963,31 +2135,35 @@ class Stage2LightningModule(pl.LightningModule):
         print(
             f"[Stage2] sampling at step {step} "
             f"(batch_size={self.sample_batch_size}, output_size={sample_size_str}, "
-            f"temp={self.sample_temperature:.3f}, top_k={self.sample_top_k if self.sample_top_k is not None else 'none'})..."
+            f"temp={self.sample_temperature:.3f}, "
+            f"top_k={self.sample_top_k if self.sample_top_k is not None else 'none'}, "
+            f"coef_penalty={self.sample_coef_extreme_penalty:.3f}, "
+            f"micro_batch={self.sample_micro_batch_size})..."
         )
         if self.use_sliding_window_sampling:
             print(
                 f"[Stage2] latent sliding-window sampling enabled "
                 f"(window={self.H}x{self.W}, full_latent={self.sample_latent_h}x{self.sample_latent_w})"
             )
-            raw_imgs = self._sample_sliding_window_batch(step=step)
         elif self.patch_grid_h > 1 or self.patch_grid_w > 1:
             print(
                 f"[Stage2] patch-grid sampling enabled "
                 f"(grid={self.patch_grid_h}x{self.patch_grid_w}, patch={self.patch_size}, "
                 f"stride={self.patch_stride}, context_patches={self.patch_context_patches})"
             )
-            raw_imgs = self._sample_patch_grid_batch(step=step)
-        else:
-            gen = self.transformer.generate(
-                batch_size=self.sample_batch_size,
-                temperature=self.sample_temperature,
-                top_k=self.sample_top_k,
-                show_progress=True,
-                progress_desc=f"[Stage2] sample step {step}",
-                patch_pos_ids=None,
-            )
-            raw_imgs = self._decode_generated_batch(gen)
+
+        total_batch = int(self.sample_batch_size)
+        micro_batch = max(1, min(int(self.sample_micro_batch_size), total_batch))
+        raw_parts = []
+        for start in range(0, total_batch, micro_batch):
+            cur_bs = min(micro_batch, total_batch - start)
+            if total_batch > micro_batch:
+                chunk_idx = (start // micro_batch) + 1
+                chunk_total = int(math.ceil(total_batch / float(micro_batch)))
+                print(f"[Stage2] sampling chunk {chunk_idx}/{chunk_total} (batch={cur_bs})")
+            raw_chunk = self._sample_raw_images(step=step, batch_size=cur_bs)
+            raw_parts.append(raw_chunk)
+        raw_imgs = raw_parts[0] if len(raw_parts) == 1 else torch.cat(raw_parts, dim=0)
         sample_imgs = self._maybe_resize_samples(raw_imgs)
         print(f"[Stage2] sample tensor shape: {tuple(sample_imgs.shape)}")
         logged = log_image_grid_wandb(
@@ -2000,6 +2176,9 @@ class Stage2LightningModule(pl.LightningModule):
         if not logged:
             save_image_grid(sample_imgs, os.path.join(self.out_dir, f"stage2_step{step:06d}_samples.png"))
         self._compute_and_log_fid(step=step, initial_fake_imgs=raw_imgs)
+        del raw_imgs, sample_imgs, raw_parts
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(f"[Stage2] sampling done at step {step}")
         self.transformer.train()
 
@@ -2071,74 +2250,6 @@ class Stage2LightningModule(pl.LightningModule):
         if not logged:
             self.log("stage2/fid", fid_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False, rank_zero_only=True)
         self.transformer.train()
-
-
-def train_stage1_ae(
-    ae: SparseDictAE,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    lr: float,
-    bottleneck_weight: float,
-    grad_clip: float,
-    out_dir: str,
-):
-    opt = torch.optim.Adam(ae.parameters(), lr=lr)
-    best_val = float("inf")
-
-    for epoch in range(1, epochs + 1):
-        ae.train()
-        pbar = tqdm(train_loader, desc=f"[Stage1] epoch {epoch}/{epochs}")
-        running = 0.0
-        for x, _ in pbar:
-            x = x.to(device)
-            recon, b_loss, _ = ae(x)
-            recon_loss = F.mse_loss(recon, x)
-            loss = recon_loss + bottleneck_weight * b_loss
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(ae.parameters(), grad_clip)
-            opt.step()
-
-            # Optional: keep dictionary columns bounded (helps stability)
-            with torch.no_grad():
-                ae.bottleneck.dictionary.copy_(F.normalize(ae.bottleneck.dictionary, p=2, dim=0, eps=ae.bottleneck.epsilon))
-
-            running += loss.item()
-            pbar.set_postfix(loss=loss.item(), recon=recon_loss.item(), b=b_loss.item())
-
-        # Validation
-        ae.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for x, _ in val_loader:
-                x = x.to(device)
-                recon, b_loss, _ = ae(x)
-                recon_loss = F.mse_loss(recon, x)
-                loss = recon_loss + bottleneck_weight * b_loss
-                val_loss += loss.item() * x.size(0)
-        val_loss /= len(val_loader.dataset)
-
-        print(f"[Stage1] epoch {epoch} val_loss={val_loss:.6f}")
-
-        # Save recon sample
-        x_vis, _ = next(iter(val_loader))
-        x_vis = x_vis.to(device)[:64]
-        with torch.no_grad():
-            recon_vis, _, _ = ae(x_vis)
-        save_image_grid(x_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_real.png"))
-        save_image_grid(recon_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
-
-        # Save best ckpt
-        os.makedirs(out_dir, exist_ok=True)
-        ckpt_path = os.path.join(out_dir, "ae_last.pt")
-        torch.save(ae.state_dict(), ckpt_path)
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(ae.state_dict(), os.path.join(out_dir, "ae_best.pt"))
 
 
 @torch.no_grad()
@@ -2296,105 +2407,6 @@ def collect_real_images_uint8(
     return torch.cat(images, dim=0)
 
 
-def train_stage2_transformer(
-    transformer: RQTransformerPrior,
-    token_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    lr: float,
-    pad_token_id: int,
-    out_dir: str,
-    ae_for_decode: SparseDictAE,
-    H: int,
-    W: int,
-    D: int,
-    sample_every_steps: int = 200,
-    sample_batch_size: int = 8,
-    sample_image_size: Optional[int] = None,
-):
-    opt = torch.optim.Adam(transformer.parameters(), lr=lr)
-    vocab = transformer.cfg.vocab_size
-    bos = transformer.bos_token_id
-    global_step = 0
-
-    for epoch in range(1, epochs + 1):
-        transformer.train()
-        pbar = tqdm(token_loader, desc=f"[Stage2] epoch {epoch}/{epochs}")
-        running = 0.0
-
-        for batch in pbar:
-            if isinstance(batch, (tuple, list)):
-                tok_flat = batch[0]
-                if (
-                    len(batch) >= 2
-                    and torch.is_tensor(batch[-1])
-                    and batch[-1].dtype in (torch.int8, torch.int16, torch.int32, torch.int64)
-                ):
-                    patch_pos_ids = batch[-1]
-                else:
-                    patch_pos_ids = None
-            else:
-                tok_flat = batch
-                patch_pos_ids = None
-            tok_flat = tok_flat.to(device).long()  # [B, T]
-            if patch_pos_ids is not None:
-                patch_pos_ids = patch_pos_ids.to(device).long()
-            B = tok_flat.size(0)
-
-            # Prepend BOS: [B, 1+T]
-            seq = torch.cat([torch.full((B, 1), bos, device=device, dtype=torch.long), tok_flat], dim=1)
-            x_in = seq[:, :-1]
-            y = seq[:, 1:]
-
-            logits = transformer(x_in, patch_pos_ids=patch_pos_ids)  # [B, L, vocab]
-            loss = F.cross_entropy(
-                logits.reshape(-1, vocab),
-                y.reshape(-1),
-                ignore_index=pad_token_id
-            )
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
-            opt.step()
-            global_step += 1
-
-            running += loss.item()
-            pbar.set_postfix(loss=loss.item())
-
-            if sample_every_steps > 0 and (global_step % sample_every_steps == 0):
-                transformer.eval()
-                ae_for_decode.eval()
-                print(f"[Stage2] sampling at step {global_step} (batch_size={sample_batch_size})...")
-                with torch.no_grad():
-                    flat_gen = transformer.generate(
-                        batch_size=sample_batch_size,
-                        temperature=1.0,
-                        top_k=256,
-                        show_progress=True,
-                        progress_desc=f"[Stage2] sample step {global_step}",
-                        patch_pos_ids=None,
-                    )  # [B, T]
-                    tokens_gen = flat_gen.view(-1, H, W, D)
-                    imgs = ae_for_decode.decode_from_tokens(tokens_gen.to(device))
-                    if sample_image_size is not None and int(sample_image_size) > 0:
-                        if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
-                            imgs = F.interpolate(
-                                imgs,
-                                size=(int(sample_image_size), int(sample_image_size)),
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                save_image_grid(imgs, os.path.join(out_dir, f"stage2_step{global_step:06d}_samples.png"))
-                print(f"[Stage2] sampling done at step {global_step}")
-                transformer.train()
-
-        print(f"[Stage2] epoch {epoch} train_loss={running/len(token_loader):.6f}")
-
-        os.makedirs(out_dir, exist_ok=True)
-        torch.save(transformer.state_dict(), os.path.join(out_dir, "transformer_last.pt"))
-
-
 # -----------------------------
 # Main
 # -----------------------------
@@ -2472,18 +2484,42 @@ def main():
     parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--stage2_batch_size", type=int, default=16)
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
-    parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
+    parser.add_argument("--stage2_sample_batch_size", type=int, default=32)
+    parser.add_argument(
+        "--stage2_sample_micro_batch_size",
+        type=int,
+        default=8,
+        help="Generate stage-2 samples in micro-batches to avoid long stalls/OOM while keeping total sample count.",
+    )
     parser.add_argument(
         "--stage2_sample_temperature",
         type=float,
-        default=0.9,
+        default=0.8,
         help="Sampling temperature for stage-2 previews (lower usually improves coherence).",
     )
     parser.add_argument(
         "--stage2_sample_top_k",
         type=int,
-        default=128,
+        default=64,
         help="Top-k for stage-2 preview sampling (<=0 disables top-k filtering).",
+    )
+    parser.add_argument(
+        "--stage2_sample_coef_extreme_penalty",
+        type=float,
+        default=0.0,
+        help="Logit penalty for extreme coefficient bins during stage-2 sampling (0 disables).",
+    )
+    parser.add_argument(
+        "--stage2_resume_from_last",
+        action="store_true",
+        default=True,
+        help="If stage2/transformer_last.pt exists in out_dir, load it before stage-2 training.",
+    )
+    parser.add_argument(
+        "--no_stage2_resume_from_last",
+        action="store_false",
+        dest="stage2_resume_from_last",
+        help="Disable automatic stage-2 resume from stage2/transformer_last.pt.",
     )
     parser.add_argument(
         "--stage2_patchify",
@@ -2572,8 +2608,14 @@ def main():
     args = parser.parse_args()
     if args.stage2_fid_num_samples is None:
         args.stage2_fid_num_samples = int(args.stage2_sample_batch_size)
+    if args.stage2_sample_batch_size <= 0:
+        raise ValueError("stage2_sample_batch_size must be > 0.")
+    if args.stage2_sample_micro_batch_size <= 0:
+        raise ValueError("stage2_sample_micro_batch_size must be > 0.")
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0.")
+    if args.stage2_sample_coef_extreme_penalty < 0.0:
+        raise ValueError("stage2_sample_coef_extreme_penalty must be >= 0.")
     if args.ae_num_downsamples <= 0:
         raise ValueError(f"ae_num_downsamples must be positive, got {args.ae_num_downsamples}")
     if args.image_size is not None:
@@ -2769,6 +2811,15 @@ def main():
             bos_token_id=ae_model.bottleneck.bos_token_id,
             pad_token_id=ae_model.bottleneck.pad_token_id,
         )
+        if args.stage2_resume_from_last:
+            stage2_last_path = os.path.join(stage2_dir, "transformer_last.pt")
+            if os.path.exists(stage2_last_path):
+                try:
+                    stage2_state = torch.load(stage2_last_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    stage2_state = torch.load(stage2_last_path, map_location="cpu")
+                transformer.load_state_dict(stage2_state, strict=False)
+                print(f"[Stage2] resumed transformer weights from {stage2_last_path}")
         stage2_module = Stage2LightningModule(
             transformer=transformer,
             lr=args.stage2_lr,
@@ -2780,8 +2831,10 @@ def main():
             D=D,
             sample_every_steps=args.stage2_sample_every_steps,
             sample_batch_size=args.stage2_sample_batch_size,
+            sample_micro_batch_size=args.stage2_sample_micro_batch_size,
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
+            sample_coef_extreme_penalty=args.stage2_sample_coef_extreme_penalty,
             sample_image_size=args.stage2_sample_image_size,
             sample_latent_shape=sample_latent_shape,
             sample_window_stride_latent=(
@@ -2807,6 +2860,14 @@ def main():
         if effective_strategy == "ddp_fork" and torch.cuda.is_initialized():
             print("[Stage2] CUDA already initialized; falling back from ddp_fork to ddp.")
             effective_strategy = "ddp"
+        if args.stage2_devices > 1:
+            os.environ["LASER_DDP_PHASE"] = "stage2"
+        if args.stage2_devices > 1:
+            _ensure_free_master_port_for_ddp("Stage2")
+            print(
+                f"[Stage2] rendezvous endpoint: "
+                f"{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{os.environ.get('MASTER_PORT')}"
+            )
 
         trainer = pl.Trainer(
             accelerator="gpu",
@@ -2822,7 +2883,8 @@ def main():
         )
         trainer.fit(stage2_module, datamodule=stage2_dm)
 
-    # During stage-2 DDP script re-entry, skip stage-1 and tokenization work.
+    # During stage-2 DDP script re-entry (re-exec after stage-1, OR worker
+    # spawned by the stage-2 trainer), skip stage-1 and tokenization.
     if os.environ.get("LASER_DDP_PHASE") == "stage2":
         if not os.path.exists(token_cache_path):
             raise FileNotFoundError(f"Missing token cache: {token_cache_path}")
@@ -2964,6 +3026,13 @@ def main():
             warmup_epochs=args.stage1_warmup_epochs,
             min_lr_ratio=args.stage1_min_lr_ratio,
         )
+        if args.stage1_devices > 1:
+            os.environ["LASER_DDP_PHASE"] = "stage1"
+            _ensure_free_master_port_for_ddp("Stage1")
+            print(
+                f"[Stage1] rendezvous endpoint: "
+                f"{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{os.environ.get('MASTER_PORT')}"
+            )
         stage1_trainer = pl.Trainer(
             accelerator="gpu",
             devices=args.stage1_devices,
@@ -2984,79 +3053,123 @@ def main():
             return
 
     _load_best_ae_weights(ae)
-    encode_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    ae = ae.to(encode_device)
-    token_loader_batch_size = int(args.batch_size)
-    if args.stage2_patchify or args.stage2_sliding_window:
-        token_loader_batch_size = max(1, min(token_loader_batch_size, 16))
-    token_loader = DataLoader(
-        stage2_source_set,
-        batch_size=token_loader_batch_size,
-        shuffle=False,
-        num_workers=args.token_num_workers,
-        pin_memory=True,
-        persistent_workers=(args.token_num_workers > 0),
+
+    # Reuse cached tokens when stage-1 was not (re-)trained this run.
+    _use_token_cache = (
+        args.stage1_epochs <= 0
+        and os.path.exists(token_cache_path)
     )
-    patch_pos_flat = None
-    patch_grid_shape = None
-    patch_size = int(args.stage2_patch_size)
-    patch_stride = int(args.stage2_patch_stride)
-    sample_latent_shape = None
-    sliding_window_stride_latent = None
-    if args.stage2_patchify:
-        (
-            tokens_flat,
-            coeffs_flat,
-            patch_pos_flat,
-            H,
-            W,
-            D,
-            patch_grid_h,
-            patch_grid_w,
-        ) = precompute_patch_grid_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patch_encode_batch_size=args.stage2_patch_encode_batch_size,
-            max_items=min(args.token_subset, len(stage2_source_set)),
+    if _use_token_cache:
+        print(f"[Stage2] loading cached tokens from {token_cache_path}")
+        try:
+            cache = torch.load(token_cache_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            cache = torch.load(token_cache_path, map_location="cpu")
+        tokens_flat = cache["tokens_flat"]
+        coeffs_flat = cache.get("coeffs_flat")
+        patch_pos_flat = cache.get("patch_pos_flat")
+        H, W, D = cache["shape"]
+        patch_grid_shape = cache.get("patch_grid_shape")
+        patch_size = int(cache.get("patch_size", args.stage2_patch_size))
+        patch_stride = int(cache.get("patch_stride", args.stage2_patch_stride))
+        sample_latent_shape = cache.get("sample_latent_shape")
+        sliding_window_stride_latent = cache.get(
+            "sliding_window_stride_latent",
+            cache.get("sliding_window_stride_tokens"),
         )
-        patch_grid_shape = (patch_grid_h, patch_grid_w)
-    elif args.stage2_sliding_window:
-        tokens_flat, coeffs_flat, full_H, full_W, D = precompute_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-        H = int(args.stage2_window_latent_h)
-        W = int(args.stage2_window_latent_w)
-        if H > int(full_H) or W > int(full_W):
-            raise ValueError(
-                f"Sliding window latent size ({H}, {W}) exceeds full latent shape ({full_H}, {full_W})."
-            )
-        sample_latent_shape = (int(full_H), int(full_W))
-        sliding_window_stride_latent = int(args.stage2_window_stride_latent)
+        fid_real_images = cache.get("fid_real_images")
     else:
-        tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
+        encode_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        ae = ae.to(encode_device)
+        token_loader_batch_size = int(args.batch_size)
+        if args.stage2_patchify or args.stage2_sliding_window:
+            token_loader_batch_size = max(1, min(token_loader_batch_size, 16))
+        token_loader = DataLoader(
+            stage2_source_set,
+            batch_size=token_loader_batch_size,
+            shuffle=False,
+            num_workers=args.token_num_workers,
+            pin_memory=True,
+            persistent_workers=(args.token_num_workers > 0),
         )
-    fid_real_loader = DataLoader(
-        stage2_source_set if (args.stage2_patchify or args.stage2_sliding_window) else train_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
-    fid_real_images = collect_real_images_uint8(
-        fid_real_loader,
-        max_items=args.stage2_fid_num_samples,
-    )
-    ae = ae.cpu()
+        patch_pos_flat = None
+        patch_grid_shape = None
+        patch_size = int(args.stage2_patch_size)
+        patch_stride = int(args.stage2_patch_stride)
+        sample_latent_shape = None
+        sliding_window_stride_latent = None
+        if args.stage2_patchify:
+            (
+                tokens_flat,
+                coeffs_flat,
+                patch_pos_flat,
+                H,
+                W,
+                D,
+                patch_grid_h,
+                patch_grid_w,
+            ) = precompute_patch_grid_tokens(
+                ae,
+                token_loader,
+                encode_device,
+                patch_size=patch_size,
+                patch_stride=patch_stride,
+                patch_encode_batch_size=args.stage2_patch_encode_batch_size,
+                max_items=min(args.token_subset, len(stage2_source_set)),
+            )
+            patch_grid_shape = (patch_grid_h, patch_grid_w)
+        elif args.stage2_sliding_window:
+            tokens_flat, coeffs_flat, full_H, full_W, D = precompute_tokens(
+                ae,
+                token_loader,
+                encode_device,
+                max_items=min(args.token_subset, len(stage2_source_set)),
+            )
+            H = int(args.stage2_window_latent_h)
+            W = int(args.stage2_window_latent_w)
+            if H > int(full_H) or W > int(full_W):
+                raise ValueError(
+                    f"Sliding window latent size ({H}, {W}) exceeds full latent shape ({full_H}, {full_W})."
+                )
+            sample_latent_shape = (int(full_H), int(full_W))
+            sliding_window_stride_latent = int(args.stage2_window_stride_latent)
+        else:
+            tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
+                ae,
+                token_loader,
+                encode_device,
+                max_items=min(args.token_subset, len(stage2_source_set)),
+            )
+    if not _use_token_cache:
+        fid_real_loader = DataLoader(
+            stage2_source_set if (args.stage2_patchify or args.stage2_sliding_window) else train_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
+        fid_real_images = collect_real_images_uint8(
+            fid_real_loader,
+            max_items=args.stage2_fid_num_samples,
+        )
+        ae = ae.cpu()
+        torch.save(
+            {
+                "tokens_flat": tokens_flat,
+                "coeffs_flat": coeffs_flat,
+                "patch_pos_flat": patch_pos_flat,
+                "quantize_sparse_coeffs": args.quantize_sparse_coeffs,
+                "shape": (H, W, D),
+                "patch_grid_shape": patch_grid_shape,
+                "patch_size": patch_size,
+                "patch_stride": patch_stride,
+                "sample_latent_shape": sample_latent_shape,
+                "sliding_window_stride_latent": sliding_window_stride_latent,
+                "fid_real_images": fid_real_images,
+            },
+            token_cache_path,
+        )
+
     print(f"[Stage2] token dataset: {tokens_flat.shape}   (H={H}, W={W}, D={D})")
     if patch_grid_shape is not None:
         print(
@@ -3074,25 +3187,9 @@ def main():
             f"window_latent={H}x{W}, full_latent={sample_latent_shape[0]}x{sample_latent_shape[1]}, "
             f"stride_latent={stride_lat}, windows_per_image={windows_per_image}"
         )
-
-    torch.save(
-        {
-            "tokens_flat": tokens_flat,
-            "coeffs_flat": coeffs_flat,
-            "patch_pos_flat": patch_pos_flat,
-            "quantize_sparse_coeffs": args.quantize_sparse_coeffs,
-            "shape": (H, W, D),
-            "patch_grid_shape": patch_grid_shape,
-            "patch_size": patch_size,
-            "patch_stride": patch_stride,
-            "sample_latent_shape": sample_latent_shape,
-            "sliding_window_stride_latent": sliding_window_stride_latent,
-            "fid_real_images": fid_real_images,
-        },
-        token_cache_path,
-    )
     if args.stage1_epochs <= 0:
-        # If stage-1 is skipped, we don't need a process restart boundary.
+        # No prior DDP group to clean up; call directly. Stage-2 DDP workers
+        # will re-enter via LASER_DDP_PHASE=stage2 and load from cache.
         _run_stage2_lightning(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
@@ -3111,8 +3208,8 @@ def main():
         )
         return
     # Re-exec into a clean process before launching stage-2 DDP.
-    # This avoids hangs from initializing two different DDP trainers in one process.
-    # Also clear stale DDP env from stage-1 so stage-2 can launch all ranks.
+    # After stage-1 DDP, CUDA and process groups are already initialised;
+    # a fresh process avoids hangs from nested DDP contexts.
     os.environ["LASER_DDP_PHASE"] = "stage2"
     for k in (
         "LOCAL_RANK",
