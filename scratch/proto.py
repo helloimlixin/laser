@@ -2434,6 +2434,12 @@ def main():
         help="Resize shortest side to this size (keep aspect ratio) before cropping.",
     )
     parser.add_argument("--crop_size", type=int, default=32, help="Random crop size used for training/tokenization.")
+    parser.add_argument(
+        "--center_crop_only",
+        action="store_true",
+        default=False,
+        help="Use center-crop only (no resize or random crop) for train/val/tokenization transforms.",
+    )
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
 
@@ -2639,15 +2645,17 @@ def main():
     if args.image_size is not None:
         args.crop_size = int(args.image_size)
     args.image_size = int(args.crop_size)
-    if args.resize_size < args.image_size:
-        raise ValueError(
-            f"resize_size ({args.resize_size}) must be >= crop_size ({args.image_size})."
-        )
-    if args.resize_size >= (2 * args.image_size):
-        print(
-            f"[Data] WARNING: resize_size={args.resize_size} is much larger than crop_size={args.image_size}. "
-            "This can make stage-1 reconstruction harder and depress PSNR."
-        )
+    if not args.center_crop_only:
+        if args.resize_size < args.image_size:
+            raise ValueError(
+                f"resize_size ({args.resize_size}) must be >= crop_size ({args.image_size})."
+            )
+        if args.resize_size >= (2 * args.image_size):
+            print(
+                f"[Data] WARNING: resize_size={args.resize_size} is much larger than crop_size={args.image_size}. "
+                "This can make stage-1 reconstruction harder and depress PSNR."
+            )
+    effective_source_size = int(args.image_size if args.center_crop_only else args.resize_size)
     if args.stage2_patchify and args.stage2_sliding_window:
         raise ValueError("stage2_patchify and stage2_sliding_window are mutually exclusive.")
     if args.stage2_patchify:
@@ -2657,13 +2665,13 @@ def main():
             )
         if args.stage2_patch_context_patches < 0:
             raise ValueError("stage2_patch_context_patches must be >= 0.")
-        if args.resize_size < args.stage2_patch_size:
+        if effective_source_size < args.stage2_patch_size:
             raise ValueError(
-                f"resize_size ({args.resize_size}) must be >= stage2_patch_size ({args.stage2_patch_size})."
+                f"source_size ({effective_source_size}) must be >= stage2_patch_size ({args.stage2_patch_size})."
             )
-        if ((args.resize_size - args.stage2_patch_size) % args.stage2_patch_stride) != 0:
+        if ((effective_source_size - args.stage2_patch_size) % args.stage2_patch_stride) != 0:
             raise ValueError(
-                "resize_size, stage2_patch_size, and stage2_patch_stride produce a non-integer patch grid."
+                "source_size, stage2_patch_size, and stage2_patch_stride produce a non-integer patch grid."
             )
     if args.stage2_sliding_window:
         if args.stage2_window_latent_h <= 0 or args.stage2_window_latent_w <= 0:
@@ -2685,6 +2693,7 @@ def main():
     print(
         f"[Data] dataset={args.dataset} data_dir={args.data_dir} "
         f"resize_size={args.resize_size} crop_size={args.image_size} "
+        f"center_crop_only={args.center_crop_only} "
         f"stage2_patchify={args.stage2_patchify} "
         f"stage2_sliding_window={args.stage2_sliding_window} "
         f"context_patches={args.stage2_patch_context_patches if args.stage2_patchify else 0}"
@@ -2952,35 +2961,58 @@ def main():
         return
 
     # Normalize to [-1, 1].
-    # Keep aspect ratio on resize, then center-crop to a square canvas so
-    # stage-1 random crops come from a more stable distribution.
-    train_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.RandomCrop((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    eval_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.CenterCrop((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    val_vis_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.CenterCrop((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    stage2_source_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+    if args.center_crop_only:
+        # Use a deterministic center crop directly from source resolution.
+        train_tfm = transforms.Compose([
+            transforms.CenterCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        eval_tfm = transforms.Compose([
+            transforms.CenterCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        val_vis_tfm = transforms.Compose([
+            transforms.CenterCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        stage2_source_tfm = transforms.Compose([
+            transforms.CenterCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+    else:
+        # Keep aspect ratio on resize, then center-crop to a square canvas so
+        # stage-1 random crops come from a more stable distribution.
+        train_tfm = transforms.Compose([
+            transforms.Resize(args.resize_size),
+            transforms.CenterCrop((args.resize_size, args.resize_size)),
+            transforms.RandomCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        eval_tfm = transforms.Compose([
+            transforms.Resize(args.resize_size),
+            transforms.CenterCrop((args.resize_size, args.resize_size)),
+            transforms.CenterCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        val_vis_tfm = transforms.Compose([
+            transforms.Resize(args.resize_size),
+            transforms.CenterCrop((args.resize_size, args.resize_size)),
+            transforms.CenterCrop((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        stage2_source_tfm = transforms.Compose([
+            transforms.Resize(args.resize_size),
+            transforms.CenterCrop((args.resize_size, args.resize_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
     if args.dataset == "cifar10":
         train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_tfm)
         val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
