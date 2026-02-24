@@ -383,7 +383,7 @@ class DictionaryLearningTokenized(nn.Module):
         signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
         dictionary = self._normalize_dict()
         with torch.no_grad():
-            support, coeffs = self.batch_omp_with_support(signals, dictionary)
+            support, coeffs = self.batch_omp(signals, dictionary)
         if support.ndim != 2 or coeffs.ndim != 2:
             raise RuntimeError(
                 f"OMP returned invalid rank: support={tuple(support.shape)} coeffs={tuple(coeffs.shape)}"
@@ -435,9 +435,9 @@ class DictionaryLearningTokenized(nn.Module):
         recon_flat = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)  # [N, C]
         return recon_flat.view(B, H, W, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
 
-    def batch_omp_with_support(self, X: torch.Tensor, D: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def batch_omp(self, X: torch.Tensor, D: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Batched OMP adapted from LASER's DictionaryLearning.batch_omp.
+        Batched OMP matching the earlier DictLearn.update_gamma implementation.
         Runs exactly sparsity_level steps (no early-stop) so stack depth is fixed.
 
         Args:
@@ -451,67 +451,56 @@ class DictionaryLearningTokenized(nn.Module):
             raise ValueError(
                 f"sparsity_level ({self.sparsity_level}) must be <= num_atoms ({int(D.size(1))})"
             )
-        _, batch_size = X.size()
-        Dt = D.t()                   # [N, M]
-        G = Dt.mm(D)                 # [N, N]
-        eps = torch.norm(X, dim=0)   # [B]
-        h_bar = Dt.mm(X).t()         # [B, N]
-        h = h_bar
-        x = torch.zeros_like(h_bar)  # [B, N]
-        L = torch.ones(batch_size, 1, 1, device=h.device, dtype=h.dtype)
-        I = torch.ones(batch_size, 0, device=h.device, dtype=torch.long)
-        I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
-        delta = torch.zeros(batch_size, device=h.device, dtype=h.dtype)
-
-        def _update_logical(logical: torch.Tensor, to_add: torch.Tensor):
-            running_idx = torch.arange(to_add.shape[0], device=to_add.device)
-            logical[running_idx, to_add] = True
+        _, num_signals = X.size()
+        dictionary_t = D.t()                  # [N, M]
+        gram_matrix = dictionary_t.mm(D)      # [N, N]
+        corr_init = dictionary_t.mm(X).t()    # [B, N]
+        gamma = torch.zeros_like(corr_init)   # [B, N]
+        corr = corr_init
+        L = torch.ones(num_signals, 1, 1, device=X.device, dtype=X.dtype)
+        I = torch.zeros(num_signals, 0, dtype=torch.long, device=X.device)
+        omega = torch.ones_like(corr_init, dtype=torch.bool)
+        signal_idx = torch.arange(num_signals, device=X.device)
 
         k = 0
-        # Always run exactly K selections; relying on residual-based stopping can return short supports.
         while k < self.sparsity_level:
             k += 1
-            index = (h * (~I_logic).float()).abs().argmax(dim=1)  # [B]
-            _update_logical(I_logic, index)
-
-            batch_idx = torch.arange(batch_size, device=G.device)
-            expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()  # [B,k]
+            # Select max-correlation atom while masking previously selected atoms.
+            k_hats = torch.argmax(torch.abs(corr * omega), dim=1)  # [B]
+            omega[signal_idx, k_hats] = False
+            expanded_signal_idx = signal_idx.unsqueeze(0).expand(k, num_signals).t()  # [B, k]
 
             if k > 1:
-                G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
-                w = torch.linalg.solve_triangular(L, G_stack, upper=False)
-                w = w.view(-1, 1, k - 1)
-                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-12))
-                k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device, dtype=h.dtype)
+                G_ = gram_matrix[
+                    I[signal_idx, :],
+                    k_hats[expanded_signal_idx[..., :-1]],
+                ].view(num_signals, k - 1, 1)
+                w = torch.linalg.solve_triangular(L, G_, upper=False).view(-1, 1, k - 1)
+                w_br = torch.sqrt(1 - (w ** 2).sum(dim=2, keepdim=True))
+                k_zeros = torch.zeros(num_signals, k - 1, 1, device=X.device, dtype=X.dtype)
                 L = torch.cat(
                     (
                         torch.cat((L, k_zeros), dim=2),
-                        torch.cat((w, w_corner), dim=2),
+                        torch.cat((w, w_br), dim=2),
                     ),
                     dim=1,
                 )
 
-            I = torch.cat([I, index.unsqueeze(1)], dim=1)  # [B,k]
-
-            h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)
-            x_stack = torch.cholesky_solve(h_stack, L)
-            x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack[batch_idx].squeeze(-1)
+            I = torch.cat([I, k_hats.unsqueeze(1)], dim=1)  # [B, k]
+            corr_ = corr_init[expanded_signal_idx, I[signal_idx, :]].view(num_signals, k, 1)
+            gamma_ = torch.cholesky_solve(corr_, L)
+            gamma[signal_idx.unsqueeze(1), I[signal_idx]] = gamma_[signal_idx].squeeze(-1)
 
             beta = (
-                x[batch_idx.unsqueeze(1), I[batch_idx]]
+                gamma[signal_idx.unsqueeze(1), I[signal_idx]]
                 .unsqueeze(1)
-                .bmm(G[I[batch_idx], :])
+                .bmm(gram_matrix[I[signal_idx], :])
                 .squeeze(1)
             )
-            h = h_bar - beta
+            corr = corr_init - beta
 
-            new_delta = (x * beta).sum(dim=1)
-            eps = eps + delta - new_delta
-            delta = new_delta
-
-        # Ordered coefficients: x is dense over atoms; gather along support I
-        batch_idx = torch.arange(batch_size, device=x.device)[:, None]
-        coeffs_ordered = x[batch_idx, I]  # [B, K]
+        batch_idx = torch.arange(num_signals, device=gamma.device)[:, None]
+        coeffs_ordered = gamma[batch_idx, I]  # [B, K]
 
         return I, coeffs_ordered
 
@@ -766,6 +755,7 @@ class RQTransformerConfig:
     H: int
     W: int
     D: int
+    num_classes: int = 0
     num_patch_positions: int = 0
     context_tokens: int = 0
     predict_coefficients: bool = False
@@ -804,6 +794,11 @@ class RQTransformerPrior(nn.Module):
             if cfg.num_patch_positions > 0
             else None
         )
+        self.class_emb = (
+            nn.Embedding(cfg.num_classes, cfg.d_model)
+            if int(cfg.num_classes) > 0
+            else None
+        )
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([
@@ -837,6 +832,7 @@ class RQTransformerPrior(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        class_ids: Optional[torch.Tensor] = None,
         patch_pos_ids: Optional[torch.Tensor] = None,
         kv_cache: Optional[list] = None,
         start_pos: int = 0,
@@ -881,6 +877,15 @@ class RQTransformerPrior(nn.Module):
                 raise ValueError(
                     f"patch_pos_ids must have rank 1 or 2, got rank {patch_pos_ids.dim()}"
                 )
+        if self.class_emb is not None:
+            if class_ids is None:
+                raise ValueError("class_ids must be provided when num_classes > 0")
+            class_ids = class_ids.to(device=x.device, dtype=torch.long)
+            if class_ids.dim() != 1 or class_ids.shape[0] != B:
+                raise ValueError(
+                    f"class_ids must have shape [B]={B}, got {tuple(class_ids.shape)}"
+                )
+            h = h + self.class_emb(class_ids).unsqueeze(1)
         h = self.drop(h)
 
         new_kv_cache = []
@@ -902,6 +907,7 @@ class RQTransformerPrior(nn.Module):
         top_k: Optional[int] = None,
         show_progress: bool = False,
         progress_desc: Optional[str] = None,
+        class_ids: Optional[torch.Tensor] = None,
         patch_pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -916,6 +922,14 @@ class RQTransformerPrior(nn.Module):
         T = self.cfg.H * self.cfg.W * self.cfg.D
 
         seq = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
+        if self.class_emb is not None:
+            if class_ids is None:
+                raise ValueError("class_ids must be provided when num_classes > 0")
+            class_ids = class_ids.to(device=device, dtype=torch.long)
+            if class_ids.dim() != 1 or class_ids.shape[0] != batch_size:
+                raise ValueError(
+                    f"class_ids must have shape [batch_size], got {tuple(class_ids.shape)}"
+                )
         if self.patch_pos_emb is not None:
             if patch_pos_ids is None:
                 raise ValueError("patch_pos_ids must be provided when num_patch_positions > 0")
@@ -945,7 +959,7 @@ class RQTransformerPrior(nn.Module):
                 start_pos = seq.size(1) - 1
 
             atom_logits, coeff_pred, kv_cache = self(
-                inp, patch_pos_ids=patch_pos_ids,
+                inp, class_ids=class_ids, patch_pos_ids=patch_pos_ids,
                 kv_cache=kv_cache, start_pos=start_pos,
             )
 
@@ -1107,6 +1121,7 @@ class Stage2TokenDataModule(pl.LightningDataModule):
         num_workers: int = 2,
         coeffs_flat: Optional[torch.Tensor] = None,
         patch_pos_flat: Optional[torch.Tensor] = None,
+        class_ids_flat: Optional[torch.Tensor] = None,
         context_patches: int = 0,
         pad_token_id: Optional[int] = None,
         sliding_window_shape: Optional[Tuple[int, int]] = None,
@@ -1120,6 +1135,7 @@ class Stage2TokenDataModule(pl.LightningDataModule):
         self.num_workers = int(num_workers)
         self.coeffs_flat = coeffs_flat
         self.patch_pos_flat = patch_pos_flat
+        self.class_ids_flat = class_ids_flat
         self.context_patches = max(0, int(context_patches))
         self.pad_token_id = (None if pad_token_id is None else int(pad_token_id))
         self.sliding_window_shape = (
@@ -1138,6 +1154,13 @@ class Stage2TokenDataModule(pl.LightningDataModule):
             if sliding_window_stride_latent is None
             else max(1, int(sliding_window_stride_latent))
         )
+        if self.class_ids_flat is not None:
+            if self.class_ids_flat.dim() != 1 or self.class_ids_flat.shape[0] != self.tokens_flat.shape[0]:
+                raise ValueError(
+                    f"class_ids_flat must be [N] with N={self.tokens_flat.shape[0]}, got "
+                    f"{tuple(self.class_ids_flat.shape)}"
+                )
+            self.class_ids_flat = self.class_ids_flat.to(torch.long)
 
     def train_dataloader(self):
         if self.sliding_window_shape is not None:
@@ -1156,6 +1179,7 @@ class Stage2TokenDataModule(pl.LightningDataModule):
                     else self.sliding_window_shape[0]
                 ),
                 coeffs_flat=self.coeffs_flat,
+                class_ids_flat=self.class_ids_flat,
             )
         elif (
             self.patch_pos_flat is not None
@@ -1168,6 +1192,7 @@ class Stage2TokenDataModule(pl.LightningDataModule):
                 patch_pos_flat=self.patch_pos_flat,
                 context_patches=self.context_patches,
                 pad_token_id=self.pad_token_id,
+                class_ids_flat=self.class_ids_flat,
             )
         else:
             tensors = [self.tokens_flat]
@@ -1175,6 +1200,8 @@ class Stage2TokenDataModule(pl.LightningDataModule):
                 tensors.append(self.coeffs_flat)
             if self.patch_pos_flat is not None:
                 tensors.append(self.patch_pos_flat)
+            if self.class_ids_flat is not None:
+                tensors.append(self.class_ids_flat)
             tok_ds = TensorDataset(*tensors)
         return DataLoader(
             tok_ds,
@@ -1203,6 +1230,7 @@ class PatchContextTokenDataset(Dataset):
         patch_pos_flat: torch.Tensor,
         context_patches: int,
         pad_token_id: int,
+        class_ids_flat: Optional[torch.Tensor] = None,
     ):
         if tokens_flat.dim() != 2:
             raise ValueError(f"tokens_flat must be [N, T], got {tuple(tokens_flat.shape)}")
@@ -1210,8 +1238,15 @@ class PatchContextTokenDataset(Dataset):
             raise ValueError(
                 f"patch_pos_flat must be [N] with N={tokens_flat.shape[0]}, got {tuple(patch_pos_flat.shape)}"
             )
+        if class_ids_flat is not None and (
+            class_ids_flat.dim() != 1 or class_ids_flat.shape[0] != tokens_flat.shape[0]
+        ):
+            raise ValueError(
+                f"class_ids_flat must be [N] with N={tokens_flat.shape[0]}, got {tuple(class_ids_flat.shape)}"
+            )
         self.tokens_flat = tokens_flat
         self.patch_pos_flat = patch_pos_flat.to(torch.long)
+        self.class_ids_flat = (None if class_ids_flat is None else class_ids_flat.to(torch.long))
         self.context_patches = max(0, int(context_patches))
         self.pad_token_id = int(pad_token_id)
         self.tokens_per_patch = int(tokens_flat.shape[1])
@@ -1222,9 +1257,12 @@ class PatchContextTokenDataset(Dataset):
     def __getitem__(self, idx: int):
         tok = self.tokens_flat[idx]
         patch_pos = self.patch_pos_flat[idx]
+        class_id = (None if self.class_ids_flat is None else self.class_ids_flat[idx])
 
         if self.context_patches <= 0:
-            return tok, patch_pos
+            if class_id is None:
+                return tok, patch_pos
+            return tok, patch_pos, class_id
 
         ctx_len = self.context_patches * self.tokens_per_patch
         ctx_tok = torch.full((ctx_len,), self.pad_token_id, dtype=self.tokens_flat.dtype)
@@ -1247,7 +1285,9 @@ class PatchContextTokenDataset(Dataset):
             ctx_tok[start:end] = self.tokens_flat[src_idx]
             ctx_patch_pos[start:end] = prev_pos
 
-        return tok, patch_pos, ctx_tok, ctx_patch_pos
+        if class_id is None:
+            return tok, patch_pos, ctx_tok, ctx_patch_pos
+        return tok, patch_pos, ctx_tok, ctx_patch_pos, class_id
 
 
 class SlidingWindowTokenDataset(Dataset):
@@ -1268,11 +1308,19 @@ class SlidingWindowTokenDataset(Dataset):
         window_latent_w: int,
         stride_latent: int,
         coeffs_flat: Optional[torch.Tensor] = None,
+        class_ids_flat: Optional[torch.Tensor] = None,
     ):
         if tokens_flat.dim() != 2:
             raise ValueError(f"tokens_flat must be [N, T], got {tuple(tokens_flat.shape)}")
         self.tokens_flat = tokens_flat
         self.coeffs_flat = coeffs_flat
+        if class_ids_flat is not None and (
+            class_ids_flat.dim() != 1 or class_ids_flat.shape[0] != tokens_flat.shape[0]
+        ):
+            raise ValueError(
+                f"class_ids_flat must be [N] with N={tokens_flat.shape[0]}, got {tuple(class_ids_flat.shape)}"
+            )
+        self.class_ids_flat = (None if class_ids_flat is None else class_ids_flat.to(torch.long))
         self.full_latent_h = int(full_latent_h)
         self.full_latent_w = int(full_latent_w)
         self.latent_depth = int(latent_depth)
@@ -1331,13 +1379,18 @@ class SlidingWindowTokenDataset(Dataset):
             self.full_latent_h, self.full_latent_w, self.latent_depth
         )
         tok = tok_img[h0:h1, w0:w1, :].contiguous().view(self.window_tokens)
+        class_id = (None if self.class_ids_flat is None else self.class_ids_flat[image_idx])
         if self.coeffs_flat is None:
-            return (tok,)
+            if class_id is None:
+                return (tok,)
+            return tok, class_id
         coeff_img = self.coeffs_flat[image_idx].view(
             self.full_latent_h, self.full_latent_w, self.latent_depth
         )
         coeff = coeff_img[h0:h1, w0:w1, :].contiguous().view(self.window_tokens)
-        return tok, coeff
+        if class_id is None:
+            return tok, coeff
+        return tok, coeff, class_id
 
 
 class Stage1LightningModule(pl.LightningModule):
@@ -1595,6 +1648,7 @@ class Stage2LightningModule(pl.LightningModule):
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
+        sample_class_id: int = -1,
     ):
         super().__init__()
         self.transformer = transformer
@@ -1632,6 +1686,15 @@ class Stage2LightningModule(pl.LightningModule):
         self.patch_context_patches = max(0, int(patch_context_patches))
         self.use_patch_positions = bool(getattr(self.transformer.cfg, "num_patch_positions", 0) > 0)
         self.context_tokens = int(getattr(self.transformer.cfg, "context_tokens", 0))
+        self.num_classes = int(getattr(self.transformer.cfg, "num_classes", 0))
+        self.use_class_conditioning = self.num_classes > 0
+        sample_class_id_int = int(sample_class_id)
+        self.sample_class_id = (None if sample_class_id_int < 0 else sample_class_id_int)
+        if self.use_class_conditioning and self.sample_class_id is not None:
+            if self.sample_class_id >= self.num_classes:
+                raise ValueError(
+                    f"sample_class_id={self.sample_class_id} must be < num_classes={self.num_classes}"
+                )
         self._sample_quantized_vocab_tokens = 0
         self._sample_n_bins = 0
         bottleneck = getattr(self.ae_for_decode, "bottleneck", None)
@@ -1663,6 +1726,8 @@ class Stage2LightningModule(pl.LightningModule):
         self._fid_warned_compute_failed = False
         self._fid_metric = None
         self._fid_metric_feature = None
+        self._last_heartbeat_step = -1
+        self._last_sample_step = -1
 
         self.ae_for_decode.eval()
         for p in self.ae_for_decode.parameters():
@@ -1706,43 +1771,63 @@ class Stage2LightningModule(pl.LightningModule):
     def _get_or_create_fid_metric(self, feature: int):
         feat = int(feature)
         if self._fid_metric is None or self._fid_metric_feature != feat:
-            self._fid_metric = FrechetInceptionDistance(
+            fid = FrechetInceptionDistance(
                 feature=feat,
                 sync_on_compute=False,
             ).to(self.device)
+            # Bypass nn.Module.__setattr__ so the metric is NOT registered as
+            # a submodule.  Registration would make the DDP-wrapped model's
+            # buffer/parameter list differ between rank 0 (where FID runs) and
+            # other ranks, causing _sync_buffers to deadlock on broadcast.
+            object.__setattr__(self, '_fid_metric', fid)
             self._fid_metric_feature = feat
         else:
-            self._fid_metric = self._fid_metric.to(self.device)
+            self._fid_metric.to(self.device)
         self._fid_metric.reset()
         return self._fid_metric
 
     def training_step(self, batch, batch_idx):
+        if not isinstance(batch, (tuple, list)):
+            batch = (batch,)
+        batch_items = list(batch)
+        class_ids = None
+        if self.use_class_conditioning:
+            if len(batch_items) <= 0:
+                raise ValueError("Conditional stage-2 requires class IDs in each batch.")
+            class_ids = batch_items.pop(-1).long()
+
         patch_pos_ids = None
         ctx_tokens = None
         ctx_patch_pos = None
         if self.predict_coefficients:
             if self.use_patch_positions:
-                if len(batch) == 3:
-                    tok_flat, coeff_flat, patch_pos_ids = batch
-                elif len(batch) == 5:
-                    tok_flat, coeff_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch
+                if len(batch_items) == 3:
+                    tok_flat, coeff_flat, patch_pos_ids = batch_items
+                elif len(batch_items) == 5:
+                    tok_flat, coeff_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch_items
                 else:
-                    raise ValueError(f"Unexpected stage2 coefficient batch format with {len(batch)} entries.")
+                    raise ValueError(
+                        f"Unexpected stage2 coefficient batch format with {len(batch_items)} entries."
+                    )
             else:
-                tok_flat, coeff_flat = batch
+                tok_flat, coeff_flat = batch_items
             coeff_flat = coeff_flat.to(torch.float32)
         else:
             if self.use_patch_positions:
-                if len(batch) == 2:
-                    tok_flat, patch_pos_ids = batch
-                elif len(batch) == 4:
-                    tok_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch
+                if len(batch_items) == 2:
+                    tok_flat, patch_pos_ids = batch_items
+                elif len(batch_items) == 4:
+                    tok_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch_items
                 else:
-                    raise ValueError(f"Unexpected stage2 patch batch format with {len(batch)} entries.")
+                    raise ValueError(
+                        f"Unexpected stage2 patch batch format with {len(batch_items)} entries."
+                    )
             else:
-                (tok_flat,) = batch
+                (tok_flat,) = batch_items
             coeff_flat = None
         tok_flat = tok_flat.long()
+        if class_ids is not None:
+            class_ids = class_ids.long()
         if patch_pos_ids is not None:
             patch_pos_ids = patch_pos_ids.long()
         if ctx_tokens is not None:
@@ -1776,7 +1861,11 @@ class Stage2LightningModule(pl.LightningModule):
 
         x_in = seq[:, :-1]
 
-        logits, coeff_pred, _ = self.transformer(x_in, patch_pos_ids=patch_pos_for_x)
+        logits, coeff_pred, _ = self.transformer(
+            x_in,
+            class_ids=class_ids,
+            patch_pos_ids=patch_pos_for_x,
+        )
         if self.predict_coefficients:
             atom_loss = F.cross_entropy(
                 logits.reshape(-1, self.transformer.cfg.vocab_size),
@@ -1827,10 +1916,26 @@ class Stage2LightningModule(pl.LightningModule):
             torch.distributed.barrier()
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        if (
+            self.trainer.is_global_zero
+            and self.global_step > 0
+            and (self.global_step % 50) == 0
+            and int(self.global_step) != int(self._last_heartbeat_step)
+        ):
+            self._last_heartbeat_step = int(self.global_step)
+            print(
+                f"[Stage2] heartbeat step={int(self.global_step)} "
+                f"epoch={int(self.current_epoch) + 1} batch_idx={int(batch_idx)}",
+                flush=True,
+            )
+
         if self.sample_every_steps <= 0:
             return
         if self.global_step <= 0 or (self.global_step % self.sample_every_steps) != 0:
             return
+        if int(self.global_step) == int(self._last_sample_step):
+            return
+        self._last_sample_step = int(self.global_step)
 
         if self._dist_initialized():
             # Keep ranks synchronized while rank0 generates/saves.
@@ -1842,14 +1947,16 @@ class Stage2LightningModule(pl.LightningModule):
                 except Exception as exc:
                     sample_error_flag.fill_(1)
                     print(f"[Stage2] sampling failed at step {self.global_step}: {exc}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             print(f"[rank {self.global_rank}] entering post-sample sync (step {self.global_step})", flush=True)
             torch.distributed.all_reduce(sample_error_flag, op=torch.distributed.ReduceOp.MAX)
             self._dist_barrier()
             print(f"[rank {self.global_rank}] post-sample sync done (step {self.global_step})", flush=True)
             if int(sample_error_flag.item()) != 0:
                 raise RuntimeError(f"Stage-2 sampling failed at step {self.global_step} on at least one rank.")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return
         if self.trainer.is_global_zero:
             self._sample_and_save(step=self.global_step)
@@ -1901,8 +2008,26 @@ class Stage2LightningModule(pl.LightningModule):
         tokens_gen = gen.view(-1, self.H, self.W, self.D)
         return self.ae_for_decode.decode_from_tokens(tokens_gen.to(self.device))
 
+    def _build_sample_class_ids(self, batch_size: int, start_idx: int = 0) -> Optional[torch.Tensor]:
+        if not self.use_class_conditioning:
+            return None
+        if self.sample_class_id is not None:
+            return torch.full((int(batch_size),), int(self.sample_class_id), dtype=torch.long, device=self.device)
+        base = torch.arange(
+            int(start_idx),
+            int(start_idx) + int(batch_size),
+            dtype=torch.long,
+            device=self.device,
+        )
+        return torch.remainder(base, max(1, int(self.num_classes)))
+
     @torch.no_grad()
-    def _sample_sliding_window_batch(self, step: int, batch_size: int) -> torch.Tensor:
+    def _sample_sliding_window_batch(
+        self,
+        step: int,
+        batch_size: int,
+        class_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B = int(batch_size)
         bos_id = int(self.transformer.bos_token_id)
         win_tokens = int(self.H * self.W * self.D)
@@ -1922,6 +2047,7 @@ class Stage2LightningModule(pl.LightningModule):
                 top_k=self.sample_top_k,
                 show_progress=False,
                 progress_desc=f"[Stage2] sample step {step}",
+                class_ids=class_ids,
                 patch_pos_ids=None,
             )
             return self._decode_generated_batch(gen)
@@ -1968,7 +2094,11 @@ class Stage2LightningModule(pl.LightningModule):
             window_flat = generated[:, h0 : h0 + self.H, w0 : w0 + self.W, :].contiguous().view(B, win_tokens)
             ctx = window_flat[:, :local_t]
             seq = torch.cat([bos, ctx], dim=1)
-            logits, coeff_pred, _ = self.transformer(seq, patch_pos_ids=None)
+            logits, coeff_pred, _ = self.transformer(
+                seq,
+                class_ids=class_ids,
+                patch_pos_ids=None,
+            )
             logits = logits[:, -1, :] / self.sample_temperature
             logits = self._apply_sampling_constraints(logits)
             if self.sample_top_k is not None:
@@ -2000,6 +2130,7 @@ class Stage2LightningModule(pl.LightningModule):
         batch_size: int,
         temperature: float = 1.0,
         top_k: Optional[int] = 256,
+        class_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.predict_coefficients:
             raise NotImplementedError("Patch-context sampling is only supported in quantized-token mode.")
@@ -2048,7 +2179,11 @@ class Stage2LightningModule(pl.LightningModule):
                 pp = nxt_patch_pos
 
             atom_logits, _, kv_cache = self.transformer(
-                inp, patch_pos_ids=pp, kv_cache=kv_cache, start_pos=start_pos,
+                inp,
+                class_ids=class_ids,
+                patch_pos_ids=pp,
+                kv_cache=kv_cache,
+                start_pos=start_pos,
             )
             logits = atom_logits[:, -1, :] / max(temperature, 1e-8)
             logits = self._apply_sampling_constraints(logits)
@@ -2065,7 +2200,12 @@ class Stage2LightningModule(pl.LightningModule):
         return seq[:, -T:]
 
     @torch.no_grad()
-    def _sample_patch_grid_batch(self, step: int, batch_size: int) -> torch.Tensor:
+    def _sample_patch_grid_batch(
+        self,
+        step: int,
+        batch_size: int,
+        class_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         total_patches = self.patch_grid_h * self.patch_grid_w
         generated_patch_tokens: list[torch.Tensor] = []
         patch_batches = []
@@ -2077,6 +2217,7 @@ class Stage2LightningModule(pl.LightningModule):
                     batch_size=batch_size,
                     temperature=self.sample_temperature,
                     top_k=self.sample_top_k,
+                    class_ids=class_ids,
                 )
                 generated_patch_tokens.append(patch_tokens)
                 patch_img = self.ae_for_decode.decode_from_tokens(
@@ -2097,6 +2238,7 @@ class Stage2LightningModule(pl.LightningModule):
                     top_k=self.sample_top_k,
                     show_progress=False,
                     progress_desc=f"[Stage2] patch {patch_idx + 1}/{total_patches} step {step}",
+                    class_ids=class_ids,
                     patch_pos_ids=patch_pos_ids,
                 )
                 patch_img = self._decode_generated_batch(gen_patch)
@@ -2119,17 +2261,23 @@ class Stage2LightningModule(pl.LightningModule):
         )
 
     @torch.no_grad()
-    def _sample_raw_images(self, step: int, batch_size: int) -> torch.Tensor:
+    def _sample_raw_images(
+        self,
+        step: int,
+        batch_size: int,
+        class_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self.use_sliding_window_sampling:
-            return self._sample_sliding_window_batch(step=step, batch_size=batch_size)
+            return self._sample_sliding_window_batch(step=step, batch_size=batch_size, class_ids=class_ids)
         if self.patch_grid_h > 1 or self.patch_grid_w > 1:
-            return self._sample_patch_grid_batch(step=step, batch_size=batch_size)
+            return self._sample_patch_grid_batch(step=step, batch_size=batch_size, class_ids=class_ids)
         gen = self.transformer.generate(
             batch_size=int(batch_size),
             temperature=self.sample_temperature,
             top_k=self.sample_top_k,
             show_progress=True,
             progress_desc=f"[Stage2] sample step {step}",
+            class_ids=class_ids,
             patch_pos_ids=None,
         )
         return self._decode_generated_batch(gen)
@@ -2166,17 +2314,35 @@ class Stage2LightningModule(pl.LightningModule):
         total_batch = int(self.sample_batch_size)
         micro_batch = max(1, min(int(self.sample_micro_batch_size), total_batch))
         raw_parts = []
-        for start in range(0, total_batch, micro_batch):
+        chunk_starts = list(range(0, total_batch, micro_batch))
+        chunk_total = len(chunk_starts)
+        tqdm_disable = str(os.environ.get("TQDM_DISABLE", "")).strip().lower() in {"1", "true", "yes", "on"}
+        chunk_iter = tqdm(
+            chunk_starts,
+            desc=f"[Stage2] sampling chunks step {step}",
+            total=chunk_total,
+            leave=True,
+            dynamic_ncols=True,
+            disable=tqdm_disable,
+        )
+        for chunk_idx, start in enumerate(chunk_iter, start=1):
             cur_bs = min(micro_batch, total_batch - start)
-            if total_batch > micro_batch:
-                chunk_idx = (start // micro_batch) + 1
-                chunk_total = int(math.ceil(total_batch / float(micro_batch)))
-                print(f"[Stage2] sampling chunk {chunk_idx}/{chunk_total} (batch={cur_bs})")
-            raw_chunk = self._sample_raw_images(step=step, batch_size=cur_bs)
+            if chunk_total > 1:
+                chunk_iter.set_postfix_str(f"chunk={chunk_idx}/{chunk_total} batch={cur_bs}")
+                print(
+                    f"[Stage2] sampling chunk {chunk_idx}/{chunk_total} (batch={cur_bs})",
+                    flush=True,
+                )
+            chunk_class_ids = self._build_sample_class_ids(batch_size=cur_bs, start_idx=start)
+            raw_chunk = self._sample_raw_images(
+                step=step,
+                batch_size=cur_bs,
+                class_ids=chunk_class_ids,
+            )
             raw_parts.append(raw_chunk)
         raw_imgs = raw_parts[0] if len(raw_parts) == 1 else torch.cat(raw_parts, dim=0)
         sample_imgs = self._maybe_resize_samples(raw_imgs)
-        print(f"[Stage2] sample tensor shape: {tuple(sample_imgs.shape)}")
+        print(f"[Stage2] sample tensor shape: {tuple(sample_imgs.shape)}", flush=True)
         logged = log_image_grid_wandb(
             self.logger,
             key="stage2/samples",
@@ -2190,7 +2356,7 @@ class Stage2LightningModule(pl.LightningModule):
         del raw_imgs, sample_imgs, raw_parts
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print(f"[Stage2] sampling done at step {step}")
+        print(f"[Stage2] sampling done at step {step}", flush=True)
         self.transformer.train()
 
     @torch.no_grad()
@@ -2243,15 +2409,40 @@ class Stage2LightningModule(pl.LightningModule):
 
         try:
             fid_metric = self._get_or_create_fid_metric(effective_feature)
-            fid_metric.update(real_u8, real=True)
-            fid_metric.update(fake_u8, real=False)
+            fid_update_bs = min(128, int(n))
+            fid_chunk_starts = list(range(0, int(n), fid_update_bs))
+            tqdm_disable = str(os.environ.get("TQDM_DISABLE", "")).strip().lower() in {"1", "true", "yes", "on"}
+            print(
+                f"[Stage2] FID compute start (n={n}, feature={effective_feature}, chunk_bs={fid_update_bs})",
+                flush=True,
+            )
+            for start in tqdm(
+                fid_chunk_starts,
+                desc=f"[Stage2] FID update step {step}",
+                total=len(fid_chunk_starts),
+                leave=True,
+                dynamic_ncols=True,
+                disable=tqdm_disable,
+            ):
+                end = min(start + fid_update_bs, int(n))
+                if len(fid_chunk_starts) > 1:
+                    chunk_idx = (start // fid_update_bs) + 1
+                    print(
+                        f"[Stage2] FID chunk {chunk_idx}/{len(fid_chunk_starts)}",
+                        flush=True,
+                    )
+                fid_metric.update(real_u8[start:end], real=True)
+                fid_metric.update(fake_u8[start:end], real=False)
             fid_value = float(fid_metric.compute().detach().cpu().item())
             fid_metric.reset()
+            print(f"[Stage2] FID compute done: {fid_value:.4f}", flush=True)
         except Exception as exc:
             if not self._fid_warned_compute_failed:
                 print(f"[Stage2] FID compute failed at step {step}: {exc}")
                 self._fid_warned_compute_failed = True
             fid_value = -1.0
+        if self._fid_metric is not None:
+            self._fid_metric.cpu()
         logged = log_scalar_wandb(
             self.logger,
             key="stage2/fid",
@@ -2269,21 +2460,24 @@ def precompute_tokens(
     loader: DataLoader,
     device: torch.device,
     max_items: Optional[int] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, int, int]:
+    collect_labels: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int, int, int]:
     """
     Encode dataset to tokens for stage-2 training.
     Returns:
       tokens_flat: [N, H*W*D] int32
       coeffs_flat: [N, H*W*D] float32 (None if quantized)
+      class_ids_flat: [N] int64 (None when collect_labels=False)
       H, W, D
     """
     ae.eval()
     all_tokens = []
     all_coeffs = []
+    all_class_ids = []
     seen = 0
     H = W = D = None
 
-    for x, _ in tqdm(loader, desc="[Stage2] precompute tokens"):
+    for x, y in tqdm(loader, desc="[Stage2] precompute tokens"):
         x = x.to(device)
         if ae.bottleneck.quantize_sparse_coeffs:
             tokens, h, w = ae.encode_to_tokens(x)
@@ -2297,6 +2491,11 @@ def precompute_tokens(
         all_tokens.append(flat)
         if coeffs is not None:
             all_coeffs.append(coeffs.view(coeffs.size(0), -1).to(torch.float32).cpu())
+        if collect_labels:
+            y_t = torch.as_tensor(y, dtype=torch.long)
+            if y_t.dim() == 0:
+                y_t = y_t.view(1)
+            all_class_ids.append(y_t[: flat.size(0)].cpu())
         seen += flat.size(0)
         if max_items is not None and seen >= max_items:
             break
@@ -2306,11 +2505,14 @@ def precompute_tokens(
         coeffs_flat = torch.cat(all_coeffs, dim=0)
     else:
         coeffs_flat = None
+    class_ids_flat = torch.cat(all_class_ids, dim=0) if (collect_labels and len(all_class_ids) > 0) else None
     if max_items is not None:
         tokens_flat = tokens_flat[:max_items]
         if coeffs_flat is not None:
             coeffs_flat = coeffs_flat[:max_items]
-    return tokens_flat, coeffs_flat, H, W, D
+        if class_ids_flat is not None:
+            class_ids_flat = class_ids_flat[:max_items]
+    return tokens_flat, coeffs_flat, class_ids_flat, H, W, D
 
 
 @torch.no_grad()
@@ -2322,13 +2524,15 @@ def precompute_patch_grid_tokens(
     patch_stride: int,
     patch_encode_batch_size: int = 512,
     max_items: Optional[int] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, int, int, int, int, int]:
+    collect_labels: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], int, int, int, int, int]:
     """
     Encode full-resolution images as patch tokens for stage-2 patch-grid generation.
     Returns:
       tokens_flat: [N_patches, H*W*D] int32
       coeffs_flat: [N_patches, H*W*D] float32 (None if quantized)
       patch_pos_flat: [N_patches] int64 patch index in raster order
+      class_ids_flat: [N_patches] int64 (None when collect_labels=False)
       H, W, D: latent patch shape
       grid_h, grid_w: patch grid shape over the full image
     """
@@ -2336,18 +2540,20 @@ def precompute_patch_grid_tokens(
     all_tokens = []
     all_coeffs = []
     all_patch_pos = []
+    all_class_ids = []
     seen_images = 0
     H = W = D = None
     grid_h = grid_w = None
     chunk_bs = max(1, int(patch_encode_batch_size))
 
-    for x, _ in tqdm(loader, desc="[Stage2] precompute patch-grid tokens"):
+    for x, y in tqdm(loader, desc="[Stage2] precompute patch-grid tokens"):
         if max_items is not None:
             remaining = int(max_items) - seen_images
             if remaining <= 0:
                 break
             if x.size(0) > remaining:
                 x = x[:remaining]
+                y = y[:remaining]
         if x.numel() == 0:
             continue
 
@@ -2360,6 +2566,13 @@ def precompute_patch_grid_tokens(
             )
 
         patch_pos = torch.arange(gh * gw, dtype=torch.long).unsqueeze(0).expand(x.size(0), -1).reshape(-1)
+        if collect_labels:
+            y_t = torch.as_tensor(y, dtype=torch.long)
+            if y_t.dim() == 0:
+                y_t = y_t.view(1)
+            patch_class_ids = y_t.view(-1, 1).expand(-1, gh * gw).reshape(-1).cpu()
+        else:
+            patch_class_ids = None
 
         for start in range(0, patches.size(0), chunk_bs):
             end = min(start + chunk_bs, patches.size(0))
@@ -2378,6 +2591,8 @@ def precompute_patch_grid_tokens(
             all_patch_pos.append(patch_pos[start:end].to(torch.long).cpu())
             if coeffs is not None:
                 all_coeffs.append(coeffs.view(coeffs.size(0), -1).to(torch.float32).cpu())
+            if patch_class_ids is not None:
+                all_class_ids.append(patch_class_ids[start:end].to(torch.long))
 
         seen_images += x.size(0)
         if max_items is not None and seen_images >= max_items:
@@ -2389,7 +2604,8 @@ def precompute_patch_grid_tokens(
     tokens_flat = torch.cat(all_tokens, dim=0)
     patch_pos_flat = torch.cat(all_patch_pos, dim=0)
     coeffs_flat = torch.cat(all_coeffs, dim=0) if len(all_coeffs) > 0 else None
-    return tokens_flat, coeffs_flat, patch_pos_flat, H, W, D, grid_h, grid_w
+    class_ids_flat = torch.cat(all_class_ids, dim=0) if len(all_class_ids) > 0 else None
+    return tokens_flat, coeffs_flat, patch_pos_flat, class_ids_flat, H, W, D, grid_h, grid_w
 
 
 @torch.no_grad()
@@ -2424,7 +2640,7 @@ def collect_real_images_uint8(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "celeba"])
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "celeba", "stl10", "imagenette"])
     parser.add_argument("--data_dir", type=str, default=None, help="Root directory for dataset files.")
     parser.add_argument("--image_size", type=int, default=None, help="Legacy alias for --crop_size.")
     parser.add_argument(
@@ -2464,7 +2680,7 @@ def main():
     parser.add_argument(
         "--stage1_val_vis_batch_size",
         type=int,
-        default=32,
+        default=64,
         help="Number of full-resolution validation images logged each stage-1 epoch.",
     )
 
@@ -2507,8 +2723,26 @@ def main():
     parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--stage2_batch_size", type=int, default=16)
     parser.add_argument("--stage2_grad_accum", type=int, default=4, help="Gradient accumulation steps for stage-2.")
+    parser.add_argument(
+        "--stage2_conditional",
+        action="store_true",
+        default=False,
+        help="Condition stage-2 generation on class labels.",
+    )
+    parser.add_argument(
+        "--stage2_num_classes",
+        type=int,
+        default=None,
+        help="Number of classes for stage-2 conditioning (default: inferred from dataset).",
+    )
+    parser.add_argument(
+        "--stage2_sample_class_id",
+        type=int,
+        default=-1,
+        help="Class id used for conditional stage-2 samples (<0 cycles classes in the sample batch).",
+    )
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
-    parser.add_argument("--stage2_sample_batch_size", type=int, default=32)
+    parser.add_argument("--stage2_sample_batch_size", type=int, default=64)
     parser.add_argument(
         "--stage2_sample_micro_batch_size",
         type=int,
@@ -2640,22 +2874,33 @@ def main():
         raise ValueError("stage2_sample_temperature must be > 0.")
     if args.stage2_sample_coef_extreme_penalty < 0.0:
         raise ValueError("stage2_sample_coef_extreme_penalty must be >= 0.")
+    if args.stage2_num_classes is not None and int(args.stage2_num_classes) <= 1:
+        raise ValueError("stage2_num_classes must be > 1 when provided.")
     if args.ae_num_downsamples <= 0:
         raise ValueError(f"ae_num_downsamples must be positive, got {args.ae_num_downsamples}")
-    if args.image_size is not None:
-        args.crop_size = int(args.image_size)
-    args.image_size = int(args.crop_size)
-    if not args.center_crop_only:
-        if args.resize_size < args.image_size:
-            raise ValueError(
-                f"resize_size ({args.resize_size}) must be >= crop_size ({args.image_size})."
-            )
-        if args.resize_size >= (2 * args.image_size):
-            print(
-                f"[Data] WARNING: resize_size={args.resize_size} is much larger than crop_size={args.image_size}. "
-                "This can make stage-1 reconstruction harder and depress PSNR."
-            )
-    effective_source_size = int(args.image_size if args.center_crop_only else args.resize_size)
+    use_direct_resize_only = args.dataset in ("celeba", "imagenette")
+    if use_direct_resize_only:
+        # For direct-resize datasets, crop_size/image_size are not used by transforms.
+        # Keep them aligned to resize_size to avoid misleading warnings/logs.
+        args.crop_size = int(args.resize_size)
+        args.image_size = int(args.resize_size)
+    else:
+        if args.image_size is not None:
+            args.crop_size = int(args.image_size)
+        args.image_size = int(args.crop_size)
+        if not args.center_crop_only:
+            if args.resize_size < args.image_size:
+                raise ValueError(
+                    f"resize_size ({args.resize_size}) must be >= crop_size ({args.image_size})."
+                )
+            if args.resize_size >= (2 * args.image_size):
+                print(
+                    f"[Data] WARNING: resize_size={args.resize_size} is much larger than crop_size={args.image_size}. "
+                    "This can make stage-1 reconstruction harder and depress PSNR."
+                )
+    effective_source_size = int(args.resize_size) if use_direct_resize_only else int(
+        args.image_size if args.center_crop_only else args.resize_size
+    )
     if args.stage2_patchify and args.stage2_sliding_window:
         raise ValueError("stage2_patchify and stage2_sliding_window are mutually exclusive.")
     if args.stage2_patchify:
@@ -2679,9 +2924,29 @@ def main():
         if args.stage2_window_stride_latent <= 0:
             raise ValueError("stage2_window_stride_latent must be positive.")
     if args.data_dir is None:
-        args.data_dir = "../../data/celeba" if args.dataset == "celeba" else "./data"
+        if args.dataset == "celeba":
+            args.data_dir = "../../data/celeba"
+        elif args.dataset == "imagenette":
+            args.data_dir = "./data/imagenette2-160"
+        else:
+            args.data_dir = "./data"
     if args.out_dir is None:
         args.out_dir = f"./runs/sparse_dict_rq_{args.dataset}_{args.image_size}"
+    dataset_num_classes_hint = 10 if args.dataset in ("cifar10", "stl10", "imagenette") else 0
+    requested_stage2_num_classes = 0
+    if args.stage2_conditional:
+        requested_stage2_num_classes = int(
+            args.stage2_num_classes
+            if args.stage2_num_classes is not None
+            else dataset_num_classes_hint
+        )
+        if requested_stage2_num_classes <= 1:
+            raise ValueError(
+                "stage2_conditional requires a labeled dataset (e.g., cifar10/stl10/imagenette) "
+                "or explicit --stage2_num_classes > 1."
+            )
+    elif args.stage2_num_classes is not None:
+        print("[Stage2] WARNING: --stage2_num_classes is ignored unless --stage2_conditional is enabled.")
 
     pl.seed_everything(args.seed, workers=True)
     torch.manual_seed(args.seed)
@@ -2694,6 +2959,8 @@ def main():
         f"[Data] dataset={args.dataset} data_dir={args.data_dir} "
         f"resize_size={args.resize_size} crop_size={args.image_size} "
         f"center_crop_only={args.center_crop_only} "
+        f"stage2_conditional={args.stage2_conditional} "
+        f"stage2_num_classes={requested_stage2_num_classes} "
         f"stage2_patchify={args.stage2_patchify} "
         f"stage2_sliding_window={args.stage2_sliding_window} "
         f"context_patches={args.stage2_patch_context_patches if args.stage2_patchify else 0}"
@@ -2768,6 +3035,8 @@ def main():
         tokens_flat: torch.Tensor,
         coeffs_flat: Optional[torch.Tensor],
         patch_pos_flat: Optional[torch.Tensor],
+        class_ids_flat: Optional[torch.Tensor],
+        stage2_num_classes: int,
         quantize_sparse_coeffs: bool,
         H: int,
         W: int,
@@ -2792,12 +3061,29 @@ def main():
             raise ValueError("patch_pos_flat is required for patch context training.")
         if sample_latent_shape is not None and patch_grid_shape is not None:
             raise ValueError("sample_latent_shape and patch_grid_shape cannot both be set.")
+        if int(stage2_num_classes) > 0:
+            if class_ids_flat is None:
+                raise ValueError("Conditional stage-2 requires class_ids_flat.")
+            if class_ids_flat.dim() != 1 or class_ids_flat.shape[0] != tokens_flat.shape[0]:
+                raise ValueError(
+                    f"class_ids_flat must be [N] with N={tokens_flat.shape[0]}, got {tuple(class_ids_flat.shape)}"
+                )
+            class_ids_flat = class_ids_flat.to(torch.long)
+            cmin = int(class_ids_flat.min().item())
+            cmax = int(class_ids_flat.max().item())
+            if cmin < 0 or cmax >= int(stage2_num_classes):
+                raise ValueError(
+                    f"class_ids_flat out of range [0, {int(stage2_num_classes) - 1}]: min={cmin}, max={cmax}"
+                )
+        else:
+            class_ids_flat = None
 
         stage2_dm = Stage2TokenDataModule(
             tokens_flat=tokens_flat,
             batch_size=args.stage2_batch_size,
             coeffs_flat=None if coeffs_flat is None else coeffs_flat,
             patch_pos_flat=patch_pos_flat,
+            class_ids_flat=class_ids_flat,
             context_patches=(args.stage2_patch_context_patches if patch_grid_shape is not None else 0),
             pad_token_id=ae_model.bottleneck.pad_token_id,
             sliding_window_shape=((int(H), int(W)) if sample_latent_shape is not None else None),
@@ -2820,6 +3106,7 @@ def main():
             H=H,
             W=W,
             D=D,
+            num_classes=int(stage2_num_classes),
             num_patch_positions=patch_positions,
             context_tokens=context_tokens,
             predict_coefficients=not quantize_sparse_coeffs,
@@ -2831,6 +3118,16 @@ def main():
             d_ff=args.tf_ff,
             dropout=args.tf_dropout,
         )
+        if int(stage2_num_classes) > 0:
+            sample_class_note = (
+                "cycle"
+                if int(args.stage2_sample_class_id) < 0
+                else str(int(args.stage2_sample_class_id))
+            )
+            print(
+                f"[Stage2] conditional mode enabled: num_classes={int(stage2_num_classes)} "
+                f"(sample_class_id={sample_class_note})"
+            )
         transformer = RQTransformerPrior(
             cfg,
             bos_token_id=ae_model.bottleneck.bos_token_id,
@@ -2887,6 +3184,7 @@ def main():
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
+            sample_class_id=args.stage2_sample_class_id,
         )
 
         effective_strategy = (args.stage2_strategy if args.stage2_devices > 1 else "auto")
@@ -2929,6 +3227,8 @@ def main():
         tokens_flat = cache["tokens_flat"]
         coeffs_flat = cache.get("coeffs_flat")
         patch_pos_flat = cache.get("patch_pos_flat")
+        class_ids_flat = cache.get("class_ids_flat")
+        stage2_num_classes = int(cache.get("stage2_num_classes", requested_stage2_num_classes))
         quantize_sparse_coeffs = cache.get("quantize_sparse_coeffs", True)
         H, W, D = cache["shape"]
         patch_grid_shape = cache.get("patch_grid_shape")
@@ -2946,6 +3246,8 @@ def main():
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
             patch_pos_flat=patch_pos_flat,
+            class_ids_flat=class_ids_flat,
+            stage2_num_classes=stage2_num_classes,
             quantize_sparse_coeffs=quantize_sparse_coeffs,
             H=H,
             W=W,
@@ -3013,6 +3315,32 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
+    # For CelebA/Imagenette, use direct square resize without center-cropping.
+    # Use resize_size as the single source of truth so runs do not need crop_size/image_size.
+    if args.dataset in ("celeba", "imagenette"):
+        resize_hw = (args.resize_size, args.resize_size)
+        train_tfm = transforms.Compose([
+            transforms.Resize(resize_hw),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        eval_tfm = transforms.Compose([
+            transforms.Resize(resize_hw),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        val_vis_tfm = transforms.Compose([
+            transforms.Resize(resize_hw),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        stage2_source_tfm = transforms.Compose([
+            transforms.Resize(resize_hw),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+
+    dataset_num_classes = 0
     if args.dataset == "cifar10":
         train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_tfm)
         val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
@@ -3026,6 +3354,21 @@ def main():
             )
         else:
             stage2_source_set = train_set
+        dataset_num_classes = 10
+    elif args.dataset == "stl10":
+        train_set = datasets.STL10(root=args.data_dir, split="train", download=True, transform=train_tfm)
+        val_set = datasets.STL10(root=args.data_dir, split="test", download=True, transform=eval_tfm)
+        val_vis_set = datasets.STL10(root=args.data_dir, split="test", download=True, transform=val_vis_tfm)
+        if args.stage2_patchify or args.stage2_sliding_window:
+            stage2_source_set = datasets.STL10(
+                root=args.data_dir,
+                split="train",
+                download=True,
+                transform=stage2_source_tfm,
+            )
+        else:
+            stage2_source_set = train_set
+        dataset_num_classes = 10
     elif args.dataset == "celeba":
         train_full = FlatImageDataset(root=args.data_dir, transform=train_tfm)
         val_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
@@ -3045,11 +3388,52 @@ def main():
             stage2_source_set = Subset(stage2_source_full, train_indices)
         else:
             stage2_source_set = train_set
+        dataset_num_classes = 0
+    elif args.dataset == "imagenette":
+        train_dir = os.path.join(args.data_dir, "train")
+        val_dir = os.path.join(args.data_dir, "val")
+        if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+            train_set = datasets.ImageFolder(root=train_dir, transform=train_tfm)
+            val_set = datasets.ImageFolder(root=val_dir, transform=eval_tfm)
+            val_vis_set = datasets.ImageFolder(root=val_dir, transform=val_vis_tfm)
+            if args.stage2_patchify or args.stage2_sliding_window:
+                stage2_source_set = datasets.ImageFolder(root=train_dir, transform=stage2_source_tfm)
+            else:
+                stage2_source_set = train_set
+            dataset_num_classes = len(getattr(train_set, "classes", []))
+        else:
+            # Fallback: single ImageFolder root; split train/val deterministically.
+            train_full = datasets.ImageFolder(root=args.data_dir, transform=train_tfm)
+            val_full = datasets.ImageFolder(root=args.data_dir, transform=eval_tfm)
+            val_vis_full = datasets.ImageFolder(root=args.data_dir, transform=val_vis_tfm)
+            stage2_source_full = datasets.ImageFolder(root=args.data_dir, transform=stage2_source_tfm)
+            if len(train_full) < 2:
+                raise RuntimeError("Imagenette dataset needs at least 2 images for train/val split.")
+            val_size = max(1, int(0.05 * len(train_full)))
+            train_size = len(train_full) - val_size
+            all_indices = torch.randperm(len(train_full), generator=torch.Generator().manual_seed(args.seed))
+            train_indices = all_indices[:train_size].tolist()
+            val_indices = all_indices[train_size:].tolist()
+            train_set = Subset(train_full, train_indices)
+            val_set = Subset(val_full, val_indices)
+            val_vis_set = Subset(val_vis_full, val_indices)
+            if args.stage2_patchify or args.stage2_sliding_window:
+                stage2_source_set = Subset(stage2_source_full, train_indices)
+            else:
+                stage2_source_set = train_set
+            dataset_num_classes = len(getattr(train_full, "classes", []))
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
+    stage2_num_classes = int(requested_stage2_num_classes)
+    if stage2_num_classes > 0 and dataset_num_classes <= 1:
+        print(
+            "[Stage2] WARNING: conditional mode is enabled but dataset labels are "
+            "not known to provide multiple classes."
+        )
+
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
 
     stage1_val_vis_images = None
     if args.stage1_val_vis_batch_size > 0 and len(val_vis_set) > 0:
@@ -3127,6 +3511,20 @@ def main():
         tokens_flat = cache["tokens_flat"]
         coeffs_flat = cache.get("coeffs_flat")
         patch_pos_flat = cache.get("patch_pos_flat")
+        class_ids_flat = cache.get("class_ids_flat")
+        cached_stage2_num_classes = int(cache.get("stage2_num_classes", 0))
+        if stage2_num_classes > 0 and cached_stage2_num_classes not in (0, int(stage2_num_classes)):
+            print(
+                f"[Stage2] WARNING: cached stage2_num_classes={cached_stage2_num_classes} "
+                f"differs from requested {stage2_num_classes}; using requested value."
+            )
+        if stage2_num_classes > 0 and class_ids_flat is None:
+            raise ValueError(
+                "Cached token file does not contain class_ids_flat required for conditional stage-2. "
+                "Delete token cache or run with stage1_epochs > 0 to rebuild it."
+            )
+        if stage2_num_classes <= 0 and cached_stage2_num_classes > 0 and class_ids_flat is not None:
+            print("[Stage2] cached class labels found; ignoring because stage2_conditional is disabled.")
         H, W, D = cache["shape"]
         patch_grid_shape = cache.get("patch_grid_shape")
         patch_size = int(cache.get("patch_size", args.stage2_patch_size))
@@ -3153,6 +3551,7 @@ def main():
         )
         patch_pos_flat = None
         patch_grid_shape = None
+        class_ids_flat = None
         patch_size = int(args.stage2_patch_size)
         patch_stride = int(args.stage2_patch_stride)
         sample_latent_shape = None
@@ -3162,6 +3561,7 @@ def main():
                 tokens_flat,
                 coeffs_flat,
                 patch_pos_flat,
+                class_ids_flat,
                 H,
                 W,
                 D,
@@ -3175,14 +3575,16 @@ def main():
                 patch_stride=patch_stride,
                 patch_encode_batch_size=args.stage2_patch_encode_batch_size,
                 max_items=min(args.token_subset, len(stage2_source_set)),
+                collect_labels=(stage2_num_classes > 0),
             )
             patch_grid_shape = (patch_grid_h, patch_grid_w)
         elif args.stage2_sliding_window:
-            tokens_flat, coeffs_flat, full_H, full_W, D = precompute_tokens(
+            tokens_flat, coeffs_flat, class_ids_flat, full_H, full_W, D = precompute_tokens(
                 ae,
                 token_loader,
                 encode_device,
                 max_items=min(args.token_subset, len(stage2_source_set)),
+                collect_labels=(stage2_num_classes > 0),
             )
             H = int(args.stage2_window_latent_h)
             W = int(args.stage2_window_latent_w)
@@ -3193,11 +3595,12 @@ def main():
             sample_latent_shape = (int(full_H), int(full_W))
             sliding_window_stride_latent = int(args.stage2_window_stride_latent)
         else:
-            tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
+            tokens_flat, coeffs_flat, class_ids_flat, H, W, D = precompute_tokens(
                 ae,
                 token_loader,
                 encode_device,
                 max_items=min(args.token_subset, len(stage2_source_set)),
+                collect_labels=(stage2_num_classes > 0),
             )
     if not _use_token_cache:
         fid_real_loader = DataLoader(
@@ -3217,6 +3620,8 @@ def main():
                 "tokens_flat": tokens_flat,
                 "coeffs_flat": coeffs_flat,
                 "patch_pos_flat": patch_pos_flat,
+                "class_ids_flat": class_ids_flat,
+                "stage2_num_classes": int(stage2_num_classes),
                 "quantize_sparse_coeffs": args.quantize_sparse_coeffs,
                 "shape": (H, W, D),
                 "patch_grid_shape": patch_grid_shape,
@@ -3253,6 +3658,8 @@ def main():
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
             patch_pos_flat=patch_pos_flat,
+            class_ids_flat=class_ids_flat,
+            stage2_num_classes=stage2_num_classes,
             quantize_sparse_coeffs=args.quantize_sparse_coeffs,
             H=H,
             W=W,
