@@ -505,8 +505,8 @@ class RQTransformerConfig:
     num_classes: int = 0
     coeff_max: Optional[float] = 12.0
     d_model: int = 256
-    n_heads: int = 8
-    n_layers: int = 6
+    n_heads: int = 4
+    n_layers: int = 4
     d_ff: int = 1024
     dropout: float = 0.1
 
@@ -1236,10 +1236,10 @@ def main():
     )
     parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
     parser.add_argument("--stage2_fid_feature", type=int, default=64)
-    parser.add_argument("--tf_d_model", type=int, default=384)
-    parser.add_argument("--tf_heads", type=int, default=8)
-    parser.add_argument("--tf_layers", type=int, default=8)
-    parser.add_argument("--tf_ff", type=int, default=1536)
+    parser.add_argument("--tf_d_model", type=int, default=256)
+    parser.add_argument("--tf_heads", type=int, default=4)
+    parser.add_argument("--tf_layers", type=int, default=4)
+    parser.add_argument("--tf_ff", type=int, default=1024)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument("--token_subset", type=int, default=50000)
     parser.add_argument("--wandb_mode", type=str, default="online",
