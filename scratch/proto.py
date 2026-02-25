@@ -1692,6 +1692,11 @@ def main():
             token_cache_path, map_location="cpu", weights_only=False,
         )
         tokens_flat = cache["tokens"]
+        if tokens_flat.size(0) == 0:
+            print("[WARNING] Cached tokens are empty, recomputing...")
+            os.remove(token_cache_path)
+            use_cache = False
+    if use_cache:
         coeffs_flat = cache["coeffs"]
         class_ids_flat = cache.get("class_ids")
         fid_real_images = cache.get("fid_real_images")
