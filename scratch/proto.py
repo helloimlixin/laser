@@ -1705,7 +1705,10 @@ def main():
         )
         tokens_flat, coeffs_flat, class_ids_flat, H, W, D = precompute_tokens(
             ae, tok_loader, device,
-            max_items=min(args.token_subset, len(train_set)),
+            max_items=(
+                min(args.token_subset, len(train_set))
+                if args.token_subset > 0 else None
+            ),
             collect_labels=(stage2_num_classes > 0),
         )
         fid_loader = DataLoader(
