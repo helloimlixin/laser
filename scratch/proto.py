@@ -653,6 +653,55 @@ class RQTransformerPrior(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Spatial coefficient refinement (post-transformer)
+# ---------------------------------------------------------------------------
+
+class CoeffRefiner(nn.Module):
+    """Spatial CNN that refines per-token coefficient predictions from the
+    transformer by enforcing coherence across the (H, W) spatial grid.
+
+    The transformer predicts coefficients independently per token position.
+    This module takes the raw predictions, embeds the selected atom IDs for
+    context, and applies spatial convolutions so that neighboring positions
+    produce mutually consistent coefficients.
+    """
+
+    def __init__(self, K: int, vocab_size: int, atom_embed_dim: int = 16,
+                 hidden_dim: int = 64, num_layers: int = 4):
+        super().__init__()
+        self.K = K
+        self.atom_emb = nn.Embedding(vocab_size, atom_embed_dim)
+        in_ch = K * (atom_embed_dim + 1)
+        layers: list[nn.Module] = []
+        ch = in_ch
+        for i in range(num_layers):
+            out_ch = hidden_dim if i < num_layers - 1 else K
+            layers.append(nn.Conv2d(ch, out_ch, 3, padding=1))
+            if i < num_layers - 1:
+                layers.append(nn.GroupNorm(min(8, out_ch), out_ch))
+                layers.append(nn.GELU())
+            ch = out_ch
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, atom_ids: torch.Tensor,
+                coeffs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            atom_ids: [B, H, W, K] long — selected atom indices.
+            coeffs:   [B, H, W, K] float — raw coefficient predictions.
+
+        Returns:
+            [B, H, W, K] refined coefficients (residual correction).
+        """
+        B, H, W, K = atom_ids.shape
+        emb = self.atom_emb(atom_ids.long())               # [B, H, W, K, E]
+        feat = torch.cat([emb, coeffs.unsqueeze(-1)], dim=-1)
+        feat = feat.reshape(B, H, W, -1).permute(0, 3, 1, 2)
+        delta = self.net(feat)                              # [B, K, H, W]
+        return coeffs + delta.permute(0, 2, 3, 1)
+
+
+# ---------------------------------------------------------------------------
 # Training helpers
 # ---------------------------------------------------------------------------
 
@@ -878,8 +927,8 @@ class Stage2Module(pl.LightningModule):
         fid_real_images: Optional[torch.Tensor] = None,
         fid_num_samples: int = 64,
         fid_feature: int = 64,
-        coeff_noise_std: float = 0.0,
-        coeff_smooth_sigma: float = 0.0,
+        coeff_refiner: Optional["CoeffRefiner"] = None,
+        refine_weight: float = 1.0,
     ):
         super().__init__()
         self.transformer = transformer
@@ -892,9 +941,6 @@ class Stage2Module(pl.LightningModule):
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
         self.coeff_loss_weight = coeff_loss_weight
-        self.coeff_noise_std = coeff_noise_std
-        self.coeff_smooth_sigma = coeff_smooth_sigma
-        self._smooth_kernel = None
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
@@ -906,13 +952,18 @@ class Stage2Module(pl.LightningModule):
         self.fid_feature = fid_feature
         self._fid_metric = None
         self._last_sample_step = -1
+        self.coeff_refiner = coeff_refiner
+        self.refine_weight = refine_weight
 
         self.ae.eval()
         for p in self.ae.parameters():
             p.requires_grad_(False)
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(self.transformer.parameters(), lr=self.lr)
+        params = list(self.transformer.parameters())
+        if self.coeff_refiner is not None:
+            params += list(self.coeff_refiner.parameters())
+        opt = torch.optim.Adam(params, lr=self.lr)
         if self.lr_schedule != "cosine":
             return opt
         max_ep = max(1, int(getattr(self.trainer, "max_epochs", 1) or 1))
@@ -945,8 +996,6 @@ class Stage2Module(pl.LightningModule):
         tok_flat, coeff_flat = items
         tok_flat = tok_flat.long()
         coeff_flat = coeff_flat.float()
-        if self.training and self.coeff_noise_std > 0.0:
-            coeff_flat = coeff_flat + self.coeff_noise_std * torch.randn_like(coeff_flat)
         B = tok_flat.size(0)
         bos = self.transformer.bos_token_id
         pad = self.transformer.pad_token_id
@@ -965,15 +1014,20 @@ class Stage2Module(pl.LightningModule):
             ignore_index=pad,
         )
         coeff_for_target = coeff_pred.gather(-1, y.unsqueeze(-1)).squeeze(-1)
-        coeff_scale = self.transformer.cfg.coeff_max
-        if coeff_scale is not None and float(coeff_scale) > 0.0:
-            s = float(coeff_scale)
-            # Keep train-time regression in the same bounded space used by
-            # sampling to reduce outlier-driven "block" artifacts.
-            coeff_for_target = s * torch.tanh(coeff_for_target / s)
-            coeff_flat = s * torch.tanh(coeff_flat / s)
         coeff_loss = F.mse_loss(coeff_for_target, coeff_flat)
         loss = atom_loss + self.coeff_loss_weight * coeff_loss
+
+        if self.coeff_refiner is not None:
+            H, W, K = self.H, self.W, self.D
+            atom_ids_2d = y.reshape(B, H, W, K)
+            raw_coeffs_2d = coeff_for_target.detach().reshape(B, H, W, K)
+            gt_coeffs_2d = coeff_flat.reshape(B, H, W, K)
+            refined = self.coeff_refiner(atom_ids_2d, raw_coeffs_2d)
+            refine_loss = F.mse_loss(refined, gt_coeffs_2d)
+            loss = loss + self.refine_weight * refine_loss
+            self.log("train/refine_loss", refine_loss,
+                     prog_bar=True, on_step=True, on_epoch=True,
+                     sync_dist=True, batch_size=B)
 
         self.log("train/atom_loss", atom_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
@@ -1012,6 +1066,11 @@ class Stage2Module(pl.LightningModule):
                 self.transformer.state_dict(),
                 os.path.join(self.out_dir, "transformer_last.pt"),
             )
+            if self.coeff_refiner is not None:
+                torch.save(
+                    self.coeff_refiner.state_dict(),
+                    os.path.join(self.out_dir, "refiner_last.pt"),
+                )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -1024,27 +1083,6 @@ class Stage2Module(pl.LightningModule):
                 dtype=torch.long, device=self.device,
             )
         return torch.arange(n, dtype=torch.long, device=self.device) % self.num_classes
-
-    def _spatial_smooth_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
-        """Apply Gaussian blur on spatial (H, W) dims of [B, H, W, D]."""
-        if self.coeff_smooth_sigma <= 0.0:
-            return coeffs
-        B, H, W, D = coeffs.shape
-        sigma = self.coeff_smooth_sigma
-        ks = max(3, int(2 * round(sigma) + 1))
-        if ks % 2 == 0:
-            ks += 1
-        if self._smooth_kernel is None or self._smooth_kernel.device != coeffs.device:
-            ax = torch.arange(ks, dtype=torch.float32, device=coeffs.device) - ks // 2
-            g = torch.exp(-0.5 * (ax / sigma) ** 2)
-            g = g / g.sum()
-            k2d = g.unsqueeze(1) * g.unsqueeze(0)
-            self._smooth_kernel = k2d.unsqueeze(0).unsqueeze(0)  # [1, 1, ks, ks]
-        pad = ks // 2
-        x = coeffs.permute(0, 3, 1, 2).reshape(B * D, 1, H, W)
-        x = F.pad(x, [pad, pad, pad, pad], mode="reflect")
-        x = F.conv2d(x, self._smooth_kernel)
-        return x.reshape(B, D, H, W).permute(0, 2, 3, 1)
 
     @torch.no_grad()
     def _sample_and_save(self):
@@ -1062,7 +1100,11 @@ class Stage2Module(pl.LightningModule):
         )
         support = tokens.view(-1, self.H, self.W, self.D)
         coeffs = coeffs.view(-1, self.H, self.W, self.D)
-        coeffs = self._spatial_smooth_coeffs(coeffs)
+        if self.coeff_refiner is not None:
+            self.coeff_refiner.eval()
+            coeffs = self.coeff_refiner(
+                support.to(self.device), coeffs.to(self.device),
+            )
         raw_imgs = self.ae.decode_from_codes(
             support.to(self.device), coeffs.to(self.device),
         )
@@ -1262,13 +1304,6 @@ def main():
     parser.add_argument("--stage2_strategy", type=str, default="ddp_fork",
                         choices=["ddp", "ddp_fork", "auto"])
     parser.add_argument("--stage2_coeff_loss_weight", type=float, default=2.0)
-    parser.add_argument("--stage2_coeff_noise_std", type=float, default=0.0,
-                        help="Gaussian noise std added to target coefficients "
-                             "during stage-2 training for robustness.")
-    parser.add_argument("--stage2_coeff_smooth_sigma", type=float, default=0.0,
-                        help="Gaussian-blur sigma applied to coefficient map "
-                             "spatially before decoding at sample time. "
-                             "0 = disabled. Try 0.5-1.0.")
     parser.add_argument(
         "--stage2_coeff_max",
         type=float,
@@ -1281,6 +1316,20 @@ def main():
     )
     parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
     parser.add_argument("--stage2_fid_feature", type=int, default=64)
+
+    # Coefficient refiner
+    parser.add_argument(
+        "--stage2_refine_weight", type=float, default=0.0,
+        help=(
+            "Weight for the CoeffRefiner loss.  When > 0 a small spatial CNN "
+            "is trained alongside the transformer to smooth per-token "
+            "coefficient predictions across the (H,W) grid, eliminating "
+            "blocky artifacts at generation time.  0 = disabled."
+        ),
+    )
+    parser.add_argument("--refiner_hidden", type=int, default=64)
+    parser.add_argument("--refiner_layers", type=int, default=4)
+    parser.add_argument("--refiner_embed_dim", type=int, default=16)
     parser.add_argument("--tf_d_model", type=int, default=256)
     parser.add_argument("--tf_heads", type=int, default=4)
     parser.add_argument("--tf_layers", type=int, default=4)
@@ -1437,6 +1486,24 @@ def main():
                 transformer.load_state_dict(filtered, strict=False)
                 print(f"[Stage2] resumed from {ckpt}")
 
+        coeff_refiner = None
+        if args.stage2_refine_weight > 0:
+            coeff_refiner = CoeffRefiner(
+                K=D,
+                vocab_size=ae.bottleneck.vocab_size,
+                atom_embed_dim=args.refiner_embed_dim,
+                hidden_dim=args.refiner_hidden,
+                num_layers=args.refiner_layers,
+            )
+            if args.stage2_resume_from_last:
+                ref_ckpt = os.path.join(stage2_dir, "refiner_last.pt")
+                if os.path.exists(ref_ckpt):
+                    coeff_refiner.load_state_dict(
+                        torch.load(ref_ckpt, map_location="cpu",
+                                   weights_only=True),
+                    )
+                    print(f"[Stage2] resumed refiner from {ref_ckpt}")
+
         module = Stage2Module(
             transformer=transformer,
             ae=ae,
@@ -1448,8 +1515,6 @@ def main():
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
-            coeff_noise_std=args.stage2_coeff_noise_std,
-            coeff_smooth_sigma=args.stage2_coeff_smooth_sigma,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
@@ -1461,6 +1526,8 @@ def main():
             fid_real_images=fid_real_images,
             fid_num_samples=args.stage2_fid_num_samples,
             fid_feature=args.stage2_fid_feature,
+            coeff_refiner=coeff_refiner,
+            refine_weight=args.stage2_refine_weight,
         )
 
         strategy: object = (
