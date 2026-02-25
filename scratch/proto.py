@@ -879,6 +879,7 @@ class Stage2Module(pl.LightningModule):
         fid_num_samples: int = 64,
         fid_feature: int = 64,
         coeff_noise_std: float = 0.0,
+        coeff_smooth_sigma: float = 0.0,
     ):
         super().__init__()
         self.transformer = transformer
@@ -892,6 +893,8 @@ class Stage2Module(pl.LightningModule):
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
         self.coeff_loss_weight = coeff_loss_weight
         self.coeff_noise_std = coeff_noise_std
+        self.coeff_smooth_sigma = coeff_smooth_sigma
+        self._smooth_kernel = None
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
@@ -1022,6 +1025,27 @@ class Stage2Module(pl.LightningModule):
             )
         return torch.arange(n, dtype=torch.long, device=self.device) % self.num_classes
 
+    def _spatial_smooth_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        """Apply Gaussian blur on spatial (H, W) dims of [B, H, W, D]."""
+        if self.coeff_smooth_sigma <= 0.0:
+            return coeffs
+        B, H, W, D = coeffs.shape
+        sigma = self.coeff_smooth_sigma
+        ks = max(3, int(2 * round(sigma) + 1))
+        if ks % 2 == 0:
+            ks += 1
+        if self._smooth_kernel is None or self._smooth_kernel.device != coeffs.device:
+            ax = torch.arange(ks, dtype=torch.float32, device=coeffs.device) - ks // 2
+            g = torch.exp(-0.5 * (ax / sigma) ** 2)
+            g = g / g.sum()
+            k2d = g.unsqueeze(1) * g.unsqueeze(0)
+            self._smooth_kernel = k2d.unsqueeze(0).unsqueeze(0)  # [1, 1, ks, ks]
+        pad = ks // 2
+        x = coeffs.permute(0, 3, 1, 2).reshape(B * D, 1, H, W)
+        x = F.pad(x, [pad, pad, pad, pad], mode="reflect")
+        x = F.conv2d(x, self._smooth_kernel)
+        return x.reshape(B, D, H, W).permute(0, 2, 3, 1)
+
     @torch.no_grad()
     def _sample_and_save(self):
         self.transformer.eval()
@@ -1038,6 +1062,7 @@ class Stage2Module(pl.LightningModule):
         )
         support = tokens.view(-1, self.H, self.W, self.D)
         coeffs = coeffs.view(-1, self.H, self.W, self.D)
+        coeffs = self._spatial_smooth_coeffs(coeffs)
         raw_imgs = self.ae.decode_from_codes(
             support.to(self.device), coeffs.to(self.device),
         )
@@ -1240,6 +1265,10 @@ def main():
     parser.add_argument("--stage2_coeff_noise_std", type=float, default=0.0,
                         help="Gaussian noise std added to target coefficients "
                              "during stage-2 training for robustness.")
+    parser.add_argument("--stage2_coeff_smooth_sigma", type=float, default=0.0,
+                        help="Gaussian-blur sigma applied to coefficient map "
+                             "spatially before decoding at sample time. "
+                             "0 = disabled. Try 0.5-1.0.")
     parser.add_argument(
         "--stage2_coeff_max",
         type=float,
@@ -1420,6 +1449,7 @@ def main():
             sample_top_k=args.stage2_sample_top_k,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
             coeff_noise_std=args.stage2_coeff_noise_std,
+            coeff_smooth_sigma=args.stage2_coeff_smooth_sigma,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
