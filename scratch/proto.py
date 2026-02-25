@@ -878,6 +878,7 @@ class Stage2Module(pl.LightningModule):
         fid_real_images: Optional[torch.Tensor] = None,
         fid_num_samples: int = 64,
         fid_feature: int = 64,
+        coeff_noise_std: float = 0.0,
     ):
         super().__init__()
         self.transformer = transformer
@@ -890,6 +891,7 @@ class Stage2Module(pl.LightningModule):
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
         self.coeff_loss_weight = coeff_loss_weight
+        self.coeff_noise_std = coeff_noise_std
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
@@ -940,6 +942,8 @@ class Stage2Module(pl.LightningModule):
         tok_flat, coeff_flat = items
         tok_flat = tok_flat.long()
         coeff_flat = coeff_flat.float()
+        if self.training and self.coeff_noise_std > 0.0:
+            coeff_flat = coeff_flat + self.coeff_noise_std * torch.randn_like(coeff_flat)
         B = tok_flat.size(0)
         bos = self.transformer.bos_token_id
         pad = self.transformer.pad_token_id
@@ -1233,6 +1237,9 @@ def main():
     parser.add_argument("--stage2_strategy", type=str, default="ddp_fork",
                         choices=["ddp", "ddp_fork", "auto"])
     parser.add_argument("--stage2_coeff_loss_weight", type=float, default=2.0)
+    parser.add_argument("--stage2_coeff_noise_std", type=float, default=0.0,
+                        help="Gaussian noise std added to target coefficients "
+                             "during stage-2 training for robustness.")
     parser.add_argument(
         "--stage2_coeff_max",
         type=float,
@@ -1412,6 +1419,7 @@ def main():
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
+            coeff_noise_std=args.stage2_coeff_noise_std,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
