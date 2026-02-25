@@ -503,7 +503,7 @@ class RQTransformerConfig:
     W: int
     D: int
     num_classes: int = 0
-    coeff_max: float = 12.0
+    coeff_max: Optional[float] = 12.0
     d_model: int = 256
     n_heads: int = 8
     n_layers: int = 6
@@ -639,9 +639,12 @@ class RQTransformerPrior(nn.Module):
             nxt = torch.multinomial(F.softmax(logits, dim=-1), 1)
             seq = torch.cat([seq, nxt], dim=1)
             c = coeff_pred[:, -1, :].gather(-1, nxt).squeeze(-1)
-            gen_coeffs.append(
-                c.clamp(-self.cfg.coeff_max, self.cfg.coeff_max)
-            )
+            if self.cfg.coeff_max is None or float(self.cfg.coeff_max) <= 0.0:
+                gen_coeffs.append(c)
+            else:
+                gen_coeffs.append(
+                    c.clamp(-float(self.cfg.coeff_max), float(self.cfg.coeff_max))
+                )
 
         tokens = seq[:, 1:]
         coeffs = torch.stack(gen_coeffs, dim=1)
@@ -1222,8 +1225,15 @@ def main():
     parser.add_argument("--stage2_strategy", type=str, default="ddp_fork",
                         choices=["ddp", "ddp_fork", "auto"])
     parser.add_argument("--stage2_coeff_loss_weight", type=float, default=2.0)
-    parser.add_argument("--stage2_coeff_max", type=float, default=12.0,
-                        help="Clamp range for sampled coefficients in stage-2.")
+    parser.add_argument(
+        "--stage2_coeff_max",
+        type=float,
+        default=12.0,
+        help=(
+            "Clamp range for sampled coefficients in stage-2. "
+            "Set <= 0 to disable clamping."
+        ),
+    )
     parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
     parser.add_argument("--stage2_fid_feature", type=int, default=64)
     parser.add_argument("--tf_d_model", type=int, default=384)
@@ -1241,9 +1251,6 @@ def main():
     parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
     args = parser.parse_args()
-    if args.stage2_coeff_max <= 0:
-        raise ValueError("stage2_coeff_max must be > 0.")
-
     # ---- defaults ----
     if args.data_dir is None:
         if args.dataset == "celeba":
@@ -1356,7 +1363,11 @@ def main():
             vocab_size=ae.bottleneck.vocab_size,
             H=H, W=W, D=D,
             num_classes=stage2_num_classes,
-            coeff_max=float(args.stage2_coeff_max),
+            coeff_max=(
+                None
+                if float(args.stage2_coeff_max) <= 0.0
+                else float(args.stage2_coeff_max)
+            ),
             d_model=args.tf_d_model,
             n_heads=args.tf_heads,
             n_layers=args.tf_layers,
