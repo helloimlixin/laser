@@ -642,9 +642,10 @@ class RQTransformerPrior(nn.Module):
             if self.cfg.coeff_max is None or float(self.cfg.coeff_max) <= 0.0:
                 gen_coeffs.append(c)
             else:
-                gen_coeffs.append(
-                    c.clamp(-float(self.cfg.coeff_max), float(self.cfg.coeff_max))
-                )
+                # Soft clamp avoids hard clipping edges while still bounding
+                # outlier coefficients.
+                s = float(self.cfg.coeff_max)
+                gen_coeffs.append(s * torch.tanh(c / s))
 
         tokens = seq[:, 1:]
         coeffs = torch.stack(gen_coeffs, dim=1)
@@ -957,6 +958,13 @@ class Stage2Module(pl.LightningModule):
             ignore_index=pad,
         )
         coeff_for_target = coeff_pred.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+        coeff_scale = self.transformer.cfg.coeff_max
+        if coeff_scale is not None and float(coeff_scale) > 0.0:
+            s = float(coeff_scale)
+            # Keep train-time regression in the same bounded space used by
+            # sampling to reduce outlier-driven "block" artifacts.
+            coeff_for_target = s * torch.tanh(coeff_for_target / s)
+            coeff_flat = s * torch.tanh(coeff_flat / s)
         coeff_loss = F.mse_loss(coeff_for_target, coeff_flat)
         loss = atom_loss + self.coeff_loss_weight * coeff_loss
 
@@ -1230,7 +1238,8 @@ def main():
         type=float,
         default=12.0,
         help=(
-            "Clamp range for sampled coefficients in stage-2. "
+            "Soft-clamp scale for sampled coefficients in stage-2 "
+            "(scale * tanh(x / scale)). "
             "Set <= 0 to disable clamping."
         ),
     )
