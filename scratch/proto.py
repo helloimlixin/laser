@@ -42,22 +42,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "models"
 from lpips import LPIPS
 
 
-def _disable_lightning_cuda_matmul_capability_probe():
-    try:
-        import lightning.pytorch.accelerators.cuda as pl_cuda
-        import lightning.fabric.accelerators.cuda as fabric_cuda
-    except Exception:
-        return
-
-    def _noop(device):
-        return
-
-    pl_cuda._check_cuda_matmul_precision = _noop
-    fabric_cuda._check_cuda_matmul_precision = _noop
-
-
-_disable_lightning_cuda_matmul_capability_probe()
-
 
 def _pick_free_tcp_port(excluded: Optional[set[int]] = None) -> int:
     excluded = excluded or set()
@@ -244,9 +228,7 @@ class DictionaryLearning(nn.Module):
             torch.randn(embedding_dim, num_embeddings)
         )
 
-        self.pad_token_id = num_embeddings
-        self.bos_token_id = num_embeddings + 1
-        self.vocab_size = num_embeddings + 2
+        self.vocab_size = num_embeddings
 
     # ---- batch OMP (adapted from bottleneck.py / sparse-vqvae) ----
 
@@ -456,8 +438,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         out = F.scaled_dot_product_attention(
             q, k, v,
-            is_causal=(T > 1),
             dropout_p=(self.dropout if self.training else 0.0),
+            is_causal=(T > 1),
         )
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.out_proj(out))
@@ -490,9 +472,6 @@ class RQTransformerConfig:
     W: int
     D: int
     num_classes: int = 0
-    coeff_max: Optional[float] = 12.0
-    coeff_logvar_min: float = -6.0
-    coeff_logvar_max: float = 2.0
     d_model: int = 256
     n_heads: int = 4
     n_layers: int = 4
@@ -504,24 +483,32 @@ class RQTransformerConfig:
 class RQTransformerPrior(nn.Module):
     """Two-stage transformer prior with continuous coefficient modeling."""
 
-    def __init__(self, cfg: RQTransformerConfig,
-                 bos_token_id: int, pad_token_id: int):
+    def __init__(self, cfg: RQTransformerConfig):
         super().__init__()
         self.cfg = cfg
-        self.bos_token_id = bos_token_id
-        self.pad_token_id = pad_token_id
 
-        self.tokens_per_pos = cfg.D
         self.positions_per_image = cfg.H * cfg.W
-        self.tokens_per_image = self.positions_per_image * self.tokens_per_pos
 
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.spatial_emb = nn.Embedding(self.positions_per_image, cfg.d_model)
+        self.row_emb = nn.Embedding(cfg.H, cfg.d_model)
+        self.col_emb = nn.Embedding(cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.spatial_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.row_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.col_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.depth_emb.weight, mean=0.0, std=0.02)
         self.start_emb = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+        spatial_pos = torch.arange(self.positions_per_image, dtype=torch.long)
+        self.register_buffer(
+            "_spatial_rows",
+            torch.div(spatial_pos, cfg.W, rounding_mode="floor"),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_spatial_cols",
+            torch.remainder(spatial_pos, cfg.W),
+            persistent=False,
+        )
         self.class_emb = (
             nn.Embedding(cfg.num_classes, cfg.d_model)
             if cfg.num_classes > 0 else None
@@ -544,24 +531,27 @@ class RQTransformerPrior(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.d_model, cfg.d_model),
         )
-        self.coeff_head = nn.Sequential(
-            nn.Linear(2 * cfg.d_model, cfg.d_model),
+        # Learn how to fuse per-depth token/coeff context before spatial AR.
+        self.spatial_depth_fuse = nn.Sequential(
+            nn.LayerNorm(cfg.D * cfg.d_model),
+            nn.Linear(cfg.D * cfg.d_model, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model, 2),
+            nn.Linear(cfg.d_model, cfg.d_model),
         )
-        self.coeff_max = (
-            float(cfg.coeff_max) if (cfg.coeff_max is not None and cfg.coeff_max > 0) else None
+        self.num_atoms = cfg.vocab_size
+        coeff_in_dim = (1 + 2 * cfg.D) * cfg.d_model
+        self.full_coeff_head = nn.Sequential(
+            nn.Linear(coeff_in_dim, cfg.d_model),
+            nn.GELU(),
+            nn.Linear(cfg.d_model, self.num_atoms),
         )
-        self.coeff_logvar_min = float(cfg.coeff_logvar_min)
-        self.coeff_logvar_max = float(cfg.coeff_logvar_max)
-
-    @staticmethod
-    def _run_blocks(
-        x: torch.Tensor, blocks: nn.ModuleList,
-    ) -> torch.Tensor:
-        for block in blocks:
-            x = block(x)
-        return x
+        nn.init.zeros_(self.full_coeff_head[-1].weight)
+        nn.init.zeros_(self.full_coeff_head[-1].bias)
+        self.direct_coeff_head = nn.Sequential(
+            nn.Linear(coeff_in_dim, cfg.d_model),
+            nn.GELU(),
+            nn.Linear(cfg.d_model, cfg.D),
+        )
 
     def _class_bias(
         self, class_ids: Optional[torch.Tensor], batch_size: int,
@@ -578,34 +568,22 @@ class RQTransformerPrior(nn.Module):
             )
         return self.class_emb(class_ids.long().to(device)).unsqueeze(1)
 
-    def _coeff_embed(self, coeffs: torch.Tensor) -> torch.Tensor:
-        return self.coeff_proj(coeffs.unsqueeze(-1))
-
-    def _coeff_stats(
-        self, depth_h: torch.Tensor, atom_emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        stats = self.coeff_head(torch.cat([depth_h, atom_emb], dim=-1))
-        mu = stats[..., 0]
-        logvar = stats[..., 1].clamp(
-            min=self.coeff_logvar_min, max=self.coeff_logvar_max,
-        )
-        return mu, logvar
-
-    def _apply_coeff_limit(self, coeffs: torch.Tensor) -> torch.Tensor:
-        if self.coeff_max is None:
-            return coeffs
-        return self.coeff_max * torch.tanh(coeffs / self.coeff_max)
-
-    def _reshape_tokens(self, tokens_flat: torch.Tensor) -> torch.Tensor:
-        if tokens_flat.dim() != 2:
-            raise ValueError(f"Expected [B, T*D], got {tuple(tokens_flat.shape)}")
-        B, L = tokens_flat.shape
-        expected = self.positions_per_image * self.tokens_per_pos
-        if L != expected:
+    def _spatial_pos(self, length: int, device: torch.device) -> torch.Tensor:
+        """Return learned 2D positional embeddings for flattened raster order."""
+        if length > self.positions_per_image:
             raise ValueError(
-                f"Expected flattened token length {expected} (=H*W*D), got {L}"
+                f"Requested {length} positions, but max is {self.positions_per_image}."
             )
-        return tokens_flat.view(B, self.positions_per_image, self.tokens_per_pos)
+        rows = self._spatial_rows[:length].to(device)
+        cols = self._spatial_cols[:length].to(device)
+        return self.row_emb(rows) + self.col_emb(cols)
+
+    def _fuse_spatial_context(
+        self, tok_emb: torch.Tensor, coeff_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse [B, T, D, C] token/coeff embeddings to [B, T, C]."""
+        fused = (tok_emb + coeff_emb).reshape(tok_emb.size(0), tok_emb.size(1), -1)
+        return self.spatial_depth_fuse(fused)
 
     def forward_tokens(
         self,
@@ -616,30 +594,25 @@ class RQTransformerPrior(nn.Module):
         """Teacher-forced logits over flattened [H*W*D] tokens.
 
         Returns:
-            atom_logits:  [B, H*W, D, vocab_size]
-            coeff_mu:     [B, H*W, D]
-            coeff_logvar: [B, H*W, D]
+            atom_logits:       [B, H*W, D, vocab_size]
+            full_coeff_pred:   [B, H*W, num_atoms]
+            direct_coeff_pred: [B, H*W, D]
         """
         device = tokens_flat.device
-        tok = self._reshape_tokens(tokens_flat).long()            # [B, T, D]
+        D = self.cfg.D
+        tok = tokens_flat.long().view(-1, self.positions_per_image, D)
         B, T, D = tok.shape
         d_model = self.cfg.d_model
-
         coeffs = coeffs_flat.float().view(B, T, D)
 
-        # Spatial input u_t:
-        # t=0 : start token + PE_T(0)
-        # t>0 : sum_d [e(S_{t-1,d}) + coeff_embed(c_{t-1,d})] + PE_T(t)
         spatial_in = torch.zeros(B, T, d_model, device=device)
         if T > 1:
-            prev_tok_emb = self.token_emb(tok[:, :-1, :])             # [B, T-1, D, C]
-            prev_coeff_emb = self._coeff_embed(coeffs[:, :-1, :])     # [B, T-1, D, C]
-            prev_stack_sum = (prev_tok_emb + prev_coeff_emb).sum(dim=2)
-            spatial_in[:, 1:, :] = prev_stack_sum
-        spatial_pos = self.spatial_emb(
-            torch.arange(T, device=device, dtype=torch.long),
-        ).unsqueeze(0)
-        spatial_in = spatial_in + spatial_pos
+            prev_tok_emb = self.token_emb(tok[:, :-1, :])
+            prev_coeff_emb = self.coeff_proj(coeffs[:, :-1, :].unsqueeze(-1))
+            spatial_in[:, 1:, :] = self._fuse_spatial_context(
+                prev_tok_emb, prev_coeff_emb,
+            )
+        spatial_in = spatial_in + self._spatial_pos(T, device).unsqueeze(0)
         spatial_in[:, :1, :] = spatial_in[:, :1, :] + self.start_emb
 
         class_bias = self._class_bias(class_ids, B, device)
@@ -647,38 +620,40 @@ class RQTransformerPrior(nn.Module):
             spatial_in = spatial_in + class_bias
 
         spatial_h = self.drop(spatial_in)
-        spatial_h = self._run_blocks(spatial_h, self.spatial_blocks)
-        spatial_h = self.spatial_ln(spatial_h)                    # [B, T, C]
+        for blk in self.spatial_blocks:
+            spatial_h = blk(spatial_h)
+        spatial_h = self.spatial_ln(spatial_h)
 
-        # Depth input v_{t,d} with continuous coefficient feedback:
-        # d=0 : h_t + PE_D(0)
-        # d>0 : e(S_{t,d-1}) + coeff_embed(c_{t,d-1}) + PE_D(d)
         bt = B * T
-        tok_bt = tok.view(bt, D)                                  # [B*T, D]
-        coeff_bt = coeffs.reshape(bt, D)                           # [B*T, D]
-        tok_emb = self.token_emb(tok_bt)                          # [B*T, D, C]
-        c_emb = self._coeff_embed(coeff_bt)                        # [B*T, D, C]
-        combined = tok_emb + c_emb                                 # [B*T, D, C]
+        tok_bt = tok.view(bt, D)
+        tok_emb = self.token_emb(tok_bt)
         depth_in = torch.cat([
             spatial_h.reshape(bt, 1, d_model),
-            combined[:, :-1, :],
-        ], dim=1)                                                  # [B*T, D, C]
-        depth_pos = self.depth_emb(
+            tok_emb[:, :-1, :],
+        ], dim=1)
+        depth_in = depth_in + self.depth_emb(
             torch.arange(D, device=device, dtype=torch.long),
         ).unsqueeze(0)
-        depth_in = depth_in + depth_pos
 
         depth_h = self.drop(depth_in)
-        depth_h = self._run_blocks(depth_h, self.depth_blocks)
-        depth_h = self.depth_ln(depth_h)                          # [B*T, D, C]
+        for blk in self.depth_blocks:
+            depth_h = blk(depth_h)
+        depth_h = self.depth_ln(depth_h)
 
-        atom_logits = self.atom_head(depth_h)                      # [B*T, D, V]
-        gt_atom_emb = self.token_emb(tok_bt)                       # [B*T, D, C]
-        coeff_mu, coeff_logvar = self._coeff_stats(depth_h, gt_atom_emb)
+        atom_logits = self.atom_head(depth_h)
+
+        atom_probs = F.softmax(atom_logits.detach(), dim=-1)
+        soft_atom_emb = atom_probs @ self.token_emb.weight
+
+        depth_flat = depth_h.reshape(B, T, D * d_model)
+        atom_flat = soft_atom_emb.reshape(B, T, D * d_model)
+        combined_h = torch.cat([spatial_h, depth_flat, atom_flat], dim=-1)
+        full_coeff_pred = self.full_coeff_head(combined_h)
+        direct_coeff_pred = self.direct_coeff_head(combined_h)
         return (
             atom_logits.view(B, T, D, self.cfg.vocab_size),
-            coeff_mu.view(B, T, D),
-            coeff_logvar.view(B, T, D),
+            full_coeff_pred,
+            direct_coeff_pred,
         )
 
     @torch.no_grad()
@@ -692,16 +667,11 @@ class RQTransformerPrior(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         T = self.positions_per_image
-        D = self.tokens_per_pos
+        D = self.cfg.D
         d_model = self.cfg.d_model
 
-        special = torch.tensor(
-            [self.bos_token_id, self.pad_token_id], device=device,
-        )
         class_bias = self._class_bias(class_ids, batch_size, device)
-        spatial_pos = self.spatial_emb(
-            torch.arange(T, device=device, dtype=torch.long),
-        )
+        spatial_pos = self._spatial_pos(T, device)
         depth_pos = self.depth_emb(
             torch.arange(D, device=device, dtype=torch.long),
         )
@@ -713,35 +683,38 @@ class RQTransformerPrior(nn.Module):
         )
 
         for t in steps:
-            # Build spatial input for positions [0..t], run full causal pass
             spatial_in = torch.zeros(batch_size, t + 1, d_model, device=device)
             spatial_in[:, 0, :] = self.start_emb.squeeze(1)
             if t > 0:
                 prev_tok = self.token_emb(tokens[:, :t, :])
-                prev_coeff = self._coeff_embed(coeffs[:, :t, :])
-                spatial_in[:, 1:, :] = (prev_tok + prev_coeff).sum(dim=2)
+                prev_coeff = self.coeff_proj(coeffs[:, :t, :].unsqueeze(-1))
+                spatial_in[:, 1:, :] = self._fuse_spatial_context(
+                    prev_tok, prev_coeff,
+                )
             spatial_in = spatial_in + spatial_pos[: t + 1].unsqueeze(0)
             if class_bias is not None:
                 spatial_in = spatial_in + class_bias
 
-            spatial_h = self._run_blocks(spatial_in, self.spatial_blocks)
-            h_t = self.spatial_ln(spatial_h)[:, -1, :]                # [B, C]
+            spatial_h = spatial_in
+            for blk in self.spatial_blocks:
+                spatial_h = blk(spatial_h)
+            h_t = self.spatial_ln(spatial_h)[:, -1, :]
 
+            depth_hiddens: list[torch.Tensor] = []
             for d in range(D):
-                # Build depth input for depths [0..d], run full causal pass
                 depth_in = torch.zeros(batch_size, d + 1, d_model, device=device)
                 depth_in[:, 0, :] = h_t
                 if d > 0:
-                    prev_atom = self.token_emb(tokens[:, t, :d])
-                    prev_c = self._coeff_embed(coeffs[:, t, :d])
-                    depth_in[:, 1:, :] = prev_atom + prev_c
+                    depth_in[:, 1:, :] = self.token_emb(tokens[:, t, :d])
                 depth_in = depth_in + depth_pos[: d + 1].unsqueeze(0)
 
-                depth_h = self._run_blocks(depth_in, self.depth_blocks)
-                z_last = self.depth_ln(depth_h)[:, -1, :]             # [B, C]
+                depth_h = depth_in
+                for blk in self.depth_blocks:
+                    depth_h = blk(depth_h)
+                z_last = self.depth_ln(depth_h)[:, -1, :]
+                depth_hiddens.append(z_last)
 
                 logits = self.atom_head(z_last) / max(temperature, 1e-8)
-                logits[:, special] = float("-inf")
                 if top_k is not None and top_k > 0:
                     v, ix = torch.topk(
                         logits, min(top_k, logits.size(-1)), dim=-1,
@@ -749,17 +722,16 @@ class RQTransformerPrior(nn.Module):
                     mask = torch.full_like(logits, float("-inf"))
                     mask.scatter_(1, ix, v)
                     logits = mask
-                nxt = torch.multinomial(
+                tokens[:, t, d] = torch.multinomial(
                     F.softmax(logits, dim=-1), 1,
                 ).squeeze(-1)
-                tokens[:, t, d] = nxt
 
-                atom_emb = self.token_emb(nxt)
-                c_mu, c_logvar = self._coeff_stats(z_last, atom_emb)
-                c_std = torch.exp(0.5 * c_logvar)
-                c = c_mu + torch.randn_like(c_std) * c_std * max(temperature, 1e-8)
-                c = self._apply_coeff_limit(c)
-                coeffs[:, t, d] = c
+            combined_h = torch.cat([
+                h_t,
+                torch.cat(depth_hiddens, dim=-1),
+                self.token_emb(tokens[:, t, :]).reshape(batch_size, D * d_model),
+            ], dim=-1)
+            coeffs[:, t, :] = self.direct_coeff_head(combined_h)
 
         return (
             tokens.view(batch_size, T * D),
@@ -985,7 +957,7 @@ class Stage2Module(pl.LightningModule):
         sample_temperature: float = 0.8,
         sample_top_k: int = 64,
         coeff_loss_weight: float = 1.0,
-        coeff_l1_weight: float = 0.05,
+        recon_loss_weight: float = 1.0,
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
@@ -1006,7 +978,7 @@ class Stage2Module(pl.LightningModule):
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
         self.coeff_loss_weight = coeff_loss_weight
-        self.coeff_l1_weight = coeff_l1_weight
+        self.recon_loss_weight = recon_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
@@ -1063,38 +1035,63 @@ class Stage2Module(pl.LightningModule):
         tok_flat = tok_flat.long()
         coeff_flat = coeff_flat.float()
         B = tok_flat.size(0)
-        pad = self.transformer.pad_token_id
         y = tok_flat.view(B, self.H * self.W, self.D)
         coeff_target = coeff_flat.view(B, self.H * self.W, self.D)
 
-        atom_logits, coeff_mu, coeff_logvar = self.transformer.forward_tokens(
-            tok_flat, coeff_flat, class_ids=class_ids,
+        atom_logits, full_coeff_pred, direct_coeff_pred = (
+            self.transformer.forward_tokens(
+                tok_flat, coeff_flat, class_ids=class_ids,
+            )
         )
         atom_hard_loss = F.cross_entropy(
             atom_logits.reshape(-1, self.transformer.cfg.vocab_size),
             y.reshape(-1),
-            ignore_index=pad,
         )
-        coeff_var = torch.exp(coeff_logvar)
-        coeff_nll = 0.5 * (
-            coeff_logvar + (coeff_target - coeff_mu).pow(2) / coeff_var
+
+        T = self.H * self.W
+        num_atoms = self.transformer.num_atoms
+        D = self.D
+        full_target = torch.zeros(
+            B, T, num_atoms, device=tok_flat.device, dtype=coeff_target.dtype,
         )
-        coeff_nll_loss = coeff_nll.mean()
-        coeff_l1_loss = F.smooth_l1_loss(coeff_mu, coeff_target)
+        full_target.scatter_(2, y.long(), coeff_target)
+
+        active_mask = torch.zeros_like(full_target)
+        active_mask.scatter_(2, y.long(), 1.0)
+        w = torch.where(active_mask > 0, num_atoms / D, 1.0)
+
+        sq_err = (full_coeff_pred - full_target).pow(2) * w
+        coeff_reg_loss = sq_err.mean()
+
+        bn = self.ae.bottleneck
+        dictionary = F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
+        C = bn.embedding_dim
+
+        z_pred = bn._reconstruct(
+            y.reshape(-1, D), direct_coeff_pred.reshape(-1, D), dictionary,
+        ).view(B, self.H, self.W, C).permute(0, 3, 1, 2).contiguous()
+        feat_pred = self.ae.decoder(self.ae.post(z_pred))
+
+        with torch.no_grad():
+            z_gt = bn._reconstruct(
+                y.reshape(-1, D), coeff_target.reshape(-1, D), dictionary,
+            ).view(B, self.H, self.W, C).permute(0, 3, 1, 2).contiguous()
+            feat_gt = self.ae.decoder(self.ae.post(z_gt))
+        recon_loss = F.mse_loss(feat_pred, feat_gt)
 
         loss = (
             atom_hard_loss
-            + self.coeff_loss_weight * coeff_nll_loss
-            + self.coeff_l1_weight * coeff_l1_loss
+            + self.coeff_loss_weight * coeff_reg_loss
+            + self.recon_loss_weight * recon_loss
         )
 
         self.log("train/atom_loss", atom_hard_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
-        self.log("train/coeff_nll_loss", coeff_nll_loss,
+        self.log("train/coeff_reg_loss", coeff_reg_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
-        self.log("train/coeff_l1_loss", coeff_l1_loss,
+        self.log("train/recon_loss", recon_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
         self.log("train/loss", loss,
@@ -1311,10 +1308,7 @@ def main():
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--stage1_devices", type=int, default=2)
-    parser.add_argument("--stage1_precision", type=str, default="32-true")
-    parser.add_argument("--stage1_strategy", type=str, default="ddp",
-                        choices=["ddp", "auto"])
+    parser.add_argument("--devices", type=int, default=2)
     parser.add_argument("--stage1_init_ckpt", type=str, default=None)
     # Model
     parser.add_argument("--num_hiddens", type=int, default=128)
@@ -1336,7 +1330,6 @@ def main():
     parser.add_argument("--stage2_warmup_epochs", type=int, default=1)
     parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--stage2_batch_size", type=int, default=16)
-    parser.add_argument("--stage2_grad_accum", type=int, default=4)
     parser.add_argument("--stage2_conditional", action="store_true",
                         default=False)
     parser.add_argument("--stage2_num_classes", type=int, default=None)
@@ -1350,43 +1343,17 @@ def main():
                         default=True)
     parser.add_argument("--no_stage2_resume_from_last", action="store_false",
                         dest="stage2_resume_from_last")
-    parser.add_argument("--stage2_devices", type=int, default=2)
-    parser.add_argument("--stage2_precision", type=str, default="32-true")
-    parser.add_argument("--stage2_strategy", type=str, default="ddp_fork",
-                        choices=["ddp", "ddp_fork", "auto"])
     parser.add_argument(
         "--stage2_coeff_loss_weight",
         type=float,
+        default=0.1,
+        help="Weight for MSE coefficient regression loss in stage-2.",
+    )
+    parser.add_argument(
+        "--stage2_recon_loss_weight",
+        type=float,
         default=1.0,
-        help="Weight for Gaussian NLL coefficient loss in stage-2.",
-    )
-    parser.add_argument(
-        "--stage2_coeff_l1_weight",
-        type=float,
-        default=0.05,
-        help="Weight for smooth-L1 stabilization term on coefficient means.",
-    )
-    parser.add_argument(
-        "--stage2_coeff_max",
-        type=float,
-        default=12.0,
-        help=(
-            "Soft-clamp scale for sampled coefficients in stage-2 "
-            "(scale * tanh(x / scale)). "
-            "Set <= 0 to disable clamping."
-        ),
-    )
-    parser.add_argument(
-        "--stage2_coeff_logvar_min",
-        type=float,
-        default=-6.0,
-        help="Minimum log-variance clamp for stage-2 coefficient head.",
-    )
-    parser.add_argument(
-        "--stage2_coeff_logvar_max",
-        type=float,
-        default=2.0,
-        help="Maximum log-variance clamp for stage-2 coefficient head.",
+        help="Weight for latent reconstruction loss (z_pred vs z_gt) in stage-2.",
     )
     parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
     parser.add_argument("--stage2_fid_feature", type=int, default=64)
@@ -1396,7 +1363,7 @@ def main():
     parser.add_argument("--tf_depth_layers", type=int, default=4)
     parser.add_argument("--tf_ff", type=int, default=1024)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
-    parser.add_argument("--token_subset", type=int, default=50000)
+    parser.add_argument("--token_subset", type=int, default=0)
     parser.add_argument("--wandb_mode", type=str, default="online",
                         choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_project", type=str, default="laser-scratch")
@@ -1429,7 +1396,6 @@ def main():
 
     pl.seed_everything(args.seed, workers=True)
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("medium")
 
     os.makedirs(args.out_dir, exist_ok=True)
     stage1_dir = os.path.join(args.out_dir, "stage1")
@@ -1518,13 +1484,6 @@ def main():
             vocab_size=ae.bottleneck.vocab_size,
             H=H, W=W, D=D,
             num_classes=stage2_num_classes,
-            coeff_max=(
-                None
-                if float(args.stage2_coeff_max) <= 0.0
-                else float(args.stage2_coeff_max)
-            ),
-            coeff_logvar_min=float(args.stage2_coeff_logvar_min),
-            coeff_logvar_max=float(args.stage2_coeff_logvar_max),
             d_model=args.tf_d_model,
             n_heads=args.tf_heads,
             n_layers=args.tf_layers,
@@ -1534,8 +1493,6 @@ def main():
         )
         transformer = RQTransformerPrior(
             cfg,
-            bos_token_id=ae.bottleneck.bos_token_id,
-            pad_token_id=ae.bottleneck.pad_token_id,
         )
 
         if args.stage2_resume_from_last:
@@ -1561,7 +1518,7 @@ def main():
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
-            coeff_l1_weight=args.stage2_coeff_l1_weight,
+            recon_loss_weight=args.stage2_recon_loss_weight,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
@@ -1575,31 +1532,24 @@ def main():
             fid_feature=args.stage2_fid_feature,
         )
 
-        strategy: object = (
-            args.stage2_strategy if args.stage2_devices > 1 else "auto"
+        from lightning.pytorch.strategies import DDPStrategy
+        s2_strategy: object = (
+            DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
+            if args.devices > 1 else "auto"
         )
-        if strategy == "ddp_fork" and torch.cuda.is_initialized():
-            strategy = "ddp"
-        if strategy in ("ddp", "ddp_fork"):
-            from lightning.pytorch.strategies import DDPStrategy
-            strategy = DDPStrategy(
-                broadcast_buffers=False, find_unused_parameters=False,
-            )
-        if args.stage2_devices > 1:
+        if args.devices > 1:
             os.environ["LASER_DDP_PHASE"] = "stage2"
             _ensure_free_master_port("Stage2")
 
         trainer = pl.Trainer(
             accelerator="gpu",
-            devices=args.stage2_devices,
-            strategy=strategy,
+            devices=args.devices,
+            strategy=s2_strategy,
             max_epochs=args.stage2_epochs,
             logger=_wandb_logger("stage2"),
             enable_checkpointing=False,
             gradient_clip_val=1.0,
-            precision=args.stage2_precision,
             log_every_n_steps=10,
-            accumulate_grad_batches=args.stage2_grad_accum,
         )
         trainer.fit(module, train_dataloaders=dl)
 
@@ -1699,26 +1649,22 @@ def main():
             lpips_weight=args.lpips_weight,
         )
 
-        if args.stage1_devices > 1:
+        if args.devices > 1:
             os.environ["LASER_DDP_PHASE"] = "stage1"
             _ensure_free_master_port("Stage1")
+        from lightning.pytorch.strategies import DDPStrategy
         s1_strategy: object = (
-            args.stage1_strategy if args.stage1_devices > 1 else "auto"
+            DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
+            if args.devices > 1 else "auto"
         )
-        if s1_strategy in ("ddp", "ddp_fork"):
-            from lightning.pytorch.strategies import DDPStrategy
-            s1_strategy = DDPStrategy(
-                broadcast_buffers=False, find_unused_parameters=False,
-            )
         pl.Trainer(
             accelerator="gpu",
-            devices=args.stage1_devices,
+            devices=args.devices,
             strategy=s1_strategy,
             max_epochs=args.stage1_epochs,
             logger=_wandb_logger("stage1"),
             enable_checkpointing=False,
             gradient_clip_val=args.grad_clip,
-            precision=args.stage1_precision,
             log_every_n_steps=10,
         ).fit(stage1_mod, train_dataloaders=train_loader,
               val_dataloaders=val_loader)
