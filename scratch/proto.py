@@ -232,13 +232,6 @@ class DictionaryLearning(nn.Module):
         sparsity_level: int = 5,
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
-        variational_coeffs: bool = False,
-        coeff_posterior_hidden: int = 32,
-        coeff_kl_weight: float = 1e-3,
-        coeff_anchor_weight: float = 0.1,
-        coeff_free_bits: float = 0.0,
-        coeff_logvar_min: float = -6.0,
-        coeff_logvar_max: float = 2.0,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -246,34 +239,14 @@ class DictionaryLearning(nn.Module):
         self.sparsity_level = sparsity_level
         self.commitment_cost = commitment_cost
         self.epsilon = epsilon
-        self.variational_coeffs = bool(variational_coeffs)
-        self.coeff_kl_weight = float(coeff_kl_weight)
-        self.coeff_anchor_weight = float(coeff_anchor_weight)
-        self.coeff_free_bits = float(max(0.0, coeff_free_bits))
-        self.coeff_logvar_min = float(coeff_logvar_min)
-        self.coeff_logvar_max = float(coeff_logvar_max)
-        self.kl_scale = 1.0
 
         self.dictionary = nn.Parameter(
             torch.randn(embedding_dim, num_embeddings)
         )
 
-        self.coeff_posterior = None
-        if self.variational_coeffs:
-            hidden = max(4, int(coeff_posterior_hidden))
-            self.coeff_posterior = nn.Sequential(
-                nn.Linear(1, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, 2),
-            )
-
         self.pad_token_id = num_embeddings
         self.bos_token_id = num_embeddings + 1
         self.vocab_size = num_embeddings + 2
-        self.last_coeff_kl = torch.tensor(0.0)
-        self.last_coeff_anchor = torch.tensor(0.0)
-        self.last_coeff_post_std = torch.tensor(0.0)
-        self.last_coeff_kl_scale = torch.tensor(1.0)
 
     # ---- batch OMP (adapted from bottleneck.py / sparse-vqvae) ----
 
@@ -351,18 +324,6 @@ class DictionaryLearning(nn.Module):
         atoms = dict_t[support.long()]              # [..., K, C]
         return (atoms * coeffs.unsqueeze(-1)).sum(dim=-2)
 
-    def _posterior_from_omp_coeffs(
-        self, coeffs_omp: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.coeff_posterior is None:
-            raise RuntimeError("Coefficient posterior head is not initialized.")
-        stats = self.coeff_posterior(coeffs_omp.unsqueeze(-1))
-        mu = stats[..., 0]
-        logvar = stats[..., 1].clamp(
-            min=self.coeff_logvar_min, max=self.coeff_logvar_max,
-        )
-        return mu, logvar
-
     # ---- forward (matches bottleneck.py style) ----
 
     def forward(
@@ -386,25 +347,7 @@ class DictionaryLearning(nn.Module):
         dictionary = F.normalize(self.dictionary, p=2, dim=0, eps=self.epsilon)
 
         with torch.no_grad():
-            support, coeffs_omp = self.batch_omp(signals, dictionary)
-
-        coeffs = coeffs_omp
-        coeff_kl = z_e.new_tensor(0.0)
-        coeff_anchor = z_e.new_tensor(0.0)
-        coeff_post_std = z_e.new_tensor(0.0)
-        if self.variational_coeffs:
-            mu, logvar = self._posterior_from_omp_coeffs(coeffs_omp)
-            std = torch.exp(0.5 * logvar)
-            coeff_post_std = std.mean()
-            if self.training:
-                coeffs = mu + std * torch.randn_like(std)
-            else:
-                coeffs = mu
-            kl_terms = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
-            if self.coeff_free_bits > 0:
-                kl_terms = torch.clamp(kl_terms, min=self.coeff_free_bits)
-            coeff_kl = kl_terms.mean()
-            coeff_anchor = F.mse_loss(mu, coeffs_omp)
+            support, coeffs = self.batch_omp(signals, dictionary)
 
         recon = self._reconstruct(support, coeffs, dictionary)
         z_dl = recon.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
@@ -412,16 +355,8 @@ class DictionaryLearning(nn.Module):
         dl_latent_loss = F.mse_loss(z_dl, z_e.detach())
         e_latent_loss = F.mse_loss(z_dl.detach(), z_e)
         loss = dl_latent_loss + self.commitment_cost * e_latent_loss
-        if self.variational_coeffs:
-            loss = loss + self.coeff_anchor_weight * coeff_anchor
-            loss = loss + (self.coeff_kl_weight * float(self.kl_scale)) * coeff_kl
 
         z_dl = z_e + (z_dl - z_e).detach()
-
-        self.last_coeff_kl = coeff_kl.detach()
-        self.last_coeff_anchor = coeff_anchor.detach()
-        self.last_coeff_post_std = coeff_post_std.detach()
-        self.last_coeff_kl_scale = z_e.new_tensor(float(self.kl_scale)).detach()
 
         K = self.sparsity_level
         return z_dl, loss, support.view(B, H, W, K), coeffs.view(B, H, W, K)
@@ -457,13 +392,6 @@ class SparseDictAE(nn.Module):
         num_embeddings: int = 256,
         sparsity_level: int = 4,
         commitment_cost: float = 0.25,
-        variational_coeffs: bool = False,
-        coeff_posterior_hidden: int = 32,
-        coeff_kl_weight: float = 1e-3,
-        coeff_anchor_weight: float = 0.1,
-        coeff_free_bits: float = 0.0,
-        coeff_logvar_min: float = -6.0,
-        coeff_logvar_max: float = 2.0,
     ):
         super().__init__()
         self.encoder = Encoder(
@@ -477,13 +405,6 @@ class SparseDictAE(nn.Module):
             embedding_dim=embedding_dim,
             sparsity_level=sparsity_level,
             commitment_cost=commitment_cost,
-            variational_coeffs=variational_coeffs,
-            coeff_posterior_hidden=coeff_posterior_hidden,
-            coeff_kl_weight=coeff_kl_weight,
-            coeff_anchor_weight=coeff_anchor_weight,
-            coeff_free_bits=coeff_free_bits,
-            coeff_logvar_min=coeff_logvar_min,
-            coeff_logvar_max=coeff_logvar_max,
         )
         self.post = nn.Conv2d(embedding_dim, num_hiddens, 3, padding=1)
         self.decoder = Decoder(
@@ -986,7 +907,6 @@ class Stage1Module(pl.LightningModule):
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
         lpips_weight: float = 0.0,
-        coeff_kl_warmup_steps: int = 20_000,
     ):
         super().__init__()
         self.ae = ae
@@ -999,7 +919,6 @@ class Stage1Module(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
         self.lpips_weight = lpips_weight
-        self.coeff_kl_warmup_steps = max(0, int(coeff_kl_warmup_steps))
         self._lpips = None
 
     def configure_optimizers(self):
@@ -1032,17 +951,6 @@ class Stage1Module(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
-        bn = self.ae.bottleneck
-        if getattr(bn, "variational_coeffs", False):
-            if self.coeff_kl_warmup_steps > 0:
-                bn.kl_scale = min(
-                    1.0,
-                    float(self.global_step + 1) / float(self.coeff_kl_warmup_steps),
-                )
-            else:
-                bn.kl_scale = 1.0
-        else:
-            bn.kl_scale = 1.0
         recon, b_loss, _, _ = self.ae(x)
         recon_loss = F.mse_loss(recon, x)
         loss = recon_loss + self.bottleneck_weight * b_loss
@@ -1061,15 +969,6 @@ class Stage1Module(pl.LightningModule):
                  on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
         self.log("stage1/b_loss", b_loss,
                  on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
-        if getattr(bn, "variational_coeffs", False):
-            self.log("stage1/coeff_kl", bn.last_coeff_kl,
-                     on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
-            self.log("stage1/coeff_anchor", bn.last_coeff_anchor,
-                     on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
-            self.log("stage1/coeff_post_std", bn.last_coeff_post_std,
-                     on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
-            self.log("stage1/coeff_kl_scale", bn.last_coeff_kl_scale,
-                     on_step=True, on_epoch=False, sync_dist=True, batch_size=bs)
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -1081,9 +980,6 @@ class Stage1Module(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, _ = batch
-        bn = self.ae.bottleneck
-        if getattr(bn, "variational_coeffs", False):
-            bn.kl_scale = 1.0
         recon, b_loss, _, _ = self.ae(x)
         recon_loss = F.mse_loss(recon, x)
         loss = recon_loss + self.bottleneck_weight * b_loss
@@ -1100,11 +996,6 @@ class Stage1Module(pl.LightningModule):
                  on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
         self.log("stage1/val_psnr", psnr,
                  on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
-        if getattr(bn, "variational_coeffs", False):
-            self.log("stage1/val_coeff_kl", bn.last_coeff_kl,
-                     on_epoch=True, sync_dist=True, batch_size=bs)
-            self.log("stage1/val_coeff_anchor", bn.last_coeff_anchor,
-                     on_epoch=True, sync_dist=True, batch_size=bs)
         return loss
 
     def on_validation_epoch_end(self):
@@ -1487,16 +1378,6 @@ def main():
     parser.add_argument("--stage1_strategy", type=str, default="ddp",
                         choices=["ddp", "auto"])
     parser.add_argument("--stage1_init_ckpt", type=str, default=None)
-    parser.add_argument(
-        "--coeff_kl_warmup_steps",
-        type=int,
-        default=20_000,
-        help=(
-            "Number of stage-1 optimization steps used to linearly warm up "
-            "the coefficient KL weight multiplier."
-        ),
-    )
-
     # Model
     parser.add_argument("--num_hiddens", type=int, default=128)
     parser.add_argument("--ae_num_downsamples", type=int, default=2)
@@ -1508,51 +1389,6 @@ def main():
     parser.add_argument("--commitment_cost", type=float, default=0.25)
     parser.add_argument("--lpips_weight", type=float, default=0.1,
                         help="Weight for LPIPS perceptual loss in stage-1.")
-    parser.add_argument(
-        "--variational_coeffs",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable VAE-style posterior over OMP coefficients "
-            "(Gaussian mu/logvar with reparameterization)."
-        ),
-    )
-    parser.add_argument(
-        "--coeff_posterior_hidden",
-        type=int,
-        default=32,
-        help="Hidden width of the coefficient posterior MLP.",
-    )
-    parser.add_argument(
-        "--coeff_kl_weight",
-        type=float,
-        default=1e-3,
-        help="Weight for KL[q(coeff)|p(coeff)] in the dictionary bottleneck.",
-    )
-    parser.add_argument(
-        "--coeff_anchor_weight",
-        type=float,
-        default=0.1,
-        help="Weight for anchoring posterior mean to OMP coefficients.",
-    )
-    parser.add_argument(
-        "--coeff_free_bits",
-        type=float,
-        default=0.0,
-        help="Free-bits floor applied to per-coefficient KL terms.",
-    )
-    parser.add_argument(
-        "--coeff_logvar_min",
-        type=float,
-        default=-6.0,
-        help="Minimum log-variance clamp for coefficient posterior.",
-    )
-    parser.add_argument(
-        "--coeff_logvar_max",
-        type=float,
-        default=2.0,
-        help="Maximum log-variance clamp for coefficient posterior.",
-    )
 
     # Stage-2
     parser.add_argument("--stage2_epochs", type=int, default=10)
@@ -1706,13 +1542,6 @@ def main():
             num_embeddings=args.num_atoms,
             sparsity_level=args.sparsity_level,
             commitment_cost=args.commitment_cost,
-            variational_coeffs=args.variational_coeffs,
-            coeff_posterior_hidden=args.coeff_posterior_hidden,
-            coeff_kl_weight=args.coeff_kl_weight,
-            coeff_anchor_weight=args.coeff_anchor_weight,
-            coeff_free_bits=args.coeff_free_bits,
-            coeff_logvar_min=args.coeff_logvar_min,
-            coeff_logvar_max=args.coeff_logvar_max,
         )
 
     def _load_ae(ae: SparseDictAE, path: str, tag: str = "Stage1"):
@@ -1930,7 +1759,6 @@ def main():
             warmup_epochs=args.stage1_warmup_epochs,
             min_lr_ratio=args.stage1_min_lr_ratio,
             lpips_weight=args.lpips_weight,
-            coeff_kl_warmup_steps=args.coeff_kl_warmup_steps,
         )
 
         if args.stage1_devices > 1:
