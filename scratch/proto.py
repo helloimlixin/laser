@@ -957,6 +957,7 @@ class Stage2Module(pl.LightningModule):
         sample_temperature: float = 0.8,
         sample_top_k: int = 64,
         coeff_loss_weight: float = 1.0,
+        direct_coeff_loss_weight: float = 0.25,
         recon_loss_weight: float = 1.0,
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
@@ -978,6 +979,7 @@ class Stage2Module(pl.LightningModule):
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
         self.coeff_loss_weight = coeff_loss_weight
+        self.direct_coeff_loss_weight = direct_coeff_loss_weight
         self.recon_loss_weight = recon_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
@@ -1062,6 +1064,7 @@ class Stage2Module(pl.LightningModule):
 
         sq_err = (full_coeff_pred - full_target).pow(2) * w
         coeff_reg_loss = sq_err.mean()
+        direct_coeff_loss = F.mse_loss(direct_coeff_pred, coeff_target)
 
         bn = self.ae.bottleneck
         dictionary = F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
@@ -1082,6 +1085,7 @@ class Stage2Module(pl.LightningModule):
         loss = (
             atom_hard_loss
             + self.coeff_loss_weight * coeff_reg_loss
+            + self.direct_coeff_loss_weight * direct_coeff_loss
             + self.recon_loss_weight * recon_loss
         )
 
@@ -1089,6 +1093,9 @@ class Stage2Module(pl.LightningModule):
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
         self.log("train/coeff_reg_loss", coeff_reg_loss,
+                 prog_bar=True, on_step=True, on_epoch=True,
+                 sync_dist=True, batch_size=B)
+        self.log("train/direct_coeff_loss", direct_coeff_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
         self.log("train/recon_loss", recon_loss,
@@ -1350,6 +1357,12 @@ def main():
         help="Weight for MSE coefficient regression loss in stage-2.",
     )
     parser.add_argument(
+        "--stage2_direct_coeff_loss_weight",
+        type=float,
+        default=0.25,
+        help="Weight for direct coefficient MSE loss on sampled head output.",
+    )
+    parser.add_argument(
         "--stage2_recon_loss_weight",
         type=float,
         default=1.0,
@@ -1518,6 +1531,7 @@ def main():
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
+            direct_coeff_loss_weight=args.stage2_direct_coeff_loss_weight,
             recon_loss_weight=args.stage2_recon_loss_weight,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,
