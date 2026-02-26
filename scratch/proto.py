@@ -448,28 +448,19 @@ class CausalSelfAttention(nn.Module):
         self.dropout = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(
-        self, x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
-        if kv_cache is not None:
-            k = torch.cat([kv_cache[0], k], dim=2)
-            v = torch.cat([kv_cache[1], v], dim=2)
-        new_kv = (k, v)
-
         out = F.scaled_dot_product_attention(
             q, k, v,
-            is_causal=(kv_cache is None and T > 1),
+            is_causal=(T > 1),
             dropout_p=(self.dropout if self.training else 0.0),
         )
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.out_proj(out)), new_kv
+        return self.resid_dropout(self.out_proj(out))
 
 
 class TransformerBlock(nn.Module):
@@ -486,14 +477,10 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(
-        self, x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        attn_out, new_kv = self.attn(self.ln1(x), kv_cache=kv_cache)
-        x = x + attn_out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
         x = x + self.ffn(self.ln2(x))
-        return x, new_kv
+        return x
 
 
 @dataclass
@@ -573,20 +560,8 @@ class RQTransformerPrior(nn.Module):
         x: torch.Tensor, blocks: nn.ModuleList,
     ) -> torch.Tensor:
         for block in blocks:
-            x, _ = block(x, kv_cache=None)
+            x = block(x)
         return x
-
-    @staticmethod
-    def _run_blocks_cached(
-        x: torch.Tensor, blocks: nn.ModuleList,
-        kv_caches: Optional[list],
-    ) -> Tuple[torch.Tensor, list]:
-        new_kv_caches = []
-        for i, block in enumerate(blocks):
-            cache = kv_caches[i] if kv_caches is not None else None
-            x, new_kv = block(x, kv_cache=cache)
-            new_kv_caches.append(new_kv)
-        return x, new_kv_caches
 
     def _class_bias(
         self, class_ids: Optional[torch.Tensor], batch_size: int,
@@ -706,32 +681,6 @@ class RQTransformerPrior(nn.Module):
             coeff_logvar.view(B, T, D),
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        coeffs: Optional[torch.Tensor] = None,
-        class_ids: Optional[torch.Tensor] = None,
-        kv_cache: Optional[list] = None,
-        start_pos: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]:
-        if kv_cache is not None or start_pos != 0:
-            raise NotImplementedError(
-                "KV-cache decoding is not implemented for the split "
-                "spatial/depth RQTransformerPrior."
-            )
-        if coeffs is None:
-            coeffs = torch.zeros_like(x, dtype=torch.float32)
-        atom_logits, coeff_mu, coeff_logvar = self.forward_tokens(
-            x, coeffs, class_ids=class_ids,
-        )
-        B, T, D, V = atom_logits.shape
-        return (
-            atom_logits.view(B, T * D, V),
-            coeff_mu.view(B, T * D),
-            coeff_logvar.view(B, T * D),
-            [],
-        )
-
     @torch.no_grad()
     def generate(
         self,
@@ -763,43 +712,33 @@ class RQTransformerPrior(nn.Module):
             range(T), desc="sampling", leave=False, disable=(not show_progress),
         )
 
-        spatial_kv: Optional[list] = None
-
         for t in steps:
-            if t == 0:
-                s_in = (self.start_emb.expand(batch_size, 1, -1)
-                        + spatial_pos[0].view(1, 1, -1))
-            else:
-                prev_tok_emb = self.token_emb(tokens[:, t - 1, :])   # [B, D, C]
-                prev_coeff_emb = self._coeff_embed(coeffs[:, t - 1, :])
-                prev_sum = (prev_tok_emb + prev_coeff_emb).sum(
-                    dim=1, keepdim=True,
-                )                                                     # [B, 1, C]
-                s_in = prev_sum + spatial_pos[t].view(1, 1, -1)
+            # Build spatial input for positions [0..t], run full causal pass
+            spatial_in = torch.zeros(batch_size, t + 1, d_model, device=device)
+            spatial_in[:, 0, :] = self.start_emb.squeeze(1)
+            if t > 0:
+                prev_tok = self.token_emb(tokens[:, :t, :])
+                prev_coeff = self._coeff_embed(coeffs[:, :t, :])
+                spatial_in[:, 1:, :] = (prev_tok + prev_coeff).sum(dim=2)
+            spatial_in = spatial_in + spatial_pos[: t + 1].unsqueeze(0)
             if class_bias is not None:
-                s_in = s_in + class_bias
+                spatial_in = spatial_in + class_bias
 
-            s_in = self.drop(s_in)
-            spatial_h_t, spatial_kv = self._run_blocks_cached(
-                s_in, self.spatial_blocks, spatial_kv,
-            )
-            h_t = self.spatial_ln(spatial_h_t).squeeze(1)            # [B, C]
-
-            depth_kv: Optional[list] = None
-            prev_combined: Optional[torch.Tensor] = None
+            spatial_h = self._run_blocks(spatial_in, self.spatial_blocks)
+            h_t = self.spatial_ln(spatial_h)[:, -1, :]                # [B, C]
 
             for d in range(D):
-                if d == 0:
-                    d_in = h_t.unsqueeze(1) + depth_pos[0].view(1, 1, -1)
-                else:
-                    d_in = (prev_combined.unsqueeze(1)
-                            + depth_pos[d].view(1, 1, -1))
+                # Build depth input for depths [0..d], run full causal pass
+                depth_in = torch.zeros(batch_size, d + 1, d_model, device=device)
+                depth_in[:, 0, :] = h_t
+                if d > 0:
+                    prev_atom = self.token_emb(tokens[:, t, :d])
+                    prev_c = self._coeff_embed(coeffs[:, t, :d])
+                    depth_in[:, 1:, :] = prev_atom + prev_c
+                depth_in = depth_in + depth_pos[: d + 1].unsqueeze(0)
 
-                d_in = self.drop(d_in)
-                depth_h_d, depth_kv = self._run_blocks_cached(
-                    d_in, self.depth_blocks, depth_kv,
-                )
-                z_last = self.depth_ln(depth_h_d).squeeze(1)         # [B, C]
+                depth_h = self._run_blocks(depth_in, self.depth_blocks)
+                z_last = self.depth_ln(depth_h)[:, -1, :]             # [B, C]
 
                 logits = self.atom_head(z_last) / max(temperature, 1e-8)
                 logits[:, special] = float("-inf")
@@ -821,7 +760,6 @@ class RQTransformerPrior(nn.Module):
                 c = c_mu + torch.randn_like(c_std) * c_std * max(temperature, 1e-8)
                 c = self._apply_coeff_limit(c)
                 coeffs[:, t, d] = c
-                prev_combined = atom_emb + self._coeff_embed(c)
 
         return (
             tokens.view(batch_size, T * D),
