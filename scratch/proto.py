@@ -216,6 +216,11 @@ class DictionaryLearning(nn.Module):
         sparsity_level: int = 5,
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
+        usage_ema_decay: float = 0.99,
+        usage_balance_alpha: float = 0.3,
+        dead_atom_threshold: float = 5e-4,
+        dead_atom_interval: int = 200,
+        dead_atom_max_reinit: int = 16,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -223,14 +228,127 @@ class DictionaryLearning(nn.Module):
         self.sparsity_level = sparsity_level
         self.commitment_cost = commitment_cost
         self.epsilon = epsilon
+        self.usage_ema_decay = float(min(max(usage_ema_decay, 0.0), 0.9999))
+        self.usage_balance_alpha = float(max(usage_balance_alpha, 0.0))
+        self.dead_atom_threshold = float(max(dead_atom_threshold, 0.0))
+        self.dead_atom_interval = int(max(dead_atom_interval, 1))
+        self.dead_atom_max_reinit = int(max(dead_atom_max_reinit, 0))
 
         self.dictionary = nn.Parameter(
             torch.randn(embedding_dim, num_embeddings)
         )
 
         self.vocab_size = num_embeddings
+        self.register_buffer(
+            "usage_ema",
+            torch.full((num_embeddings,), 1.0 / max(1, num_embeddings)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_steps_since_reinit",
+            torch.zeros((), dtype=torch.long),
+            persistent=False,
+        )
+        self._residual_prototypes: Optional[torch.Tensor] = None
 
     # ---- batch OMP (adapted from bottleneck.py / sparse-vqvae) ----
+
+    def _selection_boost(
+        self, device: torch.device, dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.usage_balance_alpha <= 0:
+            return None
+        usage = self.usage_ema.to(device=device, dtype=dtype)
+        usage = usage / usage.sum().clamp(min=self.epsilon)
+        uniform = 1.0 / max(1.0, float(self.num_embeddings))
+        boost = (uniform / usage.clamp(min=self.epsilon)).pow(self.usage_balance_alpha)
+        return boost.clamp(max=8.0)
+
+    @torch.no_grad()
+    def _update_usage_ema(self, support: torch.Tensor) -> None:
+        flat = support.reshape(-1)
+        if flat.numel() == 0:
+            return
+        counts = torch.bincount(flat, minlength=self.num_embeddings).to(
+            device=self.usage_ema.device, dtype=self.usage_ema.dtype,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        probs = counts / counts.sum().clamp(min=self.epsilon)
+        self.usage_ema.mul_(self.usage_ema_decay).add_(
+            probs * (1.0 - self.usage_ema_decay)
+        )
+
+    @torch.no_grad()
+    def _cache_residual_prototypes(
+        self, signals_bt: torch.Tensor, recon_bt: torch.Tensor,
+    ) -> None:
+        if self.dead_atom_threshold <= 0 or self.dead_atom_max_reinit <= 0:
+            return
+        residual = (signals_bt - recon_bt).detach()
+        if residual.numel() == 0:
+            return
+        bank_size = min(
+            residual.size(0),
+            max(1, 4 * self.dead_atom_max_reinit),
+        )
+        energy = residual.pow(2).sum(dim=1)
+        top_idx = torch.topk(energy, k=bank_size, largest=True).indices
+        self._residual_prototypes = residual[top_idx].t().contiguous()
+
+    @torch.no_grad()
+    def usage_stats(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        usage = self.usage_ema / self.usage_ema.sum().clamp(min=self.epsilon)
+        top1 = usage.max()
+        entropy = -(usage * usage.clamp(min=self.epsilon).log()).sum()
+        perplexity = entropy.exp()
+        threshold = (
+            self.dead_atom_threshold
+            if self.dead_atom_threshold > 0 else (0.5 / max(1, self.num_embeddings))
+        )
+        active_frac = (usage > threshold).float().mean()
+        return top1, perplexity, active_frac
+
+    @torch.no_grad()
+    def revive_dead_atoms(self) -> int:
+        if self.dead_atom_threshold <= 0 or self.dead_atom_max_reinit <= 0:
+            return 0
+        if self._residual_prototypes is None or self._residual_prototypes.numel() == 0:
+            return 0
+
+        usage = self.usage_ema / self.usage_ema.sum().clamp(min=self.epsilon)
+        dead = torch.nonzero(
+            usage < self.dead_atom_threshold, as_tuple=False,
+        ).squeeze(1)
+        if dead.numel() == 0:
+            return 0
+
+        k = min(
+            int(dead.numel()),
+            int(self.dead_atom_max_reinit),
+            int(self._residual_prototypes.size(1)),
+        )
+        if k <= 0:
+            return 0
+
+        order = torch.argsort(usage[dead], descending=False)
+        dead = dead[order[:k]]
+        pick = torch.randperm(
+            self._residual_prototypes.size(1),
+            device=self._residual_prototypes.device,
+        )[:k]
+        repl = self._residual_prototypes[:, pick]
+        repl = F.normalize(
+            repl + 0.01 * torch.randn_like(repl),
+            p=2, dim=0, eps=self.epsilon,
+        )
+        self.dictionary[:, dead] = repl.to(
+            device=self.dictionary.device, dtype=self.dictionary.dtype,
+        )
+        self.usage_ema[dead] = usage.mean().to(self.usage_ema.dtype)
+        self._steps_since_reinit.zero_()
+        self._residual_prototypes = None
+        return int(k)
 
     def batch_omp(
         self, X: torch.Tensor, D: torch.Tensor,
@@ -255,9 +373,13 @@ class DictionaryLearning(nn.Module):
         mask = torch.ones_like(h_bar, dtype=torch.bool)
         gamma = torch.zeros_like(h_bar)
         batch_idx = torch.arange(B, device=X.device)
+        selection_boost = self._selection_boost(device=X.device, dtype=X.dtype)
 
         for k in range(1, self.sparsity_level + 1):
-            idx = (h.abs() * mask.float()).argmax(dim=1)
+            scores = h.abs() * mask.float()
+            if selection_boost is not None:
+                scores = scores * selection_boost.unsqueeze(0)
+            idx = scores.argmax(dim=1)
             mask[batch_idx, idx] = False
             expanded = batch_idx.unsqueeze(0).expand(k, B).t()
 
@@ -332,6 +454,11 @@ class DictionaryLearning(nn.Module):
             support, coeffs = self.batch_omp(signals, dictionary)
 
         recon = self._reconstruct(support, coeffs, dictionary)
+        if self.training:
+            with torch.no_grad():
+                self._update_usage_ema(support)
+                self._cache_residual_prototypes(signals.t(), recon)
+                self._steps_since_reinit.add_(1)
         z_dl = recon.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
         dl_latent_loss = F.mse_loss(z_dl, z_e.detach())
@@ -374,6 +501,11 @@ class SparseDictAE(nn.Module):
         num_embeddings: int = 256,
         sparsity_level: int = 4,
         commitment_cost: float = 0.25,
+        usage_ema_decay: float = 0.99,
+        usage_balance_alpha: float = 0.3,
+        dead_atom_threshold: float = 5e-4,
+        dead_atom_interval: int = 200,
+        dead_atom_max_reinit: int = 16,
     ):
         super().__init__()
         self.encoder = Encoder(
@@ -387,6 +519,11 @@ class SparseDictAE(nn.Module):
             embedding_dim=embedding_dim,
             sparsity_level=sparsity_level,
             commitment_cost=commitment_cost,
+            usage_ema_decay=usage_ema_decay,
+            usage_balance_alpha=usage_balance_alpha,
+            dead_atom_threshold=dead_atom_threshold,
+            dead_atom_interval=dead_atom_interval,
+            dead_atom_max_reinit=dead_atom_max_reinit,
         )
         self.post = nn.Conv2d(embedding_dim, num_hiddens, 3, padding=1)
         self.decoder = Decoder(
@@ -882,11 +1019,49 @@ class Stage1Module(pl.LightningModule):
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        bs = batch[0].size(0) if isinstance(batch, (tuple, list)) else 1
+        revived = 0
         with torch.no_grad():
             bn = self.ae.bottleneck
             bn.dictionary.copy_(
                 F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
             )
+            if (
+                self.trainer.is_global_zero
+                and bn.dead_atom_threshold > 0
+                and bn.dead_atom_max_reinit > 0
+                and int(bn._steps_since_reinit.item()) >= bn.dead_atom_interval
+            ):
+                revived = bn.revive_dead_atoms()
+
+            revived_value = torch.tensor(
+                float(revived),
+                device=bn.dictionary.device,
+                dtype=bn.dictionary.dtype,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast(bn.dictionary.data, src=0)
+                torch.distributed.broadcast(bn.usage_ema, src=0)
+                torch.distributed.broadcast(revived_value, src=0)
+
+            usage_top1, usage_perplexity, usage_active = bn.usage_stats()
+
+        self.log(
+            "stage1/usage_top1", usage_top1,
+            on_step=True, on_epoch=True, sync_dist=True, batch_size=bs,
+        )
+        self.log(
+            "stage1/usage_perplexity", usage_perplexity,
+            on_step=True, on_epoch=True, sync_dist=True, batch_size=bs,
+        )
+        self.log(
+            "stage1/usage_active_frac", usage_active,
+            on_step=True, on_epoch=True, sync_dist=True, batch_size=bs,
+        )
+        self.log(
+            "stage1/revived_atoms", revived_value,
+            on_step=True, on_epoch=True, sync_dist=True, batch_size=bs,
+        )
 
     def validation_step(self, batch, batch_idx):
         x, _ = batch
@@ -1326,6 +1501,26 @@ def main():
     parser.add_argument("--num_atoms", type=int, default=128)
     parser.add_argument("--sparsity_level", type=int, default=3)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
+    parser.add_argument(
+        "--usage_ema_decay", type=float, default=0.99,
+        help="EMA decay for tracking dictionary atom usage.",
+    )
+    parser.add_argument(
+        "--usage_balance_alpha", type=float, default=0.3,
+        help="Inverse-usage reweighting strength for OMP atom selection.",
+    )
+    parser.add_argument(
+        "--dead_atom_threshold", type=float, default=5e-4,
+        help="Usage threshold for reviving dead atoms; <=0 disables revival.",
+    )
+    parser.add_argument(
+        "--dead_atom_interval", type=int, default=200,
+        help="Train batches between dead-atom revival checks.",
+    )
+    parser.add_argument(
+        "--dead_atom_max_reinit", type=int, default=16,
+        help="Maximum number of atoms to reinitialize per revival check.",
+    )
     parser.add_argument("--lpips_weight", type=float, default=0.1,
                         help="Weight for LPIPS perceptual loss in stage-1.")
 
@@ -1459,6 +1654,11 @@ def main():
             num_embeddings=args.num_atoms,
             sparsity_level=args.sparsity_level,
             commitment_cost=args.commitment_cost,
+            usage_ema_decay=args.usage_ema_decay,
+            usage_balance_alpha=args.usage_balance_alpha,
+            dead_atom_threshold=args.dead_atom_threshold,
+            dead_atom_interval=args.dead_atom_interval,
+            dead_atom_max_reinit=args.dead_atom_max_reinit,
         )
 
     def _load_ae(ae: SparseDictAE, path: str, tag: str = "Stage1"):
