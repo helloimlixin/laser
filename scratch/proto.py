@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import lightning as pl
 from lightning.pytorch.loggers import WandbLogger
 from PIL import Image
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 from torchvision import datasets, transforms, utils
 from tqdm import tqdm
@@ -719,12 +720,7 @@ class RQTransformerPrior(nn.Module):
         self.spatial_ln = nn.LayerNorm(cfg.d_model)
         self.depth_ln = nn.LayerNorm(cfg.d_model)
         self.atom_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        self.coeff_proj = nn.Sequential(
-            nn.Linear(1, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model),
-        )
-        # Learn how to fuse per-depth token/coeff context before spatial AR.
+        # Fuse per-depth token + coefficient context before spatial AR.
         self.spatial_depth_fuse = nn.Sequential(
             nn.LayerNorm(cfg.D * cfg.d_model),
             nn.Linear(cfg.D * cfg.d_model, cfg.d_model),
@@ -732,19 +728,14 @@ class RQTransformerPrior(nn.Module):
             nn.Linear(cfg.d_model, cfg.d_model),
         )
         self.num_atoms = cfg.vocab_size
-        coeff_in_dim = (1 + 2 * cfg.D) * cfg.d_model
-        self.full_coeff_head = nn.Sequential(
+        coeff_in_dim = (2 + 2 * cfg.D) * cfg.d_model
+        self.coeff_query_head = nn.Sequential(
             nn.Linear(coeff_in_dim, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model, self.num_atoms),
+            nn.Linear(cfg.d_model, cfg.d_model),
         )
-        nn.init.zeros_(self.full_coeff_head[-1].weight)
-        nn.init.zeros_(self.full_coeff_head[-1].bias)
-        self.direct_coeff_head = nn.Sequential(
-            nn.Linear(coeff_in_dim, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.D),
-        )
+        nn.init.zeros_(self.coeff_query_head[-1].weight)
+        nn.init.zeros_(self.coeff_query_head[-1].bias)
 
     def _class_bias(
         self, class_ids: Optional[torch.Tensor], batch_size: int,
@@ -771,6 +762,25 @@ class RQTransformerPrior(nn.Module):
         cols = self._spatial_cols[:length].to(device)
         return self.row_emb(rows) + self.col_emb(cols)
 
+    @staticmethod
+    def _apply_coeff_clamp(
+        x: torch.Tensor, coeff_clamp: Optional[Tuple[float, float]],
+    ) -> torch.Tensor:
+        if coeff_clamp is None:
+            return x
+        lo, hi = coeff_clamp
+        lo_t = x.new_tensor(lo)
+        hi_t = x.new_tensor(hi)
+        mid = 0.5 * (lo_t + hi_t)
+        half = torch.clamp(0.5 * (hi_t - lo_t), min=1e-6)
+        return mid + half * torch.tanh((x - mid) / half)
+
+    def _coeff_pair_to_embed(
+        self, atom_emb: torch.Tensor, coeff_val: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode (atom id embedding, scalar coeff) as coeff feedback feature."""
+        return torch.tanh(atom_emb * coeff_val.unsqueeze(-1))
+
     def _fuse_spatial_context(
         self, tok_emb: torch.Tensor, coeff_emb: torch.Tensor,
     ) -> torch.Tensor:
@@ -778,18 +788,36 @@ class RQTransformerPrior(nn.Module):
         fused = (tok_emb + coeff_emb).reshape(tok_emb.size(0), tok_emb.size(1), -1)
         return self.spatial_depth_fuse(fused)
 
+    def _run_no_cache_blocks(
+        self, x: torch.Tensor, blocks: nn.ModuleList,
+    ) -> torch.Tensor:
+        """Run transformer blocks without KV cache, with checkpointing in train."""
+        for blk in blocks:
+            if self.training:
+                x = checkpoint(
+                    lambda inp, m=blk: m(inp)[0],
+                    x,
+                    use_reentrant=False,
+                )
+            else:
+                x, _ = blk(x)
+        return x
+
     def forward_tokens(
         self,
         tokens_flat: torch.Tensor,
         coeffs_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        compute_sparse_reg: bool = False,
+        coeff_neg_samples: int = 0,
+        coeff_clamp: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Teacher-forced logits over flattened [H*W*D] tokens.
 
         Returns:
             atom_logits:       [B, H*W, D, vocab_size]
-            full_coeff_pred:   [B, H*W, num_atoms]
             direct_coeff_pred: [B, H*W, D]
+            sparse_reg:        [B, H*W, D] or None
         """
         device = tokens_flat.device
         D = self.cfg.D
@@ -798,12 +826,15 @@ class RQTransformerPrior(nn.Module):
         d_model = self.cfg.d_model
         coeffs = coeffs_flat.float().view(B, T, D)
 
+        tok_emb_spatial = self.token_emb(tok)
+        coeff_teacher_spatial = torch.tanh(tok_emb_spatial * coeffs.unsqueeze(-1))
         spatial_in = torch.zeros(B, T, d_model, device=device)
         if T > 1:
-            prev_tok_emb = self.token_emb(tok[:, :-1, :])
-            prev_coeff_emb = self.coeff_proj(coeffs[:, :-1, :].unsqueeze(-1))
+            prev_tok_emb = tok_emb_spatial[:, :-1, :]
+            prev_coeff_emb = coeff_teacher_spatial[:, :-1, :]
             spatial_in[:, 1:, :] = self._fuse_spatial_context(
-                prev_tok_emb, prev_coeff_emb,
+                prev_tok_emb,
+                prev_coeff_emb,
             )
         spatial_in = spatial_in + self._spatial_pos(T, device).unsqueeze(0)
         spatial_in[:, :1, :] = spatial_in[:, :1, :] + self.start_emb
@@ -813,37 +844,78 @@ class RQTransformerPrior(nn.Module):
             spatial_in = spatial_in + class_bias
 
         spatial_h = self.drop(spatial_in)
-        for blk in self.spatial_blocks:
-            spatial_h, _ = blk(spatial_h)
+        spatial_h = self._run_no_cache_blocks(spatial_h, self.spatial_blocks)
         spatial_h = self.spatial_ln(spatial_h)
 
         bt = B * T
+        h_t = spatial_h.reshape(bt, d_model)
         tok_bt = tok.view(bt, D)
         tok_emb = self.token_emb(tok_bt)
-        depth_in = torch.cat([
-            spatial_h.reshape(bt, 1, d_model),
-            tok_emb[:, :-1, :],
-        ], dim=1)
-        depth_in = depth_in + self.depth_emb(
+        coeff_bt = coeffs.reshape(bt, D)
+        coeff_teacher_depth = self._coeff_pair_to_embed(tok_emb, coeff_bt)
+        depth_pos = self.depth_emb(
             torch.arange(D, device=device, dtype=torch.long),
         ).unsqueeze(0)
 
+        # Teacher-forced depth AR can run in one causal pass:
+        # depth position d predicts atom/coeff for sparse layer d.
+        depth_in = torch.zeros(bt, D, d_model, device=device)
+        depth_in[:, 0, :] = h_t
+        if D > 1:
+            depth_in[:, 1:, :] = tok_emb[:, :-1, :] + coeff_teacher_depth[:, :-1, :]
+        depth_in = depth_in + depth_pos
+
         depth_h = self.drop(depth_in)
-        for blk in self.depth_blocks:
-            depth_h, _ = blk(depth_h)
+        depth_h = self._run_no_cache_blocks(depth_h, self.depth_blocks)
         depth_h = self.depth_ln(depth_h)
+        atom_logits_bt = self.atom_head(depth_h)
 
-        atom_logits = self.atom_head(depth_h)
+        token_slots = torch.zeros(bt, D, d_model, device=device)
+        coeff_slots = torch.zeros(bt, D, d_model, device=device)
+        direct_coeff_list: list[torch.Tensor] = []
+        sparse_reg_list: list[torch.Tensor] = []
+        neg_k = int(max(0, coeff_neg_samples))
+        use_sparse_reg = bool(compute_sparse_reg and neg_k > 0 and self.num_atoms > 1)
 
-        depth_flat = depth_h.reshape(B, T, D * d_model)
-        atom_flat = self.token_emb(tok).reshape(B, T, D * d_model)
-        combined_h = torch.cat([spatial_h, depth_flat, atom_flat], dim=-1)
-        full_coeff_pred = self.full_coeff_head(combined_h)
-        direct_coeff_pred = self.direct_coeff_head(combined_h)
+        for d in range(D):
+            z_last = depth_h[:, d, :]
+            tok_cur = tok_emb[:, d, :]
+            token_slots[:, d, :] = tok_cur
+            combined_h = torch.cat([
+                h_t,
+                z_last,
+                token_slots.reshape(bt, D * d_model),
+                coeff_slots.reshape(bt, D * d_model),
+            ], dim=-1)
+            coeff_query_d = self.coeff_query_head(combined_h)
+            direct_coeff_d = (coeff_query_d * tok_cur).sum(dim=-1)
+            direct_coeff_d = self._apply_coeff_clamp(direct_coeff_d, coeff_clamp)
+            direct_coeff_list.append(direct_coeff_d)
+            if use_sparse_reg:
+                k = min(neg_k, self.num_atoms - 1)
+                neg_idx = torch.randint(
+                    0, self.num_atoms, (bt, k), device=device, dtype=torch.long,
+                )
+                pos_idx = tok_bt[:, d: d + 1]
+                collision = neg_idx.eq(pos_idx)
+                if collision.any():
+                    neg_idx = torch.where(collision, (neg_idx + 1) % self.num_atoms, neg_idx)
+                neg_emb = self.token_emb(neg_idx)
+                neg_coeff = torch.einsum("bd,bkd->bk", coeff_query_d, neg_emb)
+                neg_coeff = self._apply_coeff_clamp(neg_coeff, coeff_clamp)
+                sparse_reg_list.append(neg_coeff.pow(2).mean(dim=-1))
+
+            coeff_slots[:, d, :] = coeff_teacher_depth[:, d, :]
+
+        atom_logits = atom_logits_bt.view(B, T, D, self.cfg.vocab_size)
+        direct_coeff_pred = torch.stack(direct_coeff_list, dim=1).view(B, T, D)
+        sparse_reg: Optional[torch.Tensor] = None
+        if use_sparse_reg:
+            sparse_reg = torch.stack(sparse_reg_list, dim=1).view(B, T, D)
         return (
-            atom_logits.view(B, T, D, self.cfg.vocab_size),
-            full_coeff_pred,
+            atom_logits,
             direct_coeff_pred,
+            sparse_reg,
         )
 
     @torch.no_grad()
@@ -869,6 +941,7 @@ class RQTransformerPrior(nn.Module):
 
         tokens = torch.zeros(batch_size, T, D, dtype=torch.long, device=device)
         coeffs = torch.zeros(batch_size, T, D, dtype=torch.float32, device=device)
+        prev_coeff_slots = torch.zeros(batch_size, D, d_model, device=device)
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
             None
         ] * len(self.spatial_blocks)
@@ -881,10 +954,9 @@ class RQTransformerPrior(nn.Module):
                 x_new = self.start_emb.expand(batch_size, -1, -1)
             else:
                 prev_tok = self.token_emb(tokens[:, t - 1 : t, :])
-                prev_coeff = self.coeff_proj(
-                    coeffs[:, t - 1 : t, :].unsqueeze(-1),
+                x_new = self._fuse_spatial_context(
+                    prev_tok, prev_coeff_slots.unsqueeze(1),
                 )
-                x_new = self._fuse_spatial_context(prev_tok, prev_coeff)
             x_new = x_new + spatial_pos[t : t + 1].unsqueeze(0)
             if class_bias is not None:
                 x_new = x_new + class_bias
@@ -896,21 +968,20 @@ class RQTransformerPrior(nn.Module):
                 )
             h_t = self.spatial_ln(spatial_h).squeeze(1)
 
-            depth_hiddens: list[torch.Tensor] = []
+            token_slots = torch.zeros(batch_size, D, d_model, device=device)
+            coeff_slots = torch.zeros(batch_size, D, d_model, device=device)
+            depth_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
+                None
+            ] * len(self.depth_blocks)
             for d in range(D):
-                depth_in = torch.zeros(
-                    batch_size, d + 1, d_model, device=device,
-                )
-                depth_in[:, 0, :] = h_t
-                if d > 0:
-                    depth_in[:, 1:, :] = self.token_emb(tokens[:, t, :d])
-                depth_in = depth_in + depth_pos[: d + 1].unsqueeze(0)
-
-                depth_h = depth_in
-                for blk in self.depth_blocks:
-                    depth_h, _ = blk(depth_h)
-                z_last = self.depth_ln(depth_h)[:, -1, :]
-                depth_hiddens.append(z_last)
+                if d == 0:
+                    depth_x = h_t
+                else:
+                    depth_x = token_slots[:, d - 1, :] + coeff_slots[:, d - 1, :]
+                depth_h = (depth_x + depth_pos[d]).unsqueeze(1)
+                for i, blk in enumerate(self.depth_blocks):
+                    depth_h, depth_kv[i] = blk(depth_h, kv_cache=depth_kv[i])
+                z_last = self.depth_ln(depth_h)[:, 0, :]
 
                 logits = self.atom_head(z_last) / max(temperature, 1e-8)
                 if top_k is not None and top_k > 0:
@@ -923,18 +994,20 @@ class RQTransformerPrior(nn.Module):
                 tokens[:, t, d] = torch.multinomial(
                     F.softmax(logits, dim=-1), 1,
                 ).squeeze(-1)
-
-            combined_h = torch.cat([
-                h_t,
-                torch.cat(depth_hiddens, dim=-1),
-                self.token_emb(tokens[:, t, :]).reshape(
-                    batch_size, D * d_model,
-                ),
-            ], dim=-1)
-            pred_c = self.direct_coeff_head(combined_h)
-            if coeff_clamp is not None:
-                pred_c = pred_c.clamp(coeff_clamp[0], coeff_clamp[1])
-            coeffs[:, t, :] = pred_c
+                tok_cur = self.token_emb(tokens[:, t, d])
+                token_slots[:, d, :] = tok_cur
+                combined_h = torch.cat([
+                    h_t,
+                    z_last,
+                    token_slots.reshape(batch_size, D * d_model),
+                    coeff_slots.reshape(batch_size, D * d_model),
+                ], dim=-1)
+                coeff_query = self.coeff_query_head(combined_h)
+                pred_coeff = (coeff_query * tok_cur).sum(dim=-1)
+                pred_coeff = self._apply_coeff_clamp(pred_coeff, coeff_clamp)
+                coeffs[:, t, d] = pred_coeff
+                coeff_slots[:, d, :] = self._coeff_pair_to_embed(tok_cur, pred_coeff)
+            prev_coeff_slots = coeff_slots
 
         return (
             tokens.view(batch_size, T * D),
@@ -1198,6 +1271,7 @@ class Stage2Module(pl.LightningModule):
         sample_temperature: float = 0.8,
         sample_top_k: int = 64,
         coeff_loss_weight: float = 1.0,
+        coeff_neg_samples: int = 32,
         direct_coeff_loss_weight: float = 0.25,
         recon_loss_weight: float = 1.0,
         lr_schedule: str = "cosine",
@@ -1221,6 +1295,7 @@ class Stage2Module(pl.LightningModule):
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
         self.coeff_loss_weight = coeff_loss_weight
+        self.coeff_neg_samples = max(0, int(coeff_neg_samples))
         self.direct_coeff_loss_weight = direct_coeff_loss_weight
         self.recon_loss_weight = recon_loss_weight
         self.lr_schedule = lr_schedule
@@ -1267,7 +1342,12 @@ class Stage2Module(pl.LightningModule):
             "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
         }
 
-    def training_step(self, batch, batch_idx):
+    def _unpack_stage2_batch(
+        self,
+        batch,
+        limit: Optional[int] = None,
+        move_to_device: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if not isinstance(batch, (tuple, list)):
             batch = (batch,)
         items = list(batch)
@@ -1279,13 +1359,45 @@ class Stage2Module(pl.LightningModule):
         tok_flat, coeff_flat = items
         tok_flat = tok_flat.long()
         coeff_flat = coeff_flat.float()
+
+        if limit is not None and limit > 0 and tok_flat.size(0) > limit:
+            tok_flat = tok_flat[:limit]
+            coeff_flat = coeff_flat[:limit]
+            if class_ids is not None:
+                class_ids = class_ids[:limit]
+
+        if move_to_device:
+            tok_flat = tok_flat.to(self.device, non_blocking=True)
+            coeff_flat = coeff_flat.to(self.device, non_blocking=True)
+            if class_ids is not None:
+                class_ids = class_ids.to(self.device, non_blocking=True)
+
+        return tok_flat, coeff_flat, class_ids
+
+    def _resize_for_logging(self, x: torch.Tensor) -> torch.Tensor:
+        if self.sample_image_size and self.sample_image_size > 0:
+            return F.interpolate(
+                x,
+                size=(self.sample_image_size, self.sample_image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return x
+
+    def training_step(self, batch, batch_idx):
+        tok_flat, coeff_flat, class_ids = self._unpack_stage2_batch(batch)
         B = tok_flat.size(0)
         y = tok_flat.view(B, self.H * self.W, self.D)
         coeff_target = coeff_flat.view(B, self.H * self.W, self.D)
 
-        atom_logits, full_coeff_pred, direct_coeff_pred = (
+        atom_logits, direct_coeff_pred, sparse_reg = (
             self.transformer.forward_tokens(
-                tok_flat, coeff_flat, class_ids=class_ids,
+                tok_flat,
+                coeff_flat,
+                class_ids=class_ids,
+                compute_sparse_reg=(self.coeff_loss_weight > 0),
+                coeff_neg_samples=self.coeff_neg_samples,
+                coeff_clamp=self.coeff_clamp,
             )
         )
         atom_hard_loss = F.cross_entropy(
@@ -1293,20 +1405,11 @@ class Stage2Module(pl.LightningModule):
             y.reshape(-1),
         )
 
-        T = self.H * self.W
-        num_atoms = self.transformer.num_atoms
         D = self.D
-        full_target = torch.zeros(
-            B, T, num_atoms, device=tok_flat.device, dtype=coeff_target.dtype,
-        )
-        full_target.scatter_(2, y.long(), coeff_target)
-
-        active_mask = torch.zeros_like(full_target)
-        active_mask.scatter_(2, y.long(), 1.0)
-        w = torch.where(active_mask > 0, num_atoms / D, 1.0)
-
-        sq_err = (full_coeff_pred - full_target).pow(2) * w
-        coeff_reg_loss = sq_err.mean()
+        if sparse_reg is None:
+            coeff_reg_loss = coeff_target.new_zeros(())
+        else:
+            coeff_reg_loss = sparse_reg.mean()
         direct_coeff_loss = F.mse_loss(direct_coeff_pred, coeff_target)
 
         bn = self.ae.bottleneck
@@ -1367,7 +1470,7 @@ class Stage2Module(pl.LightningModule):
             return
         self._last_sample_step = self.global_step
         if self.trainer.is_global_zero:
-            self._sample_and_save()
+            self._sample_and_save(batch=batch)
 
     def on_train_epoch_end(self):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -1392,7 +1495,7 @@ class Stage2Module(pl.LightningModule):
         return torch.arange(n, dtype=torch.long, device=self.device) % self.num_classes
 
     @torch.no_grad()
-    def _sample_and_save(self):
+    def _sample_and_save(self, batch=None):
         self.transformer.eval()
         self.ae.eval()
         step = self.global_step
@@ -1411,15 +1514,7 @@ class Stage2Module(pl.LightningModule):
         raw_imgs = self.ae.decode_from_codes(
             support.to(self.device), coeffs.to(self.device),
         )
-        if self.sample_image_size and self.sample_image_size > 0:
-            imgs = F.interpolate(
-                raw_imgs,
-                size=(self.sample_image_size, self.sample_image_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            imgs = raw_imgs
+        imgs = self._resize_for_logging(raw_imgs)
 
         if not log_images_wandb(
             self.logger, "stage2/samples", imgs, step, f"step={step}",
@@ -1427,6 +1522,68 @@ class Stage2Module(pl.LightningModule):
             save_grid(
                 imgs, os.path.join(self.out_dir, f"step{step:06d}_samples.png"),
             )
+
+        if batch is not None:
+            try:
+                tf_tok, tf_coeff, tf_class_ids = self._unpack_stage2_batch(
+                    batch,
+                    limit=self.sample_batch_size,
+                    move_to_device=True,
+                )
+                if tf_tok.numel() > 0:
+                    bsz = tf_tok.size(0)
+                    tf_support = tf_tok.view(bsz, self.H, self.W, self.D)
+                    tf_coeff_target = tf_coeff.view(bsz, self.H, self.W, self.D)
+                    _, tf_direct_coeff, _ = self.transformer.forward_tokens(
+                        tf_tok,
+                        tf_coeff,
+                        class_ids=tf_class_ids,
+                        compute_sparse_reg=False,
+                        coeff_clamp=self.coeff_clamp,
+                    )
+                    tf_coeff_pred = tf_direct_coeff.view(
+                        bsz, self.H, self.W, self.D,
+                    )
+                    tf_gt_raw = self.ae.decode_from_codes(
+                        tf_support, tf_coeff_target,
+                    )
+                    tf_pred_raw = self.ae.decode_from_codes(
+                        tf_support, tf_coeff_pred,
+                    )
+                    tf_gt = self._resize_for_logging(tf_gt_raw)
+                    tf_pred = self._resize_for_logging(tf_pred_raw)
+
+                    gt_logged = log_images_wandb(
+                        self.logger,
+                        "stage2/teacher_forced_gt",
+                        tf_gt,
+                        step,
+                        f"step={step}",
+                    )
+                    pred_logged = log_images_wandb(
+                        self.logger,
+                        "stage2/teacher_forced_pred",
+                        tf_pred,
+                        step,
+                        f"step={step}",
+                    )
+                    if not (gt_logged and pred_logged):
+                        save_grid(
+                            tf_gt,
+                            os.path.join(
+                                self.out_dir,
+                                f"step{step:06d}_teacher_forced_gt.png",
+                            ),
+                        )
+                        save_grid(
+                            tf_pred,
+                            os.path.join(
+                                self.out_dir,
+                                f"step{step:06d}_teacher_forced_pred.png",
+                            ),
+                        )
+            except Exception as exc:
+                print(f"[Stage2] teacher-forced preview failed at step {step}: {exc}")
 
         self._compute_and_log_fid(step, raw_imgs)
         self.transformer.train()
@@ -1624,7 +1781,13 @@ def main():
         "--stage2_coeff_loss_weight",
         type=float,
         default=0.1,
-        help="Weight for MSE coefficient regression loss in stage-2.",
+        help="Weight for sampled negative-atom coefficient energy in stage-2.",
+    )
+    parser.add_argument(
+        "--stage2_coeff_neg_samples",
+        type=int,
+        default=32,
+        help="Number of negative atoms sampled per sparse coeff for coeff regularization.",
     )
     parser.add_argument(
         "--stage2_direct_coeff_loss_weight",
@@ -1827,6 +1990,7 @@ def main():
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
+            coeff_neg_samples=args.stage2_coeff_neg_samples,
             direct_coeff_loss_weight=args.stage2_direct_coeff_loss_weight,
             recon_loss_weight=args.stage2_recon_loss_weight,
             lr_schedule=args.stage2_lr_schedule,
@@ -2030,12 +2194,12 @@ def main():
         ae = ae.cpu()
         cf = coeffs_flat.reshape(-1)
         if cf.numel() > 1_000_000:
-            idx = torch.randperm(cf.numel())[:1_000_000]
+            idx = torch.randint(0, cf.numel(), (1_000_000,))
             cf = cf[idx]
-        coeff_lo = float(cf.quantile(0.001).item())
-        coeff_hi = float(cf.quantile(0.999).item())
+        coeff_lo = float(cf.quantile(0.01).item())
+        coeff_hi = float(cf.quantile(0.99).item())
         coeff_clamp = (coeff_lo, coeff_hi)
-        print(f"[Coeffs] range 0.1%-99.9%: [{coeff_lo:.3f}, {coeff_hi:.3f}]")
+        print(f"[Coeffs] range 1%-99%: [{coeff_lo:.3f}, {coeff_hi:.3f}]")
         torch.save({
             "tokens": tokens_flat,
             "coeffs": coeffs_flat,
