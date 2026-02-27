@@ -1283,6 +1283,8 @@ class Stage2Module(pl.LightningModule):
         fid_num_samples: int = 64,
         fid_feature: int = 64,
         coeff_clamp: Optional[Tuple[float, float]] = None,
+        atom_focus_ratio: float = 0.2,
+        coeff_ramp_ratio: float = 0.2,
     ):
         super().__init__()
         self.transformer = transformer
@@ -1310,6 +1312,8 @@ class Stage2Module(pl.LightningModule):
         self.coeff_clamp = coeff_clamp
         self._fid_metric = None
         self._last_sample_step = -1
+        self.atom_focus_ratio = float(max(0.0, atom_focus_ratio))
+        self.coeff_ramp_ratio = float(max(0.0, coeff_ramp_ratio))
 
         self.ae.eval()
         for p in self.ae.parameters():
@@ -1341,6 +1345,22 @@ class Stage2Module(pl.LightningModule):
             "optimizer": opt,
             "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
         }
+
+    def _coefficulum_scale(self) -> float:
+        max_ep = int(getattr(self.trainer, "max_epochs", 0) or 0)
+        if max_ep <= 1:
+            return 1.0
+
+        focus_epochs = max(1, int(round(max_ep * self.atom_focus_ratio)))
+        ramp_epochs = max(1, int(round(max_ep * self.coeff_ramp_ratio)))
+        epoch = int(self.current_epoch)
+
+        if epoch < focus_epochs:
+            return 0.0
+        if epoch >= (focus_epochs + ramp_epochs):
+            return 1.0
+
+        return float(epoch - focus_epochs + 1) / float(ramp_epochs)
 
     def _unpack_stage2_batch(
         self,
@@ -1390,12 +1410,17 @@ class Stage2Module(pl.LightningModule):
         y = tok_flat.view(B, self.H * self.W, self.D)
         coeff_target = coeff_flat.view(B, self.H * self.W, self.D)
 
+        coeff_scale = self._coefficulum_scale()
+        coeff_weight = self.coeff_loss_weight * coeff_scale
+        direct_coeff_weight = self.direct_coeff_loss_weight * coeff_scale
+        recon_weight = self.recon_loss_weight * coeff_scale
+
         atom_logits, direct_coeff_pred, sparse_reg = (
             self.transformer.forward_tokens(
                 tok_flat,
                 coeff_flat,
                 class_ids=class_ids,
-                compute_sparse_reg=(self.coeff_loss_weight > 0),
+                compute_sparse_reg=(coeff_weight > 0),
                 coeff_neg_samples=self.coeff_neg_samples,
                 coeff_clamp=self.coeff_clamp,
             )
@@ -1412,30 +1437,33 @@ class Stage2Module(pl.LightningModule):
             coeff_reg_loss = sparse_reg.mean()
         direct_coeff_loss = F.mse_loss(direct_coeff_pred, coeff_target)
 
-        bn = self.ae.bottleneck
-        dictionary = F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
+        if recon_weight > 0:
+            bn = self.ae.bottleneck
+            dictionary = F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
 
-        z_pred = bn._unpatchify(
-            bn._reconstruct(
-                y.reshape(-1, D), direct_coeff_pred.reshape(-1, D), dictionary,
-            ), B, self.H, self.W,
-        )
-        feat_pred = self.ae.decoder(self.ae.post(z_pred))
-
-        with torch.no_grad():
-            z_gt = bn._unpatchify(
+            z_pred = bn._unpatchify(
                 bn._reconstruct(
-                    y.reshape(-1, D), coeff_target.reshape(-1, D), dictionary,
+                    y.reshape(-1, D), direct_coeff_pred.reshape(-1, D), dictionary,
                 ), B, self.H, self.W,
             )
-            feat_gt = self.ae.decoder(self.ae.post(z_gt))
-        recon_loss = F.mse_loss(feat_pred, feat_gt)
+            feat_pred = self.ae.decoder(self.ae.post(z_pred))
+
+            with torch.no_grad():
+                z_gt = bn._unpatchify(
+                    bn._reconstruct(
+                        y.reshape(-1, D), coeff_target.reshape(-1, D), dictionary,
+                    ), B, self.H, self.W,
+                )
+                feat_gt = self.ae.decoder(self.ae.post(z_gt))
+            recon_loss = F.mse_loss(feat_pred, feat_gt)
+        else:
+            recon_loss = coeff_target.new_zeros(())
 
         loss = (
             atom_hard_loss
-            + self.coeff_loss_weight * coeff_reg_loss
-            + self.direct_coeff_loss_weight * direct_coeff_loss
-            + self.recon_loss_weight * recon_loss
+            + coeff_weight * coeff_reg_loss
+            + direct_coeff_weight * direct_coeff_loss
+            + recon_weight * recon_loss
         )
 
         self.log("train/atom_loss", atom_hard_loss,
@@ -1453,6 +1481,18 @@ class Stage2Module(pl.LightningModule):
         self.log("train/loss", loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
+        self.log("train/coefficulum_scale", coeff_scale,
+             prog_bar=True, on_step=True, on_epoch=True,
+             sync_dist=True, batch_size=B)
+        self.log("train/coeff_w_eff", coeff_weight,
+             on_step=True, on_epoch=True,
+             sync_dist=True, batch_size=B)
+        self.log("train/direct_coeff_w_eff", direct_coeff_weight,
+             on_step=True, on_epoch=True,
+             sync_dist=True, batch_size=B)
+        self.log("train/recon_w_eff", recon_weight,
+             on_step=True, on_epoch=True,
+             sync_dist=True, batch_size=B)
         return loss
 
     def on_fit_start(self):
@@ -1801,6 +1841,18 @@ def main():
         default=1.0,
         help="Weight for latent reconstruction loss (z_pred vs z_gt) in stage-2.",
     )
+    parser.add_argument(
+        "--stage2_atom_focus_ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of stage-2 epochs focused on atom ID loss only.",
+    )
+    parser.add_argument(
+        "--stage2_coeff_ramp_ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of stage-2 epochs to ramp coeff/recon losses from 0 to full weight.",
+    )
     parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
     parser.add_argument("--stage2_fid_feature", type=int, default=64)
     parser.add_argument("--tf_d_model", type=int, default=256)
@@ -2005,6 +2057,8 @@ def main():
             fid_num_samples=args.stage2_fid_num_samples,
             fid_feature=args.stage2_fid_feature,
             coeff_clamp=coeff_clamp,
+            atom_focus_ratio=args.stage2_atom_focus_ratio,
+            coeff_ramp_ratio=args.stage2_coeff_ramp_ratio,
         )
 
         from lightning.pytorch.strategies import DDPStrategy
