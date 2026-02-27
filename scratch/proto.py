@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+torch.set_float32_matmul_precision("high")
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
