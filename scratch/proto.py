@@ -204,10 +204,11 @@ class Decoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DictionaryLearning(nn.Module):
-    """Per-pixel dictionary learning bottleneck with batch OMP sparse coding.
+    """Patch-based dictionary learning bottleneck with batch OMP sparse coding.
 
-    Closely follows src/models/bottleneck.py but returns ordered support
-    indices + coefficients so the transformer prior can tokenise them.
+    When ``patch_size > 1``, non-overlapping ``patch_size x patch_size``
+    spatial patches are flattened and encoded jointly, yielding a coarser
+    latent grid (H/P x W/P) with higher-dimensional dictionary atoms.
     """
 
     def __init__(
@@ -222,6 +223,7 @@ class DictionaryLearning(nn.Module):
         dead_atom_threshold: float = 5e-4,
         dead_atom_interval: int = 200,
         dead_atom_max_reinit: int = 16,
+        patch_size: int = 1,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -235,8 +237,11 @@ class DictionaryLearning(nn.Module):
         self.dead_atom_interval = int(max(dead_atom_interval, 1))
         self.dead_atom_max_reinit = int(max(dead_atom_max_reinit, 0))
 
+        self.patch_size = patch_size
+        self.atom_dim = embedding_dim * patch_size * patch_size
+
         self.dictionary = nn.Parameter(
-            torch.randn(embedding_dim, num_embeddings)
+            torch.randn(self.atom_dim, num_embeddings)
         )
 
         self.vocab_size = num_embeddings
@@ -419,14 +424,46 @@ class DictionaryLearning(nn.Module):
         coeffs_ordered = gamma[batch_idx[:, None], I]
         return I, coeffs_ordered
 
+    # ---- patch helpers ----
+
+    def _patchify(self, z: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
+        """[B, C, H, W] → [B, Hp, Wp, atom_dim] and return (patches, Hp, Wp)."""
+        B, C, H, W = z.shape
+        P = self.patch_size
+        if P <= 1:
+            return z.permute(0, 2, 3, 1).contiguous(), H, W
+        Hp, Wp = H // P, W // P
+        return (
+            z.reshape(B, C, Hp, P, Wp, P)
+            .permute(0, 2, 4, 1, 3, 5)
+            .contiguous()
+            .reshape(B, Hp, Wp, self.atom_dim),
+            Hp, Wp,
+        )
+
+    def _unpatchify(
+        self, flat: torch.Tensor, B: int, Hp: int, Wp: int,
+    ) -> torch.Tensor:
+        """[B*Hp*Wp, atom_dim] → [B, C, H, W]."""
+        P = self.patch_size
+        C = self.embedding_dim
+        if P <= 1:
+            return flat.view(B, Hp, Wp, C).permute(0, 3, 1, 2).contiguous()
+        return (
+            flat.view(B, Hp, Wp, C, P, P)
+            .permute(0, 3, 1, 4, 2, 5)
+            .contiguous()
+            .reshape(B, C, Hp * P, Wp * P)
+        )
+
     # ---- reconstruction helper ----
 
     def _reconstruct(
         self, support: torch.Tensor, coeffs: torch.Tensor,
         dictionary: torch.Tensor,
     ) -> torch.Tensor:
-        dict_t = dictionary.t()                     # [N, C]
-        atoms = dict_t[support.long()]              # [..., K, C]
+        dict_t = dictionary.t()                     # [N, atom_dim]
+        atoms = dict_t[support.long()]              # [..., K, atom_dim]
         return (atoms * coeffs.unsqueeze(-1)).sum(dim=-2)
 
     # ---- forward (matches bottleneck.py style) ----
@@ -439,16 +476,22 @@ class DictionaryLearning(nn.Module):
             z_e: [B, C, H, W] encoder output.
 
         Returns:
-            z_dl:    [B, C, H, W]  STE-quantised latent.
-            loss:    scalar        bottleneck loss.
-            support: [B, H, W, K]  ordered atom indices.
-            coeffs:  [B, H, W, K]  ordered coefficients.
+            z_dl:    [B, C, H, W]    STE-quantised latent (full resolution).
+            loss:    scalar           bottleneck loss.
+            support: [B, Hp, Wp, K]  ordered atom indices (patch grid).
+            coeffs:  [B, Hp, Wp, K]  ordered coefficients (patch grid).
         """
         if z_e.dim() != 4:
             raise ValueError(f"Expected [B, C, H, W], got {tuple(z_e.shape)}")
         B, C, H, W = z_e.shape
+        P = self.patch_size
+        if P > 1 and (H % P != 0 or W % P != 0):
+            raise ValueError(
+                f"Spatial dims ({H},{W}) not divisible by patch_size={P}"
+            )
 
-        signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
+        patches, Hp, Wp = self._patchify(z_e)
+        signals = patches.reshape(-1, self.atom_dim).t()
         dictionary = F.normalize(self.dictionary, p=2, dim=0, eps=self.epsilon)
 
         with torch.no_grad():
@@ -460,7 +503,7 @@ class DictionaryLearning(nn.Module):
                 self._update_usage_ema(support)
                 self._cache_residual_prototypes(signals.t(), recon)
                 self._steps_since_reinit.add_(1)
-        z_dl = recon.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        z_dl = self._unpatchify(recon, B, Hp, Wp)
 
         dl_latent_loss = F.mse_loss(z_dl, z_e.detach())
         e_latent_loss = F.mse_loss(z_dl.detach(), z_e)
@@ -469,21 +512,21 @@ class DictionaryLearning(nn.Module):
         z_dl = z_e + (z_dl - z_e).detach()
 
         K = self.sparsity_level
-        return z_dl, loss, support.view(B, H, W, K), coeffs.view(B, H, W, K)
+        return z_dl, loss, support.view(B, Hp, Wp, K), coeffs.view(B, Hp, Wp, K)
 
     @torch.no_grad()
     def decode_sparse_codes(
         self, support: torch.Tensor, coeffs: torch.Tensor,
     ) -> torch.Tensor:
         """Reconstruct [B, C, H, W] from atom ids + coefficients."""
-        B, H, W, K = support.shape
+        B, Hp, Wp, K = support.shape
         dictionary = F.normalize(self.dictionary, p=2, dim=0, eps=self.epsilon)
         recon = self._reconstruct(
             support.reshape(-1, K),
             coeffs.reshape(-1, K).to(dictionary.dtype),
             dictionary,
         )
-        return recon.view(B, H, W, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
+        return self._unpatchify(recon, B, Hp, Wp)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +550,7 @@ class SparseDictAE(nn.Module):
         dead_atom_threshold: float = 5e-4,
         dead_atom_interval: int = 200,
         dead_atom_max_reinit: int = 16,
+        bottleneck_patch_size: int = 1,
     ):
         super().__init__()
         self.encoder = Encoder(
@@ -525,6 +569,7 @@ class SparseDictAE(nn.Module):
             dead_atom_threshold=dead_atom_threshold,
             dead_atom_interval=dead_atom_interval,
             dead_atom_max_reinit=dead_atom_max_reinit,
+            patch_size=bottleneck_patch_size,
         )
         self.post = nn.Conv2d(embedding_dim, num_hiddens, 3, padding=1)
         self.decoder = Decoder(
@@ -568,19 +613,25 @@ class CausalSelfAttention(nn.Module):
         self.dropout = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=2)
+            v = torch.cat([kv_cache[1], v], dim=2)
         out = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=(self.dropout if self.training else 0.0),
-            is_causal=(T > 1),
+            is_causal=(kv_cache is None and T > 1),
         )
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.out_proj(out))
+        return self.resid_dropout(self.out_proj(out)), (k, v)
 
 
 class TransformerBlock(nn.Module):
@@ -597,10 +648,14 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self, x: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        attn_out, new_cache = self.attn(self.ln1(x), kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, new_cache
 
 
 @dataclass
@@ -759,7 +814,7 @@ class RQTransformerPrior(nn.Module):
 
         spatial_h = self.drop(spatial_in)
         for blk in self.spatial_blocks:
-            spatial_h = blk(spatial_h)
+            spatial_h, _ = blk(spatial_h)
         spatial_h = self.spatial_ln(spatial_h)
 
         bt = B * T
@@ -775,16 +830,13 @@ class RQTransformerPrior(nn.Module):
 
         depth_h = self.drop(depth_in)
         for blk in self.depth_blocks:
-            depth_h = blk(depth_h)
+            depth_h, _ = blk(depth_h)
         depth_h = self.depth_ln(depth_h)
 
         atom_logits = self.atom_head(depth_h)
 
-        atom_probs = F.softmax(atom_logits.detach(), dim=-1)
-        soft_atom_emb = atom_probs @ self.token_emb.weight
-
         depth_flat = depth_h.reshape(B, T, D * d_model)
-        atom_flat = soft_atom_emb.reshape(B, T, D * d_model)
+        atom_flat = self.token_emb(tok).reshape(B, T, D * d_model)
         combined_h = torch.cat([spatial_h, depth_flat, atom_flat], dim=-1)
         full_coeff_pred = self.full_coeff_head(combined_h)
         direct_coeff_pred = self.direct_coeff_head(combined_h)
@@ -802,6 +854,7 @@ class RQTransformerPrior(nn.Module):
         top_k: Optional[int] = None,
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
+        coeff_clamp: Optional[Tuple[float, float]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         T = self.positions_per_image
@@ -816,31 +869,38 @@ class RQTransformerPrior(nn.Module):
 
         tokens = torch.zeros(batch_size, T, D, dtype=torch.long, device=device)
         coeffs = torch.zeros(batch_size, T, D, dtype=torch.float32, device=device)
+        spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
+            None
+        ] * len(self.spatial_blocks)
         steps = tqdm(
             range(T), desc="sampling", leave=False, disable=(not show_progress),
         )
 
         for t in steps:
-            spatial_in = torch.zeros(batch_size, t + 1, d_model, device=device)
-            spatial_in[:, 0, :] = self.start_emb.squeeze(1)
-            if t > 0:
-                prev_tok = self.token_emb(tokens[:, :t, :])
-                prev_coeff = self.coeff_proj(coeffs[:, :t, :].unsqueeze(-1))
-                spatial_in[:, 1:, :] = self._fuse_spatial_context(
-                    prev_tok, prev_coeff,
+            if t == 0:
+                x_new = self.start_emb.expand(batch_size, -1, -1)
+            else:
+                prev_tok = self.token_emb(tokens[:, t - 1 : t, :])
+                prev_coeff = self.coeff_proj(
+                    coeffs[:, t - 1 : t, :].unsqueeze(-1),
                 )
-            spatial_in = spatial_in + spatial_pos[: t + 1].unsqueeze(0)
+                x_new = self._fuse_spatial_context(prev_tok, prev_coeff)
+            x_new = x_new + spatial_pos[t : t + 1].unsqueeze(0)
             if class_bias is not None:
-                spatial_in = spatial_in + class_bias
+                x_new = x_new + class_bias
 
-            spatial_h = spatial_in
-            for blk in self.spatial_blocks:
-                spatial_h = blk(spatial_h)
-            h_t = self.spatial_ln(spatial_h)[:, -1, :]
+            spatial_h = x_new
+            for i, blk in enumerate(self.spatial_blocks):
+                spatial_h, spatial_kv[i] = blk(
+                    spatial_h, kv_cache=spatial_kv[i],
+                )
+            h_t = self.spatial_ln(spatial_h).squeeze(1)
 
             depth_hiddens: list[torch.Tensor] = []
             for d in range(D):
-                depth_in = torch.zeros(batch_size, d + 1, d_model, device=device)
+                depth_in = torch.zeros(
+                    batch_size, d + 1, d_model, device=device,
+                )
                 depth_in[:, 0, :] = h_t
                 if d > 0:
                     depth_in[:, 1:, :] = self.token_emb(tokens[:, t, :d])
@@ -848,7 +908,7 @@ class RQTransformerPrior(nn.Module):
 
                 depth_h = depth_in
                 for blk in self.depth_blocks:
-                    depth_h = blk(depth_h)
+                    depth_h, _ = blk(depth_h)
                 z_last = self.depth_ln(depth_h)[:, -1, :]
                 depth_hiddens.append(z_last)
 
@@ -867,9 +927,14 @@ class RQTransformerPrior(nn.Module):
             combined_h = torch.cat([
                 h_t,
                 torch.cat(depth_hiddens, dim=-1),
-                self.token_emb(tokens[:, t, :]).reshape(batch_size, D * d_model),
+                self.token_emb(tokens[:, t, :]).reshape(
+                    batch_size, D * d_model,
+                ),
             ], dim=-1)
-            coeffs[:, t, :] = self.direct_coeff_head(combined_h)
+            pred_c = self.direct_coeff_head(combined_h)
+            if coeff_clamp is not None:
+                pred_c = pred_c.clamp(coeff_clamp[0], coeff_clamp[1])
+            coeffs[:, t, :] = pred_c
 
         return (
             tokens.view(batch_size, T * D),
@@ -1143,6 +1208,7 @@ class Stage2Module(pl.LightningModule):
         fid_real_images: Optional[torch.Tensor] = None,
         fid_num_samples: int = 64,
         fid_feature: int = 64,
+        coeff_clamp: Optional[Tuple[float, float]] = None,
     ):
         super().__init__()
         self.transformer = transformer
@@ -1166,6 +1232,7 @@ class Stage2Module(pl.LightningModule):
         self.fid_real_images = fid_real_images
         self.fid_num_samples = max(0, fid_num_samples)
         self.fid_feature = fid_feature
+        self.coeff_clamp = coeff_clamp
         self._fid_metric = None
         self._last_sample_step = -1
 
@@ -1244,17 +1311,20 @@ class Stage2Module(pl.LightningModule):
 
         bn = self.ae.bottleneck
         dictionary = F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
-        C = bn.embedding_dim
 
-        z_pred = bn._reconstruct(
-            y.reshape(-1, D), direct_coeff_pred.reshape(-1, D), dictionary,
-        ).view(B, self.H, self.W, C).permute(0, 3, 1, 2).contiguous()
+        z_pred = bn._unpatchify(
+            bn._reconstruct(
+                y.reshape(-1, D), direct_coeff_pred.reshape(-1, D), dictionary,
+            ), B, self.H, self.W,
+        )
         feat_pred = self.ae.decoder(self.ae.post(z_pred))
 
         with torch.no_grad():
-            z_gt = bn._reconstruct(
-                y.reshape(-1, D), coeff_target.reshape(-1, D), dictionary,
-            ).view(B, self.H, self.W, C).permute(0, 3, 1, 2).contiguous()
+            z_gt = bn._unpatchify(
+                bn._reconstruct(
+                    y.reshape(-1, D), coeff_target.reshape(-1, D), dictionary,
+                ), B, self.H, self.W,
+            )
             feat_gt = self.ae.decoder(self.ae.post(z_gt))
         recon_loss = F.mse_loss(feat_pred, feat_gt)
 
@@ -1334,6 +1404,7 @@ class Stage2Module(pl.LightningModule):
             top_k=self.sample_top_k,
             class_ids=class_ids,
             show_progress=True,
+            coeff_clamp=self.coeff_clamp,
         )
         support = tokens.view(-1, self.H, self.W, self.D)
         coeffs = coeffs.view(-1, self.H, self.W, self.D)
@@ -1524,6 +1595,9 @@ def main():
     )
     parser.add_argument("--lpips_weight", type=float, default=0.1,
                         help="Weight for LPIPS perceptual loss in stage-1.")
+    parser.add_argument("--bottleneck_patch_size", type=int, default=1,
+                        help="Patch size for dictionary learning; >1 groups "
+                             "PxP spatial patches into single atoms.")
 
     # Stage-2
     parser.add_argument("--stage2_epochs", type=int, default=10)
@@ -1603,6 +1677,25 @@ def main():
                 "--stage2_num_classes > 1."
             )
 
+    P = args.bottleneck_patch_size
+    if P > 1:
+        signal_dim = P * P * args.embedding_dim
+        min_atoms = 2 * signal_dim
+        if args.num_atoms < signal_dim:
+            print(
+                f"[Overcomplete] atom_dim={signal_dim} "
+                f"(patch {P}x{P} x embed {args.embedding_dim}), "
+                f"num_atoms={args.num_atoms} < atom_dim; "
+                f"increasing to {min_atoms} for 2x overcomplete."
+            )
+            args.num_atoms = min_atoms
+        else:
+            ratio = args.num_atoms / signal_dim
+            print(
+                f"[Dictionary] atom_dim={signal_dim}, "
+                f"num_atoms={args.num_atoms} ({ratio:.1f}x overcomplete)"
+            )
+
     pl.seed_everything(args.seed, workers=True)
     torch.backends.cudnn.benchmark = True
 
@@ -1660,6 +1753,7 @@ def main():
             dead_atom_threshold=args.dead_atom_threshold,
             dead_atom_interval=args.dead_atom_interval,
             dead_atom_max_reinit=args.dead_atom_max_reinit,
+            bottleneck_patch_size=args.bottleneck_patch_size,
         )
 
     def _load_ae(ae: SparseDictAE, path: str, tag: str = "Stage1"):
@@ -1676,6 +1770,7 @@ def main():
         H: int, W: int, D: int,
         ae: SparseDictAE,
         fid_real_images: Optional[torch.Tensor] = None,
+        coeff_clamp: Optional[Tuple[float, float]] = None,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-2 requires CUDA.")
@@ -1745,6 +1840,7 @@ def main():
             fid_real_images=fid_real_images,
             fid_num_samples=args.stage2_fid_num_samples,
             fid_feature=args.stage2_fid_feature,
+            coeff_clamp=coeff_clamp,
         )
 
         from lightning.pytorch.strategies import DDPStrategy
@@ -1782,6 +1878,7 @@ def main():
             cache["tokens"], cache["coeffs"], cache.get("class_ids"),
             H, W, D, ae,
             fid_real_images=cache.get("fid_real_images"),
+            coeff_clamp=cache.get("coeff_clamp"),
         )
         return
 
@@ -1907,6 +2004,7 @@ def main():
         class_ids_flat = cache.get("class_ids")
         fid_real_images = cache.get("fid_real_images")
         H, W, D = cache["shape"]
+        coeff_clamp = cache.get("coeff_clamp")
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         ae = ae.to(device)
@@ -1930,6 +2028,14 @@ def main():
             fid_loader, max_items=args.stage2_fid_num_samples,
         )
         ae = ae.cpu()
+        cf = coeffs_flat.reshape(-1)
+        if cf.numel() > 1_000_000:
+            idx = torch.randperm(cf.numel())[:1_000_000]
+            cf = cf[idx]
+        coeff_lo = float(cf.quantile(0.001).item())
+        coeff_hi = float(cf.quantile(0.999).item())
+        coeff_clamp = (coeff_lo, coeff_hi)
+        print(f"[Coeffs] range 0.1%-99.9%: [{coeff_lo:.3f}, {coeff_hi:.3f}]")
         torch.save({
             "tokens": tokens_flat,
             "coeffs": coeffs_flat,
@@ -1937,9 +2043,12 @@ def main():
             "shape": (H, W, D),
             "stage2_num_classes": stage2_num_classes,
             "fid_real_images": fid_real_images,
+            "coeff_clamp": (coeff_lo, coeff_hi),
         }, token_cache_path)
 
     print(f"[Stage2] tokens: {tokens_flat.shape}  (H={H}, W={W}, D={D})")
+    if coeff_clamp is not None:
+        print(f"[Stage2] coeff_clamp: [{coeff_clamp[0]:.3f}, {coeff_clamp[1]:.3f}]")
 
     # ---- stage-2 ----
 
@@ -1947,6 +2056,7 @@ def main():
         _run_stage2(
             tokens_flat, coeffs_flat, class_ids_flat, H, W, D, ae,
             fid_real_images=fid_real_images,
+            coeff_clamp=coeff_clamp,
         )
         return
 
