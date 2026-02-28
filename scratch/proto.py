@@ -927,6 +927,7 @@ class RQTransformerPrior(nn.Module):
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
         coeff_clamp: Optional[Tuple[float, float]] = None,
+        depth_group_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         T = self.positions_per_image
@@ -942,6 +943,23 @@ class RQTransformerPrior(nn.Module):
         tokens = torch.zeros(batch_size, T, D, dtype=torch.long, device=device)
         coeffs = torch.zeros(batch_size, T, D, dtype=torch.float32, device=device)
         prev_coeff_slots = torch.zeros(batch_size, D, d_model, device=device)
+        group_masks = None
+        if depth_group_masks is not None:
+            if depth_group_masks.dim() != 2:
+                raise ValueError(
+                    "depth_group_masks must have shape [D, vocab_size]."
+                )
+            if depth_group_masks.size(0) != D:
+                raise ValueError(
+                    f"depth_group_masks first dim must be D={D}, "
+                    f"got {depth_group_masks.size(0)}."
+                )
+            if depth_group_masks.size(1) != self.cfg.vocab_size:
+                raise ValueError(
+                    "depth_group_masks second dim must match vocab_size "
+                    f"{self.cfg.vocab_size}, got {depth_group_masks.size(1)}."
+                )
+            group_masks = depth_group_masks.to(device=device, dtype=torch.bool)
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
             None
         ] * len(self.spatial_blocks)
@@ -984,6 +1002,11 @@ class RQTransformerPrior(nn.Module):
                 z_last = self.depth_ln(depth_h)[:, 0, :]
 
                 logits = self.atom_head(z_last) / max(temperature, 1e-8)
+                if group_masks is not None:
+                    allow = group_masks[d].unsqueeze(0)
+                    if not bool(allow.any()):
+                        raise ValueError(f"Empty atom group for depth slot {d}.")
+                    logits = logits.masked_fill(~allow, float("-inf"))
                 if top_k is not None and top_k > 0:
                     v, ix = torch.topk(
                         logits, min(top_k, logits.size(-1)), dim=-1,
@@ -1285,6 +1308,12 @@ class Stage2Module(pl.LightningModule):
         coeff_clamp: Optional[Tuple[float, float]] = None,
         atom_focus_ratio: float = 0.2,
         coeff_ramp_ratio: float = 0.2,
+        coeff_l2_normalize: bool = True,
+        coeff_l2_eps: float = 1e-6,
+        coeff_l2_target: float = 1.0,
+        grouped_sampling: bool = True,
+        grouped_sampling_method: str = "kmeans",
+        grouped_sampling_kmeans_iters: int = 12,
     ):
         super().__init__()
         self.transformer = transformer
@@ -1314,6 +1343,13 @@ class Stage2Module(pl.LightningModule):
         self._last_sample_step = -1
         self.atom_focus_ratio = float(max(0.0, atom_focus_ratio))
         self.coeff_ramp_ratio = float(max(0.0, coeff_ramp_ratio))
+        self.coeff_l2_normalize = bool(coeff_l2_normalize)
+        self.coeff_l2_eps = float(max(coeff_l2_eps, 1e-8))
+        self.coeff_l2_target = float(max(coeff_l2_target, self.coeff_l2_eps))
+        self.grouped_sampling = bool(grouped_sampling)
+        self.grouped_sampling_method = str(grouped_sampling_method).lower()
+        self.grouped_sampling_kmeans_iters = int(max(1, grouped_sampling_kmeans_iters))
+        self._depth_group_masks: Optional[torch.Tensor] = None
 
         self.ae.eval()
         for p in self.ae.parameters():
@@ -1362,6 +1398,64 @@ class Stage2Module(pl.LightningModule):
 
         return float(epoch - focus_epochs + 1) / float(ramp_epochs)
 
+    def _normalize_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        if not self.coeff_l2_normalize:
+            return coeffs
+        denom = coeffs.norm(dim=-1, keepdim=True).clamp(min=self.coeff_l2_eps)
+        return coeffs * (self.coeff_l2_target / denom)
+
+    def _build_depth_group_masks(self) -> Optional[torch.Tensor]:
+        if not self.grouped_sampling or self.D <= 0:
+            return None
+
+        vocab = int(self.transformer.cfg.vocab_size)
+        groups = int(self.D)
+        if vocab <= 0 or groups <= 0:
+            return None
+
+        method = self.grouped_sampling_method
+        masks = torch.zeros(groups, vocab, dtype=torch.bool)
+        if method == "contiguous":
+            for atom_idx in range(vocab):
+                masks[atom_idx % groups, atom_idx] = True
+            return masks
+        if method != "kmeans":
+            raise ValueError(
+                f"Unsupported grouped_sampling_method: {self.grouped_sampling_method}"
+            )
+
+        atoms = self.ae.bottleneck.dictionary.detach().t().float().cpu()
+        atoms = F.normalize(atoms, p=2, dim=1, eps=1e-8)
+        if atoms.size(0) != vocab:
+            raise ValueError(
+                f"Dictionary size mismatch: expected {vocab}, got {atoms.size(0)}."
+            )
+
+        if vocab <= groups:
+            for atom_idx in range(vocab):
+                masks[atom_idx % groups, atom_idx] = True
+            return masks
+
+        gen = torch.Generator(device=atoms.device)
+        gen.manual_seed(0)
+        init_idx = torch.randperm(vocab, generator=gen)[:groups]
+        centroids = atoms[init_idx].clone()
+        assign = torch.zeros(vocab, dtype=torch.long)
+        for _ in range(self.grouped_sampling_kmeans_iters):
+            sim = atoms @ centroids.t()
+            assign = sim.argmax(dim=1)
+            for g in range(groups):
+                idx = torch.nonzero(assign == g, as_tuple=False).squeeze(1)
+                if idx.numel() == 0:
+                    fallback = torch.argmin(sim.max(dim=1).values)
+                    assign[fallback] = g
+                    idx = fallback.view(1)
+                centroids[g] = atoms[idx].mean(dim=0)
+            centroids = F.normalize(centroids, p=2, dim=1, eps=1e-8)
+
+        masks[assign, torch.arange(vocab, dtype=torch.long)] = True
+        return masks
+
     def _unpack_stage2_batch(
         self,
         batch,
@@ -1385,6 +1479,11 @@ class Stage2Module(pl.LightningModule):
             coeff_flat = coeff_flat[:limit]
             if class_ids is not None:
                 class_ids = class_ids[:limit]
+
+        if coeff_flat.numel() > 0:
+            coeff_flat = self._normalize_coeffs(
+                coeff_flat.view(coeff_flat.size(0), -1, self.D),
+            ).reshape(coeff_flat.size(0), -1)
 
         if move_to_device:
             tok_flat = tok_flat.to(self.device, non_blocking=True)
@@ -1425,6 +1524,7 @@ class Stage2Module(pl.LightningModule):
                 coeff_clamp=self.coeff_clamp,
             )
         )
+        direct_coeff_pred = self._normalize_coeffs(direct_coeff_pred)
         atom_hard_loss = F.cross_entropy(
             atom_logits.reshape(-1, self.transformer.cfg.vocab_size),
             y.reshape(-1),
@@ -1498,6 +1598,20 @@ class Stage2Module(pl.LightningModule):
     def on_fit_start(self):
         self.ae.to(self.device)
         self.ae.eval()
+        if self.grouped_sampling:
+            try:
+                masks = self._build_depth_group_masks()
+                if masks is not None:
+                    self._depth_group_masks = masks.to(self.device)
+                    sizes = [int(v) for v in masks.sum(dim=1).tolist()]
+                    print(
+                        "[Stage2] grouped sampling active "
+                        f"({self.grouped_sampling_method}), "
+                        f"group sizes={sizes}"
+                    )
+            except Exception as exc:
+                self._depth_group_masks = None
+                print(f"[Stage2] grouped sampling disabled due to error: {exc}")
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if self.sample_every_steps <= 0:
@@ -1548,9 +1662,10 @@ class Stage2Module(pl.LightningModule):
             class_ids=class_ids,
             show_progress=True,
             coeff_clamp=self.coeff_clamp,
+            depth_group_masks=self._depth_group_masks,
         )
         support = tokens.view(-1, self.H, self.W, self.D)
-        coeffs = coeffs.view(-1, self.H, self.W, self.D)
+        coeffs = self._normalize_coeffs(coeffs.view(-1, self.H, self.W, self.D))
         raw_imgs = self.ae.decode_from_codes(
             support.to(self.device), coeffs.to(self.device),
         )
@@ -1581,8 +1696,8 @@ class Stage2Module(pl.LightningModule):
                         compute_sparse_reg=False,
                         coeff_clamp=self.coeff_clamp,
                     )
-                    tf_coeff_pred = tf_direct_coeff.view(
-                        bsz, self.H, self.W, self.D,
+                    tf_coeff_pred = self._normalize_coeffs(
+                        tf_direct_coeff.view(bsz, self.H, self.W, self.D),
                     )
                     tf_gt_raw = self.ae.decode_from_codes(
                         tf_support, tf_coeff_target,
@@ -1855,6 +1970,47 @@ def main():
     )
     parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
     parser.add_argument("--stage2_fid_feature", type=int, default=64)
+    parser.add_argument(
+        "--stage2_coeff_l2_normalize",
+        action="store_true",
+        default=True,
+        help="Normalize per-location coefficient vectors to fixed L2 energy.",
+    )
+    parser.add_argument(
+        "--no_stage2_coeff_l2_normalize",
+        action="store_false",
+        dest="stage2_coeff_l2_normalize",
+    )
+    parser.add_argument(
+        "--stage2_coeff_l2_eps",
+        type=float,
+        default=1e-6,
+        help="Numerical epsilon for coefficient L2 normalization.",
+    )
+    parser.add_argument(
+        "--stage2_grouped_sampling",
+        action="store_true",
+        default=True,
+        help="Use one atom group per sparse depth slot during sampling.",
+    )
+    parser.add_argument(
+        "--no_stage2_grouped_sampling",
+        action="store_false",
+        dest="stage2_grouped_sampling",
+    )
+    parser.add_argument(
+        "--stage2_grouped_sampling_method",
+        type=str,
+        default="kmeans",
+        choices=["kmeans", "contiguous"],
+        help="How to build atom groups used for grouped sampling.",
+    )
+    parser.add_argument(
+        "--stage2_grouped_sampling_kmeans_iters",
+        type=int,
+        default=12,
+        help="K-means iterations when building grouped sampling masks.",
+    )
     parser.add_argument("--tf_d_model", type=int, default=256)
     parser.add_argument("--tf_heads", type=int, default=4)
     parser.add_argument("--tf_layers", type=int, default=4)
@@ -1986,6 +2142,7 @@ def main():
         ae: SparseDictAE,
         fid_real_images: Optional[torch.Tensor] = None,
         coeff_clamp: Optional[Tuple[float, float]] = None,
+        coeff_l2_target: float = 1.0,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-2 requires CUDA.")
@@ -2059,6 +2216,14 @@ def main():
             coeff_clamp=coeff_clamp,
             atom_focus_ratio=args.stage2_atom_focus_ratio,
             coeff_ramp_ratio=args.stage2_coeff_ramp_ratio,
+            coeff_l2_normalize=args.stage2_coeff_l2_normalize,
+            coeff_l2_eps=args.stage2_coeff_l2_eps,
+            coeff_l2_target=coeff_l2_target,
+            grouped_sampling=args.stage2_grouped_sampling,
+            grouped_sampling_method=args.stage2_grouped_sampling_method,
+            grouped_sampling_kmeans_iters=(
+                args.stage2_grouped_sampling_kmeans_iters
+            ),
         )
 
         from lightning.pytorch.strategies import DDPStrategy
@@ -2097,6 +2262,7 @@ def main():
             H, W, D, ae,
             fid_real_images=cache.get("fid_real_images"),
             coeff_clamp=cache.get("coeff_clamp"),
+            coeff_l2_target=float(cache.get("coeff_l2_target", 1.0)),
         )
         return
 
@@ -2223,6 +2389,13 @@ def main():
         fid_real_images = cache.get("fid_real_images")
         H, W, D = cache["shape"]
         coeff_clamp = cache.get("coeff_clamp")
+        coeff_l2_target_raw = cache.get("coeff_l2_target")
+        if coeff_l2_target_raw is None:
+            coeff_l2_target = float(coeffs_flat.view(-1, D).norm(dim=1).mean().item())
+        else:
+            coeff_l2_target = float(coeff_l2_target_raw)
+        if coeff_l2_target <= 0:
+            coeff_l2_target = 1.0
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         ae = ae.to(device)
@@ -2254,6 +2427,9 @@ def main():
         coeff_hi = float(cf.quantile(0.99).item())
         coeff_clamp = (coeff_lo, coeff_hi)
         print(f"[Coeffs] range 1%-99%: [{coeff_lo:.3f}, {coeff_hi:.3f}]")
+        coeff_l2 = coeffs_flat.view(-1, D).norm(dim=1)
+        coeff_l2_target = float(coeff_l2.mean().item())
+        print(f"[Coeffs] mean L2 energy: {coeff_l2_target:.3f}")
         torch.save({
             "tokens": tokens_flat,
             "coeffs": coeffs_flat,
@@ -2262,11 +2438,13 @@ def main():
             "stage2_num_classes": stage2_num_classes,
             "fid_real_images": fid_real_images,
             "coeff_clamp": (coeff_lo, coeff_hi),
+            "coeff_l2_target": coeff_l2_target,
         }, token_cache_path)
 
     print(f"[Stage2] tokens: {tokens_flat.shape}  (H={H}, W={W}, D={D})")
     if coeff_clamp is not None:
         print(f"[Stage2] coeff_clamp: [{coeff_clamp[0]:.3f}, {coeff_clamp[1]:.3f}]")
+    print(f"[Stage2] coeff_l2_target: {coeff_l2_target:.3f}")
 
     # ---- stage-2 ----
 
@@ -2275,6 +2453,7 @@ def main():
             tokens_flat, coeffs_flat, class_ids_flat, H, W, D, ae,
             fid_real_images=fid_real_images,
             coeff_clamp=coeff_clamp,
+            coeff_l2_target=coeff_l2_target,
         )
         return
 
