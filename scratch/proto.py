@@ -35,15 +35,6 @@ try:
 except Exception:
     wandb = None
 
-try:
-    from torchmetrics.image.fid import FrechetInceptionDistance
-except Exception:
-    FrechetInceptionDistance = None
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "models"))
-from lpips import LPIPS
-
-
 
 def _pick_free_tcp_port(excluded: Optional[set[int]] = None) -> int:
     excluded = excluded or set()
@@ -720,7 +711,6 @@ class RQTransformerPrior(nn.Module):
         self.spatial_ln = nn.LayerNorm(cfg.d_model)
         self.depth_ln = nn.LayerNorm(cfg.d_model)
         self.atom_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        # Fuse per-depth token + coefficient context before spatial AR.
         self.spatial_depth_fuse = nn.Sequential(
             nn.LayerNorm(cfg.D * cfg.d_model),
             nn.Linear(cfg.D * cfg.d_model, cfg.d_model),
@@ -762,19 +752,6 @@ class RQTransformerPrior(nn.Module):
         cols = self._spatial_cols[:length].to(device)
         return self.row_emb(rows) + self.col_emb(cols)
 
-    @staticmethod
-    def _apply_coeff_clamp(
-        x: torch.Tensor, coeff_clamp: Optional[Tuple[float, float]],
-    ) -> torch.Tensor:
-        if coeff_clamp is None:
-            return x
-        lo, hi = coeff_clamp
-        lo_t = x.new_tensor(lo)
-        hi_t = x.new_tensor(hi)
-        mid = 0.5 * (lo_t + hi_t)
-        half = torch.clamp(0.5 * (hi_t - lo_t), min=1e-6)
-        return mid + half * torch.tanh((x - mid) / half)
-
     def _coeff_pair_to_embed(
         self, atom_emb: torch.Tensor, coeff_val: torch.Tensor,
     ) -> torch.Tensor:
@@ -808,16 +785,12 @@ class RQTransformerPrior(nn.Module):
         tokens_flat: torch.Tensor,
         coeffs_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
-        compute_sparse_reg: bool = False,
-        coeff_neg_samples: int = 0,
-        coeff_clamp: Optional[Tuple[float, float]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Teacher-forced logits over flattened [H*W*D] tokens.
 
         Returns:
             atom_logits:       [B, H*W, D, vocab_size]
             direct_coeff_pred: [B, H*W, D]
-            sparse_reg:        [B, H*W, D] or None
         """
         device = tokens_flat.device
         D = self.cfg.D
@@ -857,8 +830,6 @@ class RQTransformerPrior(nn.Module):
             torch.arange(D, device=device, dtype=torch.long),
         ).unsqueeze(0)
 
-        # Teacher-forced depth AR can run in one causal pass:
-        # depth position d predicts atom/coeff for sparse layer d.
         depth_in = torch.zeros(bt, D, d_model, device=device)
         depth_in[:, 0, :] = h_t
         if D > 1:
@@ -870,16 +841,17 @@ class RQTransformerPrior(nn.Module):
         depth_h = self.depth_ln(depth_h)
         atom_logits_bt = self.atom_head(depth_h)
 
+        # Detached GT atoms for coeff head: coeff gradients don't corrupt the
+        # atom embedding table, keeping both heads training independently.
+        tok_emb_detached = tok_emb.detach()
+
         token_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_slots = torch.zeros(bt, D, d_model, device=device)
         direct_coeff_list: list[torch.Tensor] = []
-        sparse_reg_list: list[torch.Tensor] = []
-        neg_k = int(max(0, coeff_neg_samples))
-        use_sparse_reg = bool(compute_sparse_reg and neg_k > 0 and self.num_atoms > 1)
 
         for d in range(D):
             z_last = depth_h[:, d, :]
-            tok_cur = tok_emb[:, d, :]
+            tok_cur = tok_emb_detached[:, d, :]
             token_slots[:, d, :] = tok_cur
             combined_h = torch.cat([
                 h_t,
@@ -889,34 +861,14 @@ class RQTransformerPrior(nn.Module):
             ], dim=-1)
             coeff_query_d = self.coeff_query_head(combined_h)
             direct_coeff_d = (coeff_query_d * tok_cur).sum(dim=-1)
-            direct_coeff_d = self._apply_coeff_clamp(direct_coeff_d, coeff_clamp)
             direct_coeff_list.append(direct_coeff_d)
-            if use_sparse_reg:
-                k = min(neg_k, self.num_atoms - 1)
-                neg_idx = torch.randint(
-                    0, self.num_atoms, (bt, k), device=device, dtype=torch.long,
-                )
-                pos_idx = tok_bt[:, d: d + 1]
-                collision = neg_idx.eq(pos_idx)
-                if collision.any():
-                    neg_idx = torch.where(collision, (neg_idx + 1) % self.num_atoms, neg_idx)
-                neg_emb = self.token_emb(neg_idx)
-                neg_coeff = torch.einsum("bd,bkd->bk", coeff_query_d, neg_emb)
-                neg_coeff = self._apply_coeff_clamp(neg_coeff, coeff_clamp)
-                sparse_reg_list.append(neg_coeff.pow(2).mean(dim=-1))
-
-            coeff_slots[:, d, :] = coeff_teacher_depth[:, d, :]
+            coeff_slots[:, d, :] = self._coeff_pair_to_embed(
+                tok_cur, coeff_bt[:, d],
+            )
 
         atom_logits = atom_logits_bt.view(B, T, D, self.cfg.vocab_size)
         direct_coeff_pred = torch.stack(direct_coeff_list, dim=1).view(B, T, D)
-        sparse_reg: Optional[torch.Tensor] = None
-        if use_sparse_reg:
-            sparse_reg = torch.stack(sparse_reg_list, dim=1).view(B, T, D)
-        return (
-            atom_logits,
-            direct_coeff_pred,
-            sparse_reg,
-        )
+        return atom_logits, direct_coeff_pred
 
     @torch.no_grad()
     def generate(
@@ -926,8 +878,6 @@ class RQTransformerPrior(nn.Module):
         top_k: Optional[int] = None,
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
-        coeff_clamp: Optional[Tuple[float, float]] = None,
-        depth_group_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         T = self.positions_per_image
@@ -943,23 +893,6 @@ class RQTransformerPrior(nn.Module):
         tokens = torch.zeros(batch_size, T, D, dtype=torch.long, device=device)
         coeffs = torch.zeros(batch_size, T, D, dtype=torch.float32, device=device)
         prev_coeff_slots = torch.zeros(batch_size, D, d_model, device=device)
-        group_masks = None
-        if depth_group_masks is not None:
-            if depth_group_masks.dim() != 2:
-                raise ValueError(
-                    "depth_group_masks must have shape [D, vocab_size]."
-                )
-            if depth_group_masks.size(0) != D:
-                raise ValueError(
-                    f"depth_group_masks first dim must be D={D}, "
-                    f"got {depth_group_masks.size(0)}."
-                )
-            if depth_group_masks.size(1) != self.cfg.vocab_size:
-                raise ValueError(
-                    "depth_group_masks second dim must match vocab_size "
-                    f"{self.cfg.vocab_size}, got {depth_group_masks.size(1)}."
-                )
-            group_masks = depth_group_masks.to(device=device, dtype=torch.bool)
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
             None
         ] * len(self.spatial_blocks)
@@ -1002,11 +935,6 @@ class RQTransformerPrior(nn.Module):
                 z_last = self.depth_ln(depth_h)[:, 0, :]
 
                 logits = self.atom_head(z_last) / max(temperature, 1e-8)
-                if group_masks is not None:
-                    allow = group_masks[d].unsqueeze(0)
-                    if not bool(allow.any()):
-                        raise ValueError(f"Empty atom group for depth slot {d}.")
-                    logits = logits.masked_fill(~allow, float("-inf"))
                 if top_k is not None and top_k > 0:
                     v, ix = torch.topk(
                         logits, min(top_k, logits.size(-1)), dim=-1,
@@ -1027,7 +955,7 @@ class RQTransformerPrior(nn.Module):
                 ], dim=-1)
                 coeff_query = self.coeff_query_head(combined_h)
                 pred_coeff = (coeff_query * tok_cur).sum(dim=-1)
-                pred_coeff = self._apply_coeff_clamp(pred_coeff, coeff_clamp)
+                pred_coeff = pred_coeff.clamp(-24.0, 24.0)
                 coeffs[:, t, d] = pred_coeff
                 coeff_slots[:, d, :] = self._coeff_pair_to_embed(tok_cur, pred_coeff)
             prev_coeff_slots = coeff_slots
@@ -1079,27 +1007,6 @@ def log_scalar_wandb(logger_obj, key: str, value: float, step: int) -> bool:
     return True
 
 
-@torch.no_grad()
-def collect_real_images_uint8(
-    loader: DataLoader, max_items: int,
-) -> Optional[torch.Tensor]:
-    """Collect real images as uint8 tensors for FID reference."""
-    if max_items <= 0:
-        return None
-    images: list[torch.Tensor] = []
-    seen = 0
-    for x, _ in tqdm(loader, desc="collect FID real images"):
-        keep = min(x.size(0), max_items - seen)
-        if keep <= 0:
-            break
-        u8 = ((x[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
-        images.append(u8)
-        seen += keep
-        if seen >= max_items:
-            break
-    return torch.cat(images) if images else None
-
-
 # ---------------------------------------------------------------------------
 # Stage-1 Lightning module
 # ---------------------------------------------------------------------------
@@ -1115,7 +1022,6 @@ class Stage1Module(pl.LightningModule):
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
-        lpips_weight: float = 0.0,
     ):
         super().__init__()
         self.ae = ae
@@ -1127,8 +1033,6 @@ class Stage1Module(pl.LightningModule):
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
-        self.lpips_weight = lpips_weight
-        self._lpips = None
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.ae.parameters(), lr=self.lr)
@@ -1152,25 +1056,12 @@ class Stage1Module(pl.LightningModule):
             "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
         }
 
-    def _get_lpips(self):
-        if self._lpips is None and self.lpips_weight > 0:
-            self._lpips = LPIPS().to(self.device)
-            self._lpips.eval()
-        return self._lpips
-
     def training_step(self, batch, batch_idx):
         x, _ = batch
         recon, b_loss, _, _ = self.ae(x)
         recon_loss = F.mse_loss(recon, x)
         loss = recon_loss + self.bottleneck_weight * b_loss
         bs = x.size(0)
-
-        if self.lpips_weight > 0:
-            lpips_fn = self._get_lpips()
-            lpips_val = lpips_fn(x, recon).mean()
-            loss = loss + self.lpips_weight * lpips_val
-            self.log("stage1/lpips", lpips_val,
-                     on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
 
         self.log("stage1/train_loss", loss,
                  on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
@@ -1233,12 +1124,6 @@ class Stage1Module(pl.LightningModule):
         psnr = 10.0 * torch.log10(4.0 / recon_loss.detach().clamp(min=1e-8))
         bs = x.size(0)
 
-        if self.lpips_weight > 0:
-            lpips_fn = self._get_lpips()
-            lpips_val = lpips_fn(x, recon).mean()
-            self.log("stage1/val_lpips", lpips_val,
-                     on_epoch=True, sync_dist=True, batch_size=bs)
-
         self.log("stage1/val_loss", loss,
                  on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
         self.log("stage1/val_psnr", psnr,
@@ -1282,7 +1167,7 @@ class Stage1Module(pl.LightningModule):
 class Stage2Module(pl.LightningModule):
     def __init__(
         self,
-        transformer: RQTransformerPrior,
+        transformer: nn.Module,
         ae: SparseDictAE,
         lr: float,
         out_dir: str,
@@ -1293,27 +1178,12 @@ class Stage2Module(pl.LightningModule):
         sample_batch_size: int = 8,
         sample_temperature: float = 0.8,
         sample_top_k: int = 64,
-        coeff_loss_weight: float = 1.0,
-        coeff_neg_samples: int = 32,
         direct_coeff_loss_weight: float = 0.25,
-        recon_loss_weight: float = 1.0,
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
         sample_class_id: int = -1,
         sample_image_size: Optional[int] = None,
-        fid_real_images: Optional[torch.Tensor] = None,
-        fid_num_samples: int = 64,
-        fid_feature: int = 64,
-        coeff_clamp: Optional[Tuple[float, float]] = None,
-        atom_focus_ratio: float = 0.2,
-        coeff_ramp_ratio: float = 0.2,
-        coeff_l2_normalize: bool = True,
-        coeff_l2_eps: float = 1e-6,
-        coeff_l2_target: float = 1.0,
-        grouped_sampling: bool = True,
-        grouped_sampling_method: str = "kmeans",
-        grouped_sampling_kmeans_iters: int = 12,
     ):
         super().__init__()
         self.transformer = transformer
@@ -1325,31 +1195,14 @@ class Stage2Module(pl.LightningModule):
         self.sample_batch_size = sample_batch_size
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
-        self.coeff_loss_weight = coeff_loss_weight
-        self.coeff_neg_samples = max(0, int(coeff_neg_samples))
         self.direct_coeff_loss_weight = direct_coeff_loss_weight
-        self.recon_loss_weight = recon_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
         self.min_lr_ratio = min_lr_ratio
         self.num_classes = int(getattr(transformer.cfg, "num_classes", 0))
         self.sample_class_id = None if sample_class_id < 0 else sample_class_id
         self.sample_image_size = sample_image_size
-        self.fid_real_images = fid_real_images
-        self.fid_num_samples = max(0, fid_num_samples)
-        self.fid_feature = fid_feature
-        self.coeff_clamp = coeff_clamp
-        self._fid_metric = None
         self._last_sample_step = -1
-        self.atom_focus_ratio = float(max(0.0, atom_focus_ratio))
-        self.coeff_ramp_ratio = float(max(0.0, coeff_ramp_ratio))
-        self.coeff_l2_normalize = bool(coeff_l2_normalize)
-        self.coeff_l2_eps = float(max(coeff_l2_eps, 1e-8))
-        self.coeff_l2_target = float(max(coeff_l2_target, self.coeff_l2_eps))
-        self.grouped_sampling = bool(grouped_sampling)
-        self.grouped_sampling_method = str(grouped_sampling_method).lower()
-        self.grouped_sampling_kmeans_iters = int(max(1, grouped_sampling_kmeans_iters))
-        self._depth_group_masks: Optional[torch.Tensor] = None
 
         self.ae.eval()
         for p in self.ae.parameters():
@@ -1382,80 +1235,6 @@ class Stage2Module(pl.LightningModule):
             "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
         }
 
-    def _coefficulum_scale(self) -> float:
-        max_ep = int(getattr(self.trainer, "max_epochs", 0) or 0)
-        if max_ep <= 1:
-            return 1.0
-
-        focus_epochs = max(1, int(round(max_ep * self.atom_focus_ratio)))
-        ramp_epochs = max(1, int(round(max_ep * self.coeff_ramp_ratio)))
-        epoch = int(self.current_epoch)
-
-        if epoch < focus_epochs:
-            return 0.0
-        if epoch >= (focus_epochs + ramp_epochs):
-            return 1.0
-
-        return float(epoch - focus_epochs + 1) / float(ramp_epochs)
-
-    def _normalize_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
-        if not self.coeff_l2_normalize:
-            return coeffs
-        denom = coeffs.norm(dim=-1, keepdim=True).clamp(min=self.coeff_l2_eps)
-        return coeffs * (self.coeff_l2_target / denom)
-
-    def _build_depth_group_masks(self) -> Optional[torch.Tensor]:
-        if not self.grouped_sampling or self.D <= 0:
-            return None
-
-        vocab = int(self.transformer.cfg.vocab_size)
-        groups = int(self.D)
-        if vocab <= 0 or groups <= 0:
-            return None
-
-        method = self.grouped_sampling_method
-        masks = torch.zeros(groups, vocab, dtype=torch.bool)
-        if method == "contiguous":
-            for atom_idx in range(vocab):
-                masks[atom_idx % groups, atom_idx] = True
-            return masks
-        if method != "kmeans":
-            raise ValueError(
-                f"Unsupported grouped_sampling_method: {self.grouped_sampling_method}"
-            )
-
-        atoms = self.ae.bottleneck.dictionary.detach().t().float().cpu()
-        atoms = F.normalize(atoms, p=2, dim=1, eps=1e-8)
-        if atoms.size(0) != vocab:
-            raise ValueError(
-                f"Dictionary size mismatch: expected {vocab}, got {atoms.size(0)}."
-            )
-
-        if vocab <= groups:
-            for atom_idx in range(vocab):
-                masks[atom_idx % groups, atom_idx] = True
-            return masks
-
-        gen = torch.Generator(device=atoms.device)
-        gen.manual_seed(0)
-        init_idx = torch.randperm(vocab, generator=gen)[:groups]
-        centroids = atoms[init_idx].clone()
-        assign = torch.zeros(vocab, dtype=torch.long)
-        for _ in range(self.grouped_sampling_kmeans_iters):
-            sim = atoms @ centroids.t()
-            assign = sim.argmax(dim=1)
-            for g in range(groups):
-                idx = torch.nonzero(assign == g, as_tuple=False).squeeze(1)
-                if idx.numel() == 0:
-                    fallback = torch.argmin(sim.max(dim=1).values)
-                    assign[fallback] = g
-                    idx = fallback.view(1)
-                centroids[g] = atoms[idx].mean(dim=0)
-            centroids = F.normalize(centroids, p=2, dim=1, eps=1e-8)
-
-        masks[assign, torch.arange(vocab, dtype=torch.long)] = True
-        return masks
-
     def _unpack_stage2_batch(
         self,
         batch,
@@ -1480,11 +1259,6 @@ class Stage2Module(pl.LightningModule):
             if class_ids is not None:
                 class_ids = class_ids[:limit]
 
-        if coeff_flat.numel() > 0:
-            coeff_flat = self._normalize_coeffs(
-                coeff_flat.view(coeff_flat.size(0), -1, self.D),
-            ).reshape(coeff_flat.size(0), -1)
-
         if move_to_device:
             tok_flat = tok_flat.to(self.device, non_blocking=True)
             coeff_flat = coeff_flat.to(self.device, non_blocking=True)
@@ -1503,115 +1277,41 @@ class Stage2Module(pl.LightningModule):
             )
         return x
 
+    _COEFF_CLAMP = 24.0
+
     def training_step(self, batch, batch_idx):
         tok_flat, coeff_flat, class_ids = self._unpack_stage2_batch(batch)
         B = tok_flat.size(0)
         y = tok_flat.view(B, self.H * self.W, self.D)
         coeff_target = coeff_flat.view(B, self.H * self.W, self.D)
+        coeff_target = coeff_target.clamp(-self._COEFF_CLAMP, self._COEFF_CLAMP)
 
-        coeff_scale = self._coefficulum_scale()
-        coeff_weight = self.coeff_loss_weight * coeff_scale
-        direct_coeff_weight = self.direct_coeff_loss_weight * coeff_scale
-        recon_weight = self.recon_loss_weight * coeff_scale
-
-        atom_logits, direct_coeff_pred, sparse_reg = (
-            self.transformer.forward_tokens(
-                tok_flat,
-                coeff_flat,
-                class_ids=class_ids,
-                compute_sparse_reg=(coeff_weight > 0),
-                coeff_neg_samples=self.coeff_neg_samples,
-                coeff_clamp=self.coeff_clamp,
-            )
+        atom_logits, direct_coeff_pred = self.transformer.forward_tokens(
+            tok_flat, coeff_flat, class_ids=class_ids,
         )
-        direct_coeff_pred = self._normalize_coeffs(direct_coeff_pred)
-        atom_hard_loss = F.cross_entropy(
+        atom_loss = F.cross_entropy(
             atom_logits.reshape(-1, self.transformer.cfg.vocab_size),
             y.reshape(-1),
         )
-
-        D = self.D
-        if sparse_reg is None:
-            coeff_reg_loss = coeff_target.new_zeros(())
-        else:
-            coeff_reg_loss = sparse_reg.mean()
-        direct_coeff_loss = F.mse_loss(direct_coeff_pred, coeff_target)
-
-        if recon_weight > 0:
-            bn = self.ae.bottleneck
-            dictionary = F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon)
-
-            z_pred = bn._unpatchify(
-                bn._reconstruct(
-                    y.reshape(-1, D), direct_coeff_pred.reshape(-1, D), dictionary,
-                ), B, self.H, self.W,
-            )
-            feat_pred = self.ae.decoder(self.ae.post(z_pred))
-
-            with torch.no_grad():
-                z_gt = bn._unpatchify(
-                    bn._reconstruct(
-                        y.reshape(-1, D), coeff_target.reshape(-1, D), dictionary,
-                    ), B, self.H, self.W,
-                )
-                feat_gt = self.ae.decoder(self.ae.post(z_gt))
-            recon_loss = F.mse_loss(feat_pred, feat_gt)
-        else:
-            recon_loss = coeff_target.new_zeros(())
-
-        loss = (
-            atom_hard_loss
-            + coeff_weight * coeff_reg_loss
-            + direct_coeff_weight * direct_coeff_loss
-            + recon_weight * recon_loss
+        direct_coeff_loss = F.smooth_l1_loss(
+            direct_coeff_pred, coeff_target, beta=4.0,
         )
+        loss = atom_loss + self.direct_coeff_loss_weight * direct_coeff_loss
 
-        self.log("train/atom_loss", atom_hard_loss,
-                 prog_bar=True, on_step=True, on_epoch=True,
-                 sync_dist=True, batch_size=B)
-        self.log("train/coeff_reg_loss", coeff_reg_loss,
+        self.log("train/atom_loss", atom_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
         self.log("train/direct_coeff_loss", direct_coeff_loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
-        self.log("train/recon_loss", recon_loss,
-                 prog_bar=True, on_step=True, on_epoch=True,
-                 sync_dist=True, batch_size=B)
         self.log("train/loss", loss,
                  prog_bar=True, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=B)
-        self.log("train/coefficulum_scale", coeff_scale,
-             prog_bar=True, on_step=True, on_epoch=True,
-             sync_dist=True, batch_size=B)
-        self.log("train/coeff_w_eff", coeff_weight,
-             on_step=True, on_epoch=True,
-             sync_dist=True, batch_size=B)
-        self.log("train/direct_coeff_w_eff", direct_coeff_weight,
-             on_step=True, on_epoch=True,
-             sync_dist=True, batch_size=B)
-        self.log("train/recon_w_eff", recon_weight,
-             on_step=True, on_epoch=True,
-             sync_dist=True, batch_size=B)
         return loss
 
     def on_fit_start(self):
         self.ae.to(self.device)
         self.ae.eval()
-        if self.grouped_sampling:
-            try:
-                masks = self._build_depth_group_masks()
-                if masks is not None:
-                    self._depth_group_masks = masks.to(self.device)
-                    sizes = [int(v) for v in masks.sum(dim=1).tolist()]
-                    print(
-                        "[Stage2] grouped sampling active "
-                        f"({self.grouped_sampling_method}), "
-                        f"group sizes={sizes}"
-                    )
-            except Exception as exc:
-                self._depth_group_masks = None
-                print(f"[Stage2] grouped sampling disabled due to error: {exc}")
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if self.sample_every_steps <= 0:
@@ -1661,11 +1361,9 @@ class Stage2Module(pl.LightningModule):
             top_k=self.sample_top_k,
             class_ids=class_ids,
             show_progress=True,
-            coeff_clamp=self.coeff_clamp,
-            depth_group_masks=self._depth_group_masks,
         )
         support = tokens.view(-1, self.H, self.W, self.D)
-        coeffs = self._normalize_coeffs(coeffs.view(-1, self.H, self.W, self.D))
+        coeffs = coeffs.view(-1, self.H, self.W, self.D)
         raw_imgs = self.ae.decode_from_codes(
             support.to(self.device), coeffs.to(self.device),
         )
@@ -1689,38 +1387,25 @@ class Stage2Module(pl.LightningModule):
                     bsz = tf_tok.size(0)
                     tf_support = tf_tok.view(bsz, self.H, self.W, self.D)
                     tf_coeff_target = tf_coeff.view(bsz, self.H, self.W, self.D)
-                    _, tf_direct_coeff, _ = self.transformer.forward_tokens(
-                        tf_tok,
-                        tf_coeff,
-                        class_ids=tf_class_ids,
-                        compute_sparse_reg=False,
-                        coeff_clamp=self.coeff_clamp,
+                    _, tf_direct_coeff = self.transformer.forward_tokens(
+                        tf_tok, tf_coeff, class_ids=tf_class_ids,
                     )
-                    tf_coeff_pred = self._normalize_coeffs(
-                        tf_direct_coeff.view(bsz, self.H, self.W, self.D),
+                    tf_coeff_pred = tf_direct_coeff.view(bsz, self.H, self.W, self.D)
+                    tf_gt = self._resize_for_logging(
+                        self.ae.decode_from_codes(tf_support, tf_coeff_target),
                     )
-                    tf_gt_raw = self.ae.decode_from_codes(
-                        tf_support, tf_coeff_target,
+                    tf_pred = self._resize_for_logging(
+                        self.ae.decode_from_codes(tf_support, tf_coeff_pred),
                     )
-                    tf_pred_raw = self.ae.decode_from_codes(
-                        tf_support, tf_coeff_pred,
-                    )
-                    tf_gt = self._resize_for_logging(tf_gt_raw)
-                    tf_pred = self._resize_for_logging(tf_pred_raw)
-
                     gt_logged = log_images_wandb(
                         self.logger,
                         "stage2/teacher_forced_gt",
-                        tf_gt,
-                        step,
-                        f"step={step}",
+                        tf_gt, step, f"step={step}",
                     )
                     pred_logged = log_images_wandb(
                         self.logger,
                         "stage2/teacher_forced_pred",
-                        tf_pred,
-                        step,
-                        f"step={step}",
+                        tf_pred, step, f"step={step}",
                     )
                     if not (gt_logged and pred_logged):
                         save_grid(
@@ -1740,55 +1425,7 @@ class Stage2Module(pl.LightningModule):
             except Exception as exc:
                 print(f"[Stage2] teacher-forced preview failed at step {step}: {exc}")
 
-        self._compute_and_log_fid(step, raw_imgs)
         self.transformer.train()
-
-    @torch.no_grad()
-    def _compute_and_log_fid(
-        self, step: int, fake_imgs: torch.Tensor,
-    ):
-        if self.fid_num_samples <= 0:
-            return
-        if FrechetInceptionDistance is None:
-            return
-        if self.fid_real_images is None or self.fid_real_images.numel() == 0:
-            return
-
-        fake_u8 = (
-            (fake_imgs.detach().cpu().clamp(-1, 1) + 1.0) * 127.5
-        ).to(torch.uint8)
-        n = min(self.fid_num_samples, self.fid_real_images.size(0), fake_u8.size(0))
-        if n < 2:
-            return
-
-        feat = self.fid_feature
-        if n < feat:
-            feat = 64
-
-        if self._fid_metric is None:
-            self._fid_metric = FrechetInceptionDistance(
-                feature=feat, sync_on_compute=False,
-            )
-        fid = self._fid_metric.to(self.device)
-        fid.reset()
-
-        bs = 64
-        real_u8 = self.fid_real_images[:n].to(self.device)
-        fake_u8 = fake_u8[:n].to(self.device)
-        for i in range(0, n, bs):
-            fid.update(real_u8[i: i + bs], real=True)
-            fid.update(fake_u8[i: i + bs], real=False)
-
-        try:
-            fid_val = float(fid.compute().detach().cpu().item())
-            print(f"[Stage2] FID @ step {step}: {fid_val:.2f}")
-            if not log_scalar_wandb(self.logger, "stage2/fid", fid_val, step):
-                self.log("stage2/fid", fid_val, on_step=True, prog_bar=True,
-                         sync_dist=False, rank_zero_only=True)
-        except Exception as exc:
-            print(f"[Stage2] FID failed at step {step}: {exc}")
-        fid.reset()
-        fid.cpu()
 
 
 # ---------------------------------------------------------------------------
@@ -1855,190 +1492,169 @@ def precompute_tokens(
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cifar10",
-                        choices=["cifar10", "celeba", "stl10", "imagenette"])
-    parser.add_argument("--data_dir", type=str, default=None)
-    parser.add_argument("--image_size", type=int, default=32)
-    parser.add_argument("--out_dir", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=0)
+def _add_typed_args(add, specs):
+    for flag, arg_type, default in specs:
+        add(flag, type=arg_type, default=default)
 
-    # Stage-1
-    parser.add_argument("--stage1_epochs", type=int, default=5)
-    parser.add_argument("--stage1_lr", type=float, default=2e-4)
-    parser.add_argument("--stage1_lr_schedule", type=str, default="cosine",
-                        choices=["constant", "cosine"])
-    parser.add_argument("--stage1_warmup_epochs", type=int, default=1)
-    parser.add_argument("--stage1_min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--bottleneck_weight", type=float, default=1.0)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--devices", type=int, default=2)
-    parser.add_argument("--stage1_init_ckpt", type=str, default=None)
-    # Model
-    parser.add_argument("--num_hiddens", type=int, default=128)
-    parser.add_argument("--ae_num_downsamples", type=int, default=2)
-    parser.add_argument("--num_res_layers", type=int, default=2)
-    parser.add_argument("--num_res_hiddens", type=int, default=32)
-    parser.add_argument("--embedding_dim", type=int, default=64)
-    parser.add_argument("--num_atoms", type=int, default=128)
-    parser.add_argument("--sparsity_level", type=int, default=3)
-    parser.add_argument("--commitment_cost", type=float, default=0.25)
-    parser.add_argument(
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    add = parser.add_argument
+    add(
+        "--dataset", type=str, default="cifar10",
+        choices=["cifar10", "celeba", "stl10", "imagenette"],
+    )
+    _add_typed_args(add, (
+        ("--data_dir", str, None),
+        ("--image_size", int, 32),
+        ("--out_dir", str, None),
+        ("--seed", int, 0),
+    ))
+
+
+def _add_stage1_args(parser: argparse.ArgumentParser) -> None:
+    add = parser.add_argument
+    _add_typed_args(add, (
+        ("--stage1_epochs", int, 5),
+        ("--stage1_lr", float, 2e-4),
+        ("--stage1_warmup_epochs", int, 1),
+        ("--stage1_min_lr_ratio", float, 0.1),
+        ("--bottleneck_weight", float, 1.0),
+        ("--batch_size", int, 128),
+        ("--grad_clip", float, 1.0),
+        ("--devices", int, 2),
+        ("--stage1_init_ckpt", str, None),
+    ))
+    add(
+        "--stage1_lr_schedule", type=str, default="cosine",
+        choices=["constant", "cosine"],
+    )
+
+
+def _add_model_args(parser: argparse.ArgumentParser) -> None:
+    add = parser.add_argument
+    _add_typed_args(add, (
+        ("--num_hiddens", int, 128),
+        ("--ae_num_downsamples", int, 2),
+        ("--num_res_layers", int, 2),
+        ("--num_res_hiddens", int, 32),
+        ("--embedding_dim", int, 64),
+        ("--num_atoms", int, 128),
+        ("--sparsity_level", int, 3),
+        ("--commitment_cost", float, 0.25),
+    ))
+    add(
         "--usage_ema_decay", type=float, default=0.99,
         help="EMA decay for tracking dictionary atom usage.",
     )
-    parser.add_argument(
+    add(
         "--usage_balance_alpha", type=float, default=0.3,
         help="Inverse-usage reweighting strength for OMP atom selection.",
     )
-    parser.add_argument(
+    add(
         "--dead_atom_threshold", type=float, default=5e-4,
         help="Usage threshold for reviving dead atoms; <=0 disables revival.",
     )
-    parser.add_argument(
+    add(
         "--dead_atom_interval", type=int, default=200,
         help="Train batches between dead-atom revival checks.",
     )
-    parser.add_argument(
+    add(
         "--dead_atom_max_reinit", type=int, default=16,
         help="Maximum number of atoms to reinitialize per revival check.",
     )
-    parser.add_argument("--lpips_weight", type=float, default=0.1,
-                        help="Weight for LPIPS perceptual loss in stage-1.")
-    parser.add_argument("--bottleneck_patch_size", type=int, default=1,
-                        help="Patch size for dictionary learning; >1 groups "
-                             "PxP spatial patches into single atoms.")
+    add(
+        "--bottleneck_patch_size", type=int, default=1,
+        help="Patch size for dictionary learning; >1 groups "
+             "PxP spatial patches into single atoms.",
+    )
 
-    # Stage-2
-    parser.add_argument("--stage2_epochs", type=int, default=10)
-    parser.add_argument("--stage2_lr", type=float, default=3e-4)
-    parser.add_argument("--stage2_lr_schedule", type=str, default="cosine",
-                        choices=["constant", "cosine"])
-    parser.add_argument("--stage2_warmup_epochs", type=int, default=1)
-    parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--stage2_batch_size", type=int, default=16)
-    parser.add_argument("--stage2_conditional", action="store_true",
-                        default=False)
-    parser.add_argument("--stage2_num_classes", type=int, default=None)
-    parser.add_argument("--stage2_sample_class_id", type=int, default=-1)
-    parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
-    parser.add_argument("--stage2_sample_batch_size", type=int, default=64)
-    parser.add_argument("--stage2_sample_temperature", type=float, default=0.8)
-    parser.add_argument("--stage2_sample_top_k", type=int, default=64)
-    parser.add_argument("--stage2_sample_image_size", type=int, default=256)
-    parser.add_argument("--stage2_resume_from_last", action="store_true",
-                        default=True)
-    parser.add_argument("--no_stage2_resume_from_last", action="store_false",
-                        dest="stage2_resume_from_last")
-    parser.add_argument(
-        "--stage2_coeff_loss_weight",
-        type=float,
-        default=0.1,
-        help="Weight for sampled negative-atom coefficient energy in stage-2.",
+
+def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
+    add = parser.add_argument
+    _add_typed_args(add, (
+        ("--stage2_epochs", int, 10),
+        ("--stage2_lr", float, 3e-4),
+        ("--stage2_warmup_epochs", int, 1),
+        ("--stage2_min_lr_ratio", float, 0.1),
+        ("--stage2_batch_size", int, 16),
+        ("--stage2_num_classes", int, None),
+        ("--stage2_sample_class_id", int, -1),
+        ("--stage2_sample_every_steps", int, 200),
+        ("--stage2_sample_batch_size", int, 64),
+        ("--stage2_sample_temperature", float, 0.8),
+        ("--stage2_sample_top_k", int, 64),
+        ("--stage2_sample_image_size", int, 256),
+    ))
+    add(
+        "--stage2_lr_schedule", type=str, default="cosine",
+        choices=["constant", "cosine"],
     )
-    parser.add_argument(
-        "--stage2_coeff_neg_samples",
-        type=int,
-        default=32,
-        help="Number of negative atoms sampled per sparse coeff for coeff regularization.",
+    add(
+        "--stage2_arch",
+        type=str,
+        default="rq_hier",
+        choices=["rq_hier", "decoder_dual"],
+        help=(
+            "Stage-2 prior architecture: "
+            "'decoder_dual' (simple decoder-only dual-head prior) or "
+            "'rq_hier' (spatial+depth RQ transformer)."
+        ),
     )
-    parser.add_argument(
+    add("--stage2_conditional", action="store_true", default=False)
+    add("--stage2_resume_from_last", action="store_true", default=True)
+    add(
+        "--no_stage2_resume_from_last",
+        action="store_false",
+        dest="stage2_resume_from_last",
+    )
+    add(
         "--stage2_direct_coeff_loss_weight",
         type=float,
         default=0.25,
         help="Weight for direct coefficient MSE loss on sampled head output.",
     )
-    parser.add_argument(
-        "--stage2_recon_loss_weight",
-        type=float,
-        default=1.0,
-        help="Weight for latent reconstruction loss (z_pred vs z_gt) in stage-2.",
+    _add_typed_args(add, (
+        ("--tf_d_model", int, 256),
+        ("--tf_heads", int, 4),
+        ("--tf_layers", int, 4),
+        ("--tf_depth_layers", int, 4),
+        ("--tf_ff", int, 1024),
+        ("--tf_dropout", float, 0.1),
+        ("--token_subset", int, 0),
+        ("--wandb_project", str, "laser-scratch"),
+        ("--wandb_entity", str, None),
+        ("--wandb_name", str, None),
+        ("--wandb_group", str, None),
+        ("--wandb_dir", str, "./wandb"),
+    ))
+    add(
+        "--wandb_mode", type=str, default="online",
+        choices=["online", "offline", "disabled"],
     )
-    parser.add_argument(
-        "--stage2_atom_focus_ratio",
-        type=float,
-        default=0.2,
-        help="Fraction of stage-2 epochs focused on atom ID loss only.",
-    )
-    parser.add_argument(
-        "--stage2_coeff_ramp_ratio",
-        type=float,
-        default=0.2,
-        help="Fraction of stage-2 epochs to ramp coeff/recon losses from 0 to full weight.",
-    )
-    parser.add_argument("--stage2_fid_num_samples", type=int, default=64)
-    parser.add_argument("--stage2_fid_feature", type=int, default=64)
-    parser.add_argument(
-        "--stage2_coeff_l2_normalize",
-        action="store_true",
-        default=True,
-        help="Normalize per-location coefficient vectors to fixed L2 energy.",
-    )
-    parser.add_argument(
-        "--no_stage2_coeff_l2_normalize",
-        action="store_false",
-        dest="stage2_coeff_l2_normalize",
-    )
-    parser.add_argument(
-        "--stage2_coeff_l2_eps",
-        type=float,
-        default=1e-6,
-        help="Numerical epsilon for coefficient L2 normalization.",
-    )
-    parser.add_argument(
-        "--stage2_grouped_sampling",
-        action="store_true",
-        default=True,
-        help="Use one atom group per sparse depth slot during sampling.",
-    )
-    parser.add_argument(
-        "--no_stage2_grouped_sampling",
-        action="store_false",
-        dest="stage2_grouped_sampling",
-    )
-    parser.add_argument(
-        "--stage2_grouped_sampling_method",
-        type=str,
-        default="kmeans",
-        choices=["kmeans", "contiguous"],
-        help="How to build atom groups used for grouped sampling.",
-    )
-    parser.add_argument(
-        "--stage2_grouped_sampling_kmeans_iters",
-        type=int,
-        default=12,
-        help="K-means iterations when building grouped sampling masks.",
-    )
-    parser.add_argument("--tf_d_model", type=int, default=256)
-    parser.add_argument("--tf_heads", type=int, default=4)
-    parser.add_argument("--tf_layers", type=int, default=4)
-    parser.add_argument("--tf_depth_layers", type=int, default=4)
-    parser.add_argument("--tf_ff", type=int, default=1024)
-    parser.add_argument("--tf_dropout", type=float, default=0.1)
-    parser.add_argument("--token_subset", type=int, default=0)
-    parser.add_argument("--wandb_mode", type=str, default="online",
-                        choices=["online", "offline", "disabled"])
-    parser.add_argument("--wandb_project", type=str, default="laser-scratch")
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_name", type=str, default=None)
-    parser.add_argument("--wandb_group", type=str, default=None)
-    parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    _add_common_args(parser)
+    _add_stage1_args(parser)
+    _add_model_args(parser)
+    _add_stage2_args(parser)
+    return parser
+
+
+def main():
+    parser = _build_arg_parser()
     args = parser.parse_args()
     # ---- defaults ----
     if args.data_dir is None:
-        if args.dataset == "celeba":
-            args.data_dir = "../../data/celeba"
-        elif args.dataset == "imagenette":
-            args.data_dir = "./data/imagenette2-160"
-        else:
-            args.data_dir = "./data"
+        args.data_dir = {
+            "celeba": "../../data/celeba",
+            "imagenette": "./data/imagenette2-160",
+        }.get(args.dataset, "./data")
     if args.out_dir is None:
         args.out_dir = f"./runs/sparse_dict_{args.dataset}_{args.image_size}"
 
-    hint = 10 if args.dataset in ("cifar10", "stl10", "imagenette") else 0
+    hint = {"cifar10": 10, "stl10": 10, "imagenette": 10}.get(args.dataset, 0)
     stage2_num_classes = 0
     if args.stage2_conditional:
         stage2_num_classes = args.stage2_num_classes or hint
@@ -2134,15 +1750,111 @@ def main():
         ae.load_state_dict(state)
         print(f"[{tag}] loaded AE from {path}")
 
+    def _build_datasets(
+        transform,
+    ) -> Tuple[Dataset, Dataset]:
+        if args.dataset == "cifar10":
+            train_set = datasets.CIFAR10(
+                root=args.data_dir, train=True, download=True, transform=transform,
+            )
+            val_set = datasets.CIFAR10(
+                root=args.data_dir, train=False, download=True, transform=transform,
+            )
+            return train_set, val_set
+        if args.dataset == "stl10":
+            train_set = datasets.STL10(
+                root=args.data_dir, split="train", download=True,
+                transform=transform,
+            )
+            val_set = datasets.STL10(
+                root=args.data_dir, split="test", download=True, transform=transform,
+            )
+            return train_set, val_set
+        if args.dataset == "celeba":
+            full = FlatImageDataset(root=args.data_dir, transform=transform)
+            n_val = max(1, int(0.05 * len(full)))
+            idx = torch.randperm(
+                len(full), generator=torch.Generator().manual_seed(args.seed),
+            )
+            train_set = Subset(full, idx[: len(full) - n_val].tolist())
+            val_set = Subset(full, idx[len(full) - n_val:].tolist())
+            return train_set, val_set
+        if args.dataset == "imagenette":
+            train_set = datasets.ImageFolder(
+                root=os.path.join(args.data_dir, "train"), transform=transform,
+            )
+            val_set = datasets.ImageFolder(
+                root=os.path.join(args.data_dir, "val"), transform=transform,
+            )
+            return train_set, val_set
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    def _build_ddp_strategy() -> object:
+        if args.devices <= 1:
+            return "auto"
+        from lightning.pytorch.strategies import DDPStrategy
+        return DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
+
+    def _load_or_precompute_tokens(
+        ae: SparseDictAE,
+        train_set: Dataset,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int, int,
+    ]:
+        use_cache = args.stage1_epochs <= 0 and os.path.exists(token_cache_path)
+        if use_cache:
+            print(f"Loading cached tokens from {token_cache_path}")
+            cache = torch.load(
+                token_cache_path, map_location="cpu", weights_only=False,
+            )
+            tokens_flat = cache["tokens"]
+            if tokens_flat.size(0) == 0:
+                print("[WARNING] Cached tokens are empty, recomputing...")
+                os.remove(token_cache_path)
+                use_cache = False
+        if use_cache:
+            coeffs_flat = cache["coeffs"]
+            class_ids_flat = cache.get("class_ids")
+            H, W, D = cache["shape"]
+        else:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            ae = ae.to(device)
+            tok_loader = DataLoader(
+                train_set, batch_size=args.batch_size,
+                shuffle=False, num_workers=0, pin_memory=True,
+            )
+            tokens_flat, coeffs_flat, class_ids_flat, H, W, D = precompute_tokens(
+                ae, tok_loader, device,
+                max_items=(
+                    min(args.token_subset, len(train_set))
+                    if args.token_subset > 0 else None
+                ),
+                collect_labels=(stage2_num_classes > 0),
+            )
+            ae.cpu()
+            torch.save({
+                "tokens": tokens_flat,
+                "coeffs": coeffs_flat,
+                "class_ids": class_ids_flat,
+                "shape": (H, W, D),
+                "stage2_num_classes": stage2_num_classes,
+            }, token_cache_path)
+        return tokens_flat, coeffs_flat, class_ids_flat, H, W, D
+
+    def _clear_ddp_env_for_stage2():
+        for k in (
+            "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
+            "GROUP_RANK", "ROLE_RANK", "NODE_RANK",
+            "MASTER_ADDR", "MASTER_PORT",
+        ):
+            os.environ.pop(k, None)
+
     def _run_stage2(
         tokens_flat: torch.Tensor,
         coeffs_flat: torch.Tensor,
         class_ids_flat: Optional[torch.Tensor],
         H: int, W: int, D: int,
         ae: SparseDictAE,
-        fid_real_images: Optional[torch.Tensor] = None,
-        coeff_clamp: Optional[Tuple[float, float]] = None,
-        coeff_l2_target: float = 1.0,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-2 requires CUDA.")
@@ -2161,20 +1873,39 @@ def main():
             persistent_workers=True,
         )
 
-        cfg = RQTransformerConfig(
-            vocab_size=ae.bottleneck.vocab_size,
-            H=H, W=W, D=D,
-            num_classes=stage2_num_classes,
-            d_model=args.tf_d_model,
-            n_heads=args.tf_heads,
-            n_layers=args.tf_layers,
-            n_depth_layers=args.tf_depth_layers,
-            d_ff=args.tf_ff,
-            dropout=args.tf_dropout,
-        )
-        transformer = RQTransformerPrior(
-            cfg,
-        )
+        if args.stage2_arch == "decoder_dual":
+            from dual_head_decoder_transformer import (
+                DualHeadDecoderConfig,
+                DualHeadDecoderPrior,
+            )
+
+            cfg = DualHeadDecoderConfig(
+                vocab_size=ae.bottleneck.vocab_size,
+                H=H,
+                W=W,
+                D=D,
+                num_classes=stage2_num_classes,
+                d_model=args.tf_d_model,
+                n_heads=args.tf_heads,
+                n_layers=args.tf_layers,
+                d_ff=args.tf_ff,
+                dropout=args.tf_dropout,
+            )
+            transformer = DualHeadDecoderPrior(cfg)
+        else:
+            cfg = RQTransformerConfig(
+                vocab_size=ae.bottleneck.vocab_size,
+                H=H, W=W, D=D,
+                num_classes=stage2_num_classes,
+                d_model=args.tf_d_model,
+                n_heads=args.tf_heads,
+                n_layers=args.tf_layers,
+                n_depth_layers=args.tf_depth_layers,
+                d_ff=args.tf_ff,
+                dropout=args.tf_dropout,
+            )
+            transformer = RQTransformerPrior(cfg)
+        print(f"[Stage2] architecture: {args.stage2_arch}")
 
         if args.stage2_resume_from_last:
             ckpt = os.path.join(stage2_dir, "transformer_last.pt")
@@ -2198,10 +1929,7 @@ def main():
             sample_batch_size=args.stage2_sample_batch_size,
             sample_temperature=args.stage2_sample_temperature,
             sample_top_k=args.stage2_sample_top_k,
-            coeff_loss_weight=args.stage2_coeff_loss_weight,
-            coeff_neg_samples=args.stage2_coeff_neg_samples,
             direct_coeff_loss_weight=args.stage2_direct_coeff_loss_weight,
-            recon_loss_weight=args.stage2_recon_loss_weight,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
@@ -2210,27 +1938,9 @@ def main():
                 args.stage2_sample_image_size
                 if args.stage2_sample_image_size > 0 else None
             ),
-            fid_real_images=fid_real_images,
-            fid_num_samples=args.stage2_fid_num_samples,
-            fid_feature=args.stage2_fid_feature,
-            coeff_clamp=coeff_clamp,
-            atom_focus_ratio=args.stage2_atom_focus_ratio,
-            coeff_ramp_ratio=args.stage2_coeff_ramp_ratio,
-            coeff_l2_normalize=args.stage2_coeff_l2_normalize,
-            coeff_l2_eps=args.stage2_coeff_l2_eps,
-            coeff_l2_target=coeff_l2_target,
-            grouped_sampling=args.stage2_grouped_sampling,
-            grouped_sampling_method=args.stage2_grouped_sampling_method,
-            grouped_sampling_kmeans_iters=(
-                args.stage2_grouped_sampling_kmeans_iters
-            ),
         )
 
-        from lightning.pytorch.strategies import DDPStrategy
-        s2_strategy: object = (
-            DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
-            if args.devices > 1 else "auto"
-        )
+        s2_strategy = _build_ddp_strategy()
         if args.devices > 1:
             os.environ["LASER_DDP_PHASE"] = "stage2"
             _ensure_free_master_port("Stage2")
@@ -2260,9 +1970,6 @@ def main():
         _run_stage2(
             cache["tokens"], cache["coeffs"], cache.get("class_ids"),
             H, W, D, ae,
-            fid_real_images=cache.get("fid_real_images"),
-            coeff_clamp=cache.get("coeff_clamp"),
-            coeff_l2_target=float(cache.get("coeff_l2_target", 1.0)),
         )
         return
 
@@ -2277,37 +1984,7 @@ def main():
 
     # ---- datasets ----
 
-    if args.dataset == "cifar10":
-        train_set = datasets.CIFAR10(
-            root=args.data_dir, train=True, download=True, transform=tfm,
-        )
-        val_set = datasets.CIFAR10(
-            root=args.data_dir, train=False, download=True, transform=tfm,
-        )
-    elif args.dataset == "stl10":
-        train_set = datasets.STL10(
-            root=args.data_dir, split="train", download=True, transform=tfm,
-        )
-        val_set = datasets.STL10(
-            root=args.data_dir, split="test", download=True, transform=tfm,
-        )
-    elif args.dataset == "celeba":
-        full = FlatImageDataset(root=args.data_dir, transform=tfm)
-        n_val = max(1, int(0.05 * len(full)))
-        idx = torch.randperm(
-            len(full), generator=torch.Generator().manual_seed(args.seed),
-        )
-        train_set = Subset(full, idx[: len(full) - n_val].tolist())
-        val_set = Subset(full, idx[len(full) - n_val:].tolist())
-    elif args.dataset == "imagenette":
-        train_set = datasets.ImageFolder(
-            root=os.path.join(args.data_dir, "train"), transform=tfm,
-        )
-        val_set = datasets.ImageFolder(
-            root=os.path.join(args.data_dir, "val"), transform=tfm,
-        )
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+    train_set, val_set = _build_datasets(tfm)
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size,
@@ -2342,17 +2019,12 @@ def main():
             lr_schedule=args.stage1_lr_schedule,
             warmup_epochs=args.stage1_warmup_epochs,
             min_lr_ratio=args.stage1_min_lr_ratio,
-            lpips_weight=args.lpips_weight,
         )
 
         if args.devices > 1:
             os.environ["LASER_DDP_PHASE"] = "stage1"
             _ensure_free_master_port("Stage1")
-        from lightning.pytorch.strategies import DDPStrategy
-        s1_strategy: object = (
-            DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
-            if args.devices > 1 else "auto"
-        )
+        s1_strategy = _build_ddp_strategy()
         pl.Trainer(
             accelerator="gpu",
             devices=args.devices,
@@ -2372,100 +2044,24 @@ def main():
 
     # ---- precompute tokens ----
 
-    use_cache = args.stage1_epochs <= 0 and os.path.exists(token_cache_path)
-    if use_cache:
-        print(f"Loading cached tokens from {token_cache_path}")
-        cache = torch.load(
-            token_cache_path, map_location="cpu", weights_only=False,
-        )
-        tokens_flat = cache["tokens"]
-        if tokens_flat.size(0) == 0:
-            print("[WARNING] Cached tokens are empty, recomputing...")
-            os.remove(token_cache_path)
-            use_cache = False
-    if use_cache:
-        coeffs_flat = cache["coeffs"]
-        class_ids_flat = cache.get("class_ids")
-        fid_real_images = cache.get("fid_real_images")
-        H, W, D = cache["shape"]
-        coeff_clamp = cache.get("coeff_clamp")
-        coeff_l2_target_raw = cache.get("coeff_l2_target")
-        if coeff_l2_target_raw is None:
-            coeff_l2_target = float(coeffs_flat.view(-1, D).norm(dim=1).mean().item())
-        else:
-            coeff_l2_target = float(coeff_l2_target_raw)
-        if coeff_l2_target <= 0:
-            coeff_l2_target = 1.0
-    else:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        ae = ae.to(device)
-        tok_loader = DataLoader(
-            train_set, batch_size=args.batch_size,
-            shuffle=False, num_workers=0, pin_memory=True,
-        )
-        tokens_flat, coeffs_flat, class_ids_flat, H, W, D = precompute_tokens(
-            ae, tok_loader, device,
-            max_items=(
-                min(args.token_subset, len(train_set))
-                if args.token_subset > 0 else None
-            ),
-            collect_labels=(stage2_num_classes > 0),
-        )
-        fid_loader = DataLoader(
-            train_set, batch_size=args.batch_size,
-            shuffle=False, num_workers=0,
-        )
-        fid_real_images = collect_real_images_uint8(
-            fid_loader, max_items=args.stage2_fid_num_samples,
-        )
-        ae = ae.cpu()
-        cf = coeffs_flat.reshape(-1)
-        if cf.numel() > 1_000_000:
-            idx = torch.randint(0, cf.numel(), (1_000_000,))
-            cf = cf[idx]
-        coeff_lo = float(cf.quantile(0.01).item())
-        coeff_hi = float(cf.quantile(0.99).item())
-        coeff_clamp = (coeff_lo, coeff_hi)
-        print(f"[Coeffs] range 1%-99%: [{coeff_lo:.3f}, {coeff_hi:.3f}]")
-        coeff_l2 = coeffs_flat.view(-1, D).norm(dim=1)
-        coeff_l2_target = float(coeff_l2.mean().item())
-        print(f"[Coeffs] mean L2 energy: {coeff_l2_target:.3f}")
-        torch.save({
-            "tokens": tokens_flat,
-            "coeffs": coeffs_flat,
-            "class_ids": class_ids_flat,
-            "shape": (H, W, D),
-            "stage2_num_classes": stage2_num_classes,
-            "fid_real_images": fid_real_images,
-            "coeff_clamp": (coeff_lo, coeff_hi),
-            "coeff_l2_target": coeff_l2_target,
-        }, token_cache_path)
+    tokens_flat, coeffs_flat, class_ids_flat, H, W, D = (
+        _load_or_precompute_tokens(ae, train_set)
+    )
 
     print(f"[Stage2] tokens: {tokens_flat.shape}  (H={H}, W={W}, D={D})")
-    if coeff_clamp is not None:
-        print(f"[Stage2] coeff_clamp: [{coeff_clamp[0]:.3f}, {coeff_clamp[1]:.3f}]")
-    print(f"[Stage2] coeff_l2_target: {coeff_l2_target:.3f}")
 
     # ---- stage-2 ----
 
     if args.stage1_epochs <= 0:
         _run_stage2(
             tokens_flat, coeffs_flat, class_ids_flat, H, W, D, ae,
-            fid_real_images=fid_real_images,
-            coeff_clamp=coeff_clamp,
-            coeff_l2_target=coeff_l2_target,
         )
         return
 
     # Re-exec into a clean process so CUDA / NCCL state from stage-1 DDP
     # doesn't conflict with stage-2 DDP.
     os.environ["LASER_DDP_PHASE"] = "stage2"
-    for k in (
-        "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
-        "GROUP_RANK", "ROLE_RANK", "NODE_RANK",
-        "MASTER_ADDR", "MASTER_PORT",
-    ):
-        os.environ.pop(k, None)
+    _clear_ddp_env_for_stage2()
     print("[Stage2] restarting for clean DDP launch...")
     ret = subprocess.call(
         [sys.executable, __file__, *sys.argv[1:]],
