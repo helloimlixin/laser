@@ -1078,6 +1078,7 @@ class RQTransformerPrior(nn.Module):
         T = self.positions_per_image
         D = self.cfg.D
         d_model = self.cfg.d_model
+        _ = top_k  # Top-k truncation is intentionally disabled for sampling.
 
         class_bias = self._class_bias(class_ids, batch_size, device)
         spatial_pos = self._spatial_pos(T, device)
@@ -1143,7 +1144,6 @@ class RQTransformerPrior(nn.Module):
 
                 if is_atom_step:
                     logits = self.atom_head(z_last) / max(temperature, 1e-8)
-                    logits = self._top_k(logits, top_k)
                     tok_ids = torch.multinomial(
                         F.softmax(logits, dim=-1), 1,
                     ).squeeze(-1)
@@ -1159,7 +1159,6 @@ class RQTransformerPrior(nn.Module):
                     coeff_slots.reshape(batch_size, D * d_model),
                 ], dim=-1)
                 coeff_logits = self.coeff_head(combined_h) / max(temperature, 1e-8)
-                coeff_logits = self._top_k(coeff_logits, top_k)
                 coeff_bins = torch.multinomial(
                     F.softmax(coeff_logits, dim=-1), 1,
                 ).squeeze(-1)
@@ -1411,7 +1410,7 @@ class Stage2Module(pl.LightningModule):
         sample_every_steps: int = 200,
         sample_batch_size: int = 8,
         sample_temperature: float = 0.8,
-        sample_top_k: int = 64,
+        sample_top_k: int = 0,
         direct_coeff_loss_weight: float = 0.25,
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
@@ -1428,7 +1427,8 @@ class Stage2Module(pl.LightningModule):
         self.sample_every_steps = sample_every_steps
         self.sample_batch_size = sample_batch_size
         self.sample_temperature = max(sample_temperature, 1e-8)
-        self.sample_top_k = sample_top_k if sample_top_k > 0 else None
+        _ = sample_top_k  # Sampling always uses full-support distributions.
+        self.sample_top_k = None
         self.direct_coeff_loss_weight = direct_coeff_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
@@ -1893,7 +1893,7 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         ("--stage2_sample_every_steps", int, 200),
         ("--stage2_sample_batch_size", int, 64),
         ("--stage2_sample_temperature", float, 0.8),
-        ("--stage2_sample_top_k", int, 64),
+        ("--stage2_sample_top_k", int, 0),
         ("--stage2_sample_image_size", int, 256),
     ))
     add(
