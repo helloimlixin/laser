@@ -730,10 +730,8 @@ class RQTransformerConfig:
     dropout: float = 0.1
     use_pred_coeff_feedback: bool = True
     use_pred_atom_feedback: bool = True
-    pred_atom_feedback_prob: float = 1.0
     stochastic_feedback_sampling: bool = False
     feedback_temperature: float = 1.0
-    depth_input_mixing_prob: float = 0.0
     atom_label_smoothing: float = 0.0
     coeff_adjacent_soft_target: float = 0.0
     n_coeff_bins: int = 1024
@@ -971,68 +969,7 @@ class RQTransformerPrior(nn.Module):
             depth_content[:, 2::2, :] = coeff_teacher_depth[:, :-1, :]
         depth_content[:, 1::2, :] = tok_emb
         pos_type_bias = depth_pos.unsqueeze(0) + depth_type.unsqueeze(0)
-
-        dim_prob = (
-            float(min(max(self.cfg.depth_input_mixing_prob, 0.0), 1.0))
-            if self.training else 0.0
-        )
-        if dim_prob > 0.0:
-            fb_temp = max(float(self.cfg.feedback_temperature), 1e-8)
-            with torch.no_grad():
-                depth_in_gt = depth_content + pos_type_bias
-                depth_h_p1 = self.drop(depth_in_gt)
-                for blk in self.depth_blocks:
-                    depth_h_p1, _ = blk(depth_h_p1)
-                depth_h_p1 = self.depth_ln(depth_h_p1)
-                atom_logits_p1 = self.atom_head(
-                    depth_h_p1[:, 0::2, :],
-                )
-                pred_atom_ids = self._sample_or_argmax(
-                    atom_logits_p1, temperature=fb_temp,
-                )
-                pred_atom_emb = self.token_emb(pred_atom_ids)
-                # Pass-1 coeff rollout to approximate inference-time coeff context
-                # for atom slots at deeper levels.
-                token_slots_p1 = pred_atom_emb
-                coeff_slots_p1 = torch.zeros(bt, D, d_model, device=device)
-                for d in range(D):
-                    z_last_p1 = depth_h_p1[:, 2 * d + 1, :]
-                    tok_cur_p1 = token_slots_p1[:, d, :]
-                    combined_p1 = torch.cat([
-                        h_t,
-                        z_last_p1,
-                        token_slots_p1.reshape(bt, D * d_model),
-                        coeff_slots_p1.reshape(bt, D * d_model),
-                    ], dim=-1)
-                    coeff_logits_p1 = self.coeff_head(combined_p1)
-                    coeff_bins_p1 = self._sample_or_argmax(
-                        coeff_logits_p1, temperature=fb_temp,
-                    )
-                    coeff_vals_p1 = self.quantizer.decode(coeff_bins_p1)
-                    coeff_slots_p1[:, d, :] = self._coeff_pair_to_embed(
-                        tok_cur_p1, coeff_vals_p1,
-                    )
-            pred_atom_emb = pred_atom_emb.detach()
-            mix_mask_tok = (
-                torch.rand(bt, D, 1, device=device) < dim_prob
-            )
-            mixed_tok = torch.where(mix_mask_tok, pred_atom_emb, tok_emb)
-            depth_content_mixed = depth_content.clone()
-            depth_content_mixed[:, 1::2, :] = mixed_tok
-            if D > 1:
-                pred_coeff_prev = coeff_slots_p1[:, :-1, :].detach()
-                mix_mask_coeff = (
-                    torch.rand(bt, D - 1, 1, device=device) < dim_prob
-                )
-                mixed_coeff_prev = torch.where(
-                    mix_mask_coeff,
-                    pred_coeff_prev,
-                    coeff_teacher_depth[:, :-1, :],
-                )
-                depth_content_mixed[:, 2::2, :] = mixed_coeff_prev
-            depth_in = depth_content_mixed + pos_type_bias
-        else:
-            depth_in = depth_content + pos_type_bias
+        depth_in = depth_content + pos_type_bias
 
         depth_h = self.drop(depth_in)
         depth_h = self._run_no_cache_blocks(depth_h, self.depth_blocks)
@@ -1042,9 +979,6 @@ class RQTransformerPrior(nn.Module):
         token_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_logits_list: list[torch.Tensor] = []
-        atom_feedback_prob = float(
-            min(max(self.cfg.pred_atom_feedback_prob, 0.0), 1.0),
-        )
         fb_temp = max(float(self.cfg.feedback_temperature), 1e-8)
 
         for d in range(D):
@@ -1056,14 +990,7 @@ class RQTransformerPrior(nn.Module):
                     atom_logits_bt[:, d, :],
                     temperature=fb_temp,
                 )
-                tok_pred = self.token_emb(tok_pred_ids)
-                if self.training and atom_feedback_prob < 1.0:
-                    use_pred = (
-                        torch.rand(bt, 1, device=device) < atom_feedback_prob
-                    )
-                    tok_cur = torch.where(use_pred, tok_pred, tok_teacher)
-                else:
-                    tok_cur = tok_pred
+                tok_cur = self.token_emb(tok_pred_ids)
             else:
                 tok_cur = tok_teacher
             token_slots[:, d, :] = tok_cur
@@ -1202,10 +1129,7 @@ class RQTransformerPrior(nn.Module):
                 d = step // 2
                 is_atom_step = (step % 2 == 0)
                 if is_atom_step:
-                    if d == 0:
-                        depth_x = h_t
-                    else:
-                        depth_x = coeff_slots[:, d - 1, :]
+                    depth_x = h_t if d == 0 else coeff_slots[:, d - 1, :]
                 else:
                     depth_x = token_slots[:, d, :]
                 depth_h = (
@@ -1220,10 +1144,11 @@ class RQTransformerPrior(nn.Module):
                 if is_atom_step:
                     logits = self.atom_head(z_last) / max(temperature, 1e-8)
                     logits = self._top_k(logits, top_k)
-                    tokens[:, t, d] = torch.multinomial(
+                    tok_ids = torch.multinomial(
                         F.softmax(logits, dim=-1), 1,
                     ).squeeze(-1)
-                    token_slots[:, d, :] = self.token_emb(tokens[:, t, d])
+                    tokens[:, t, d] = tok_ids
+                    token_slots[:, d, :] = self.token_emb(tok_ids)
                     continue
 
                 tok_cur = token_slots[:, d, :]
@@ -1240,7 +1165,9 @@ class RQTransformerPrior(nn.Module):
                 ).squeeze(-1)
                 pred_coeff = self.quantizer.decode(coeff_bins)
                 coeffs[:, t, d] = pred_coeff
-                coeff_slots[:, d, :] = self._coeff_pair_to_embed(tok_cur, pred_coeff)
+                coeff_slots[:, d, :] = self._coeff_pair_to_embed(
+                    tok_cur, pred_coeff,
+                )
             prev_coeff_slots = coeff_slots
 
         return (
@@ -2008,10 +1935,6 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         ("--dual_coeff_pred_atom_mix", float, 0.5),
         ("--dual_coeff_atom_coherence_weight", float, 0.1),
     ))
-    _add_typed_args(add, (
-        ("--mingpt_atom_bin_top_k", int, 128),
-        ("--mingpt_atom_bin_chunk_rows", int, 2048),
-    ))
     add(
         "--rq_use_pred_coeff_feedback",
         action="store_true",
@@ -2035,15 +1958,6 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         dest="rq_use_pred_atom_feedback",
     )
     add(
-        "--rq_pred_atom_feedback_prob",
-        type=float,
-        default=1.0,
-        help=(
-            "Probability of using predicted (vs teacher) atom embeddings for "
-            "rq_hier coeff conditioning during training."
-        ),
-    )
-    add(
         "--rq_atom_label_smoothing",
         type=float,
         default=0.0,
@@ -2056,16 +1970,6 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Soft target mass for immediate neighbor coeff bins in rq_hier "
             "loss (center gets remaining mass)."
-        ),
-    )
-    add(
-        "--rq_depth_input_mixing_prob",
-        type=float,
-        default=0.0,
-        help=(
-            "Probability of replacing GT atom embeddings with pass-1 "
-            "predicted atom embeddings in depth transformer coeff-slot "
-            "inputs during training (two-pass scheduled sampling)."
         ),
     )
     add(
@@ -2442,10 +2346,8 @@ def main():
                 dropout=args.tf_dropout,
                 use_pred_coeff_feedback=args.rq_use_pred_coeff_feedback,
                 use_pred_atom_feedback=args.rq_use_pred_atom_feedback,
-                pred_atom_feedback_prob=args.rq_pred_atom_feedback_prob,
                 stochastic_feedback_sampling=args.rq_stochastic_feedback_sampling,
                 feedback_temperature=args.rq_feedback_temperature,
-                depth_input_mixing_prob=args.rq_depth_input_mixing_prob,
                 atom_label_smoothing=args.rq_atom_label_smoothing,
                 coeff_adjacent_soft_target=args.rq_coeff_adjacent_soft_target,
                 n_coeff_bins=args.n_coeff_bins,
@@ -2466,22 +2368,6 @@ def main():
                 }
                 transformer.load_state_dict(filtered, strict=False)
                 print(f"[Stage2] resumed from {ckpt}")
-
-        if (
-            args.stage2_arch == "mingpt"
-            and hasattr(transformer, "build_atom_coeff_bin_mask")
-            and args.mingpt_atom_bin_top_k > 0
-        ):
-            transformer.build_atom_coeff_bin_mask(
-                tokens_flat,
-                coeffs_flat,
-                top_k=args.mingpt_atom_bin_top_k,
-                chunk_rows=args.mingpt_atom_bin_chunk_rows,
-            )
-            print(
-                "[Stage2][mingpt] built atom-conditioned coeff-bin mask "
-                f"(top_k={args.mingpt_atom_bin_top_k})"
-            )
 
         module = Stage2Module(
             transformer=transformer,

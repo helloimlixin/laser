@@ -288,9 +288,6 @@ class MinGPTSparse(nn.Module):
         type_ids = torch.zeros(self.seq_len, dtype=torch.long)
         type_ids[1::2] = 1
         self.register_buffer("_type_ids", type_ids, persistent=False)
-        self.register_buffer(
-            "atom_bin_allowed", torch.empty(0, dtype=torch.bool), persistent=False,
-        )
 
     def _interleave(self, atoms: torch.Tensor, coeff_bins: torch.Tensor):
         B = atoms.size(0)
@@ -301,7 +298,6 @@ class MinGPTSparse(nn.Module):
 
     def _mask_logits_by_slot(
         self, logits: torch.Tensor, step: int,
-        prev_atom: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Mask logits so each step samples only valid token type."""
         masked = torch.full_like(logits, float("-inf"))
@@ -310,57 +306,8 @@ class MinGPTSparse(nn.Module):
         else:
             lo = self.coeff_offset
             hi = self.coeff_offset + self.cfg.n_coeff_bins
-            coeff_logits = logits[:, lo:hi]
-            if (
-                prev_atom is not None
-                and self.atom_bin_allowed.numel() > 0
-            ):
-                atom_idx = prev_atom.long().clamp(0, self.cfg.vocab_size - 1)
-                allowed = self.atom_bin_allowed[atom_idx]
-                coeff_logits = coeff_logits.masked_fill(~allowed, float("-inf"))
-                all_masked = torch.isinf(coeff_logits).all(dim=-1)
-                if all_masked.any():
-                    coeff_logits[all_masked] = logits[all_masked, lo:hi]
-            masked[:, lo:hi] = coeff_logits
+            masked[:, lo:hi] = logits[:, lo:hi]
         return masked
-
-    @torch.no_grad()
-    def build_atom_coeff_bin_mask(
-        self,
-        atoms_flat: torch.Tensor,
-        coeffs_flat: torch.Tensor,
-        top_k: int = 128,
-        chunk_rows: int = 2048,
-    ) -> None:
-        """Build per-atom allowed coeff-bin mask from training sparse codes."""
-        n_atoms = int(self.cfg.vocab_size)
-        n_bins = int(self.cfg.n_coeff_bins)
-        k = min(max(int(top_k), 0), n_bins)
-        if k <= 0:
-            self.atom_bin_allowed = torch.empty(0, dtype=torch.bool, device=self.atom_bin_allowed.device)
-            return
-
-        atoms_cpu = atoms_flat.long().cpu()
-        coeffs_cpu = coeffs_flat.float().cpu()
-        rows = atoms_cpu.size(0)
-        chunk = max(int(chunk_rows), 1)
-        counts = torch.zeros(n_atoms, n_bins, dtype=torch.int32, device="cpu")
-
-        for s in range(0, rows, chunk):
-            e = min(s + chunk, rows)
-            a = atoms_cpu[s:e].reshape(-1)
-            b = self.quantizer.encode(coeffs_cpu[s:e]).reshape(-1)
-            joint = a * n_bins + b
-            binc = torch.bincount(joint, minlength=n_atoms * n_bins)
-            counts += binc.view(n_atoms, n_bins).to(torch.int32)
-
-        vals, idx = torch.topk(counts, k=k, dim=-1)
-        allowed = torch.zeros(n_atoms, n_bins, dtype=torch.bool, device="cpu")
-        allowed.scatter_(1, idx, vals > 0)
-        unseen = allowed.sum(dim=-1) == 0
-        if unseen.any():
-            allowed[unseen] = True
-        self.atom_bin_allowed = allowed.to(self.atom_bin_allowed.device)
 
     def forward_loss(
         self, tokens_flat: torch.Tensor, coeff_bins_flat: torch.Tensor,
@@ -413,10 +360,9 @@ class MinGPTSparse(nn.Module):
             disable=(not show_progress),
         )
         for step in steps:
-            prev_atom = seq[:, step - 1] if step % 2 == 1 else None
             step_logits = self._mask_logits_by_slot(
                 logits[:, -1, :] / max(float(temperature), 1e-8),
-                step, prev_atom=prev_atom,
+                step,
             )
             if top_k is not None and top_k > 0:
                 step_logits = self.gpt._top_k(step_logits, top_k)
