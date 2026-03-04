@@ -3,9 +3,8 @@ Standalone decoder-only dual-head transformer prior.
 
 Single-stream causal decoder over flattened LASER sequence [H*W*D] with:
 - decomposed positional encoding (row + col + depth)
-- multiplicative coefficient conditioning
 - atom-id classification head
-- scalar coefficient regression head (detached GT atoms, no gradient interference)
+- coefficient regression head (real-valued sparse coefficients)
 """
 
 from dataclasses import dataclass
@@ -93,13 +92,17 @@ class DualHeadDecoderConfig:
     n_layers: int = 6
     d_ff: int = 1024
     dropout: float = 0.1
+    # Kept for CLI/checkpoint compatibility; unused by regressor version.
+    n_coeff_bins: int = 256
+    coeff_mu: float = 255.0
+    coeff_max_val: float = 24.0
 
 
 class DualHeadDecoderPrior(nn.Module):
     """
     Decoder-only prior with two heads:
       - atom logits over dictionary ids
-      - direct coefficient regression
+      - coefficient regression for real-valued sparse coeffs
 
     Input/Output compatibility:
       forward_tokens(tokens_flat, coeffs_flat, class_ids=None)
@@ -117,12 +120,15 @@ class DualHeadDecoderPrior(nn.Module):
         self.total_vocab = cfg.vocab_size + 1
 
         self.token_emb = nn.Embedding(self.total_vocab, cfg.d_model)
+        self.coeff_value_proj = nn.Linear(1, cfg.d_model)
 
         self.row_emb = nn.Embedding(cfg.H, cfg.d_model)
         self.col_emb = nn.Embedding(cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
         seq_pos = torch.arange(self.seq_len, dtype=torch.long)
+        # Location-major order: all depths for spatial position 0, then position 1, ...
         spatial_pos = torch.div(seq_pos, cfg.D, rounding_mode="floor")
+        depth_pos = torch.remainder(seq_pos, cfg.D)
         self.register_buffer(
             "_pos_rows",
             torch.div(spatial_pos, cfg.W, rounding_mode="floor"),
@@ -135,7 +141,7 @@ class DualHeadDecoderPrior(nn.Module):
         )
         self.register_buffer(
             "_pos_depths",
-            torch.remainder(seq_pos, cfg.D),
+            depth_pos,
             persistent=False,
         )
 
@@ -156,14 +162,10 @@ class DualHeadDecoderPrior(nn.Module):
             nn.Linear(2 * cfg.d_model, cfg.d_model),
             nn.GELU(),
             nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model // 2),
-            nn.GELU(),
-            nn.Linear(cfg.d_model // 2, 1),
+            nn.Linear(cfg.d_model, 1),
         )
 
         self.apply(self._init_weights)
-        nn.init.zeros_(self.coeff_head[-1].weight)
-        nn.init.zeros_(self.coeff_head[-1].bias)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -206,12 +208,6 @@ class DualHeadDecoderPrior(nn.Module):
         d = self._pos_depths[idx].to(device)
         return self.row_emb(r) + self.col_emb(c) + self.depth_emb(d)
 
-    @staticmethod
-    def _coeff_condition(
-        token_emb: torch.Tensor, coeff: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.tanh(token_emb * coeff.unsqueeze(-1))
-
     def _run_no_cache_blocks(self, x: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
             if self.training:
@@ -224,15 +220,6 @@ class DualHeadDecoderPrior(nn.Module):
                 x, _ = blk(x)
         return x
 
-    @staticmethod
-    def _apply_top_k(logits: torch.Tensor, top_k: Optional[int]) -> torch.Tensor:
-        if top_k is None or top_k <= 0:
-            return logits
-        vals, idx = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
-        masked = torch.full_like(logits, float("-inf"))
-        masked.scatter_(1, idx, vals)
-        return masked
-
     def _shifted_inputs(
         self, tokens: torch.Tensor, coeffs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -244,7 +231,7 @@ class DualHeadDecoderPrior(nn.Module):
             device=tokens.device,
         )
         in_coeffs = torch.zeros(
-            bsz, self.seq_len, dtype=coeffs.dtype, device=coeffs.device,
+            (bsz, self.seq_len), dtype=torch.float32, device=tokens.device,
         )
         if self.seq_len > 1:
             in_tokens[:, 1:] = tokens[:, :-1]
@@ -257,14 +244,26 @@ class DualHeadDecoderPrior(nn.Module):
         coeffs_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced forward pass with real-valued coefficients.
+
+        Args:
+            tokens_flat: [B, H*W*D] atom indices.
+            coeffs_flat: [B, H*W*D] real-valued sparse coefficients.
+            class_ids:   [B] optional class labels.
+
+        Returns:
+            atom_logits: [B, H*W, D, vocab_size]
+            coeff_pred:  [B, H*W, D]
+        """
         device = tokens_flat.device
         bsz = tokens_flat.size(0)
         tokens = tokens_flat.long().view(bsz, self.seq_len)
         coeffs = coeffs_flat.float().view(bsz, self.seq_len)
         in_tokens, in_coeffs = self._shifted_inputs(tokens, coeffs)
 
-        tok_emb = self.token_emb(in_tokens)
-        x = tok_emb + self._coeff_condition(tok_emb, in_coeffs)
+        x = self.token_emb(in_tokens) + self.coeff_value_proj(
+            in_coeffs.unsqueeze(-1),
+        )
         x = x + self._pos_encoding(device).unsqueeze(0)
         class_bias = self._class_bias(class_ids, bsz, device)
         if class_bias is not None:
@@ -284,9 +283,7 @@ class DualHeadDecoderPrior(nn.Module):
         atom_logits = atom_logits_flat.view(
             bsz, self.positions_per_image, self.cfg.D, self.cfg.vocab_size,
         )
-        coeff_pred = coeff_pred_flat.view(
-            bsz, self.positions_per_image, self.cfg.D,
-        )
+        coeff_pred = coeff_pred_flat.view(bsz, self.positions_per_image, self.cfg.D)
         return atom_logits, coeff_pred
 
     @torch.no_grad()
@@ -297,14 +294,22 @@ class DualHeadDecoderPrior(nn.Module):
         top_k: Optional[int] = None,
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
+        coeff_temperature: Optional[float] = None,
+        coeff_top_k: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressive generation with atom sampling + coeff regression."""
+        del temperature, top_k, coeff_temperature, coeff_top_k
         device = next(self.parameters()).device
         class_bias = self._class_bias(class_ids, batch_size, device)
 
-        tokens = torch.zeros(batch_size, self.seq_len, dtype=torch.long, device=device)
+        tokens = torch.zeros(
+            batch_size, self.seq_len, dtype=torch.long, device=device,
+        )
         coeffs = torch.zeros(batch_size, self.seq_len, dtype=torch.float32, device=device)
 
-        kv_cache: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * len(self.blocks)
+        kv_cache: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = (
+            [None] * len(self.blocks)
+        )
         steps = tqdm(
             range(self.seq_len),
             desc="sampling",
@@ -317,13 +322,14 @@ class DualHeadDecoderPrior(nn.Module):
                 prev_tok = torch.full(
                     (batch_size,), self.bos_token, dtype=torch.long, device=device,
                 )
-                prev_coeff = torch.zeros(batch_size, dtype=torch.float32, device=device)
+                prev_coeff = torch.zeros(batch_size, device=device)
             else:
                 prev_tok = tokens[:, idx - 1]
                 prev_coeff = coeffs[:, idx - 1]
 
-            tok_emb = self.token_emb(prev_tok).unsqueeze(1)
-            x_new = tok_emb + self._coeff_condition(tok_emb, prev_coeff.unsqueeze(1))
+            x_new = (
+                self.token_emb(prev_tok) + self.coeff_value_proj(prev_coeff.unsqueeze(-1))
+            ).unsqueeze(1)
             x_new = x_new + self._pos_encoding_at(idx, device).view(1, 1, -1)
             if class_bias is not None:
                 x_new = x_new + class_bias
@@ -333,15 +339,16 @@ class DualHeadDecoderPrior(nn.Module):
                 x_new, kv_cache[i] = blk(x_new, kv_cache=kv_cache[i])
             h_t = self.final_ln(x_new).squeeze(1)
 
-            logits = self.atom_head(h_t) / max(temperature, 1e-8)
-            logits = self._apply_top_k(logits, top_k=top_k)
-            tok_next = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
+            logits = self.atom_head(h_t)
+            tok_next = torch.multinomial(
+                F.softmax(logits, dim=-1), 1,
+            ).squeeze(-1)
             tokens[:, idx] = tok_next
 
             atom_emb = self.token_emb(tok_next)
             pred_coeff = self.coeff_head(
                 torch.cat([h_t, atom_emb], dim=-1),
             ).squeeze(-1)
-            coeffs[:, idx] = pred_coeff.clamp(-24.0, 24.0)
+            coeffs[:, idx] = pred_coeff
 
         return tokens, coeffs
