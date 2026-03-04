@@ -256,6 +256,19 @@ class MinGPTSparse(nn.Module):
         seq[:, 1::2] = coeff_bins.view(B, self.sparse_len) + self.coeff_offset
         return seq
 
+    def _mask_logits_by_slot(
+        self, logits: torch.Tensor, step: int,
+    ) -> torch.Tensor:
+        """Mask logits so each step samples only valid token type."""
+        masked = torch.full_like(logits, float("-inf"))
+        if step % 2 == 0:
+            masked[:, :self.cfg.vocab_size] = logits[:, :self.cfg.vocab_size]
+        else:
+            lo = self.coeff_offset
+            hi = self.coeff_offset + self.cfg.n_coeff_bins
+            masked[:, lo:hi] = logits[:, lo:hi]
+        return masked
+
     def forward_loss(
         self, tokens_flat: torch.Tensor, coeff_bins_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
@@ -275,18 +288,32 @@ class MinGPTSparse(nn.Module):
         top_k: Optional[int] = None, class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False, **_kw,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressive sampling — flat next-token, like VQ-VAE minGPT."""
+        """Type-aware autoregressive sampling (temperature/top-k disabled)."""
+        del temperature, top_k, _kw
         device = next(self.parameters()).device
         cls = class_ids.long().to(device) if class_ids is not None else None
         bos = torch.full((batch_size, 1), self.bos_token,
                          dtype=torch.long, device=device)
-        seq = self.gpt.generate(
-            bos, max_new_tokens=self.seq_len,
-            class_idx=cls, temperature=temperature, top_k=top_k,
-        )[:, 1:]  # drop BOS
+        seq = torch.empty(batch_size, self.seq_len, dtype=torch.long, device=device)
+        logits, cache = self.gpt.forward_step(bos, class_idx=cls)
 
-        atoms = seq[:, 0::2].clamp(0, self.cfg.vocab_size - 1)
-        cbins = (seq[:, 1::2] - self.coeff_offset).clamp(0, self.cfg.n_coeff_bins - 1)
+        steps = tqdm(
+            range(self.seq_len),
+            desc="sampling",
+            leave=False,
+            disable=(not show_progress),
+        )
+        for step in steps:
+            step_logits = self._mask_logits_by_slot(logits[:, -1, :], step)
+            tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
+            seq[:, step] = tok
+            if step + 1 < self.seq_len:
+                logits, cache = self.gpt.forward_step(
+                    tok.unsqueeze(1), class_idx=cls, kv_cache=cache,
+                )
+
+        atoms = seq[:, 0::2]
+        cbins = seq[:, 1::2] - self.coeff_offset
         coeffs = self.quantizer.decode(cbins).contiguous().view(batch_size, -1)
         return atoms, coeffs
 

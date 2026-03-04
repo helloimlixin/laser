@@ -666,7 +666,7 @@ class RQTransformerConfig:
 
 
 class RQTransformerPrior(nn.Module):
-    """Two-stage transformer prior with continuous coefficient modeling."""
+    """Two-stage prior with atom logits + direct coefficient regression."""
 
     def __init__(self, cfg: RQTransformerConfig):
         super().__init__()
@@ -752,6 +752,21 @@ class RQTransformerPrior(nn.Module):
         cols = self._spatial_cols[:length].to(device)
         return self.row_emb(rows) + self.col_emb(cols)
 
+    def _flat_to_btd_depth_major(
+        self, x_flat: torch.Tensor, name: str,
+    ) -> torch.Tensor:
+        """[B, H*W*D] -> [B, H*W, D], depth-major inside each location."""
+        expected = self.positions_per_image * self.cfg.D
+        if x_flat.dim() != 2 or x_flat.size(1) != expected:
+            raise ValueError(
+                f"{name} must have shape [B, {expected}], got {tuple(x_flat.shape)}"
+            )
+        return x_flat.reshape(-1, self.positions_per_image, self.cfg.D)
+
+    def _btd_to_flat_depth_major(self, x_btd: torch.Tensor) -> torch.Tensor:
+        """[B, H*W, D] -> [B, H*W*D], inverse of _flat_to_btd_depth_major."""
+        return x_btd.reshape(x_btd.size(0), self.positions_per_image * self.cfg.D)
+
     def _coeff_pair_to_embed(
         self, atom_emb: torch.Tensor, coeff_val: torch.Tensor,
     ) -> torch.Tensor:
@@ -794,10 +809,10 @@ class RQTransformerPrior(nn.Module):
         """
         device = tokens_flat.device
         D = self.cfg.D
-        tok = tokens_flat.long().view(-1, self.positions_per_image, D)
+        tok = self._flat_to_btd_depth_major(tokens_flat.long(), "tokens_flat")
         B, T, D = tok.shape
         d_model = self.cfg.d_model
-        coeffs = coeffs_flat.float().view(B, T, D)
+        coeffs = self._flat_to_btd_depth_major(coeffs_flat.float(), "coeffs_flat")
 
         tok_emb_spatial = self.token_emb(tok)
         coeff_teacher_spatial = torch.tanh(tok_emb_spatial * coeffs.unsqueeze(-1))
@@ -870,6 +885,30 @@ class RQTransformerPrior(nn.Module):
         direct_coeff_pred = torch.stack(direct_coeff_list, dim=1).view(B, T, D)
         return atom_logits, direct_coeff_pred
 
+    def forward_loss(
+        self,
+        tokens_flat: torch.Tensor,
+        coeffs_flat: torch.Tensor,
+        class_ids: Optional[torch.Tensor] = None,
+        coeff_loss_weight: float = 0.25,
+    ) -> torch.Tensor:
+        """Single scalar loss path, matching mingpt-style stage2 usage."""
+        atom_logits, direct_coeff_pred = self.forward_tokens(
+            tokens_flat, coeffs_flat, class_ids=class_ids,
+        )
+        atom_target = self._flat_to_btd_depth_major(tokens_flat.long(), "tokens_flat")
+        coeff_target = self._flat_to_btd_depth_major(
+            coeffs_flat.float(), "coeffs_flat",
+        )
+        atom_loss = F.cross_entropy(
+            atom_logits.reshape(-1, self.cfg.vocab_size),
+            atom_target.reshape(-1),
+        )
+        coeff_loss = F.smooth_l1_loss(
+            direct_coeff_pred, coeff_target, beta=4.0,
+        )
+        return atom_loss + max(float(coeff_loss_weight), 0.0) * coeff_loss
+
     @torch.no_grad()
     def generate(
         self,
@@ -879,6 +918,7 @@ class RQTransformerPrior(nn.Module):
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del top_k  # Always sample atoms from full distribution in rq_hier.
         device = next(self.parameters()).device
         T = self.positions_per_image
         D = self.cfg.D
@@ -935,13 +975,6 @@ class RQTransformerPrior(nn.Module):
                 z_last = self.depth_ln(depth_h)[:, 0, :]
 
                 logits = self.atom_head(z_last) / max(temperature, 1e-8)
-                if top_k is not None and top_k > 0:
-                    v, ix = torch.topk(
-                        logits, min(top_k, logits.size(-1)), dim=-1,
-                    )
-                    mask = torch.full_like(logits, float("-inf"))
-                    mask.scatter_(1, ix, v)
-                    logits = mask
                 tokens[:, t, d] = torch.multinomial(
                     F.softmax(logits, dim=-1), 1,
                 ).squeeze(-1)
@@ -955,14 +988,13 @@ class RQTransformerPrior(nn.Module):
                 ], dim=-1)
                 coeff_query = self.coeff_query_head(combined_h)
                 pred_coeff = (coeff_query * tok_cur).sum(dim=-1)
-                pred_coeff = pred_coeff.clamp(-24.0, 24.0)
                 coeffs[:, t, d] = pred_coeff
                 coeff_slots[:, d, :] = self._coeff_pair_to_embed(tok_cur, pred_coeff)
             prev_coeff_slots = coeff_slots
 
         return (
-            tokens.view(batch_size, T * D),
-            coeffs.view(batch_size, T * D),
+            self._btd_to_flat_depth_major(tokens),
+            self._btd_to_flat_depth_major(coeffs),
         )
 
 
@@ -1219,6 +1251,8 @@ class Stage2Module(pl.LightningModule):
         self.sample_batch_size = sample_batch_size
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
+        if isinstance(transformer, RQTransformerPrior):
+            self.sample_top_k = None
         self.direct_coeff_loss_weight = direct_coeff_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
@@ -1304,8 +1338,12 @@ class Stage2Module(pl.LightningModule):
     _COEFF_CLAMP = 24.0
 
     @property
-    def _uses_unified_loss(self) -> bool:
+    def _uses_model_loss(self) -> bool:
         return hasattr(self.transformer, "forward_loss")
+
+    @property
+    def _uses_unified_loss(self) -> bool:
+        return self._uses_model_loss and self._uses_coeff_bins
 
     @property
     def _uses_coeff_bins(self) -> bool:
@@ -1315,10 +1353,15 @@ class Stage2Module(pl.LightningModule):
         tok_flat, coeff_flat, class_ids = self._unpack_stage2_batch(batch)
         B = tok_flat.size(0)
 
-        if self._uses_unified_loss:
-            coeff_bins_flat = self.transformer.quantizer.encode(coeff_flat)
+        if self._uses_model_loss:
+            coeff_input = coeff_flat
+            kwargs = {}
+            if self._uses_coeff_bins:
+                coeff_input = self.transformer.quantizer.encode(coeff_flat)
+            else:
+                kwargs["coeff_loss_weight"] = self.direct_coeff_loss_weight
             loss = self.transformer.forward_loss(
-                tok_flat, coeff_bins_flat, class_ids=class_ids,
+                tok_flat, coeff_input, class_ids=class_ids, **kwargs,
             )
             self.log("train/loss", loss,
                      prog_bar=True, on_step=True, on_epoch=True,
@@ -1664,6 +1707,12 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         ("--stage2_sample_image_size", int, 256),
     ))
     add(
+        "--stage2_token_cache",
+        type=str,
+        default="tokens_cache.pt",
+        help="Stage-2 token cache filename (inside out_dir/stage2) or absolute path.",
+    )
+    add(
         "--stage2_lr_schedule", type=str, default="cosine",
         choices=["constant", "cosine"],
     )
@@ -1773,7 +1822,12 @@ def main():
     stage2_dir = os.path.join(args.out_dir, "stage2")
     os.makedirs(stage1_dir, exist_ok=True)
     os.makedirs(stage2_dir, exist_ok=True)
-    token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
+    token_cache_path = (
+        args.stage2_token_cache
+        if os.path.isabs(args.stage2_token_cache)
+        else os.path.join(stage2_dir, args.stage2_token_cache)
+    )
+    os.makedirs(os.path.dirname(token_cache_path), exist_ok=True)
 
     run_name = args.wandb_name or f"sparse_dict_{args.dataset}_{args.image_size}"
     if "LASER_WANDB_GROUP" in os.environ:
