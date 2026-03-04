@@ -974,19 +974,53 @@ class RQTransformerPrior(nn.Module):
                 depth_h_p1 = self.drop(depth_in_gt)
                 for blk in self.depth_blocks:
                     depth_h_p1, _ = blk(depth_h_p1)
+                depth_h_p1 = self.depth_ln(depth_h_p1)
                 atom_logits_p1 = self.atom_head(
-                    self.depth_ln(depth_h_p1)[:, 0::2, :],
+                    depth_h_p1[:, 0::2, :],
                 )
                 pred_atom_ids = self._sample_or_argmax(
                     atom_logits_p1, temperature=fb_temp,
                 )
-            pred_atom_emb = self.token_emb(pred_atom_ids).detach()
-            mix_mask = (
+                pred_atom_emb = self.token_emb(pred_atom_ids)
+                # Pass-1 coeff rollout to approximate inference-time coeff context
+                # for atom slots at deeper levels.
+                token_slots_p1 = pred_atom_emb
+                coeff_slots_p1 = torch.zeros(bt, D, d_model, device=device)
+                for d in range(D):
+                    z_last_p1 = depth_h_p1[:, 2 * d + 1, :]
+                    tok_cur_p1 = token_slots_p1[:, d, :]
+                    combined_p1 = torch.cat([
+                        h_t,
+                        z_last_p1,
+                        token_slots_p1.reshape(bt, D * d_model),
+                        coeff_slots_p1.reshape(bt, D * d_model),
+                    ], dim=-1)
+                    coeff_logits_p1 = self.coeff_head(combined_p1)
+                    coeff_bins_p1 = self._sample_or_argmax(
+                        coeff_logits_p1, temperature=fb_temp,
+                    )
+                    coeff_vals_p1 = self.quantizer.decode(coeff_bins_p1)
+                    coeff_slots_p1[:, d, :] = self._coeff_pair_to_embed(
+                        tok_cur_p1, coeff_vals_p1,
+                    )
+            pred_atom_emb = pred_atom_emb.detach()
+            mix_mask_tok = (
                 torch.rand(bt, D, 1, device=device) < dim_prob
             )
-            mixed_tok = torch.where(mix_mask, pred_atom_emb, tok_emb)
+            mixed_tok = torch.where(mix_mask_tok, pred_atom_emb, tok_emb)
             depth_content_mixed = depth_content.clone()
             depth_content_mixed[:, 1::2, :] = mixed_tok
+            if D > 1:
+                pred_coeff_prev = coeff_slots_p1[:, :-1, :].detach()
+                mix_mask_coeff = (
+                    torch.rand(bt, D - 1, 1, device=device) < dim_prob
+                )
+                mixed_coeff_prev = torch.where(
+                    mix_mask_coeff,
+                    pred_coeff_prev,
+                    coeff_teacher_depth[:, :-1, :],
+                )
+                depth_content_mixed[:, 2::2, :] = mixed_coeff_prev
             depth_in = depth_content_mixed + pos_type_bias
         else:
             depth_in = depth_content + pos_type_bias

@@ -372,7 +372,10 @@ class MinGPTSparse(nn.Module):
         bos = torch.full((B, 1), self.bos_token,
                          dtype=torch.long, device=target.device)
         inp = torch.cat([bos, target[:, :-1]], dim=1)
-        type_ids = self._type_ids.unsqueeze(0).expand(B, -1)
+        # Input stream is [BOS, target[:-1]], so type ids must be shifted too.
+        type_ids = torch.zeros(B, self.seq_len, dtype=torch.long, device=target.device)
+        if self.seq_len > 1:
+            type_ids[:, 1:] = self._type_ids[:-1].unsqueeze(0).expand(B, -1)
         cls = class_ids.long().to(target.device) if class_ids is not None else None
         logits, _ = self.gpt(inp, class_idx=cls, type_ids=type_ids)
 
@@ -400,7 +403,7 @@ class MinGPTSparse(nn.Module):
         bos = torch.full((batch_size, 1), self.bos_token,
                          dtype=torch.long, device=device)
         seq = torch.zeros(batch_size, self.seq_len, dtype=torch.long, device=device)
-        bos_type = self._type_ids[:1].unsqueeze(0).expand(batch_size, -1)
+        bos_type = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         logits, cache = self.gpt.forward_step(bos, class_idx=cls, type_ids=bos_type)
 
         steps = tqdm(
@@ -420,7 +423,8 @@ class MinGPTSparse(nn.Module):
             tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
             seq[:, step] = tok
             if step + 1 < self.seq_len:
-                step_type = self._type_ids[step + 1 : step + 2].unsqueeze(0).expand(
+                # The token we feed now is seq[:, step], so use that slot's type.
+                step_type = self._type_ids[step : step + 1].unsqueeze(0).expand(
                     batch_size, -1,
                 )
                 logits, cache = self.gpt.forward_step(
