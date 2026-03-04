@@ -543,6 +543,10 @@ class SparseDictAE(nn.Module):
         dead_atom_interval: int = 200,
         dead_atom_max_reinit: int = 16,
         bottleneck_patch_size: int = 1,
+        n_coeff_bins: int = 1024,
+        coeff_mu: float = 255.0,
+        coeff_max_val: float = 24.0,
+        discretize_sparse_coeffs: bool = True,
     ):
         super().__init__()
         self.encoder = Encoder(
@@ -569,10 +573,26 @@ class SparseDictAE(nn.Module):
             num_residual_layers, num_residual_hiddens,
             in_channels, num_downsamples,
         )
+        self.discretize_sparse_coeffs = bool(discretize_sparse_coeffs)
+        self.coeff_quantizer = CoefficientQuantizer(
+            n_coeff_bins, coeff_max_val, coeff_mu,
+        )
+
+    def _discretize_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        if not self.discretize_sparse_coeffs:
+            return coeffs
+        bins = self.coeff_quantizer.encode(coeffs)
+        return self.coeff_quantizer.decode(bins)
 
     def forward(self, x: torch.Tensor):
         z = self.pre(self.encoder(x))
         z_q, loss, support, coeffs = self.bottleneck(z)
+        coeffs = self._discretize_coeffs(coeffs)
+        if self.discretize_sparse_coeffs:
+            with torch.no_grad():
+                z_q_disc = self.bottleneck.decode_sparse_codes(support, coeffs)
+            # Keep STE gradients from z_q while using discretized values forward.
+            z_q = z_q + (z_q_disc - z_q).detach()
         recon = torch.tanh(self.decoder(self.post(z_q)))
         return recon, loss, support, coeffs
 
@@ -581,6 +601,7 @@ class SparseDictAE(nn.Module):
         """Returns (support [B,H,W,K], coeffs [B,H,W,K])."""
         z = self.pre(self.encoder(x))
         _, _, support, coeffs = self.bottleneck(z)
+        coeffs = self._discretize_coeffs(coeffs)
         return support, coeffs
 
     @torch.no_grad()
@@ -589,6 +610,50 @@ class SparseDictAE(nn.Module):
     ) -> torch.Tensor:
         z_q = self.bottleneck.decode_sparse_codes(support, coeffs)
         return torch.tanh(self.decoder(self.post(z_q)))
+
+
+# ---------------------------------------------------------------------------
+# Coefficient quantizer
+# ---------------------------------------------------------------------------
+
+class CoefficientQuantizer:
+    """Sparse coefficient quantizer with optional mu-law companding."""
+
+    def __init__(
+        self, n_bins: int = 1024, max_val: float = 24.0, mu: float = 255.0,
+    ):
+        self.n_bins = max(int(n_bins), 2)
+        self.max_val = max(float(max_val), 1e-6)
+        self.mu = max(float(mu), 0.0)
+        self.use_mu_law = self.mu > 0.0
+        self._log_mu1 = math.log1p(self.mu) if self.use_mu_law else None
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = x.float().clamp(-self.max_val, self.max_val) / self.max_val
+        if self.use_mu_law:
+            x_norm = (
+                torch.sign(x_norm)
+                * torch.log1p(self.mu * x_norm.abs())
+                / self._log_mu1
+            )
+        return (
+            ((x_norm + 1.0) / 2.0 * (self.n_bins - 1))
+            .round()
+            .long()
+            .clamp(0, self.n_bins - 1)
+        )
+
+    def decode(self, bins: torch.Tensor) -> torch.Tensor:
+        x_norm = (
+            bins.float().clamp(0, self.n_bins - 1) / (self.n_bins - 1) * 2.0 - 1.0
+        )
+        if self.use_mu_law:
+            x_norm = (
+                torch.sign(x_norm)
+                * (torch.pow(1.0 + self.mu, x_norm.abs()) - 1.0)
+                / self.mu
+            )
+        return x_norm * self.max_val
 
 
 # ---------------------------------------------------------------------------
@@ -664,12 +729,13 @@ class RQTransformerConfig:
     d_ff: int = 1024
     dropout: float = 0.1
     use_pred_coeff_feedback: bool = True
-    spatial_grad_loss_weight: float = 0.1
-    same_atom_coeff_loss_weight: float = 0.05
+    n_coeff_bins: int = 1024
+    coeff_mu: float = 255.0
+    coeff_max_val: float = 24.0
 
 
 class RQTransformerPrior(nn.Module):
-    """Two-stage prior with atom logits + direct coefficient regression."""
+    """Two-stage prior with atom logits + coefficient-bin logits."""
 
     def __init__(self, cfg: RQTransformerConfig):
         super().__init__()
@@ -721,14 +787,18 @@ class RQTransformerPrior(nn.Module):
             nn.Linear(cfg.d_model, cfg.d_model),
         )
         self.num_atoms = cfg.vocab_size
+        self.quantizer = CoefficientQuantizer(
+            cfg.n_coeff_bins, cfg.coeff_max_val, cfg.coeff_mu,
+        )
+        self.coeff_quantizer = self.quantizer
         coeff_in_dim = (2 + 2 * cfg.D) * cfg.d_model
-        self.coeff_query_head = nn.Sequential(
+        self.coeff_head = nn.Sequential(
             nn.Linear(coeff_in_dim, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.Linear(cfg.d_model, cfg.n_coeff_bins),
         )
-        nn.init.zeros_(self.coeff_query_head[-1].weight)
-        nn.init.zeros_(self.coeff_query_head[-1].bias)
+        nn.init.zeros_(self.coeff_head[-1].weight)
+        nn.init.zeros_(self.coeff_head[-1].bias)
 
     def _class_bias(
         self, class_ids: Optional[torch.Tensor], batch_size: int,
@@ -770,6 +840,18 @@ class RQTransformerPrior(nn.Module):
         """[B, H*W, D] -> [B, H*W*D], inverse of _flat_to_btd_depth_major."""
         return x_btd.reshape(x_btd.size(0), self.positions_per_image * self.cfg.D)
 
+    def _coeff_bins_and_values(
+        self, coeffs_flat: torch.Tensor, name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if torch.is_floating_point(coeffs_flat):
+            coeff_vals = self._flat_to_btd_depth_major(coeffs_flat.float(), name)
+            coeff_bins = self.quantizer.encode(coeff_vals)
+        else:
+            coeff_bins = self._flat_to_btd_depth_major(coeffs_flat.long(), name)
+            coeff_bins = coeff_bins.clamp(0, self.cfg.n_coeff_bins - 1)
+        coeff_vals = self.quantizer.decode(coeff_bins)
+        return coeff_bins, coeff_vals
+
     def _coeff_pair_to_embed(
         self, atom_emb: torch.Tensor, coeff_val: torch.Tensor,
     ) -> torch.Tensor:
@@ -798,43 +880,6 @@ class RQTransformerPrior(nn.Module):
                 x, _ = blk(x)
         return x
 
-    @staticmethod
-    def _masked_mean(diff: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        denom = mask.sum().clamp(min=1.0)
-        return (diff * mask).sum() / denom
-
-    def _spatial_grad_match_loss(
-        self, pred_bhwd: torch.Tensor, target_bhwd: torch.Tensor,
-    ) -> torch.Tensor:
-        parts: list[torch.Tensor] = []
-        if self.cfg.W > 1:
-            pred_dx = pred_bhwd[:, :, 1:, :] - pred_bhwd[:, :, :-1, :]
-            target_dx = target_bhwd[:, :, 1:, :] - target_bhwd[:, :, :-1, :]
-            parts.append(F.smooth_l1_loss(pred_dx, target_dx, beta=1.0))
-        if self.cfg.H > 1:
-            pred_dy = pred_bhwd[:, 1:, :, :] - pred_bhwd[:, :-1, :, :]
-            target_dy = target_bhwd[:, 1:, :, :] - target_bhwd[:, :-1, :, :]
-            parts.append(F.smooth_l1_loss(pred_dy, target_dy, beta=1.0))
-        if not parts:
-            return pred_bhwd.new_tensor(0.0)
-        return torch.stack(parts).mean()
-
-    def _same_atom_coeff_consistency_loss(
-        self, pred_bhwd: torch.Tensor, atom_bhwd: torch.Tensor,
-    ) -> torch.Tensor:
-        losses: list[torch.Tensor] = []
-        if self.cfg.W > 1:
-            same_x = (atom_bhwd[:, :, 1:, :] == atom_bhwd[:, :, :-1, :]).float()
-            diff_x = (pred_bhwd[:, :, 1:, :] - pred_bhwd[:, :, :-1, :]).abs()
-            losses.append(self._masked_mean(diff_x, same_x))
-        if self.cfg.H > 1:
-            same_y = (atom_bhwd[:, 1:, :, :] == atom_bhwd[:, :-1, :, :]).float()
-            diff_y = (pred_bhwd[:, 1:, :, :] - pred_bhwd[:, :-1, :, :]).abs()
-            losses.append(self._masked_mean(diff_y, same_y))
-        if not losses:
-            return pred_bhwd.new_tensor(0.0)
-        return torch.stack(losses).mean()
-
     def forward_tokens(
         self,
         tokens_flat: torch.Tensor,
@@ -845,14 +890,14 @@ class RQTransformerPrior(nn.Module):
 
         Returns:
             atom_logits:       [B, H*W, D, vocab_size]
-            direct_coeff_pred: [B, H*W, D]
+            coeff_logits:      [B, H*W, D, n_coeff_bins]
         """
         device = tokens_flat.device
         D = self.cfg.D
         tok = self._flat_to_btd_depth_major(tokens_flat.long(), "tokens_flat")
         B, T, D = tok.shape
         d_model = self.cfg.d_model
-        coeffs = self._flat_to_btd_depth_major(coeffs_flat.float(), "coeffs_flat")
+        _, coeffs = self._coeff_bins_and_values(coeffs_flat, "coeffs_flat")
 
         tok_emb_spatial = self.token_emb(tok)
         coeff_teacher_spatial = torch.tanh(tok_emb_spatial * coeffs.unsqueeze(-1))
@@ -898,7 +943,7 @@ class RQTransformerPrior(nn.Module):
 
         token_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_slots = torch.zeros(bt, D, d_model, device=device)
-        direct_coeff_list: list[torch.Tensor] = []
+        coeff_logits_list: list[torch.Tensor] = []
 
         for d in range(D):
             z_last = depth_h[:, d, :]
@@ -910,11 +955,10 @@ class RQTransformerPrior(nn.Module):
                 token_slots.reshape(bt, D * d_model),
                 coeff_slots.reshape(bt, D * d_model),
             ], dim=-1)
-            coeff_query_d = self.coeff_query_head(combined_h)
-            direct_coeff_d = (coeff_query_d * tok_cur).sum(dim=-1)
-            direct_coeff_list.append(direct_coeff_d)
+            coeff_logits_d = self.coeff_head(combined_h)
+            coeff_logits_list.append(coeff_logits_d)
             coeff_feedback = (
-                direct_coeff_d.detach()
+                self.quantizer.decode(coeff_logits_d.argmax(dim=-1))
                 if self.cfg.use_pred_coeff_feedback
                 else coeff_bt[:, d]
             )
@@ -923,49 +967,34 @@ class RQTransformerPrior(nn.Module):
             )
 
         atom_logits = atom_logits_bt.view(B, T, D, self.cfg.vocab_size)
-        direct_coeff_pred = torch.stack(direct_coeff_list, dim=1).view(B, T, D)
-        return atom_logits, direct_coeff_pred
+        coeff_logits = torch.stack(coeff_logits_list, dim=1).view(
+            B, T, D, self.cfg.n_coeff_bins,
+        )
+        return atom_logits, coeff_logits
 
     def forward_loss(
         self,
         tokens_flat: torch.Tensor,
-        coeffs_flat: torch.Tensor,
+        coeff_bins_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
-        coeff_loss_weight: float = 0.25,
     ) -> torch.Tensor:
-        """Single scalar loss path, matching mingpt-style stage2 usage."""
-        atom_logits, direct_coeff_pred = self.forward_tokens(
-            tokens_flat, coeffs_flat, class_ids=class_ids,
+        """Single CE objective over atom and coefficient-bin predictions."""
+        atom_logits, coeff_logits = self.forward_tokens(
+            tokens_flat, coeff_bins_flat, class_ids=class_ids,
         )
         atom_target = self._flat_to_btd_depth_major(tokens_flat.long(), "tokens_flat")
-        coeff_target = self._flat_to_btd_depth_major(
-            coeffs_flat.float(), "coeffs_flat",
+        coeff_target, _ = self._coeff_bins_and_values(
+            coeff_bins_flat, "coeffs_flat",
         )
         atom_loss = F.cross_entropy(
             atom_logits.reshape(-1, self.cfg.vocab_size),
             atom_target.reshape(-1),
         )
-        coeff_loss = F.smooth_l1_loss(
-            direct_coeff_pred, coeff_target, beta=4.0,
+        coeff_loss = F.cross_entropy(
+            coeff_logits.reshape(-1, self.cfg.n_coeff_bins),
+            coeff_target.reshape(-1),
         )
-        total = atom_loss + max(float(coeff_loss_weight), 0.0) * coeff_loss
-
-        spatial_w = max(float(self.cfg.spatial_grad_loss_weight), 0.0)
-        same_atom_w = max(float(self.cfg.same_atom_coeff_loss_weight), 0.0)
-        if spatial_w > 0.0 or same_atom_w > 0.0:
-            bsz = atom_target.size(0)
-            pred_bhwd = direct_coeff_pred.view(bsz, self.cfg.H, self.cfg.W, self.cfg.D)
-            target_bhwd = coeff_target.view(bsz, self.cfg.H, self.cfg.W, self.cfg.D)
-            atom_bhwd = atom_target.view(bsz, self.cfg.H, self.cfg.W, self.cfg.D)
-            if spatial_w > 0.0:
-                total = total + spatial_w * self._spatial_grad_match_loss(
-                    pred_bhwd, target_bhwd,
-                )
-            if same_atom_w > 0.0:
-                total = total + same_atom_w * self._same_atom_coeff_consistency_loss(
-                    pred_bhwd, atom_bhwd,
-                )
-        return total
+        return 0.5 * (atom_loss + coeff_loss)
 
     @torch.no_grad()
     def generate(
@@ -1044,8 +1073,11 @@ class RQTransformerPrior(nn.Module):
                     token_slots.reshape(batch_size, D * d_model),
                     coeff_slots.reshape(batch_size, D * d_model),
                 ], dim=-1)
-                coeff_query = self.coeff_query_head(combined_h)
-                pred_coeff = (coeff_query * tok_cur).sum(dim=-1)
+                coeff_logits = self.coeff_head(combined_h) / max(temperature, 1e-8)
+                coeff_bins = torch.multinomial(
+                    F.softmax(coeff_logits, dim=-1), 1,
+                ).squeeze(-1)
+                pred_coeff = self.quantizer.decode(coeff_bins)
                 coeffs[:, t, d] = pred_coeff
                 coeff_slots[:, d, :] = self._coeff_pair_to_embed(tok_cur, pred_coeff)
             prev_coeff_slots = coeff_slots
@@ -1618,12 +1650,14 @@ def precompute_tokens(
     device: torch.device,
     max_items: Optional[int] = None,
     collect_labels: bool = False,
+    coeff_quantizer: Optional[CoefficientQuantizer] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int, int]:
     """Encode dataset into atom-id / coefficient sequences.
 
     Returns:
         tokens_flat:    [N, H*W*K] int32, depth-major per location
         coeffs_flat:    [N, H*W*K] float32, depth-major per location
+                        (discretized when coeff_quantizer is provided)
         class_ids_flat: [N] int64  (None when collect_labels=False)
         H, W, K
     """
@@ -1642,9 +1676,10 @@ def precompute_tokens(
         all_tokens.append(
             _flatten_depth_major(support).to(torch.int32).cpu()
         )
-        all_coeffs.append(
-            _flatten_depth_major(coeffs).to(torch.float32).cpu()
-        )
+        coeffs_flat = _flatten_depth_major(coeffs).to(torch.float32)
+        if coeff_quantizer is not None:
+            coeffs_flat = coeff_quantizer.decode(coeff_quantizer.encode(coeffs_flat))
+        all_coeffs.append(coeffs_flat.cpu())
         if collect_labels:
             y_t = torch.as_tensor(y, dtype=torch.long)
             if y_t.dim() == 0:
@@ -1746,6 +1781,17 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         help="Patch size for dictionary learning; >1 groups "
              "PxP spatial patches into single atoms.",
     )
+    add(
+        "--stage1_discretize_sparse_coeffs",
+        action="store_true",
+        default=True,
+        help="Discretize sparse coefficients in stage-1 forward/encode paths.",
+    )
+    add(
+        "--no_stage1_discretize_sparse_coeffs",
+        action="store_false",
+        dest="stage1_discretize_sparse_coeffs",
+    )
 
 
 def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
@@ -1806,10 +1852,6 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
     _add_typed_args(add, (
         ("--mingpt_atom_bin_top_k", int, 128),
         ("--mingpt_atom_bin_chunk_rows", int, 2048),
-    ))
-    _add_typed_args(add, (
-        ("--rq_spatial_grad_loss_weight", float, 0.1),
-        ("--rq_same_atom_coeff_loss_weight", float, 0.05),
     ))
     add(
         "--rq_use_pred_coeff_feedback",
@@ -1958,6 +2000,10 @@ def main():
             dead_atom_interval=args.dead_atom_interval,
             dead_atom_max_reinit=args.dead_atom_max_reinit,
             bottleneck_patch_size=args.bottleneck_patch_size,
+            n_coeff_bins=args.n_coeff_bins,
+            coeff_mu=args.coeff_mu,
+            coeff_max_val=args.coeff_max_val,
+            discretize_sparse_coeffs=args.stage1_discretize_sparse_coeffs,
         )
 
     def _load_ae(ae: SparseDictAE, path: str, tag: str = "Stage1"):
@@ -2018,6 +2064,9 @@ def main():
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int, int,
     ]:
+        coeff_quantizer = CoefficientQuantizer(
+            args.n_coeff_bins, args.coeff_max_val, args.coeff_mu,
+        )
         use_cache = args.stage1_epochs <= 0 and os.path.exists(token_cache_path)
         if use_cache:
             print(f"Loading cached tokens from {token_cache_path}")
@@ -2031,6 +2080,28 @@ def main():
                 use_cache = False
         if use_cache:
             coeffs_flat = cache["coeffs"]
+            coeffs_flat = coeff_quantizer.decode(
+                coeff_quantizer.encode(coeffs_flat.float()),
+            )
+            cache_meta = cache.get("coeff_quantizer") or {}
+            cache_matches = (
+                bool(cache.get("coeff_discretized", False))
+                and int(cache_meta.get("n_coeff_bins", -1)) == int(args.n_coeff_bins)
+                and float(cache_meta.get("coeff_max_val", float("nan")))
+                == float(args.coeff_max_val)
+                and float(cache_meta.get("coeff_mu", float("nan")))
+                == float(args.coeff_mu)
+            )
+            if not cache_matches:
+                cache["coeffs"] = coeffs_flat
+                cache["coeff_discretized"] = True
+                cache["coeff_quantizer"] = {
+                    "n_coeff_bins": args.n_coeff_bins,
+                    "coeff_max_val": args.coeff_max_val,
+                    "coeff_mu": args.coeff_mu,
+                }
+                torch.save(cache, token_cache_path)
+                print("[Stage2] updated cached coeffs to discretized values.")
             class_ids_flat = cache.get("class_ids")
             H, W, D = cache["shape"]
         else:
@@ -2047,6 +2118,7 @@ def main():
                     if args.token_subset > 0 else None
                 ),
                 collect_labels=(stage2_num_classes > 0),
+                coeff_quantizer=coeff_quantizer,
             )
             ae.cpu()
             torch.save({
@@ -2055,6 +2127,12 @@ def main():
                 "class_ids": class_ids_flat,
                 "shape": (H, W, D),
                 "stage2_num_classes": stage2_num_classes,
+                "coeff_discretized": True,
+                "coeff_quantizer": {
+                    "n_coeff_bins": args.n_coeff_bins,
+                    "coeff_max_val": args.coeff_max_val,
+                    "coeff_mu": args.coeff_mu,
+                },
             }, token_cache_path)
         return tokens_flat, coeffs_flat, class_ids_flat, H, W, D
 
@@ -2144,8 +2222,9 @@ def main():
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
                 use_pred_coeff_feedback=args.rq_use_pred_coeff_feedback,
-                spatial_grad_loss_weight=args.rq_spatial_grad_loss_weight,
-                same_atom_coeff_loss_weight=args.rq_same_atom_coeff_loss_weight,
+                n_coeff_bins=args.n_coeff_bins,
+                coeff_mu=args.coeff_mu,
+                coeff_max_val=args.coeff_max_val,
             )
             transformer = RQTransformerPrior(cfg)
         print(f"[Stage2] architecture: {args.stage2_arch}")
@@ -2223,11 +2302,17 @@ def main():
             raise FileNotFoundError(f"Missing token cache: {token_cache_path}")
         cache = torch.load(token_cache_path, map_location="cpu",
                            weights_only=False)
+        coeff_quantizer = CoefficientQuantizer(
+            args.n_coeff_bins, args.coeff_max_val, args.coeff_mu,
+        )
+        cache_coeffs = coeff_quantizer.decode(
+            coeff_quantizer.encode(cache["coeffs"].float()),
+        )
         ae = _build_ae()
         _load_ae(ae, os.path.join(stage1_dir, "ae_best.pt"))
         H, W, D = cache["shape"]
         _run_stage2(
-            cache["tokens"], cache["coeffs"], cache.get("class_ids"),
+            cache["tokens"], cache_coeffs, cache.get("class_ids"),
             H, W, D, ae,
         )
         return
