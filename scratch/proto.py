@@ -663,6 +663,9 @@ class RQTransformerConfig:
     n_depth_layers: int = 4
     d_ff: int = 1024
     dropout: float = 0.1
+    use_pred_coeff_feedback: bool = True
+    spatial_grad_loss_weight: float = 0.1
+    same_atom_coeff_loss_weight: float = 0.05
 
 
 class RQTransformerPrior(nn.Module):
@@ -795,6 +798,43 @@ class RQTransformerPrior(nn.Module):
                 x, _ = blk(x)
         return x
 
+    @staticmethod
+    def _masked_mean(diff: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        denom = mask.sum().clamp(min=1.0)
+        return (diff * mask).sum() / denom
+
+    def _spatial_grad_match_loss(
+        self, pred_bhwd: torch.Tensor, target_bhwd: torch.Tensor,
+    ) -> torch.Tensor:
+        parts: list[torch.Tensor] = []
+        if self.cfg.W > 1:
+            pred_dx = pred_bhwd[:, :, 1:, :] - pred_bhwd[:, :, :-1, :]
+            target_dx = target_bhwd[:, :, 1:, :] - target_bhwd[:, :, :-1, :]
+            parts.append(F.smooth_l1_loss(pred_dx, target_dx, beta=1.0))
+        if self.cfg.H > 1:
+            pred_dy = pred_bhwd[:, 1:, :, :] - pred_bhwd[:, :-1, :, :]
+            target_dy = target_bhwd[:, 1:, :, :] - target_bhwd[:, :-1, :, :]
+            parts.append(F.smooth_l1_loss(pred_dy, target_dy, beta=1.0))
+        if not parts:
+            return pred_bhwd.new_tensor(0.0)
+        return torch.stack(parts).mean()
+
+    def _same_atom_coeff_consistency_loss(
+        self, pred_bhwd: torch.Tensor, atom_bhwd: torch.Tensor,
+    ) -> torch.Tensor:
+        losses: list[torch.Tensor] = []
+        if self.cfg.W > 1:
+            same_x = (atom_bhwd[:, :, 1:, :] == atom_bhwd[:, :, :-1, :]).float()
+            diff_x = (pred_bhwd[:, :, 1:, :] - pred_bhwd[:, :, :-1, :]).abs()
+            losses.append(self._masked_mean(diff_x, same_x))
+        if self.cfg.H > 1:
+            same_y = (atom_bhwd[:, 1:, :, :] == atom_bhwd[:, :-1, :, :]).float()
+            diff_y = (pred_bhwd[:, 1:, :, :] - pred_bhwd[:, :-1, :, :]).abs()
+            losses.append(self._masked_mean(diff_y, same_y))
+        if not losses:
+            return pred_bhwd.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
     def forward_tokens(
         self,
         tokens_flat: torch.Tensor,
@@ -856,17 +896,13 @@ class RQTransformerPrior(nn.Module):
         depth_h = self.depth_ln(depth_h)
         atom_logits_bt = self.atom_head(depth_h)
 
-        # Detached GT atoms for coeff head: coeff gradients don't corrupt the
-        # atom embedding table, keeping both heads training independently.
-        tok_emb_detached = tok_emb.detach()
-
         token_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_slots = torch.zeros(bt, D, d_model, device=device)
         direct_coeff_list: list[torch.Tensor] = []
 
         for d in range(D):
             z_last = depth_h[:, d, :]
-            tok_cur = tok_emb_detached[:, d, :]
+            tok_cur = tok_emb[:, d, :]
             token_slots[:, d, :] = tok_cur
             combined_h = torch.cat([
                 h_t,
@@ -877,8 +913,13 @@ class RQTransformerPrior(nn.Module):
             coeff_query_d = self.coeff_query_head(combined_h)
             direct_coeff_d = (coeff_query_d * tok_cur).sum(dim=-1)
             direct_coeff_list.append(direct_coeff_d)
+            coeff_feedback = (
+                direct_coeff_d.detach()
+                if self.cfg.use_pred_coeff_feedback
+                else coeff_bt[:, d]
+            )
             coeff_slots[:, d, :] = self._coeff_pair_to_embed(
-                tok_cur, coeff_bt[:, d],
+                tok_cur, coeff_feedback,
             )
 
         atom_logits = atom_logits_bt.view(B, T, D, self.cfg.vocab_size)
@@ -907,7 +948,24 @@ class RQTransformerPrior(nn.Module):
         coeff_loss = F.smooth_l1_loss(
             direct_coeff_pred, coeff_target, beta=4.0,
         )
-        return atom_loss + max(float(coeff_loss_weight), 0.0) * coeff_loss
+        total = atom_loss + max(float(coeff_loss_weight), 0.0) * coeff_loss
+
+        spatial_w = max(float(self.cfg.spatial_grad_loss_weight), 0.0)
+        same_atom_w = max(float(self.cfg.same_atom_coeff_loss_weight), 0.0)
+        if spatial_w > 0.0 or same_atom_w > 0.0:
+            bsz = atom_target.size(0)
+            pred_bhwd = direct_coeff_pred.view(bsz, self.cfg.H, self.cfg.W, self.cfg.D)
+            target_bhwd = coeff_target.view(bsz, self.cfg.H, self.cfg.W, self.cfg.D)
+            atom_bhwd = atom_target.view(bsz, self.cfg.H, self.cfg.W, self.cfg.D)
+            if spatial_w > 0.0:
+                total = total + spatial_w * self._spatial_grad_match_loss(
+                    pred_bhwd, target_bhwd,
+                )
+            if same_atom_w > 0.0:
+                total = total + same_atom_w * self._same_atom_coeff_consistency_loss(
+                    pred_bhwd, atom_bhwd,
+                )
+        return total
 
     @torch.no_grad()
     def generate(
@@ -1742,6 +1800,21 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         help="Weight for coefficient loss (CE over bins or smooth-L1 regression).",
     )
     _add_typed_args(add, (
+        ("--rq_spatial_grad_loss_weight", float, 0.1),
+        ("--rq_same_atom_coeff_loss_weight", float, 0.05),
+    ))
+    add(
+        "--rq_use_pred_coeff_feedback",
+        action="store_true",
+        default=True,
+        help="Use predicted coeff feedback (detached) inside rq_hier depth loop.",
+    )
+    add(
+        "--no_rq_use_pred_coeff_feedback",
+        action="store_false",
+        dest="rq_use_pred_coeff_feedback",
+    )
+    _add_typed_args(add, (
         ("--n_coeff_bins", int, 1024),
         ("--coeff_mu", float, 255.0),
         ("--coeff_max_val", float, 24.0),
@@ -2060,6 +2133,9 @@ def main():
                 n_depth_layers=args.tf_depth_layers,
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
+                use_pred_coeff_feedback=args.rq_use_pred_coeff_feedback,
+                spatial_grad_loss_weight=args.rq_spatial_grad_loss_weight,
+                same_atom_coeff_loss_weight=args.rq_same_atom_coeff_loss_weight,
             )
             transformer = RQTransformerPrior(cfg)
         print(f"[Stage2] architecture: {args.stage2_arch}")

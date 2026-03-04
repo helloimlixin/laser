@@ -191,19 +191,41 @@ class MinGPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CoefficientQuantizer:
-    """Uniform scalar quantizer for sparse coefficients."""
+    """Sparse coefficient quantizer with optional mu-law companding."""
 
-    def __init__(self, n_bins: int = 1024, max_val: float = 24.0):
+    def __init__(
+        self, n_bins: int = 1024, max_val: float = 24.0, mu: float = 255.0,
+    ):
         self.n_bins = max(int(n_bins), 2)
         self.max_val = max(float(max_val), 1e-6)
+        self.mu = max(float(mu), 0.0)
+        self.use_mu_law = self.mu > 0.0
+        self._log_mu1 = math.log1p(self.mu) if self.use_mu_law else None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float().clamp(-self.max_val, self.max_val)
-        return ((x + self.max_val) / (2 * self.max_val) * (self.n_bins - 1)
-                ).round().long().clamp(0, self.n_bins - 1)
+        x_norm = x.float().clamp(-self.max_val, self.max_val) / self.max_val
+        if self.use_mu_law:
+            x_norm = (
+                torch.sign(x_norm)
+                * torch.log1p(self.mu * x_norm.abs())
+                / self._log_mu1
+            )
+        return (
+            ((x_norm + 1.0) / 2.0 * (self.n_bins - 1))
+            .round()
+            .long()
+            .clamp(0, self.n_bins - 1)
+        )
 
     def decode(self, bins: torch.Tensor) -> torch.Tensor:
-        return bins.float().clamp(0, self.n_bins - 1) / (self.n_bins - 1) * 2 * self.max_val - self.max_val
+        x_norm = bins.float().clamp(0, self.n_bins - 1) / (self.n_bins - 1) * 2.0 - 1.0
+        if self.use_mu_law:
+            x_norm = (
+                torch.sign(x_norm)
+                * (torch.pow(1.0 + self.mu, x_norm.abs()) - 1.0)
+                / self.mu
+            )
+        return x_norm * self.max_val
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +260,9 @@ class MinGPTSparse(nn.Module):
         self.bos_token = cfg.vocab_size + cfg.n_coeff_bins
         self.total_vocab = self.bos_token + 1
 
-        self.quantizer = CoefficientQuantizer(cfg.n_coeff_bins, cfg.coeff_max_val)
+        self.quantizer = CoefficientQuantizer(
+            cfg.n_coeff_bins, cfg.coeff_max_val, cfg.coeff_mu,
+        )
         self.gpt = MinGPT(
             vocab_size=self.total_vocab,
             block_size=self.seq_len,
