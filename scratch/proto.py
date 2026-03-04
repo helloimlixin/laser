@@ -1161,6 +1161,30 @@ class Stage1Module(pl.LightningModule):
 
 
 # ---------------------------------------------------------------------------
+# Sparse-code ordering helpers
+# ---------------------------------------------------------------------------
+
+def _flatten_depth_major(x_bhwd: torch.Tensor) -> torch.Tensor:
+    """[B,H,W,D] -> [B,H*W*D], depth-major inside each spatial location."""
+    bsz, h, w, d = x_bhwd.shape
+    return x_bhwd.reshape(bsz, h * w, d).reshape(bsz, h * w * d)
+
+
+def _flat_to_btd_depth_major(
+    x_flat: torch.Tensor, H: int, W: int, D: int,
+) -> torch.Tensor:
+    """[B,H*W*D] -> [B,H*W,D] inverse of _flatten_depth_major."""
+    return x_flat.reshape(-1, H * W, D)
+
+
+def _flat_to_bhwd_depth_major(
+    x_flat: torch.Tensor, H: int, W: int, D: int,
+) -> torch.Tensor:
+    """[B,H*W*D] -> [B,H,W,D] inverse of _flatten_depth_major."""
+    return _flat_to_btd_depth_major(x_flat, H, W, D).reshape(-1, H, W, D)
+
+
+# ---------------------------------------------------------------------------
 # Stage-2 Lightning module
 # ---------------------------------------------------------------------------
 
@@ -1279,23 +1303,58 @@ class Stage2Module(pl.LightningModule):
 
     _COEFF_CLAMP = 24.0
 
+    @property
+    def _uses_unified_loss(self) -> bool:
+        return hasattr(self.transformer, "forward_loss")
+
+    @property
+    def _uses_coeff_bins(self) -> bool:
+        return hasattr(self.transformer, "quantizer")
+
     def training_step(self, batch, batch_idx):
         tok_flat, coeff_flat, class_ids = self._unpack_stage2_batch(batch)
         B = tok_flat.size(0)
-        y = tok_flat.view(B, self.H * self.W, self.D)
-        coeff_target = coeff_flat.view(B, self.H * self.W, self.D)
-        coeff_target = coeff_target.clamp(-self._COEFF_CLAMP, self._COEFF_CLAMP)
 
-        atom_logits, direct_coeff_pred = self.transformer.forward_tokens(
-            tok_flat, coeff_flat, class_ids=class_ids,
-        )
+        if self._uses_unified_loss:
+            coeff_bins_flat = self.transformer.quantizer.encode(coeff_flat)
+            loss = self.transformer.forward_loss(
+                tok_flat, coeff_bins_flat, class_ids=class_ids,
+            )
+            self.log("train/loss", loss,
+                     prog_bar=True, on_step=True, on_epoch=True,
+                     sync_dist=True, batch_size=B)
+            return loss
+
+        y = _flat_to_btd_depth_major(tok_flat, self.H, self.W, self.D)
+        if self._uses_coeff_bins:
+            coeff_bins_flat = self.transformer.quantizer.encode(coeff_flat)
+            coeff_bins_target = _flat_to_btd_depth_major(
+                coeff_bins_flat, self.H, self.W, self.D,
+            )
+            atom_logits, coeff_logits = self.transformer.forward_tokens(
+                tok_flat, coeff_bins_flat, class_ids=class_ids,
+            )
+        else:
+            coeff_target = _flat_to_btd_depth_major(
+                coeff_flat, self.H, self.W, self.D,
+            )
+            coeff_target = coeff_target.clamp(-self._COEFF_CLAMP, self._COEFF_CLAMP)
+            atom_logits, direct_coeff_pred = self.transformer.forward_tokens(
+                tok_flat, coeff_flat, class_ids=class_ids,
+            )
         atom_loss = F.cross_entropy(
             atom_logits.reshape(-1, self.transformer.cfg.vocab_size),
             y.reshape(-1),
         )
-        direct_coeff_loss = F.smooth_l1_loss(
-            direct_coeff_pred, coeff_target, beta=4.0,
-        )
+        if self._uses_coeff_bins:
+            direct_coeff_loss = F.cross_entropy(
+                coeff_logits.reshape(-1, self.transformer.cfg.n_coeff_bins),
+                coeff_bins_target.reshape(-1),
+            )
+        else:
+            direct_coeff_loss = F.smooth_l1_loss(
+                direct_coeff_pred, coeff_target, beta=4.0,
+            )
         loss = atom_loss + self.direct_coeff_loss_weight * direct_coeff_loss
 
         self.log("train/atom_loss", atom_loss,
@@ -1362,8 +1421,8 @@ class Stage2Module(pl.LightningModule):
             class_ids=class_ids,
             show_progress=True,
         )
-        support = tokens.view(-1, self.H, self.W, self.D)
-        coeffs = coeffs.view(-1, self.H, self.W, self.D)
+        support = _flat_to_bhwd_depth_major(tokens, self.H, self.W, self.D)
+        coeffs = _flat_to_bhwd_depth_major(coeffs, self.H, self.W, self.D)
         raw_imgs = self.ae.decode_from_codes(
             support.to(self.device), coeffs.to(self.device),
         )
@@ -1376,7 +1435,7 @@ class Stage2Module(pl.LightningModule):
                 imgs, os.path.join(self.out_dir, f"step{step:06d}_samples.png"),
             )
 
-        if batch is not None:
+        if batch is not None and not self._uses_unified_loss:
             try:
                 tf_tok, tf_coeff, tf_class_ids = self._unpack_stage2_batch(
                     batch,
@@ -1385,12 +1444,31 @@ class Stage2Module(pl.LightningModule):
                 )
                 if tf_tok.numel() > 0:
                     bsz = tf_tok.size(0)
-                    tf_support = tf_tok.view(bsz, self.H, self.W, self.D)
-                    tf_coeff_target = tf_coeff.view(bsz, self.H, self.W, self.D)
-                    _, tf_direct_coeff = self.transformer.forward_tokens(
-                        tf_tok, tf_coeff, class_ids=tf_class_ids,
+                    tf_support = _flat_to_bhwd_depth_major(
+                        tf_tok, self.H, self.W, self.D,
                     )
-                    tf_coeff_pred = tf_direct_coeff.view(bsz, self.H, self.W, self.D)
+                    tf_coeff_target = _flat_to_bhwd_depth_major(
+                        tf_coeff, self.H, self.W, self.D,
+                    )
+                    if self._uses_coeff_bins:
+                        tf_coeff_bins = self.transformer.quantizer.encode(tf_coeff)
+                        _, tf_coeff_logits = self.transformer.forward_tokens(
+                            tf_tok, tf_coeff_bins, class_ids=tf_class_ids,
+                        )
+                        tf_coeff_pred_btd = self.transformer.quantizer.decode(
+                            tf_coeff_logits.argmax(dim=-1),
+                        )
+                        tf_coeff_pred = _flat_to_bhwd_depth_major(
+                            tf_coeff_pred_btd.reshape(bsz, -1),
+                            self.H, self.W, self.D,
+                        )
+                    else:
+                        _, tf_direct_coeff = self.transformer.forward_tokens(
+                            tf_tok, tf_coeff, class_ids=tf_class_ids,
+                        )
+                        tf_coeff_pred = tf_direct_coeff.reshape(
+                            bsz, self.H, self.W, self.D,
+                        )
                     tf_gt = self._resize_for_logging(
                         self.ae.decode_from_codes(tf_support, tf_coeff_target),
                     )
@@ -1443,8 +1521,8 @@ def precompute_tokens(
     """Encode dataset into atom-id / coefficient sequences.
 
     Returns:
-        tokens_flat:    [N, H*W*K] int32
-        coeffs_flat:    [N, H*W*K] float32
+        tokens_flat:    [N, H*W*K] int32, depth-major per location
+        coeffs_flat:    [N, H*W*K] float32, depth-major per location
         class_ids_flat: [N] int64  (None when collect_labels=False)
         H, W, K
     """
@@ -1461,10 +1539,10 @@ def precompute_tokens(
         if H is None:
             H, W, K = support.shape[1], support.shape[2], support.shape[3]
         all_tokens.append(
-            support.view(support.size(0), -1).to(torch.int32).cpu()
+            _flatten_depth_major(support).to(torch.int32).cpu()
         )
         all_coeffs.append(
-            coeffs.view(coeffs.size(0), -1).to(torch.float32).cpu()
+            _flatten_depth_major(coeffs).to(torch.float32).cpu()
         )
         if collect_labels:
             y_t = torch.as_tensor(y, dtype=torch.long)
@@ -1593,10 +1671,11 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         "--stage2_arch",
         type=str,
         default="rq_hier",
-        choices=["rq_hier", "decoder_dual"],
+        choices=["rq_hier", "decoder_dual", "mingpt"],
         help=(
             "Stage-2 prior architecture: "
-            "'decoder_dual' (simple decoder-only dual-head prior) or "
+            "'decoder_dual' (simple decoder-only dual-head prior), "
+            "'mingpt' (plain GPT over interleaved [atom_id, coeff_bin] tokens), or "
             "'rq_hier' (spatial+depth RQ transformer)."
         ),
     )
@@ -1611,9 +1690,12 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         "--stage2_direct_coeff_loss_weight",
         type=float,
         default=0.25,
-        help="Weight for direct coefficient MSE loss on sampled head output.",
+        help="Weight for coefficient loss (CE over bins or smooth-L1 regression).",
     )
     _add_typed_args(add, (
+        ("--n_coeff_bins", int, 1024),
+        ("--coeff_mu", float, 255.0),
+        ("--coeff_max_val", float, 24.0),
         ("--tf_d_model", int, 256),
         ("--tf_heads", int, 4),
         ("--tf_layers", int, 4),
@@ -1890,8 +1972,29 @@ def main():
                 n_layers=args.tf_layers,
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
+                n_coeff_bins=args.n_coeff_bins,
+                coeff_mu=args.coeff_mu,
+                coeff_max_val=args.coeff_max_val,
             )
             transformer = DualHeadDecoderPrior(cfg)
+        elif args.stage2_arch == "mingpt":
+            from mingpt import MinGPTSparse, MinGPTSparseConfig
+
+            cfg = MinGPTSparseConfig(
+                vocab_size=ae.bottleneck.vocab_size,
+                H=H,
+                W=W,
+                D=D,
+                num_classes=stage2_num_classes,
+                d_model=args.tf_d_model,
+                n_heads=args.tf_heads,
+                n_layers=args.tf_layers,
+                dropout=args.tf_dropout,
+                n_coeff_bins=args.n_coeff_bins,
+                coeff_mu=args.coeff_mu,
+                coeff_max_val=args.coeff_max_val,
+            )
+            transformer = MinGPTSparse(cfg)
         else:
             cfg = RQTransformerConfig(
                 vocab_size=ae.bottleneck.vocab_size,
