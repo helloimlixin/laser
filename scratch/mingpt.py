@@ -181,13 +181,14 @@ class MinGPT(nn.Module):
                  temperature=1.0, top_k=None):
         self.eval()
         B = idx.size(0)
+        _ = top_k  # Top-k truncation is intentionally disabled for sampling.
         prompt = idx[:, -self.block_size:]
         P = prompt.size(1)
         out = torch.empty(B, P + max_new_tokens, dtype=idx.dtype, device=idx.device)
         out[:, :P] = prompt
         logits, cache = self.forward_step(prompt, class_idx=class_idx)
         for step in range(max_new_tokens):
-            logits = self._top_k(logits[:, -1, :] / max(temperature, 1e-8), top_k)
+            logits = logits[:, -1, :] / max(temperature, 1e-8)
             tok = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
             out[:, P + step] = tok
             if step + 1 < max_new_tokens:
@@ -344,8 +345,9 @@ class MinGPTSparse(nn.Module):
         top_k: Optional[int] = None, class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False, **_kw,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Type-aware autoregressive sampling with temperature/top-k."""
+        """Type-aware autoregressive sampling with temperature."""
         device = next(self.parameters()).device
+        _ = top_k  # Top-k truncation is intentionally disabled for sampling.
         cls = class_ids.long().to(device) if class_ids is not None else None
         bos = torch.full((batch_size, 1), self.bos_token,
                          dtype=torch.long, device=device)
@@ -364,8 +366,6 @@ class MinGPTSparse(nn.Module):
                 logits[:, -1, :] / max(float(temperature), 1e-8),
                 step,
             )
-            if top_k is not None and top_k > 0:
-                step_logits = self.gpt._top_k(step_logits, top_k)
             tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
             seq[:, step] = tok
             if step + 1 < self.seq_len:
