@@ -878,6 +878,15 @@ class RQTransformerPrior(nn.Module):
         ids = torch.multinomial(F.softmax(flat, dim=-1), 1).squeeze(-1)
         return ids.reshape(orig_shape)
 
+    @staticmethod
+    def _top_k(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
+        if not k or k <= 0:
+            return logits
+        v, ix = torch.topk(logits, min(int(k), logits.size(-1)), dim=-1)
+        out = torch.full_like(logits, float("-inf"))
+        out.scatter_(-1, ix, v)
+        return out
+
     def _fuse_spatial_context(
         self, tok_emb: torch.Tensor, coeff_emb: torch.Tensor,
     ) -> torch.Tensor:
@@ -1051,8 +1060,8 @@ class RQTransformerPrior(nn.Module):
                 if self.training and atom_feedback_prob < 1.0:
                     use_pred = (
                         torch.rand(bt, 1, device=device) < atom_feedback_prob
-                    ).to(tok_teacher.dtype)
-                    tok_cur = use_pred * tok_pred + (1.0 - use_pred) * tok_teacher
+                    )
+                    tok_cur = torch.where(use_pred, tok_pred, tok_teacher)
                 else:
                     tok_cur = tok_pred
             else:
@@ -1138,7 +1147,6 @@ class RQTransformerPrior(nn.Module):
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del top_k  # Always sample atoms from full distribution in rq_hier.
         device = next(self.parameters()).device
         T = self.positions_per_image
         D = self.cfg.D
@@ -1211,6 +1219,7 @@ class RQTransformerPrior(nn.Module):
 
                 if is_atom_step:
                     logits = self.atom_head(z_last) / max(temperature, 1e-8)
+                    logits = self._top_k(logits, top_k)
                     tokens[:, t, d] = torch.multinomial(
                         F.softmax(logits, dim=-1), 1,
                     ).squeeze(-1)
@@ -1225,6 +1234,7 @@ class RQTransformerPrior(nn.Module):
                     coeff_slots.reshape(batch_size, D * d_model),
                 ], dim=-1)
                 coeff_logits = self.coeff_head(combined_h) / max(temperature, 1e-8)
+                coeff_logits = self._top_k(coeff_logits, top_k)
                 coeff_bins = torch.multinomial(
                     F.softmax(coeff_logits, dim=-1), 1,
                 ).squeeze(-1)
@@ -1492,8 +1502,6 @@ class Stage2Module(pl.LightningModule):
         self.sample_batch_size = sample_batch_size
         self.sample_temperature = max(sample_temperature, 1e-8)
         self.sample_top_k = sample_top_k if sample_top_k > 0 else None
-        if isinstance(transformer, RQTransformerPrior):
-            self.sample_top_k = None
         self.direct_coeff_loss_weight = direct_coeff_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
