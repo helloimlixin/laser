@@ -92,6 +92,8 @@ class DualHeadDecoderConfig:
     n_layers: int = 6
     d_ff: int = 1024
     dropout: float = 0.1
+    coeff_pred_atom_mix: float = 0.5
+    coeff_atom_coherence_weight: float = 0.1
     # Kept for CLI/checkpoint compatibility; unused by regressor version.
     n_coeff_bins: int = 256
     coeff_mu: float = 255.0
@@ -238,23 +240,17 @@ class DualHeadDecoderPrior(nn.Module):
             in_coeffs[:, 1:] = coeffs[:, :-1]
         return in_tokens, in_coeffs
 
-    def forward_tokens(
+    def _atom_emb_from_logits(self, atom_logits_flat: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(atom_logits_flat, dim=-1)
+        atom_table = self.token_emb.weight[: self.cfg.vocab_size]
+        return probs @ atom_table
+
+    def _forward_core(
         self,
         tokens_flat: torch.Tensor,
         coeffs_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Teacher-forced forward pass with real-valued coefficients.
-
-        Args:
-            tokens_flat: [B, H*W*D] atom indices.
-            coeffs_flat: [B, H*W*D] real-valued sparse coefficients.
-            class_ids:   [B] optional class labels.
-
-        Returns:
-            atom_logits: [B, H*W, D, vocab_size]
-            coeff_pred:  [B, H*W, D]
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         device = tokens_flat.device
         bsz = tokens_flat.size(0)
         tokens = tokens_flat.long().view(bsz, self.seq_len)
@@ -274,17 +270,74 @@ class DualHeadDecoderPrior(nn.Module):
         h = self.final_ln(h)
 
         atom_logits_flat = self.atom_head(h)
+        atom_emb_gt = self.token_emb(tokens)
+        atom_emb_pred = self._atom_emb_from_logits(atom_logits_flat)
+        mix = min(max(float(self.cfg.coeff_pred_atom_mix), 0.0), 1.0)
+        atom_emb_ctx = (1.0 - mix) * atom_emb_gt + mix * atom_emb_pred
 
-        atom_emb = self.token_emb(tokens).detach()
         coeff_pred_flat = self.coeff_head(
-            torch.cat([h, atom_emb], dim=-1),
+            torch.cat([h, atom_emb_ctx], dim=-1),
         ).squeeze(-1)
+        return atom_logits_flat, coeff_pred_flat, atom_emb_gt, atom_emb_pred
+
+    def forward_tokens(
+        self,
+        tokens_flat: torch.Tensor,
+        coeffs_flat: torch.Tensor,
+        class_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced forward pass with real-valued coefficients.
+
+        Args:
+            tokens_flat: [B, H*W*D] atom indices.
+            coeffs_flat: [B, H*W*D] real-valued sparse coefficients.
+            class_ids:   [B] optional class labels.
+
+        Returns:
+            atom_logits: [B, H*W, D, vocab_size]
+            coeff_pred:  [B, H*W, D]
+        """
+        bsz = tokens_flat.size(0)
+        atom_logits_flat, coeff_pred_flat, _, _ = self._forward_core(
+            tokens_flat, coeffs_flat, class_ids=class_ids,
+        )
 
         atom_logits = atom_logits_flat.view(
             bsz, self.positions_per_image, self.cfg.D, self.cfg.vocab_size,
         )
         coeff_pred = coeff_pred_flat.view(bsz, self.positions_per_image, self.cfg.D)
         return atom_logits, coeff_pred
+
+    def forward_loss(
+        self,
+        tokens_flat: torch.Tensor,
+        coeffs_flat: torch.Tensor,
+        class_ids: Optional[torch.Tensor] = None,
+        coeff_loss_weight: float = 0.25,
+    ) -> torch.Tensor:
+        bsz = tokens_flat.size(0)
+        atom_logits_flat, coeff_pred_flat, atom_emb_gt, atom_emb_pred = self._forward_core(
+            tokens_flat, coeffs_flat, class_ids=class_ids,
+        )
+        atom_target = tokens_flat.long().view(bsz, self.seq_len)
+        coeff_target = coeffs_flat.float().view(bsz, self.seq_len)
+
+        atom_loss = F.cross_entropy(
+            atom_logits_flat.reshape(-1, self.cfg.vocab_size),
+            atom_target.reshape(-1),
+        )
+        coeff_loss = F.smooth_l1_loss(
+            coeff_pred_flat, coeff_target, beta=4.0,
+        )
+        total = atom_loss + max(float(coeff_loss_weight), 0.0) * coeff_loss
+
+        coh_w = max(float(self.cfg.coeff_atom_coherence_weight), 0.0)
+        if coh_w > 0.0:
+            coherence = F.smooth_l1_loss(
+                atom_emb_pred, atom_emb_gt.detach(), beta=0.5,
+            )
+            total = total + coh_w * coherence
+        return total
 
     @torch.no_grad()
     def generate(

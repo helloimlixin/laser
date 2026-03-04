@@ -1800,6 +1800,14 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         help="Weight for coefficient loss (CE over bins or smooth-L1 regression).",
     )
     _add_typed_args(add, (
+        ("--dual_coeff_pred_atom_mix", float, 0.5),
+        ("--dual_coeff_atom_coherence_weight", float, 0.1),
+    ))
+    _add_typed_args(add, (
+        ("--mingpt_atom_bin_top_k", int, 128),
+        ("--mingpt_atom_bin_chunk_rows", int, 2048),
+    ))
+    _add_typed_args(add, (
         ("--rq_spatial_grad_loss_weight", float, 0.1),
         ("--rq_same_atom_coeff_loss_weight", float, 0.05),
     ))
@@ -2099,6 +2107,8 @@ def main():
                 n_layers=args.tf_layers,
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
+                coeff_pred_atom_mix=args.dual_coeff_pred_atom_mix,
+                coeff_atom_coherence_weight=args.dual_coeff_atom_coherence_weight,
                 n_coeff_bins=args.n_coeff_bins,
                 coeff_mu=args.coeff_mu,
                 coeff_max_val=args.coeff_max_val,
@@ -2151,6 +2161,22 @@ def main():
                 }
                 transformer.load_state_dict(filtered, strict=False)
                 print(f"[Stage2] resumed from {ckpt}")
+
+        if (
+            args.stage2_arch == "mingpt"
+            and hasattr(transformer, "build_atom_coeff_bin_mask")
+            and args.mingpt_atom_bin_top_k > 0
+        ):
+            transformer.build_atom_coeff_bin_mask(
+                tokens_flat,
+                coeffs_flat,
+                top_k=args.mingpt_atom_bin_top_k,
+                chunk_rows=args.mingpt_atom_bin_chunk_rows,
+            )
+            print(
+                "[Stage2][mingpt] built atom-conditioned coeff-bin mask "
+                f"(top_k={args.mingpt_atom_bin_top_k})"
+            )
 
         module = Stage2Module(
             transformer=transformer,
