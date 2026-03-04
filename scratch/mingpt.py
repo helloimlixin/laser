@@ -94,6 +94,7 @@ class MinGPT(nn.Module):
         n_head: int = 8,
         n_embd: int = 256,
         dropout: float = 0.1,
+        n_token_types: int = 0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -101,6 +102,9 @@ class MinGPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, n_embd)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, n_embd))
+        self.type_emb = (
+            nn.Embedding(n_token_types, n_embd) if n_token_types > 0 else None
+        )
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             [Block(n_embd, n_head, dropout) for _ in range(n_layer)]
@@ -112,6 +116,7 @@ class MinGPT(nn.Module):
         )
 
         self.apply(self._init_weights)
+        nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
         print(f"MinGPT: block_size={block_size}, vocab_size={vocab_size}")
 
     @staticmethod
@@ -124,15 +129,20 @@ class MinGPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def _embed(self, idx: torch.Tensor, class_idx, past_len: int):
+    def _embed(
+        self, idx: torch.Tensor, class_idx, past_len: int,
+        type_ids: Optional[torch.Tensor] = None,
+    ):
         T = idx.size(1)
         x = self.tok_emb(idx) + self.pos_emb[:, past_len:past_len + T, :]
+        if self.type_emb is not None and type_ids is not None:
+            x = x + self.type_emb(type_ids)
         if self.class_emb is not None and class_idx is not None:
             x = x + self.class_emb(class_idx).unsqueeze(1).expand_as(x)
         return self.drop(x)
 
-    def forward(self, idx, targets=None, class_idx=None):
-        x = self._embed(idx, class_idx, past_len=0)
+    def forward(self, idx, targets=None, class_idx=None, type_ids=None):
+        x = self._embed(idx, class_idx, past_len=0, type_ids=type_ids)
         for block in self.blocks:
             x, _ = block(x)
         logits = self.head(self.ln_f(x))
@@ -147,9 +157,10 @@ class MinGPT(nn.Module):
         self, idx: torch.Tensor,
         class_idx=None,
         kv_cache: Optional[KVCache] = None,
+        type_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, KVCache]:
         past_len = kv_cache[0][0].size(2) if kv_cache else 0
-        x = self._embed(idx, class_idx, past_len)
+        x = self._embed(idx, class_idx, past_len, type_ids=type_ids)
         new_cache: KVCache = []
         for i, block in enumerate(self.blocks):
             x, kv = block(x, kv_cache=kv_cache[i] if kv_cache else None)
@@ -246,6 +257,7 @@ class MinGPTSparseConfig:
     n_coeff_bins: int = 1024
     coeff_mu: float = 255.0
     coeff_max_val: float = 24.0
+    coeff_loss_weight: float = 1.0
 
 
 class MinGPTSparse(nn.Module):
@@ -271,7 +283,11 @@ class MinGPTSparse(nn.Module):
             n_head=cfg.n_heads,
             n_embd=cfg.d_model,
             dropout=cfg.dropout,
+            n_token_types=2,
         )
+        type_ids = torch.zeros(self.seq_len, dtype=torch.long)
+        type_ids[1::2] = 1
+        self.register_buffer("_type_ids", type_ids, persistent=False)
         self.register_buffer(
             "atom_bin_allowed", torch.empty(0, dtype=torch.bool), persistent=False,
         )
@@ -350,14 +366,27 @@ class MinGPTSparse(nn.Module):
         self, tokens_flat: torch.Tensor, coeff_bins_flat: torch.Tensor,
         class_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Single next-token CE loss over the full interleaved sequence."""
+        """Weighted per-type CE loss over the interleaved sequence."""
         target = self._interleave(tokens_flat, coeff_bins_flat)
-        bos = torch.full((target.size(0), 1), self.bos_token,
+        B = target.size(0)
+        bos = torch.full((B, 1), self.bos_token,
                          dtype=torch.long, device=target.device)
         inp = torch.cat([bos, target[:, :-1]], dim=1)
+        type_ids = self._type_ids.unsqueeze(0).expand(B, -1)
         cls = class_ids.long().to(target.device) if class_ids is not None else None
-        _, loss = self.gpt(inp, targets=target, class_idx=cls)
-        return loss
+        logits, _ = self.gpt(inp, class_idx=cls, type_ids=type_ids)
+
+        atom_mask = self._type_ids == 0
+        coeff_mask = ~atom_mask
+        atom_logits = logits[:, atom_mask, :].reshape(-1, self.gpt.vocab_size)
+        coeff_logits = logits[:, coeff_mask, :].reshape(-1, self.gpt.vocab_size)
+        atom_targets = target[:, atom_mask].reshape(-1)
+        coeff_targets = target[:, coeff_mask].reshape(-1)
+
+        atom_loss = F.cross_entropy(atom_logits, atom_targets)
+        coeff_loss = F.cross_entropy(coeff_logits, coeff_targets)
+        w = float(self.cfg.coeff_loss_weight)
+        return (atom_loss + w * coeff_loss) / (1.0 + w)
 
     @torch.no_grad()
     def generate(
@@ -365,14 +394,14 @@ class MinGPTSparse(nn.Module):
         top_k: Optional[int] = None, class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False, **_kw,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Type-aware autoregressive sampling (temperature/top-k disabled)."""
-        del temperature, top_k, _kw
+        """Type-aware autoregressive sampling with temperature/top-k."""
         device = next(self.parameters()).device
         cls = class_ids.long().to(device) if class_ids is not None else None
         bos = torch.full((batch_size, 1), self.bos_token,
                          dtype=torch.long, device=device)
-        seq = torch.empty(batch_size, self.seq_len, dtype=torch.long, device=device)
-        logits, cache = self.gpt.forward_step(bos, class_idx=cls)
+        seq = torch.zeros(batch_size, self.seq_len, dtype=torch.long, device=device)
+        bos_type = self._type_ids[:1].unsqueeze(0).expand(batch_size, -1)
+        logits, cache = self.gpt.forward_step(bos, class_idx=cls, type_ids=bos_type)
 
         steps = tqdm(
             range(self.seq_len),
@@ -383,13 +412,20 @@ class MinGPTSparse(nn.Module):
         for step in steps:
             prev_atom = seq[:, step - 1] if step % 2 == 1 else None
             step_logits = self._mask_logits_by_slot(
-                logits[:, -1, :], step, prev_atom=prev_atom,
+                logits[:, -1, :] / max(float(temperature), 1e-8),
+                step, prev_atom=prev_atom,
             )
+            if top_k is not None and top_k > 0:
+                step_logits = self.gpt._top_k(step_logits, top_k)
             tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
             seq[:, step] = tok
             if step + 1 < self.seq_len:
+                step_type = self._type_ids[step + 1 : step + 2].unsqueeze(0).expand(
+                    batch_size, -1,
+                )
                 logits, cache = self.gpt.forward_step(
                     tok.unsqueeze(1), class_idx=cls, kv_cache=cache,
+                    type_ids=step_type,
                 )
 
         atoms = seq[:, 0::2]

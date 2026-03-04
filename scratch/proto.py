@@ -729,6 +729,13 @@ class RQTransformerConfig:
     d_ff: int = 1024
     dropout: float = 0.1
     use_pred_coeff_feedback: bool = True
+    use_pred_atom_feedback: bool = True
+    pred_atom_feedback_prob: float = 1.0
+    stochastic_feedback_sampling: bool = False
+    feedback_temperature: float = 1.0
+    depth_input_mixing_prob: float = 0.0
+    atom_label_smoothing: float = 0.0
+    coeff_adjacent_soft_target: float = 0.0
     n_coeff_bins: int = 1024
     coeff_mu: float = 255.0
     coeff_max_val: float = 24.0
@@ -747,10 +754,12 @@ class RQTransformerPrior(nn.Module):
         self.row_emb = nn.Embedding(cfg.H, cfg.d_model)
         self.col_emb = nn.Embedding(cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
+        self.depth_type_emb = nn.Embedding(2, cfg.d_model)
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.row_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.col_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.depth_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.depth_type_emb.weight, mean=0.0, std=0.02)
         self.start_emb = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         spatial_pos = torch.arange(self.positions_per_image, dtype=torch.long)
         self.register_buffer(
@@ -858,6 +867,17 @@ class RQTransformerPrior(nn.Module):
         """Encode (atom id embedding, scalar coeff) as coeff feedback feature."""
         return torch.tanh(atom_emb * coeff_val.unsqueeze(-1))
 
+    def _sample_or_argmax(
+        self, logits: torch.Tensor, temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Sample token ids (or argmax) for stochastic teacher roll-in."""
+        if not self.cfg.stochastic_feedback_sampling:
+            return logits.argmax(dim=-1)
+        orig_shape = logits.shape[:-1]
+        flat = logits.reshape(-1, logits.size(-1)) / max(float(temperature), 1e-8)
+        ids = torch.multinomial(F.softmax(flat, dim=-1), 1).squeeze(-1)
+        return ids.reshape(orig_shape)
+
     def _fuse_spatial_context(
         self, tok_emb: torch.Tensor, coeff_emb: torch.Tensor,
     ) -> torch.Tensor:
@@ -926,28 +946,83 @@ class RQTransformerPrior(nn.Module):
         tok_emb = self.token_emb(tok_bt)
         coeff_bt = coeffs.reshape(bt, D)
         coeff_teacher_depth = self._coeff_pair_to_embed(tok_emb, coeff_bt)
+        depth_steps = 2 * D
         depth_pos = self.depth_emb(
             torch.arange(D, device=device, dtype=torch.long),
-        ).unsqueeze(0)
+        )
+        depth_pos = (
+            depth_pos.unsqueeze(1).expand(D, 2, d_model).reshape(depth_steps, d_model)
+        )
+        depth_types = torch.tensor([0, 1], dtype=torch.long, device=device)
+        depth_type = self.depth_type_emb(depth_types).repeat(D, 1)
 
-        depth_in = torch.zeros(bt, D, d_model, device=device)
-        depth_in[:, 0, :] = h_t
+        depth_content = torch.zeros(bt, depth_steps, d_model, device=device)
+        depth_content[:, 0, :] = h_t
         if D > 1:
-            depth_in[:, 1:, :] = tok_emb[:, :-1, :] + coeff_teacher_depth[:, :-1, :]
-        depth_in = depth_in + depth_pos
+            depth_content[:, 2::2, :] = coeff_teacher_depth[:, :-1, :]
+        depth_content[:, 1::2, :] = tok_emb
+        pos_type_bias = depth_pos.unsqueeze(0) + depth_type.unsqueeze(0)
+
+        dim_prob = (
+            float(min(max(self.cfg.depth_input_mixing_prob, 0.0), 1.0))
+            if self.training else 0.0
+        )
+        if dim_prob > 0.0:
+            fb_temp = max(float(self.cfg.feedback_temperature), 1e-8)
+            with torch.no_grad():
+                depth_in_gt = depth_content + pos_type_bias
+                depth_h_p1 = self.drop(depth_in_gt)
+                for blk in self.depth_blocks:
+                    depth_h_p1, _ = blk(depth_h_p1)
+                atom_logits_p1 = self.atom_head(
+                    self.depth_ln(depth_h_p1)[:, 0::2, :],
+                )
+                pred_atom_ids = self._sample_or_argmax(
+                    atom_logits_p1, temperature=fb_temp,
+                )
+            pred_atom_emb = self.token_emb(pred_atom_ids).detach()
+            mix_mask = (
+                torch.rand(bt, D, 1, device=device) < dim_prob
+            )
+            mixed_tok = torch.where(mix_mask, pred_atom_emb, tok_emb)
+            depth_content_mixed = depth_content.clone()
+            depth_content_mixed[:, 1::2, :] = mixed_tok
+            depth_in = depth_content_mixed + pos_type_bias
+        else:
+            depth_in = depth_content + pos_type_bias
 
         depth_h = self.drop(depth_in)
         depth_h = self._run_no_cache_blocks(depth_h, self.depth_blocks)
         depth_h = self.depth_ln(depth_h)
-        atom_logits_bt = self.atom_head(depth_h)
+        atom_logits_bt = self.atom_head(depth_h[:, 0::2, :])
 
         token_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_logits_list: list[torch.Tensor] = []
+        atom_feedback_prob = float(
+            min(max(self.cfg.pred_atom_feedback_prob, 0.0), 1.0),
+        )
+        fb_temp = max(float(self.cfg.feedback_temperature), 1e-8)
 
         for d in range(D):
-            z_last = depth_h[:, d, :]
-            tok_cur = tok_emb[:, d, :]
+            # Coeff logits for depth d come from the coeff-typed slot (2*d + 1).
+            z_last = depth_h[:, 2 * d + 1, :]
+            tok_teacher = tok_emb[:, d, :]
+            if self.cfg.use_pred_atom_feedback:
+                tok_pred_ids = self._sample_or_argmax(
+                    atom_logits_bt[:, d, :],
+                    temperature=fb_temp,
+                )
+                tok_pred = self.token_emb(tok_pred_ids)
+                if self.training and atom_feedback_prob < 1.0:
+                    use_pred = (
+                        torch.rand(bt, 1, device=device) < atom_feedback_prob
+                    ).to(tok_teacher.dtype)
+                    tok_cur = use_pred * tok_pred + (1.0 - use_pred) * tok_teacher
+                else:
+                    tok_cur = tok_pred
+            else:
+                tok_cur = tok_teacher
             token_slots[:, d, :] = tok_cur
             combined_h = torch.cat([
                 h_t,
@@ -958,7 +1033,9 @@ class RQTransformerPrior(nn.Module):
             coeff_logits_d = self.coeff_head(combined_h)
             coeff_logits_list.append(coeff_logits_d)
             coeff_feedback = (
-                self.quantizer.decode(coeff_logits_d.argmax(dim=-1))
+                self.quantizer.decode(
+                    self._sample_or_argmax(coeff_logits_d, temperature=fb_temp),
+                )
                 if self.cfg.use_pred_coeff_feedback
                 else coeff_bt[:, d]
             )
@@ -986,14 +1063,36 @@ class RQTransformerPrior(nn.Module):
         coeff_target, _ = self._coeff_bins_and_values(
             coeff_bins_flat, "coeffs_flat",
         )
+        atom_smooth = float(min(max(self.cfg.atom_label_smoothing, 0.0), 0.999))
         atom_loss = F.cross_entropy(
             atom_logits.reshape(-1, self.cfg.vocab_size),
             atom_target.reshape(-1),
+            label_smoothing=atom_smooth,
         )
-        coeff_loss = F.cross_entropy(
-            coeff_logits.reshape(-1, self.cfg.n_coeff_bins),
-            coeff_target.reshape(-1),
+        coeff_logits_flat = coeff_logits.reshape(-1, self.cfg.n_coeff_bins)
+        coeff_target_flat = coeff_target.reshape(-1)
+        coeff_alpha = float(
+            min(max(self.cfg.coeff_adjacent_soft_target, 0.0), 0.999),
         )
+        if coeff_alpha <= 0.0:
+            coeff_loss = F.cross_entropy(coeff_logits_flat, coeff_target_flat)
+        else:
+            # Soft bins: center gets most mass, immediate neighbors share coeff_alpha.
+            log_probs = F.log_softmax(coeff_logits_flat, dim=-1)
+            center_idx = coeff_target_flat
+            left_idx = (center_idx - 1).clamp_min(0)
+            right_idx = (center_idx + 1).clamp_max(self.cfg.n_coeff_bins - 1)
+            has_left = (center_idx > 0).to(log_probs.dtype)
+            has_right = (center_idx < (self.cfg.n_coeff_bins - 1)).to(log_probs.dtype)
+            left_w = 0.5 * coeff_alpha * has_left
+            right_w = 0.5 * coeff_alpha * has_right
+            center_w = 1.0 - left_w - right_w
+            center_lp = log_probs.gather(1, center_idx.unsqueeze(1)).squeeze(1)
+            left_lp = log_probs.gather(1, left_idx.unsqueeze(1)).squeeze(1)
+            right_lp = log_probs.gather(1, right_idx.unsqueeze(1)).squeeze(1)
+            coeff_loss = -(
+                center_w * center_lp + left_w * left_lp + right_w * right_lp
+            ).mean()
         return 0.5 * (atom_loss + coeff_loss)
 
     @torch.no_grad()
@@ -1015,6 +1114,12 @@ class RQTransformerPrior(nn.Module):
         spatial_pos = self._spatial_pos(T, device)
         depth_pos = self.depth_emb(
             torch.arange(D, device=device, dtype=torch.long),
+        )
+        depth_pos_steps = (
+            depth_pos.unsqueeze(1).expand(D, 2, d_model).reshape(2 * D, d_model)
+        )
+        depth_type = self.depth_type_emb(
+            torch.tensor([0, 1], device=device, dtype=torch.long),
         )
 
         tokens = torch.zeros(batch_size, T, D, dtype=torch.long, device=device)
@@ -1051,22 +1156,34 @@ class RQTransformerPrior(nn.Module):
             depth_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
                 None
             ] * len(self.depth_blocks)
-            for d in range(D):
-                if d == 0:
-                    depth_x = h_t
+            for step in range(2 * D):
+                d = step // 2
+                is_atom_step = (step % 2 == 0)
+                if is_atom_step:
+                    if d == 0:
+                        depth_x = h_t
+                    else:
+                        depth_x = coeff_slots[:, d - 1, :]
                 else:
-                    depth_x = token_slots[:, d - 1, :] + coeff_slots[:, d - 1, :]
-                depth_h = (depth_x + depth_pos[d]).unsqueeze(1)
+                    depth_x = token_slots[:, d, :]
+                depth_h = (
+                    depth_x
+                    + depth_pos_steps[step]
+                    + depth_type[0 if is_atom_step else 1]
+                ).unsqueeze(1)
                 for i, blk in enumerate(self.depth_blocks):
                     depth_h, depth_kv[i] = blk(depth_h, kv_cache=depth_kv[i])
                 z_last = self.depth_ln(depth_h)[:, 0, :]
 
-                logits = self.atom_head(z_last) / max(temperature, 1e-8)
-                tokens[:, t, d] = torch.multinomial(
-                    F.softmax(logits, dim=-1), 1,
-                ).squeeze(-1)
-                tok_cur = self.token_emb(tokens[:, t, d])
-                token_slots[:, d, :] = tok_cur
+                if is_atom_step:
+                    logits = self.atom_head(z_last) / max(temperature, 1e-8)
+                    tokens[:, t, d] = torch.multinomial(
+                        F.softmax(logits, dim=-1), 1,
+                    ).squeeze(-1)
+                    token_slots[:, d, :] = self.token_emb(tokens[:, t, d])
+                    continue
+
+                tok_cur = token_slots[:, d, :]
                 combined_h = torch.cat([
                     h_t,
                     z_last,
@@ -1864,6 +1981,66 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="rq_use_pred_coeff_feedback",
     )
+    add(
+        "--rq_use_pred_atom_feedback",
+        action="store_true",
+        default=True,
+        help="Condition rq_hier coeff prediction on predicted atom embeddings.",
+    )
+    add(
+        "--no_rq_use_pred_atom_feedback",
+        action="store_false",
+        dest="rq_use_pred_atom_feedback",
+    )
+    add(
+        "--rq_pred_atom_feedback_prob",
+        type=float,
+        default=1.0,
+        help=(
+            "Probability of using predicted (vs teacher) atom embeddings for "
+            "rq_hier coeff conditioning during training."
+        ),
+    )
+    add(
+        "--rq_atom_label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for rq_hier atom-id CE targets.",
+    )
+    add(
+        "--rq_coeff_adjacent_soft_target",
+        type=float,
+        default=0.0,
+        help=(
+            "Soft target mass for immediate neighbor coeff bins in rq_hier "
+            "loss (center gets remaining mass)."
+        ),
+    )
+    add(
+        "--rq_depth_input_mixing_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of replacing GT atom embeddings with pass-1 "
+            "predicted atom embeddings in depth transformer coeff-slot "
+            "inputs during training (two-pass scheduled sampling)."
+        ),
+    )
+    add(
+        "--rq_stochastic_feedback_sampling",
+        action="store_true",
+        default=False,
+        help=(
+            "Use multinomial sampling (instead of argmax) for rq_hier "
+            "training-time predicted atom/coeff feedback."
+        ),
+    )
+    add(
+        "--rq_feedback_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for rq_hier stochastic feedback sampling.",
+    )
     _add_typed_args(add, (
         ("--n_coeff_bins", int, 1024),
         ("--coeff_mu", float, 255.0),
@@ -2222,6 +2399,13 @@ def main():
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
                 use_pred_coeff_feedback=args.rq_use_pred_coeff_feedback,
+                use_pred_atom_feedback=args.rq_use_pred_atom_feedback,
+                pred_atom_feedback_prob=args.rq_pred_atom_feedback_prob,
+                stochastic_feedback_sampling=args.rq_stochastic_feedback_sampling,
+                feedback_temperature=args.rq_feedback_temperature,
+                depth_input_mixing_prob=args.rq_depth_input_mixing_prob,
+                atom_label_smoothing=args.rq_atom_label_smoothing,
+                coeff_adjacent_soft_target=args.rq_coeff_adjacent_soft_target,
                 n_coeff_bins=args.n_coeff_bins,
                 coeff_mu=args.coeff_mu,
                 coeff_max_val=args.coeff_max_val,
