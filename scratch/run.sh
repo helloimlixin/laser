@@ -71,19 +71,54 @@ if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* 
   fi
 fi
 
-PROJECT_DIR="."
-DATA_DIR="../../data/celeba"
-OUT_DIR="./runs/laser_celeba_128"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Accept overrides, but ensure all paths are absolute for singularity binds.
+PROJECT_DIR_INPUT="${PROJECT_DIR:-$SCRIPT_DIR}"
+DATA_DIR_INPUT="${DATA_DIR:-$SCRIPT_DIR/../../data/celeba}"
+OUT_DIR_INPUT="${OUT_DIR:-$SCRIPT_DIR/runs/laser_celeba_128}"
+
+if [[ "$PROJECT_DIR_INPUT" != /* ]]; then
+  PROJECT_DIR_INPUT="$SCRIPT_DIR/$PROJECT_DIR_INPUT"
+fi
+if [[ "$DATA_DIR_INPUT" != /* ]]; then
+  DATA_DIR_INPUT="$SCRIPT_DIR/$DATA_DIR_INPUT"
+fi
+if [[ "$OUT_DIR_INPUT" != /* ]]; then
+  OUT_DIR_INPUT="$SCRIPT_DIR/$OUT_DIR_INPUT"
+fi
+
+if [[ ! -d "$PROJECT_DIR_INPUT" ]]; then
+  echo "ERROR: PROJECT_DIR does not exist: $PROJECT_DIR_INPUT" >&2
+  exit 1
+fi
+
+PROJECT_DIR="$(cd "$PROJECT_DIR_INPUT" && pwd)"
+DATA_DIR="$DATA_DIR_INPUT"
+OUT_DIR="$OUT_DIR_INPUT"
 
 nvidia-smi
 
 mkdir -p "$OUT_DIR"
 
+DATA_BIND_DIR="$DATA_DIR"
+if [[ ! -d "$DATA_BIND_DIR" ]]; then
+  DATA_BIND_DIR="$(dirname "$DATA_DIR")"
+fi
+OUT_BIND_DIR="$OUT_DIR"
+
+echo "PROJECT_DIR=$PROJECT_DIR"
+echo "DATA_DIR=$DATA_DIR"
+echo "OUT_DIR=$OUT_DIR"
+echo "IMAGE=$IMAGE"
+
 srun singularity exec --nv \
-  --bind "$PROJECT_DIR":"$PROJECT_DIR" \
-  --bind "/scratch/$USER":"/scratch/$USER" \
+  --bind "$PROJECT_DIR" \
+  --bind "/scratch/$USER" \
+  --bind "$DATA_BIND_DIR" \
+  --bind "$OUT_BIND_DIR" \
   "$IMAGE" \
-  python3 "laser.py" \
+  python3 "$PROJECT_DIR/laser.py" \
   --dataset celeba \
   --data_dir "$DATA_DIR" \
   --image_size 128 \
