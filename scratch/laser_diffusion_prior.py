@@ -23,6 +23,12 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def soft_clamp(x: torch.Tensor, max_val: float) -> torch.Tensor:
+    """Tanh-based soft clamp: approximately linear near zero, smoothly
+    saturates towards ±max_val instead of the hard discontinuity of clamp."""
+    return max_val * torch.tanh(x / max_val)
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -397,7 +403,7 @@ class DiffusionPrior(nn.Module):
         sims = atom_emb_flat @ weight_norm.t()                  # [B*S*D, V]
         atom_ids = sims.argmax(dim=-1).reshape(B, S, cfg.D)
 
-        coeffs = coeff_pred.clamp(-cfg.coeff_max, cfg.coeff_max)
+        coeffs = soft_clamp(coeff_pred, cfg.coeff_max)
         return atom_ids, coeffs
 
 

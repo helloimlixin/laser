@@ -64,6 +64,40 @@ def _disable_cuda_matmul_capability_probe():
 _disable_cuda_matmul_capability_probe()
 
 
+def soft_clamp(x: torch.Tensor, max_val: float) -> torch.Tensor:
+    """Tanh-based soft clamp: approximately linear near zero, smoothly
+    saturates towards ±max_val instead of the hard discontinuity of clamp."""
+    return max_val * torch.tanh(x / max_val)
+
+
+def spatial_smooth_coeffs(
+    coeffs: torch.Tensor, kernel_size: int = 3, sigma: float = 0.8
+) -> torch.Tensor:
+    """Apply mild spatial Gaussian smoothing to a coefficient grid.
+
+    Args:
+        coeffs: [B, H, W, D] coefficient grid.
+        kernel_size: size of the square Gaussian kernel (odd).
+        sigma: standard deviation of the Gaussian.
+
+    Returns:
+        Smoothed coefficients, same shape.
+    """
+    B, H, W, D = coeffs.shape
+    if H < kernel_size or W < kernel_size:
+        return coeffs
+    x = coeffs.permute(0, 3, 1, 2).reshape(B * D, 1, H, W)
+    pad = kernel_size // 2
+    ax = torch.arange(kernel_size, dtype=coeffs.dtype, device=coeffs.device) - pad
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, kernel_size, kernel_size)
+    x = F.pad(x, [pad] * 4, mode="reflect")
+    x = F.conv2d(x, kernel)
+    return x.reshape(B, D, H, W).permute(0, 2, 3, 1).contiguous()
+
+
 # -----------------------------
 # VQ-VAE style building blocks
 # -----------------------------
@@ -899,7 +933,7 @@ class Prior(nn.Module):
 
         if self.predict_coefficients:
             coeff_flat = torch.stack(coeffs, dim=1)
-            coeff_flat = coeff_flat.clamp(-self.cfg.coeff_max, self.cfg.coeff_max)
+            coeff_flat = soft_clamp(coeff_flat, self.cfg.coeff_max)
             return seq[:, 1:], coeff_flat
         return seq[:, 1:]
 
@@ -1516,8 +1550,8 @@ class Stage2Module(pl.LightningModule):
                     y.reshape(-1),
                     ignore_index=self.pad_token_id,
                 )
-            coeff_loss = torch.tensor(0.0, device=out.device, dtype=out.dtype)
-            loss = atom_loss
+                coeff_loss = torch.tensor(0.0, device=out.device, dtype=out.dtype)
+                loss = atom_loss
         self.log(
             "train/atom_loss",
             atom_loss,
@@ -1540,7 +1574,40 @@ class Stage2Module(pl.LightningModule):
         if self.global_step <= 0 or (self.global_step % self.sample_every_steps) != 0:
             return
         if self.trainer.is_global_zero:
+            self._log_gt_recons(batch, step=self.global_step)
             self._sample_and_save(step=self.global_step)
+
+    @torch.no_grad()
+    def _log_gt_recons(self, batch, step: int, max_imgs: int = 8):
+        """Decode a training batch back to images and log as ground-truth."""
+        self.laser.eval()
+        if self.predict_coefficients:
+            tok_flat, coeff_flat = batch
+            coeff_flat = coeff_flat.to(torch.float32)
+        else:
+            (tok_flat,) = batch
+            coeff_flat = None
+        tok_flat = tok_flat[:max_imgs].long().to(self.device)
+
+        if self.predict_coefficients:
+            atom_ids = tok_flat.view(-1, self.H, self.W, self.D)
+            coeffs = coeff_flat[:max_imgs].to(self.device).view(-1, self.H, self.W, self.D)
+            gt_imgs = self.laser.decode(atom_ids, coeffs)
+        else:
+            tokens = tok_flat.view(-1, self.H, self.W, self.D)
+            gt_imgs = self.laser.decode_tokens(tokens)
+
+        if gt_imgs.size(-2) != self.image_size or gt_imgs.size(-1) != self.image_size:
+            gt_imgs = F.interpolate(
+                gt_imgs, size=(self.image_size, self.image_size),
+                mode="bilinear", align_corners=False,
+            )
+        logged = log_image_grid_wandb(
+            self.logger, key="stage2/gt_recons", x=gt_imgs,
+            step=step, caption=f"gt_recons step={step}",
+        )
+        if not logged:
+            save_image_grid(gt_imgs, os.path.join(self.out_dir, f"stage2_step{step:06d}_gt_recons.png"))
 
     def on_train_epoch_end(self):
         if self.trainer.is_global_zero:
@@ -1554,21 +1621,20 @@ class Stage2Module(pl.LightningModule):
             atom_ids = atom_ids.view(-1, self.H, self.W, self.D).to(self.device)
             coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
             coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
+            coeff_gen = spatial_smooth_coeffs(coeff_gen)
             return self.laser.decode(atom_ids, coeff_gen)
         if self.predict_coefficients:
             flat_gen, coeff_gen = gen
             atom_ids = flat_gen.view(-1, self.H, self.W, self.D).to(self.device)
             coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
             coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
+            coeff_gen = spatial_smooth_coeffs(coeff_gen)
             return self.laser.decode(atom_ids, coeff_gen)
         tokens_gen = gen.view(-1, self.H, self.W, self.D)
         return self.laser.decode_tokens(tokens_gen.to(self.device))
 
     @torch.no_grad()
     def _sample_sliding_window_batch(self, step: int) -> torch.Tensor:
-        if self.predict_coefficients:
-            raise NotImplementedError("Sliding-window sampling is only supported in quantized-token mode.")
-
         B = self.sample_batch_size
         bos_id = int(self.transformer.bos_token_id)
         pad_id = int(self.pad_token_id)
@@ -1583,6 +1649,10 @@ class Stage2Module(pl.LightningModule):
         generated = torch.zeros((B, full_h, full_w, self.D), dtype=torch.long, device=self.device)
         bos = torch.full((B, 1), bos_id, dtype=torch.long, device=self.device)
         special_ids = torch.tensor([bos_id, pad_id], dtype=torch.long, device=self.device)
+
+        coeffs_gen = None
+        if self.predict_coefficients:
+            coeffs_gen = torch.zeros((B, full_h, full_w, self.D), device=self.device)
 
         steps = tqdm(
             range(full_tokens),
@@ -1607,12 +1677,31 @@ class Stage2Module(pl.LightningModule):
             window_flat = generated[:, h0 : h0 + self.H, w0 : w0 + self.W, :].contiguous().view(B, win_tokens)
             ctx = window_flat[:, :local_t]
             seq = torch.cat([bos, ctx], dim=1)
-            logits = self.transformer(seq)[:, -1, :]
-            logits[:, special_ids] = float("-inf")
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1).squeeze(1)
-            generated[:, y, x, depth_idx] = nxt
 
+            if self.predict_coefficients:
+                h = self.transformer._backbone(seq)
+                atom_logits = self.transformer.atom_head(h)
+                logits = atom_logits[:, -1, :]
+                logits[:, special_ids] = float("-inf")
+                probs = F.softmax(logits, dim=-1)
+                nxt = torch.multinomial(probs, num_samples=1)
+                generated[:, y, x, depth_idx] = nxt.squeeze(1)
+
+                coeff_val = self.transformer._predict_coeff(h[:, -1:, :], nxt)
+                coeff_val = soft_clamp(coeff_val.squeeze(-1), self.transformer.cfg.coeff_max)
+                coeffs_gen[:, y, x, depth_idx] = coeff_val
+            else:
+                logits = self.transformer(seq)[:, -1, :]
+                logits[:, special_ids] = float("-inf")
+                probs = F.softmax(logits, dim=-1)
+                nxt = torch.multinomial(probs, num_samples=1).squeeze(1)
+                generated[:, y, x, depth_idx] = nxt
+
+        if self.predict_coefficients:
+            atom_ids = generated.to(self.device)
+            coeffs_gen = coeffs_gen * self.coeff_std + self.coeff_mean
+            coeffs_gen = spatial_smooth_coeffs(coeffs_gen)
+            return self.laser.decode(atom_ids, coeffs_gen)
         return self.laser.decode_tokens(generated.to(self.device))
 
     @torch.no_grad()
@@ -2099,11 +2188,6 @@ def main():
             )
         if not quantize_sparse_coeffs and coeffs_flat is None:
             raise ValueError("coeffs_flat is required when quantize_sparse_coeffs=False")
-        if sample_latent_shape is not None and (not quantize_sparse_coeffs) and args.stage2_sample_every_steps > 0:
-            raise NotImplementedError(
-                "Sliding-window sampling currently supports quantized-token mode only. "
-                "Set --stage2_sample_every_steps 0 to train in coefficient-regression mode."
-            )
 
         dm = TokenDataModule(
             tokens_flat=tokens_flat,
@@ -2123,7 +2207,7 @@ def main():
         if args.stage2_arch == "spatial_depth":
             from laser_transformer import SpatialDepthPrior, SpatialDepthPriorConfig
             sd_cfg = SpatialDepthPriorConfig(
-                vocab_size=ae_model.bottleneck.vocab_size,
+                vocab_size=ae_model.bottleneck.num_embeddings,
                 H=H,
                 W=W,
                 D=D,

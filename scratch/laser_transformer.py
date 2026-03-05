@@ -19,6 +19,12 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def soft_clamp(x: torch.Tensor, max_val: float) -> torch.Tensor:
+    """Tanh-based soft clamp: approximately linear near zero, smoothly
+    saturates towards ±max_val instead of the hard discontinuity of clamp."""
+    return max_val * torch.tanh(x / max_val)
+
+
 @dataclass
 class SpatialDepthPriorConfig:
     vocab_size: int
@@ -66,8 +72,18 @@ class CausalSelfAttention(nn.Module):
         new_kv = (k, v)
         drop_p = self.attn_drop_p if self.training else 0.0
 
+        _CUDA_GRID_MAX = 65535
         if kv_cache is not None:
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop_p)
+        elif B * self.n_heads > _CUDA_GRID_MAX:
+            chunk_b = _CUDA_GRID_MAX // self.n_heads
+            out = torch.cat([
+                F.scaled_dot_product_attention(
+                    q[i:i+chunk_b], k[i:i+chunk_b], v[i:i+chunk_b],
+                    is_causal=True, dropout_p=drop_p,
+                )
+                for i in range(0, B, chunk_b)
+            ], dim=0)
         else:
             out = F.scaled_dot_product_attention(
                 q, k, v, is_causal=True, dropout_p=drop_p,
@@ -286,7 +302,7 @@ class SpatialDepthPrior(nn.Module):
                 c_emb = self.atom_coeff_emb(sampled)
                 c_in = torch.cat([last_h, c_emb], dim=-1)
                 c_val = self.coeff_head(c_in).squeeze(-1)
-                coeffs[:, t, d] = c_val.clamp(-cfg.coeff_max, cfg.coeff_max)
+                coeffs[:, t, d] = soft_clamp(c_val, cfg.coeff_max)
 
         return atom_ids, coeffs
 
