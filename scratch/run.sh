@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1                    # Total # of tasks across all nodes
 #SBATCH --cpus-per-task=16            # Cores per task (>1 if multithread tasks)
 #SBATCH --gres=gpu:4                  # Request number of GPUs
-#SBATCH --mem=128100                  # Real memory (RAM) required (MB)
+#SBATCH --mem=64000                  # Real memory (RAM) required (MB)
 #SBATCH --time=24:00:00               # Total run time limit (HH:MM:SS)
 #SBATCH --output=laser.out            # STDOUT output file
 #SBATCH --error=laser.err             # STDERR output file (optional)
