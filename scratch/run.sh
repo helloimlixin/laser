@@ -121,8 +121,35 @@ if [[ ! -f "$PROJECT_DIR/laser.py" ]]; then
 fi
 
 if [[ ! -d "$DATA_DIR" ]]; then
+  for cand in \
+    "/scratch/$USER/Projects/data/celeba" \
+    "/scratch/$USER/Projects/data/CelebA" \
+    "/scratch/$USER/Projects/data/img_align_celeba" \
+    "/scratch/$USER/data/celeba" \
+    "/scratch/$USER/data/CelebA" \
+    "/scratch/$USER/data/img_align_celeba" \
+    "$BASE_DIR/../../data/celeba" \
+    "$BASE_DIR/../data/celeba"
+  do
+    if [[ -d "$cand" ]]; then
+      DATA_DIR="$cand"
+      break
+    fi
+  done
+fi
+
+if [[ ! -d "$DATA_DIR" ]]; then
+  FOUND_DATA_DIR="$(find "/scratch/$USER" -maxdepth 6 -type d \( -iname "celeba" -o -iname "img_align_celeba" \) 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$FOUND_DATA_DIR" && -d "$FOUND_DATA_DIR" ]]; then
+    DATA_DIR="$FOUND_DATA_DIR"
+  fi
+fi
+
+if [[ ! -d "$DATA_DIR" ]]; then
   echo "ERROR: DATA_DIR does not exist: $DATA_DIR" >&2
-  echo "Set DATA_DIR explicitly, e.g.:" >&2
+  echo "Tried common paths and a shallow search under /scratch/$USER." >&2
+  echo "Set DATA_DIR explicitly to the folder containing CelebA images." >&2
+  echo "Example:" >&2
   echo "  DATA_DIR=/scratch/$USER/Projects/data/celeba sbatch scratch/run.sh" >&2
   exit 1
 fi
