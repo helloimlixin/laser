@@ -1346,7 +1346,7 @@ class Stage1Module(pl.LightningModule):
 class Stage2Module(pl.LightningModule):
     def __init__(
         self,
-        transformer: Prior,
+        transformer,  # Prior or SpatialDepthPrior
         lr: float,
         pad_token_id: int,
         out_dir: str,
@@ -1374,7 +1374,14 @@ class Stage2Module(pl.LightningModule):
         self.transformer = transformer
         self.lr = float(lr)
         self.pad_token_id = int(pad_token_id)
-        self.predict_coefficients = bool(self.transformer.cfg.predict_coefficients)
+        from laser_transformer import SpatialDepthPrior
+        from laser_diffusion_prior import DiffusionPrior
+        self.is_spatial_depth = isinstance(transformer, SpatialDepthPrior)
+        self.is_diffusion = isinstance(transformer, DiffusionPrior)
+        self.predict_coefficients = (
+            True if (self.is_spatial_depth or self.is_diffusion)
+            else bool(self.transformer.cfg.predict_coefficients)
+        )
         self.coeff_loss_weight = float(coeff_loss_weight)
         self.coeff_mean = float(coeff_mean)
         self.coeff_std = max(float(coeff_std), 1e-8)
@@ -1465,38 +1472,50 @@ class Stage2Module(pl.LightningModule):
             coeff_flat = None
         tok_flat = tok_flat.long()
         B = tok_flat.size(0)
-        bos = self.transformer.bos_token_id
 
-        seq = torch.cat([torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), tok_flat], dim=1)
-        y = seq[:, 1:]
-        x_in = seq[:, :-1]
-
-        out = self.transformer(x_in, atom_targets=y if self.predict_coefficients else None)
-        if self.predict_coefficients:
-            logits, coeff_pred = out
+        if self.is_diffusion:
+            atom_ids = tok_flat.view(B, self.H * self.W, self.D)
+            coeffs_3d = (coeff_flat.view(B, self.H * self.W, self.D).to(tok_flat.device) - self.coeff_mean) / self.coeff_std
+            loss = self.transformer(atom_ids, coeffs_3d)
+            atom_loss = loss
+            self.log("train/diffusion_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=B)
+        elif self.is_spatial_depth:
+            atom_ids = tok_flat.view(B, self.H * self.W, self.D)
+            coeffs_3d = coeff_flat.view(B, self.H * self.W, self.D).to(tok_flat.device)
+            atom_logits, coeff_pred = self.transformer(atom_ids, coeffs_3d)
+            vocab = self.transformer.cfg.vocab_size
             atom_loss = F.cross_entropy(
-                logits.reshape(-1, self.transformer.cfg.vocab_size),
-                y.reshape(-1),
-                ignore_index=self.pad_token_id,
+                atom_logits.reshape(-1, vocab),
+                atom_ids.reshape(-1),
             )
-            coeff_target = (coeff_flat.to(logits.device) - self.coeff_mean) / self.coeff_std
+            coeff_target = (coeffs_3d - self.coeff_mean) / self.coeff_std
             coeff_loss = F.mse_loss(coeff_pred.reshape(-1), coeff_target.reshape(-1))
             loss = atom_loss + self.coeff_loss_weight * coeff_loss
-            self.log(
-                "train/coeff_loss",
-                coeff_loss,
-                prog_bar=True,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=B,
-            )
+            self.log("train/coeff_loss", coeff_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=B)
         else:
-            atom_loss = F.cross_entropy(
-                out.reshape(-1, self.transformer.cfg.vocab_size),
-                y.reshape(-1),
-                ignore_index=self.pad_token_id,
-            )
+            bos = self.transformer.bos_token_id
+            seq = torch.cat([torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), tok_flat], dim=1)
+            y = seq[:, 1:]
+            x_in = seq[:, :-1]
+
+            out = self.transformer(x_in, atom_targets=y if self.predict_coefficients else None)
+            if self.predict_coefficients:
+                logits, coeff_pred = out
+                atom_loss = F.cross_entropy(
+                    logits.reshape(-1, self.transformer.cfg.vocab_size),
+                    y.reshape(-1),
+                    ignore_index=self.pad_token_id,
+                )
+                coeff_target = (coeff_flat.to(logits.device) - self.coeff_mean) / self.coeff_std
+                coeff_loss = F.mse_loss(coeff_pred.reshape(-1), coeff_target.reshape(-1))
+                loss = atom_loss + self.coeff_loss_weight * coeff_loss
+                self.log("train/coeff_loss", coeff_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=B)
+            else:
+                atom_loss = F.cross_entropy(
+                    out.reshape(-1, self.transformer.cfg.vocab_size),
+                    y.reshape(-1),
+                    ignore_index=self.pad_token_id,
+                )
             coeff_loss = torch.tensor(0.0, device=out.device, dtype=out.dtype)
             loss = atom_loss
         self.log(
@@ -1526,9 +1545,16 @@ class Stage2Module(pl.LightningModule):
     def on_train_epoch_end(self):
         if self.trainer.is_global_zero:
             os.makedirs(self.out_dir, exist_ok=True)
-            torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, "transformer_last.pt"))
+            arch_tag = "spatial_depth" if self.is_spatial_depth else "flat"
+            torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, f"transformer_{arch_tag}_last.pt"))
 
     def _decode_generated_batch(self, gen) -> torch.Tensor:
+        if self.is_spatial_depth or self.is_diffusion:
+            atom_ids, coeff_gen = gen
+            atom_ids = atom_ids.view(-1, self.H, self.W, self.D).to(self.device)
+            coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
+            coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
+            return self.laser.decode(atom_ids, coeff_gen)
         if self.predict_coefficients:
             flat_gen, coeff_gen = gen
             atom_ids = flat_gen.view(-1, self.H, self.W, self.D).to(self.device)
@@ -1604,11 +1630,10 @@ class Stage2Module(pl.LightningModule):
             )
             raw_imgs = self._sample_sliding_window_batch(step=step)
         else:
-            gen = self.transformer.generate(
-                batch_size=self.sample_batch_size,
-                show_progress=True,
-                progress_desc=f"[Stage2] sample step {step}",
-            )
+            gen_kwargs = dict(batch_size=self.sample_batch_size, show_progress=True)
+            if not (self.is_spatial_depth or self.is_diffusion):
+                gen_kwargs["progress_desc"] = f"[Stage2] sample step {step}"
+            gen = self.transformer.generate(**gen_kwargs)
             raw_imgs = self._decode_generated_batch(gen)
         sample_imgs = raw_imgs
         if sample_imgs.size(-2) != self.image_size or sample_imgs.size(-1) != self.image_size:
@@ -1885,9 +1910,12 @@ def main():
     parser.add_argument("--stage2_devices", type=int, default=2, help="Number of GPUs for Lightning stage-2 training.")
     parser.add_argument("--stage2_precision", type=str, default="32-true", help="Lightning precision, e.g. 32-true or 16-mixed.")
     parser.add_argument("--stage2_strategy", type=str, default="ddp_fork", choices=["ddp", "ddp_fork", "auto"])
+    parser.add_argument("--stage2_arch", type=str, default="flat", choices=["flat", "spatial_depth", "diffusion"],
+                        help="Prior architecture: flat, spatial_depth, or diffusion.")
     parser.add_argument("--tf_d_model", type=int, default=256)
     parser.add_argument("--tf_heads", type=int, default=8)
     parser.add_argument("--tf_layers", type=int, default=6)
+    parser.add_argument("--tf_depth_layers", type=int, default=4, help="Depth-stage layers (spatial_depth arch only).")
     parser.add_argument("--tf_ff", type=int, default=1024)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument(
@@ -2039,9 +2067,9 @@ def main():
             required=required,
         )
 
-    def _load_transformer_weights(transformer_model: Prior) -> Optional[str]:
-        last_path = os.path.join(stage2_dir, "transformer_last.pt")
-        best_path = os.path.join(stage2_dir, "transformer_best.pt")
+    def _load_transformer_weights(transformer_model, arch: str = "flat") -> Optional[str]:
+        last_path = os.path.join(stage2_dir, f"transformer_{arch}_last.pt")
+        best_path = os.path.join(stage2_dir, f"transformer_{arch}_best.pt")
         return _load_checkpoint(
             model=transformer_model,
             candidates=[last_path, best_path],
@@ -2092,26 +2120,58 @@ def main():
             num_workers=2,
         )
 
-        cfg = PriorConfig(
-            vocab_size=ae_model.bottleneck.vocab_size,
-            H=H,
-            W=W,
-            D=D,
-            predict_coefficients=not quantize_sparse_coeffs,
-            coeff_loss_weight=args.stage2_coeff_loss_weight,
-            coeff_max=args.coef_max,
-            d_model=args.tf_d_model,
-            n_heads=args.tf_heads,
-            n_layers=args.tf_layers,
-            d_ff=args.tf_ff,
-            dropout=args.tf_dropout,
-        )
-        transformer = Prior(
-            cfg,
-            bos_token_id=ae_model.bottleneck.bos_token_id,
-            pad_token_id=ae_model.bottleneck.pad_token_id,
-        )
-        _load_transformer_weights(transformer)
+        if args.stage2_arch == "spatial_depth":
+            from laser_transformer import SpatialDepthPrior, SpatialDepthPriorConfig
+            sd_cfg = SpatialDepthPriorConfig(
+                vocab_size=ae_model.bottleneck.vocab_size,
+                H=H,
+                W=W,
+                D=D,
+                d_model=args.tf_d_model,
+                n_heads=args.tf_heads,
+                n_spatial_layers=args.tf_layers,
+                n_depth_layers=args.tf_depth_layers,
+                d_ff=args.tf_ff,
+                dropout=args.tf_dropout,
+                coeff_max=args.coef_max,
+            )
+            transformer = SpatialDepthPrior(sd_cfg)
+        elif args.stage2_arch == "diffusion":
+            from laser_diffusion_prior import DiffusionPrior, DiffusionPriorConfig
+            diff_cfg = DiffusionPriorConfig(
+                vocab_size=ae_model.bottleneck.vocab_size,
+                H=H,
+                W=W,
+                D=D,
+                d_model=args.tf_d_model,
+                n_heads=args.tf_heads,
+                n_layers=args.tf_layers,
+                d_ff=args.tf_ff,
+                dropout=args.tf_dropout,
+                coeff_max=args.coef_max,
+            )
+            transformer = DiffusionPrior(diff_cfg)
+        else:
+            cfg = PriorConfig(
+                vocab_size=ae_model.bottleneck.vocab_size,
+                H=H,
+                W=W,
+                D=D,
+                predict_coefficients=not quantize_sparse_coeffs,
+                coeff_loss_weight=args.stage2_coeff_loss_weight,
+                coeff_max=args.coef_max,
+                d_model=args.tf_d_model,
+                n_heads=args.tf_heads,
+                n_layers=args.tf_layers,
+                d_ff=args.tf_ff,
+                dropout=args.tf_dropout,
+            )
+            transformer = Prior(
+                cfg,
+                bos_token_id=ae_model.bottleneck.bos_token_id,
+                pad_token_id=ae_model.bottleneck.pad_token_id,
+            )
+        _load_transformer_weights(transformer, arch=args.stage2_arch)
         module = Stage2Module(
             transformer=transformer,
             lr=args.stage2_lr,
@@ -2144,7 +2204,8 @@ def main():
 
         if args.stage2_devices > 1:
             from lightning.pytorch.strategies import DDPStrategy
-            effective_strategy = DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
+            needs_find_unused = args.stage2_arch == "diffusion"
+            effective_strategy = DDPStrategy(broadcast_buffers=False, find_unused_parameters=needs_find_unused)
         else:
             effective_strategy = "auto"
 
