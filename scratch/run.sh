@@ -43,19 +43,31 @@ if ! command -v singularity >/dev/null 2>&1; then
   exit 1
 fi
 
-# Set this to an existing container image on your cluster.
-# Good baseline image: PyTorch + CUDA matching your GPU drivers.
+# Container image can be:
+# 1) local path to .sif (recommended), or
+# 2) URI like docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+#
+# Default is a local .sif path.
 IMAGE="${IMAGE:-/scratch/$USER/containers/pytorch_24.02.sif}"
 
-if [[ ! -f "$IMAGE" ]]; then
-  echo "ERROR: container image not found: $IMAGE" >&2
-  echo "Set IMAGE=/path/to/your.sif before sbatch." >&2
-  exit 1
+if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* ]]; then
+  if [[ ! -f "$IMAGE" ]]; then
+    echo "ERROR: container image not found: $IMAGE" >&2
+    echo "Set IMAGE to an existing .sif path, or use a URI, e.g.:" >&2
+    echo "  IMAGE=docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime sbatch scratch/run.sh" >&2
+    echo "Or pre-pull once on login node:" >&2
+    echo "  mkdir -p /scratch/$USER/containers" >&2
+    echo "  singularity pull /scratch/$USER/containers/pytorch_24.02.sif \\" >&2
+    echo "    docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime" >&2
+    exit 1
+  fi
 fi
 
-PROJECT_DIR="/cache/home/$USER/Projects/laser"
-DATA_DIR="/scratch/$USER/data/celeba"
-OUT_DIR="/scratch/$USER/runs/laser_celeba_128"
+PROJECT_DIR="/sratch/$USER/Projects/laser"
+DATA_DIR="/scratch/$USER/Projects/data/celeba"
+OUT_DIR="/scratch/$USER/Projects/laser/scratch/runs/laser_celeba_128"
+
+nvidia-smi
 
 mkdir -p "$OUT_DIR"
 
