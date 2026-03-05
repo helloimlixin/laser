@@ -21,7 +21,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 STAGE1_DEVICES="${STAGE1_DEVICES:-4}"
 STAGE2_DEVICES="${STAGE2_DEVICES:-4}"
-STAGE1_STRATEGY="${STAGE1_STRATEGY:-auto}"
+STAGE1_STRATEGY="${STAGE1_STRATEGY:-ddp}"
 
 # Try to initialize environment modules if needed.
 if ! command -v module >/dev/null 2>&1; then
@@ -80,13 +80,12 @@ if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* 
   fi
 fi
 
-# SLURM may stage the script under /var/lib/slurm/...; do NOT derive paths from BASH_SOURCE.
-BASE_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-cd "$BASE_DIR"
+# Use current working directory (expected: scratch/).
+BASE_DIR="."
 
 # Accept overrides, but ensure all paths are absolute for singularity binds.
 # PROJECT_DIR should be the folder containing laser.py.
-PROJECT_DIR_INPUT="${PROJECT_DIR:-$BASE_DIR}"
+PROJECT_DIR_INPUT="${PROJECT_DIR:-.}"
 OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
 
 if [[ -n "${DATA_DIR:-}" ]]; then
