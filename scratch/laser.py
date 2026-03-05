@@ -1403,6 +1403,7 @@ class Stage2Module(pl.LightningModule):
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
+        coeff_norm_clip: float = 3.0,
     ):
         super().__init__()
         self.transformer = transformer
@@ -1419,6 +1420,7 @@ class Stage2Module(pl.LightningModule):
         self.coeff_loss_weight = float(coeff_loss_weight)
         self.coeff_mean = float(coeff_mean)
         self.coeff_std = max(float(coeff_std), 1e-8)
+        self.coeff_norm_clip = max(float(coeff_norm_clip), 1e-6)
         self.out_dir = out_dir
         self.laser = laser
         self.H, self.W, self.D = int(H), int(W), int(D)
@@ -1445,9 +1447,31 @@ class Stage2Module(pl.LightningModule):
         self._fid_metric = None
         self._fid_metric_feature = None
 
+        if (
+            self.use_sliding_window_sampling
+            and (self.is_spatial_depth or self.is_diffusion)
+            and self.sample_every_steps > 0
+        ):
+            print(
+                "[Stage2] disabling periodic sampling: sliding-window sampling is only "
+                "implemented for stage2_arch=flat."
+            )
+            self.sample_every_steps = 0
+
         self.laser.eval()
         for p in self.laser.parameters():
             p.requires_grad_(False)
+
+    def _postprocess_generated_coeffs(self, coeff_gen: torch.Tensor) -> torch.Tensor:
+        """Map generated normalized coefficients back to AE coefficient space safely."""
+        coeff_gen = coeff_gen.to(self.device, dtype=torch.float32)
+        coeff_gen = torch.nan_to_num(coeff_gen, nan=0.0, posinf=0.0, neginf=0.0)
+        coeff_gen = soft_clamp(coeff_gen, self.coeff_norm_clip)
+        coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
+        raw_clip = float(getattr(self.laser.bottleneck, "coef_max", 0.0))
+        if raw_clip > 0.0:
+            coeff_gen = coeff_gen.clamp(-raw_clip, raw_clip)
+        return spatial_smooth_coeffs(coeff_gen)
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.transformer.parameters(), lr=self.lr)
@@ -1619,16 +1643,14 @@ class Stage2Module(pl.LightningModule):
         if self.is_spatial_depth or self.is_diffusion:
             atom_ids, coeff_gen = gen
             atom_ids = atom_ids.view(-1, self.H, self.W, self.D).to(self.device)
-            coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
-            coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
-            coeff_gen = spatial_smooth_coeffs(coeff_gen)
+            coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D)
+            coeff_gen = self._postprocess_generated_coeffs(coeff_gen)
             return self.laser.decode(atom_ids, coeff_gen)
         if self.predict_coefficients:
             flat_gen, coeff_gen = gen
             atom_ids = flat_gen.view(-1, self.H, self.W, self.D).to(self.device)
-            coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
-            coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
-            coeff_gen = spatial_smooth_coeffs(coeff_gen)
+            coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D)
+            coeff_gen = self._postprocess_generated_coeffs(coeff_gen)
             return self.laser.decode(atom_ids, coeff_gen)
         tokens_gen = gen.view(-1, self.H, self.W, self.D)
         return self.laser.decode_tokens(tokens_gen.to(self.device))
@@ -1699,8 +1721,7 @@ class Stage2Module(pl.LightningModule):
 
         if self.predict_coefficients:
             atom_ids = generated.to(self.device)
-            coeffs_gen = coeffs_gen * self.coeff_std + self.coeff_mean
-            coeffs_gen = spatial_smooth_coeffs(coeffs_gen)
+            coeffs_gen = self._postprocess_generated_coeffs(coeffs_gen)
             return self.laser.decode(atom_ids, coeffs_gen)
         return self.laser.decode_tokens(generated.to(self.device))
 
@@ -1713,6 +1734,11 @@ class Stage2Module(pl.LightningModule):
             f"(batch_size={self.sample_batch_size}, output_size={self.image_size}x{self.image_size})..."
         )
         if self.use_sliding_window_sampling:
+            if self.is_spatial_depth or self.is_diffusion:
+                raise RuntimeError(
+                    "Sliding-window sampling currently supports only stage2_arch=flat. "
+                    "Use --stage2_arch flat or disable --stage2_sliding_window."
+                )
             print(
                 f"[Stage2] latent sliding-window sampling enabled "
                 f"(window={self.H}x{self.W}, full_latent={self.sample_latent_h}x{self.sample_latent_w})"
@@ -2013,6 +2039,12 @@ def main():
         default=1.0,
         help="Coefficient regression loss weight when using continuous coefficients.",
     )
+    parser.add_argument(
+        "--stage2_coeff_norm_clip",
+        type=float,
+        default=3.0,
+        help="Clamp generated normalized coefficients to [-clip, clip] before unnormalizing.",
+    )
     parser.add_argument("--token_subset", type=int, default=0, help="Use only first N tokens/images (0 = use all).")
     parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for stage-2 token precompute loader.")
     parser.add_argument("--force_retokenize", action="store_true", help="Recompute tokens even if cache exists.")
@@ -2039,6 +2071,13 @@ def main():
             raise ValueError("stage2_window_latent_h and stage2_window_latent_w must be positive.")
         if args.stage2_window_stride_latent <= 0:
             raise ValueError("stage2_window_stride_latent must be positive.")
+    if args.stage2_arch in {"spatial_depth", "diffusion"} and args.quantize_sparse_coeffs:
+        raise ValueError(
+            f"stage2_arch={args.stage2_arch} requires continuous atom/coeff pairs. "
+            "Use --no_quantize_sparse_coeffs."
+        )
+    if args.stage2_coeff_norm_clip <= 0:
+        raise ValueError(f"stage2_coeff_norm_clip must be positive, got {args.stage2_coeff_norm_clip}")
     if args.data_dir is None:
         args.data_dir = "../../data/celeba" if args.dataset == "celeba" else "./data"
     if args.out_dir is None:
@@ -2217,7 +2256,7 @@ def main():
                 n_depth_layers=args.tf_depth_layers,
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
-                coeff_max=args.coef_max,
+                coeff_max=args.stage2_coeff_norm_clip,
             )
             transformer = SpatialDepthPrior(sd_cfg)
         elif args.stage2_arch == "diffusion":
@@ -2232,7 +2271,7 @@ def main():
                 n_layers=args.tf_layers,
                 d_ff=args.tf_ff,
                 dropout=args.tf_dropout,
-                coeff_max=args.coef_max,
+                coeff_max=args.stage2_coeff_norm_clip,
             )
             transformer = DiffusionPrior(diff_cfg)
         else:
@@ -2243,7 +2282,7 @@ def main():
                 D=D,
                 predict_coefficients=not quantize_sparse_coeffs,
                 coeff_loss_weight=args.stage2_coeff_loss_weight,
-                coeff_max=args.coef_max,
+                coeff_max=args.stage2_coeff_norm_clip,
                 d_model=args.tf_d_model,
                 n_heads=args.tf_heads,
                 n_layers=args.tf_layers,
@@ -2284,6 +2323,7 @@ def main():
             coeff_loss_weight=args.stage2_coeff_loss_weight,
             coeff_mean=coeff_mean,
             coeff_std=coeff_std,
+            coeff_norm_clip=args.stage2_coeff_norm_clip,
         )
 
         if args.stage2_devices > 1:
@@ -2483,6 +2523,14 @@ def main():
             cache = torch.load(token_cache_path, map_location="cpu", weights_only=False)
         except TypeError:
             cache = torch.load(token_cache_path, map_location="cpu")
+        cache_quantized = bool(cache.get("quantize_sparse_coeffs", True))
+        if cache_quantized != bool(args.quantize_sparse_coeffs):
+            raise ValueError(
+                "Token cache quantization mode does not match current run "
+                f"(cache quantize_sparse_coeffs={cache_quantized}, "
+                f"args quantize_sparse_coeffs={args.quantize_sparse_coeffs}). "
+                "Re-run with --force_retokenize."
+            )
         tokens_flat = cache["tokens_flat"]
         coeffs_flat = cache.get("coeffs_flat")
         fid_real_images = cache.get("fid_real_images")
