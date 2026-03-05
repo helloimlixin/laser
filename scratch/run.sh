@@ -14,6 +14,14 @@
 
 set -euo pipefail
 
+export PYTHONUNBUFFERED=1
+export NCCL_DEBUG=INFO
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export NCCL_ASYNC_ERROR_HANDLING=1
+
+STAGE1_DEVICES="${STAGE1_DEVICES:-4}"
+STAGE2_DEVICES="${STAGE2_DEVICES:-4}"
+
 # Try to initialize environment modules if needed.
 if ! command -v module >/dev/null 2>&1; then
   if [[ -f /etc/profile.d/modules.sh ]]; then
@@ -145,6 +153,8 @@ echo "DATA_DIR=$DATA_DIR"
 echo "OUT_DIR=$OUT_DIR"
 echo "IMAGE=$IMAGE"
 echo "BASE_DIR=$BASE_DIR"
+echo "STAGE1_DEVICES=$STAGE1_DEVICES"
+echo "STAGE2_DEVICES=$STAGE2_DEVICES"
 
 srun singularity exec --nv \
   --bind "$PROJECT_DIR" \
@@ -152,13 +162,13 @@ srun singularity exec --nv \
   --bind "$DATA_BIND_DIR" \
   --bind "$OUT_BIND_DIR" \
   "$IMAGE" \
-  python3 "$PROJECT_DIR/laser.py" \
+  python3 -u "$PROJECT_DIR/laser.py" \
   --dataset celeba \
   --data_dir "$DATA_DIR" \
   --image_size 128 \
   --out_dir "$OUT_DIR" \
-  --stage1_devices 4 \
-  --stage2_devices 4 \
+  --stage1_devices "$STAGE1_DEVICES" \
+  --stage2_devices "$STAGE2_DEVICES" \
   --stage1_strategy ddp \
   --stage2_arch spatial_depth \
   --no_quantize_sparse_coeffs
