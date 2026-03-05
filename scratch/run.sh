@@ -14,13 +14,40 @@
 
 set -euo pipefail
 
-cd /scratch/$USER/laser
+# If your cluster exposes Singularity via modules, uncomment:
+# module load singularity
 
-srun python3 scratch/laser.py \
+if ! command -v singularity >/dev/null 2>&1; then
+  echo "ERROR: singularity not found on PATH." >&2
+  echo "Load the proper module, then re-submit (e.g. module load singularity)." >&2
+  exit 1
+fi
+
+# Set this to an existing container image on your cluster.
+# Good baseline image: PyTorch + CUDA matching your GPU drivers.
+IMAGE="${IMAGE:-/scratch/$USER/containers/pytorch_24.02.sif}"
+
+if [[ ! -f "$IMAGE" ]]; then
+  echo "ERROR: container image not found: $IMAGE" >&2
+  echo "Set IMAGE=/path/to/your.sif before sbatch." >&2
+  exit 1
+fi
+
+PROJECT_DIR="/cache/home/$USER/Projects/laser"
+DATA_DIR="/scratch/$USER/data/celeba"
+OUT_DIR="/scratch/$USER/runs/laser_celeba_128"
+
+mkdir -p "$OUT_DIR"
+
+srun singularity exec --nv \
+  --bind "$PROJECT_DIR":"$PROJECT_DIR" \
+  --bind "/scratch/$USER":"/scratch/$USER" \
+  "$IMAGE" \
+  python3 "$PROJECT_DIR/scratch/laser.py" \
   --dataset celeba \
-  --data_dir /scratch/$USER/data/celeba \
+  --data_dir "$DATA_DIR" \
   --image_size 128 \
-  --out_dir /scratch/$USER/runs/laser_celeba_128 \
+  --out_dir "$OUT_DIR" \
   --stage1_devices 4 \
   --stage2_devices 4 \
   --stage1_strategy ddp \
