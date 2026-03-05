@@ -14,12 +14,32 @@
 
 set -euo pipefail
 
-# If your cluster exposes Singularity via modules, uncomment:
-# module load singularity
+# Try to initialize environment modules if needed.
+if ! command -v module >/dev/null 2>&1; then
+  if [[ -f /etc/profile.d/modules.sh ]]; then
+    # shellcheck disable=SC1091
+    source /etc/profile.d/modules.sh
+  elif [[ -f /usr/share/Modules/init/bash ]]; then
+    # shellcheck disable=SC1091
+    source /usr/share/Modules/init/bash
+  fi
+fi
+
+# Ensure singularity is available; if not, try common module names.
+if ! command -v singularity >/dev/null 2>&1; then
+  if command -v module >/dev/null 2>&1; then
+    module load singularity 2>/dev/null || true
+    module load singularityce 2>/dev/null || true
+    module load singularity-ce 2>/dev/null || true
+  fi
+fi
 
 if ! command -v singularity >/dev/null 2>&1; then
-  echo "ERROR: singularity not found on PATH." >&2
-  echo "Load the proper module, then re-submit (e.g. module load singularity)." >&2
+  echo "ERROR: singularity not found on PATH after module init/load attempts." >&2
+  echo "Try one of these in an interactive shell, then resubmit:" >&2
+  echo "  module load singularity" >&2
+  echo "  module load singularityce" >&2
+  echo "  module load singularity-ce" >&2
   exit 1
 fi
 
