@@ -82,6 +82,7 @@ fi
 
 # SLURM may stage the script under /var/lib/slurm/...; do NOT derive paths from BASH_SOURCE.
 BASE_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+cd "$BASE_DIR"
 
 # Accept overrides, but ensure all paths are absolute for singularity binds.
 # PROJECT_DIR should be the folder containing laser.py.
@@ -91,7 +92,7 @@ OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
 if [[ -n "${DATA_DIR:-}" ]]; then
   DATA_DIR_INPUT="$DATA_DIR"
 else
-  DATA_DIR_INPUT="/scratch/$USER/Projects/data/celeba"
+  DATA_DIR_INPUT="$BASE_DIR/../../data/celeba"
 fi
 
 if [[ "$PROJECT_DIR_INPUT" != /* ]]; then
@@ -122,13 +123,14 @@ fi
 
 if [[ ! -d "$DATA_DIR" ]]; then
   for cand in \
+    "$BASE_DIR/../../data/celeba" \
+    "$BASE_DIR/../data/celeba" \
     "/scratch/$USER/Projects/data/celeba" \
     "/scratch/$USER/Projects/data/CelebA" \
     "/scratch/$USER/Projects/data/img_align_celeba" \
     "/scratch/$USER/data/celeba" \
     "/scratch/$USER/data/CelebA" \
-    "/scratch/$USER/data/img_align_celeba" \
-    "../../data/celeba"
+    "/scratch/$USER/data/img_align_celeba"
   do
     if [[ -d "$cand" ]]; then
       DATA_DIR="$cand"
@@ -168,6 +170,7 @@ echo "DATA_DIR=$DATA_DIR"
 echo "OUT_DIR=$OUT_DIR"
 echo "IMAGE=$IMAGE"
 echo "BASE_DIR=$BASE_DIR"
+echo "PWD=$PWD"
 echo "STAGE1_DEVICES=$STAGE1_DEVICES"
 echo "STAGE2_DEVICES=$STAGE2_DEVICES"
 echo "STAGE1_STRATEGY=$STAGE1_STRATEGY"
