@@ -77,8 +77,25 @@ BASE_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 # Accept overrides, but ensure all paths are absolute for singularity binds.
 # PROJECT_DIR should be the folder containing laser.py.
 PROJECT_DIR_INPUT="${PROJECT_DIR:-$BASE_DIR}"
-DATA_DIR_INPUT="${DATA_DIR:-/scratch/$USER/data/celeba}"
 OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
+
+if [[ -n "${DATA_DIR:-}" ]]; then
+  DATA_DIR_INPUT="$DATA_DIR"
+else
+  DATA_DIR_INPUT=""
+  for cand in \
+    "/scratch/$USER/Projects/data/celeba" \
+    "$BASE_DIR/../../data/celeba"
+  do
+    if [[ -d "$cand" ]]; then
+      DATA_DIR_INPUT="$cand"
+      break
+    fi
+  done
+  if [[ -z "$DATA_DIR_INPUT" ]]; then
+    DATA_DIR_INPUT="/scratch/$USER/Projects/data/celeba"
+  fi
+fi
 
 if [[ "$PROJECT_DIR_INPUT" != /* ]]; then
   PROJECT_DIR_INPUT="$BASE_DIR/$PROJECT_DIR_INPUT"
@@ -103,6 +120,13 @@ if [[ ! -f "$PROJECT_DIR/laser.py" ]]; then
   echo "ERROR: laser.py not found under PROJECT_DIR: $PROJECT_DIR" >&2
   echo "Set PROJECT_DIR to your scratch source folder, e.g.:" >&2
   echo "  PROJECT_DIR=/cache/home/$USER/Projects/laser/scratch sbatch scratch/run.sh" >&2
+  exit 1
+fi
+
+if [[ ! -d "$DATA_DIR" ]]; then
+  echo "ERROR: DATA_DIR does not exist: $DATA_DIR" >&2
+  echo "Set DATA_DIR explicitly, e.g.:" >&2
+  echo "  DATA_DIR=/scratch/$USER/Projects/data/celeba sbatch scratch/run.sh" >&2
   exit 1
 fi
 
