@@ -876,15 +876,6 @@ class RQTransformerPrior(nn.Module):
         ids = torch.multinomial(F.softmax(flat, dim=-1), 1).squeeze(-1)
         return ids.reshape(orig_shape)
 
-    @staticmethod
-    def _top_k(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
-        if not k or k <= 0:
-            return logits
-        v, ix = torch.topk(logits, min(int(k), logits.size(-1)), dim=-1)
-        out = torch.full_like(logits, float("-inf"))
-        out.scatter_(-1, ix, v)
-        return out
-
     def _fuse_spatial_context(
         self, tok_emb: torch.Tensor, coeff_emb: torch.Tensor,
     ) -> torch.Tensor:
@@ -952,48 +943,58 @@ class RQTransformerPrior(nn.Module):
         tok_bt = tok.view(bt, D)
         tok_emb = self.token_emb(tok_bt)
         coeff_bt = coeffs.reshape(bt, D)
-        coeff_teacher_depth = self._coeff_pair_to_embed(tok_emb, coeff_bt)
-        depth_steps = 2 * D
         depth_pos = self.depth_emb(
             torch.arange(D, device=device, dtype=torch.long),
         )
-        depth_pos = (
-            depth_pos.unsqueeze(1).expand(D, 2, d_model).reshape(depth_steps, d_model)
+        depth_pos_steps = (
+            depth_pos.unsqueeze(1).expand(D, 2, d_model).reshape(2 * D, d_model)
         )
-        depth_types = torch.tensor([0, 1], dtype=torch.long, device=device)
-        depth_type = self.depth_type_emb(depth_types).repeat(D, 1)
-
-        depth_content = torch.zeros(bt, depth_steps, d_model, device=device)
-        depth_content[:, 0, :] = h_t
-        if D > 1:
-            depth_content[:, 2::2, :] = coeff_teacher_depth[:, :-1, :]
-        depth_content[:, 1::2, :] = tok_emb
-        pos_type_bias = depth_pos.unsqueeze(0) + depth_type.unsqueeze(0)
-        depth_in = depth_content + pos_type_bias
-
-        depth_h = self.drop(depth_in)
-        depth_h = self._run_no_cache_blocks(depth_h, self.depth_blocks)
-        depth_h = self.depth_ln(depth_h)
-        atom_logits_bt = self.atom_head(depth_h[:, 0::2, :])
+        depth_type = self.depth_type_emb(
+            torch.tensor([0, 1], dtype=torch.long, device=device),
+        )
 
         token_slots = torch.zeros(bt, D, d_model, device=device)
         coeff_slots = torch.zeros(bt, D, d_model, device=device)
+        atom_logits_list: list[torch.Tensor] = []
         coeff_logits_list: list[torch.Tensor] = []
+        depth_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
+            None
+        ] * len(self.depth_blocks)
         fb_temp = max(float(self.cfg.feedback_temperature), 1e-8)
 
-        for d in range(D):
-            # Coeff logits for depth d come from the coeff-typed slot (2*d + 1).
-            z_last = depth_h[:, 2 * d + 1, :]
-            tok_teacher = tok_emb[:, d, :]
-            if self.cfg.use_pred_atom_feedback:
-                tok_pred_ids = self._sample_or_argmax(
-                    atom_logits_bt[:, d, :],
-                    temperature=fb_temp,
-                )
-                tok_cur = self.token_emb(tok_pred_ids)
+        # Roll through depth steps autoregressively, mirroring generate().
+        for step in range(2 * D):
+            d = step // 2
+            is_atom_step = (step % 2 == 0)
+            if is_atom_step:
+                depth_x = h_t if d == 0 else coeff_slots[:, d - 1, :]
             else:
-                tok_cur = tok_teacher
-            token_slots[:, d, :] = tok_cur
+                tok_teacher = tok_emb[:, d, :]
+                if self.cfg.use_pred_atom_feedback:
+                    tok_pred_ids = self._sample_or_argmax(
+                        atom_logits_list[d],
+                        temperature=fb_temp,
+                    )
+                    tok_cur = self.token_emb(tok_pred_ids)
+                else:
+                    tok_cur = tok_teacher
+                token_slots[:, d, :] = tok_cur
+                depth_x = tok_cur
+
+            depth_h = (
+                depth_x
+                + depth_pos_steps[step]
+                + depth_type[0 if is_atom_step else 1]
+            ).unsqueeze(1)
+            depth_h = self.drop(depth_h)
+            for i, blk in enumerate(self.depth_blocks):
+                depth_h, depth_kv[i] = blk(depth_h, kv_cache=depth_kv[i])
+            z_last = self.depth_ln(depth_h)[:, 0, :]
+
+            if is_atom_step:
+                atom_logits_list.append(self.atom_head(z_last))
+                continue
+
             combined_h = torch.cat([
                 h_t,
                 z_last,
@@ -1010,9 +1011,10 @@ class RQTransformerPrior(nn.Module):
                 else coeff_bt[:, d]
             )
             coeff_slots[:, d, :] = self._coeff_pair_to_embed(
-                tok_cur, coeff_feedback,
+                token_slots[:, d, :], coeff_feedback,
             )
 
+        atom_logits_bt = torch.stack(atom_logits_list, dim=1)
         atom_logits = atom_logits_bt.view(B, T, D, self.cfg.vocab_size)
         coeff_logits = torch.stack(coeff_logits_list, dim=1).view(
             B, T, D, self.cfg.n_coeff_bins,
@@ -1070,7 +1072,6 @@ class RQTransformerPrior(nn.Module):
         self,
         batch_size: int,
         temperature: float = 1.0,
-        top_k: Optional[int] = None,
         class_ids: Optional[torch.Tensor] = None,
         show_progress: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1078,7 +1079,6 @@ class RQTransformerPrior(nn.Module):
         T = self.positions_per_image
         D = self.cfg.D
         d_model = self.cfg.d_model
-        _ = top_k  # Top-k truncation is intentionally disabled for sampling.
 
         class_bias = self._class_bias(class_ids, batch_size, device)
         spatial_pos = self._spatial_pos(T, device)
@@ -1410,7 +1410,6 @@ class Stage2Module(pl.LightningModule):
         sample_every_steps: int = 200,
         sample_batch_size: int = 8,
         sample_temperature: float = 0.8,
-        sample_top_k: int = 0,
         direct_coeff_loss_weight: float = 0.25,
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
@@ -1427,8 +1426,6 @@ class Stage2Module(pl.LightningModule):
         self.sample_every_steps = sample_every_steps
         self.sample_batch_size = sample_batch_size
         self.sample_temperature = max(sample_temperature, 1e-8)
-        _ = sample_top_k  # Sampling always uses full-support distributions.
-        self.sample_top_k = None
         self.direct_coeff_loss_weight = direct_coeff_loss_weight
         self.lr_schedule = lr_schedule
         self.warmup_epochs = warmup_epochs
@@ -1636,7 +1633,6 @@ class Stage2Module(pl.LightningModule):
         tokens, coeffs = self.transformer.generate(
             self.sample_batch_size,
             temperature=self.sample_temperature,
-            top_k=self.sample_top_k,
             class_ids=class_ids,
             show_progress=True,
         )
@@ -1893,7 +1889,6 @@ def _add_stage2_args(parser: argparse.ArgumentParser) -> None:
         ("--stage2_sample_every_steps", int, 200),
         ("--stage2_sample_batch_size", int, 64),
         ("--stage2_sample_temperature", float, 0.8),
-        ("--stage2_sample_top_k", int, 0),
         ("--stage2_sample_image_size", int, 256),
     ))
     add(
@@ -2378,7 +2373,6 @@ def main():
             sample_every_steps=args.stage2_sample_every_steps,
             sample_batch_size=args.stage2_sample_batch_size,
             sample_temperature=args.stage2_sample_temperature,
-            sample_top_k=args.stage2_sample_top_k,
             direct_coeff_loss_weight=args.stage2_direct_coeff_loss_weight,
             lr_schedule=args.stage2_lr_schedule,
             warmup_epochs=args.stage2_warmup_epochs,

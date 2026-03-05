@@ -160,6 +160,12 @@ class MinGPT(nn.Module):
         type_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, KVCache]:
         past_len = kv_cache[0][0].size(2) if kv_cache else 0
+        if past_len + idx.size(1) > self.block_size:
+            raise ValueError(
+                f"Sequence length exceeds block_size: "
+                f"past_len={past_len}, step_len={idx.size(1)}, "
+                f"block_size={self.block_size}",
+            )
         x = self._embed(idx, class_idx, past_len, type_ids=type_ids)
         new_cache: KVCache = []
         for i, block in enumerate(self.blocks):
@@ -167,35 +173,40 @@ class MinGPT(nn.Module):
             new_cache.append(kv)
         return self.head(self.ln_f(x)), new_cache
 
-    @staticmethod
-    def _top_k(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
-        if not k or k <= 0:
-            return logits
-        v, ix = torch.topk(logits, min(k, logits.size(-1)), dim=-1)
-        out = torch.full_like(logits, float("-inf"))
-        out.scatter_(-1, ix, v)
-        return out
-
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, class_idx=None,
-                 temperature=1.0, top_k=None):
+                 temperature=1.0):
+        was_training = self.training
         self.eval()
-        B = idx.size(0)
-        _ = top_k  # Top-k truncation is intentionally disabled for sampling.
-        prompt = idx[:, -self.block_size:]
-        P = prompt.size(1)
-        out = torch.empty(B, P + max_new_tokens, dtype=idx.dtype, device=idx.device)
-        out[:, :P] = prompt
-        logits, cache = self.forward_step(prompt, class_idx=class_idx)
-        for step in range(max_new_tokens):
-            logits = logits[:, -1, :] / max(temperature, 1e-8)
-            tok = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
-            out[:, P + step] = tok
-            if step + 1 < max_new_tokens:
-                logits, cache = self.forward_step(
-                    tok.unsqueeze(1), class_idx=class_idx, kv_cache=cache,
+        try:
+            B = idx.size(0)
+            prompt = idx[:, -self.block_size:]
+            P = prompt.size(1)
+            # With KV cache we can advance by at most block_size - P + 1 steps.
+            if P + max_new_tokens - 1 > self.block_size:
+                raise ValueError(
+                    f"Requested generation exceeds context window: "
+                    f"prompt_len={P}, max_new_tokens={max_new_tokens}, "
+                    f"block_size={self.block_size}",
                 )
-        return out
+            out = torch.empty(
+                B, P + max_new_tokens, dtype=idx.dtype, device=idx.device,
+            )
+            out[:, :P] = prompt
+            logits, cache = self.forward_step(prompt, class_idx=class_idx)
+            temp = max(float(temperature), 1e-8)
+            for step in range(max_new_tokens):
+                step_logits = logits[:, -1, :] / temp
+                tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
+                out[:, P + step] = tok
+                if step + 1 < max_new_tokens:
+                    logits, cache = self.forward_step(
+                        tok.unsqueeze(1), class_idx=class_idx, kv_cache=cache,
+                    )
+            return out
+        finally:
+            if was_training:
+                self.train()
 
 
 # ---------------------------------------------------------------------------
@@ -329,10 +340,16 @@ class MinGPTSparse(nn.Module):
 
         atom_mask = self._type_ids == 0
         coeff_mask = ~atom_mask
-        atom_logits = logits[:, atom_mask, :].reshape(-1, self.gpt.vocab_size)
-        coeff_logits = logits[:, coeff_mask, :].reshape(-1, self.gpt.vocab_size)
+        lo = self.coeff_offset
+        hi = self.coeff_offset + self.cfg.n_coeff_bins
+
+        # Train each slot type only on its valid token range, matching sampler masking.
+        atom_logits = logits[:, atom_mask, :self.cfg.vocab_size].reshape(
+            -1, self.cfg.vocab_size,
+        )
+        coeff_logits = logits[:, coeff_mask, lo:hi].reshape(-1, self.cfg.n_coeff_bins)
         atom_targets = target[:, atom_mask].reshape(-1)
-        coeff_targets = target[:, coeff_mask].reshape(-1)
+        coeff_targets = (target[:, coeff_mask] - lo).reshape(-1)
 
         atom_loss = F.cross_entropy(atom_logits, atom_targets)
         coeff_loss = F.cross_entropy(coeff_logits, coeff_targets)
@@ -342,46 +359,54 @@ class MinGPTSparse(nn.Module):
     @torch.no_grad()
     def generate(
         self, batch_size: int, temperature: float = 1.0,
-        top_k: Optional[int] = None, class_ids: Optional[torch.Tensor] = None,
-        show_progress: bool = False, **_kw,
+        class_ids: Optional[torch.Tensor] = None,
+        show_progress: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Type-aware autoregressive sampling with temperature."""
-        device = next(self.parameters()).device
-        _ = top_k  # Top-k truncation is intentionally disabled for sampling.
-        cls = class_ids.long().to(device) if class_ids is not None else None
-        bos = torch.full((batch_size, 1), self.bos_token,
-                         dtype=torch.long, device=device)
-        seq = torch.zeros(batch_size, self.seq_len, dtype=torch.long, device=device)
-        bos_type = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-        logits, cache = self.gpt.forward_step(bos, class_idx=cls, type_ids=bos_type)
-
-        steps = tqdm(
-            range(self.seq_len),
-            desc="sampling",
-            leave=False,
-            disable=(not show_progress),
-        )
-        for step in steps:
-            step_logits = self._mask_logits_by_slot(
-                logits[:, -1, :] / max(float(temperature), 1e-8),
-                step,
+        was_training = self.training
+        self.eval()
+        try:
+            device = next(self.parameters()).device
+            cls = class_ids.long().to(device) if class_ids is not None else None
+            bos = torch.full((batch_size, 1), self.bos_token,
+                             dtype=torch.long, device=device)
+            seq = torch.zeros(batch_size, self.seq_len, dtype=torch.long, device=device)
+            bos_type = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+            logits, cache = self.gpt.forward_step(
+                bos, class_idx=cls, type_ids=bos_type,
             )
-            tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
-            seq[:, step] = tok
-            if step + 1 < self.seq_len:
-                # The token we feed now is seq[:, step], so use that slot's type.
-                step_type = self._type_ids[step : step + 1].unsqueeze(0).expand(
-                    batch_size, -1,
-                )
-                logits, cache = self.gpt.forward_step(
-                    tok.unsqueeze(1), class_idx=cls, kv_cache=cache,
-                    type_ids=step_type,
-                )
+            temp = max(float(temperature), 1e-8)
 
-        atoms = seq[:, 0::2]
-        cbins = seq[:, 1::2] - self.coeff_offset
-        coeffs = self.quantizer.decode(cbins).contiguous().view(batch_size, -1)
-        return atoms, coeffs
+            steps = tqdm(
+                range(self.seq_len),
+                desc="sampling",
+                leave=False,
+                disable=(not show_progress),
+            )
+            for step in steps:
+                step_logits = self._mask_logits_by_slot(
+                    logits[:, -1, :] / temp,
+                    step,
+                )
+                tok = torch.multinomial(F.softmax(step_logits, dim=-1), 1).squeeze(-1)
+                seq[:, step] = tok
+                if step + 1 < self.seq_len:
+                    # The token we feed now is seq[:, step], so use that slot's type.
+                    step_type = self._type_ids[step : step + 1].unsqueeze(0).expand(
+                        batch_size, -1,
+                    )
+                    logits, cache = self.gpt.forward_step(
+                        tok.unsqueeze(1), class_idx=cls, kv_cache=cache,
+                        type_ids=step_type,
+                    )
+
+            atoms = seq[:, 0::2]
+            cbins = seq[:, 1::2] - self.coeff_offset
+            coeffs = self.quantizer.decode(cbins).contiguous().view(batch_size, -1)
+            return atoms, coeffs
+        finally:
+            if was_training:
+                self.train()
 
 
 # Backward-compat aliases.
