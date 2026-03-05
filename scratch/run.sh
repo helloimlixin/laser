@@ -71,21 +71,23 @@ if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* 
   fi
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SLURM may stage the script under /var/lib/slurm/...; do NOT derive paths from BASH_SOURCE.
+BASE_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 
 # Accept overrides, but ensure all paths are absolute for singularity binds.
-PROJECT_DIR_INPUT="${PROJECT_DIR:-$SCRIPT_DIR}"
-DATA_DIR_INPUT="${DATA_DIR:-$SCRIPT_DIR/../../data/celeba}"
-OUT_DIR_INPUT="${OUT_DIR:-$SCRIPT_DIR/runs/laser_celeba_128}"
+# PROJECT_DIR should be the folder containing laser.py.
+PROJECT_DIR_INPUT="${PROJECT_DIR:-$BASE_DIR}"
+DATA_DIR_INPUT="${DATA_DIR:-/scratch/$USER/data/celeba}"
+OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
 
 if [[ "$PROJECT_DIR_INPUT" != /* ]]; then
-  PROJECT_DIR_INPUT="$SCRIPT_DIR/$PROJECT_DIR_INPUT"
+  PROJECT_DIR_INPUT="$BASE_DIR/$PROJECT_DIR_INPUT"
 fi
 if [[ "$DATA_DIR_INPUT" != /* ]]; then
-  DATA_DIR_INPUT="$SCRIPT_DIR/$DATA_DIR_INPUT"
+  DATA_DIR_INPUT="$BASE_DIR/$DATA_DIR_INPUT"
 fi
 if [[ "$OUT_DIR_INPUT" != /* ]]; then
-  OUT_DIR_INPUT="$SCRIPT_DIR/$OUT_DIR_INPUT"
+  OUT_DIR_INPUT="$BASE_DIR/$OUT_DIR_INPUT"
 fi
 
 if [[ ! -d "$PROJECT_DIR_INPUT" ]]; then
@@ -96,6 +98,13 @@ fi
 PROJECT_DIR="$(cd "$PROJECT_DIR_INPUT" && pwd)"
 DATA_DIR="$DATA_DIR_INPUT"
 OUT_DIR="$OUT_DIR_INPUT"
+
+if [[ ! -f "$PROJECT_DIR/laser.py" ]]; then
+  echo "ERROR: laser.py not found under PROJECT_DIR: $PROJECT_DIR" >&2
+  echo "Set PROJECT_DIR to your scratch source folder, e.g.:" >&2
+  echo "  PROJECT_DIR=/cache/home/$USER/Projects/laser/scratch sbatch scratch/run.sh" >&2
+  exit 1
+fi
 
 nvidia-smi
 
@@ -111,6 +120,7 @@ echo "PROJECT_DIR=$PROJECT_DIR"
 echo "DATA_DIR=$DATA_DIR"
 echo "OUT_DIR=$OUT_DIR"
 echo "IMAGE=$IMAGE"
+echo "BASE_DIR=$BASE_DIR"
 
 srun singularity exec --nv \
   --bind "$PROJECT_DIR" \
