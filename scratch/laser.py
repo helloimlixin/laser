@@ -250,11 +250,14 @@ class SparseBottleneck(nn.Module):
         coef_mu: float = 50.0,
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
+        latent_patch_size: int = 1,
     ):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         self.sparsity_level = int(sparsity_level)
+        self.latent_patch_size = int(latent_patch_size)
+        self.signal_dim = self.embedding_dim * self.latent_patch_size ** 2
         self.n_bins = int(n_bins)
         self.coef_max = float(coef_max)
         self.quantize_sparse_coeffs = bool(quantize_sparse_coeffs)
@@ -266,11 +269,13 @@ class SparseBottleneck(nn.Module):
             )
         if self.coef_mu <= 0.0:
             raise ValueError(f"coef_mu must be > 0, got {self.coef_mu}")
+        if self.latent_patch_size < 1:
+            raise ValueError(f"latent_patch_size must be >= 1, got {self.latent_patch_size}")
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
 
-        # Dictionary shape [C, K] (matches LASER)
-        self.dictionary = nn.Parameter(torch.randn(self.embedding_dim, self.num_embeddings) * 0.02)
+        # Dictionary shape [signal_dim, K].  signal_dim = C * P * P.
+        self.dictionary = nn.Parameter(torch.randn(self.signal_dim, self.num_embeddings) * 0.02)
 
         # Coefficient bin centers (uniform)
         centers = torch.linspace(-self.coef_max, self.coef_max, steps=self.n_bins)
@@ -323,14 +328,35 @@ class SparseBottleneck(nn.Module):
         decoded_norm = torch.sign(z) * (torch.expm1(z_abs / self.coef_mu_invlog1p) / self.coef_mu)
         return decoded_norm * self.coef_max
 
+    def _to_patches(self, z: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
+        """[B, C, H, W] -> [B*pH*pW, C*P*P] and return (signals, pH, pW)."""
+        B, C, H, W = z.shape
+        P = self.latent_patch_size
+        if P == 1:
+            return z.permute(0, 2, 3, 1).reshape(-1, C), H, W
+        pH, pW = H // P, W // P
+        z = z.reshape(B, C, pH, P, pW, P)
+        z = z.permute(0, 2, 4, 1, 3, 5).contiguous()
+        return z.reshape(B * pH * pW, C * P * P), pH, pW
+
+    def _from_patches(self, flat: torch.Tensor, B: int, pH: int, pW: int) -> torch.Tensor:
+        """[B*pH*pW, C*P*P] -> [B, C, H, W]."""
+        P = self.latent_patch_size
+        C = self.embedding_dim
+        if P == 1:
+            return flat.view(B, pH, pW, C).permute(0, 3, 1, 2).contiguous()
+        z = flat.view(B, pH, pW, C, P, P)
+        z = z.permute(0, 3, 1, 4, 2, 5).contiguous()
+        return z.reshape(B, C, pH * P, pW * P)
+
     def _encode(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run OMP and return support code ids and continuous coefficients."""
         B, C, H, W = z_e.shape
-        n_signals = B * H * W
-        signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
+        signals, pH, pW = self._to_patches(z_e)
+        n_signals = signals.size(0)
         dictionary = self._norm_dict()
         with torch.no_grad():
-            support, coeffs = self.omp(signals, dictionary)
+            support, coeffs = self.omp(signals.t(), dictionary)
         if support.ndim != 2 or coeffs.ndim != 2:
             raise RuntimeError(
                 f"OMP returned invalid rank: support={tuple(support.shape)} coeffs={tuple(coeffs.shape)}"
@@ -340,7 +366,6 @@ class SparseBottleneck(nn.Module):
                 f"OMP returned invalid batch size: expected {n_signals}, "
                 f"got support={support.size(0)} coeffs={coeffs.size(0)}"
             )
-        # Defensive shape guard: keep a fixed D stack even if OMP exits short due to numerical edge cases.
         if support.size(1) != self.sparsity_level or coeffs.size(1) != self.sparsity_level:
             cur_d = min(support.size(1), coeffs.size(1))
             if cur_d > 0:
@@ -356,31 +381,32 @@ class SparseBottleneck(nn.Module):
                 support = torch.cat([support, support_pad], dim=1)
                 coeffs = torch.cat([coeffs, coeffs_pad], dim=1)
         return (
-            support.view(B, H, W, self.sparsity_level),
-            coeffs.view(B, H, W, self.sparsity_level),
+            support.view(B, pH, pW, self.sparsity_level),
+            coeffs.view(B, pH, pW, self.sparsity_level),
         )
 
     def _decode(
         self, support: torch.Tensor, coeffs: torch.Tensor
     ) -> torch.Tensor:
-        """Reconstruct latent map from code ids + coefficients."""
+        """Reconstruct latent map from code ids + coefficients.
+        support/coeffs: [B, pH, pW, D] where pH, pW are patch-grid dims."""
         if support.shape != coeffs.shape:
             raise ValueError(
                 f"support and coeffs shape mismatch: {support.shape} vs {coeffs.shape}"
             )
 
-        B, H, W, D = support.shape
+        B, pH, pW, D = support.shape
         if D != self.sparsity_level:
             raise ValueError(f"Expected D={self.sparsity_level}, got {D}")
 
-        dictionary = self._norm_dict().t()  # [num_embeddings, C]
+        dictionary = self._norm_dict().t()  # [num_embeddings, signal_dim]
         support = support.to(torch.long)
         coeffs = coeffs.to(dictionary.dtype)
         support_flat = support.reshape(-1, D)
         coeffs_flat = coeffs.reshape(-1, D)
-        code_vectors = dictionary[support_flat]  # [B*H*W, D, C]
-        recon_flat = (code_vectors * coeffs_flat.unsqueeze(-1)).sum(dim=1)  # [N, C]
-        return recon_flat.view(B, H, W, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
+        code_vectors = dictionary[support_flat]  # [N, D, signal_dim]
+        recon_flat = (code_vectors * coeffs_flat.unsqueeze(-1)).sum(dim=1)  # [N, signal_dim]
+        return self._from_patches(recon_flat, B, pH, pW)
 
     def omp(self, X: torch.Tensor, D: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -458,7 +484,7 @@ class SparseBottleneck(nn.Module):
         Returns:
             z_q_ste: [B, C, H, W]
             loss: scalar bottleneck loss
-            tokens: [B, H, W, D] (D=sparsity_level)
+            tokens: [B, pH, pW, D] where pH=H/P, pW=W/P
         """
         if z_e.dim() != 4:
             raise ValueError(f"Expected [B,C,H,W], got {tuple(z_e.shape)}")
@@ -467,28 +493,25 @@ class SparseBottleneck(nn.Module):
             raise ValueError(f"Expected channel dim {self.embedding_dim}, got {C}")
 
         support, coeffs = self._encode(z_e)
+        pH, pW = support.shape[1], support.shape[2]
         support_flat = support.view(-1, self.sparsity_level)
         coeffs_flat = coeffs.view(-1, self.sparsity_level)
 
         if self.quantize_sparse_coeffs:
-            # Quantize coefficients (Option A)
-            bin_idx, coeff_q = self._quantize_coeff(coeffs_flat)  # both [Nsig, D]
-            # Tokens: [Nsig, D] -> [B,H,W,D]
-            tokens = (support_flat * self.n_bins + bin_idx).view(B, H, W, self.sparsity_level)
+            bin_idx, coeff_q = self._quantize_coeff(coeffs_flat)
+            tokens = (support_flat * self.n_bins + bin_idx).view(B, pH, pW, self.sparsity_level)
             coeffs_for_recon = coeff_q
         else:
-            tokens = support.view(B, H, W, self.sparsity_level).long()
+            tokens = support.view(B, pH, pW, self.sparsity_level).long()
             coeffs_for_recon = coeffs_flat
 
-        coeffs_for_recon = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
+        coeffs_for_recon = coeffs_for_recon.reshape(B, pH, pW, self.sparsity_level)
         z_q = self._decode(support, coeffs_for_recon)
 
-        # Bottleneck loss (LASER-style)
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
         loss = dl_latent_loss + self.commitment_cost * e_latent_loss
 
-        # Straight-through estimator to encoder
         z_q_ste = z_e + (z_q - z_e).detach()
         return z_q_ste, loss, tokens
 
@@ -497,27 +520,26 @@ class SparseBottleneck(nn.Module):
         """
         Decode tokens back to a latent map.
         Args:
-            tokens: [B, H, W, D]
-            coeffs: [B, H, W, D] (only used in non-quantized mode)
+            tokens: [B, pH, pW, D]
+            coeffs: [B, pH, pW, D] (only used in non-quantized mode)
         Returns:
-            z_q: [B, C, H, W]
+            z_q: [B, C, H, W]  (H = pH * P, W = pW * P)
         """
         if tokens.dim() != 4:
-            raise ValueError(f"Expected [B,H,W,D], got {tuple(tokens.shape)}")
-        B, H, W, D = tokens.shape
+            raise ValueError(f"Expected [B,pH,pW,D], got {tuple(tokens.shape)}")
+        D = tokens.shape[3]
         if D != self.sparsity_level:
             raise ValueError(f"Expected D={self.sparsity_level}, got {D}")
 
         if self.quantize_sparse_coeffs:
-            dictionary = self._norm_dict()
             tok = tokens.to(torch.long)
-            special = tok >= self.pad_token_id  # pad or bos
+            special = tok >= self.pad_token_id
             tok_clamped = tok.clamp_max(self.pad_token_id - 1)
 
             code_ids = tok_clamped // self.n_bins
             bin_idx = tok_clamped % self.n_bins
 
-            coeff = self._dequantize_coeff(bin_idx).to(dictionary.dtype)
+            coeff = self._dequantize_coeff(bin_idx).to(self._norm_dict().dtype)
             coeff = coeff * (~special).float()
             code_ids = code_ids * (~special).long()
             return self._decode(code_ids, coeff)
@@ -549,6 +571,7 @@ class LASER(nn.Module):
         coef_mu: float = 50.0,
         out_tanh: bool = True,
         quantize_sparse_coeffs: bool = True,
+        latent_patch_size: int = 1,
     ):
         super().__init__()
         self.out_tanh = bool(out_tanh)
@@ -571,6 +594,7 @@ class LASER(nn.Module):
             coef_quantization=coef_quantization,
             coef_mu=coef_mu,
             commitment_cost=commitment_cost,
+            latent_patch_size=latent_patch_size,
         )
         self.post_bottleneck = nn.Conv2d(embedding_dim, num_hiddens, kernel_size=3, padding=1)
         self.decoder = Decoder(
@@ -671,9 +695,6 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
-        self.register_buffer("causal_mask", mask.view(1, 1, max_seq_len, max_seq_len))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         qkv = self.qkv(x)
@@ -682,12 +703,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = attn.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        out = attn @ v
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=dropout_p,
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.out_proj(out)
         out = self.resid_dropout(out)
@@ -720,8 +739,6 @@ class PriorConfig:
     H: int
     W: int
     D: int
-    num_patch_positions: int = 0
-    context_tokens: int = 0
     predict_coefficients: bool = False
     coeff_loss_weight: float = 1.0
     coeff_max: float = 3.0
@@ -747,17 +764,12 @@ class Prior(nn.Module):
         self.pad_token_id = int(pad_token_id)
 
         self.tokens_per_patch = cfg.H * cfg.W * cfg.D
-        self.max_len = 1 + int(cfg.context_tokens) + self.tokens_per_patch
+        self.max_len = 1 + self.tokens_per_patch
 
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.spatial_emb = nn.Embedding(cfg.H * cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
         self.type_emb = nn.Embedding(2, cfg.d_model)
-        self.patch_pos_emb = (
-            nn.Embedding(cfg.num_patch_positions, cfg.d_model)
-            if cfg.num_patch_positions > 0
-            else None
-        )
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([
@@ -767,13 +779,16 @@ class Prior(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.atom_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if self.predict_coefficients:
-            self.coeff_head = nn.Linear(cfg.d_model, 1)
+            self.atom_coeff_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+            self.coeff_head = nn.Sequential(
+                nn.Linear(cfg.d_model * 2, cfg.d_model),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, 1),
+            )
 
-        # Precompute position ids for [BOS] + optional context + current patch tokens.
-        # For context tokens, repeat the local (spatial, depth) pattern per patch.
         spatial_ids = torch.zeros(self.max_len, dtype=torch.long)
         depth_ids = torch.zeros(self.max_len, dtype=torch.long)
-        type_ids = torch.zeros(self.max_len, dtype=torch.long)  # 0 for BOS, 1 for normal
+        type_ids = torch.zeros(self.max_len, dtype=torch.long)
         if self.max_len > 1:
             idx = torch.arange(self.max_len - 1)
             local_idx = idx % self.tokens_per_patch
@@ -784,20 +799,8 @@ class Prior(nn.Module):
         self.register_buffer("_depth_ids", depth_ids)
         self.register_buffer("_type_ids", type_ids)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        patch_pos_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: [B, L] tokens, L <= max_len
-        Returns:
-            If predict_coefficients=False:
-                logits: [B, L, vocab]
-            If predict_coefficients=True:
-                atom_logits: [B, L, vocab], coeff: [B, L]
-        """
+    def _backbone(self, x: torch.Tensor) -> torch.Tensor:
+        """Run transformer backbone, return hidden states [B, L, d_model]."""
         B, L = x.shape
         if L > self.max_len:
             raise ValueError(f"Got L={L}, but max_len={self.max_len}")
@@ -808,37 +811,46 @@ class Prior(nn.Module):
         tp = self.type_emb(self._type_ids[:L])
 
         h = tok + sp.unsqueeze(0) + dp.unsqueeze(0) + tp.unsqueeze(0)
-        if self.patch_pos_emb is not None:
-            if patch_pos_ids is None:
-                raise ValueError("patch_pos_ids must be provided when num_patch_positions > 0")
-            patch_pos_ids = patch_pos_ids.to(device=x.device, dtype=torch.long)
-            if patch_pos_ids.dim() == 1:
-                if patch_pos_ids.shape[0] != B:
-                    raise ValueError(
-                        f"patch_pos_ids must have shape [B], got {tuple(patch_pos_ids.shape)} for B={B}"
-                    )
-                h = h + self.patch_pos_emb(patch_pos_ids).unsqueeze(1)
-            elif patch_pos_ids.dim() == 2:
-                if patch_pos_ids.shape != (B, L):
-                    raise ValueError(
-                        f"patch_pos_ids must have shape [B, L]={B, L}, got {tuple(patch_pos_ids.shape)}"
-                    )
-                h = h + self.patch_pos_emb(patch_pos_ids)
-            else:
-                raise ValueError(
-                    f"patch_pos_ids must have rank 1 or 2, got rank {patch_pos_ids.dim()}"
-                )
         h = self.drop(h)
 
         for block in self.blocks:
             h = block(h)
 
-        h = self.ln_f(h)
+        return self.ln_f(h)
+
+    def _predict_coeff(self, h: torch.Tensor, atom_ids: torch.Tensor) -> torch.Tensor:
+        """Predict coefficients given hidden states and atom IDs. Both [B, L]."""
+        atom_ids = atom_ids.clamp(0, self.cfg.vocab_size - 1)
+        atom_emb = self.atom_coeff_emb(atom_ids)
+        coeff_input = torch.cat([h, atom_emb], dim=-1)
+        return self.coeff_head(coeff_input).squeeze(-1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        atom_targets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, L] tokens, L <= max_len
+            atom_targets: [B, L] ground-truth atom IDs for coefficient prediction
+                          (training only; ignored when predict_coefficients=False)
+        Returns:
+            If predict_coefficients=False:
+                logits: [B, L, vocab]
+            If predict_coefficients=True:
+                atom_logits: [B, L, vocab], coeff: [B, L]
+        """
+        h = self._backbone(x)
         atom_logits = self.atom_head(h)
         if not self.predict_coefficients:
             return atom_logits
 
-        coeff = self.coeff_head(h).squeeze(-1)
+        if atom_targets is not None:
+            atom_ids = atom_targets
+        else:
+            atom_ids = atom_logits.argmax(dim=-1)
+        coeff = self._predict_coeff(h, atom_ids)
         return atom_logits, coeff
 
     @torch.no_grad()
@@ -847,7 +859,6 @@ class Prior(nn.Module):
         batch_size: int,
         show_progress: bool = False,
         progress_desc: Optional[str] = None,
-        patch_pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Unconditional generation.
@@ -861,14 +872,6 @@ class Prior(nn.Module):
         T = self.cfg.H * self.cfg.W * self.cfg.D
 
         seq = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
-        if self.patch_pos_emb is not None:
-            if patch_pos_ids is None:
-                raise ValueError("patch_pos_ids must be provided when num_patch_positions > 0")
-            patch_pos_ids = patch_pos_ids.to(device=device, dtype=torch.long)
-            if patch_pos_ids.dim() != 1 or patch_pos_ids.shape[0] != batch_size:
-                raise ValueError(
-                    f"patch_pos_ids must have shape [batch_size], got {tuple(patch_pos_ids.shape)}"
-                )
         coeffs: list[torch.Tensor] = []
         steps = tqdm(
             range(T),
@@ -878,14 +881,9 @@ class Prior(nn.Module):
             disable=(not show_progress),
         )
         for _ in steps:
-            out = self(seq, patch_pos_ids=patch_pos_ids)
+            h = self._backbone(seq)
+            atom_logits = self.atom_head(h)
             if self.predict_coefficients:
-                atom_logits, coeff_step = out
-                coeff_step = coeff_step[:, -1]
-            else:
-                atom_logits = out
-            if self.predict_coefficients:
-                # Keep atom predictions in [0, num_atoms) so decode is well-defined.
                 special_ids = torch.tensor(
                     [self.bos_token_id, self.pad_token_id],
                     device=atom_logits.device,
@@ -896,7 +894,8 @@ class Prior(nn.Module):
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
             if self.predict_coefficients:
-                coeffs.append(coeff_step)
+                coeff_step = self._predict_coeff(h[:, -1:, :], nxt)
+                coeffs.append(coeff_step.squeeze(-1))
 
         if self.predict_coefficients:
             coeff_flat = torch.stack(coeffs, dim=1)
@@ -923,72 +922,6 @@ def save_image_grid(x: torch.Tensor, path: str, nrow: int = 8):
     grid = _make_image_grid(x, nrow=nrow)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     utils.save_image(grid, path)
-
-
-def unfold_image_patches(
-    x: torch.Tensor,
-    patch_size: int,
-    stride: int,
-) -> Tuple[torch.Tensor, int, int]:
-    """
-    Split images into patches with unfold.
-    Returns:
-      patches: [B * (grid_h*grid_w), C, patch_size, patch_size]
-      grid_h, grid_w
-    """
-    if x.dim() != 4:
-        raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
-    B, C, H, W = x.shape
-    p = int(patch_size)
-    s = int(stride)
-    if p <= 0 or s <= 0:
-        raise ValueError(f"patch_size and stride must be positive, got patch_size={p}, stride={s}")
-    if H < p or W < p:
-        raise ValueError(f"Image size {(H, W)} is smaller than patch_size={p}")
-    if ((H - p) % s) != 0 or ((W - p) % s) != 0:
-        raise ValueError(
-            f"Invalid patch grid for HxW={H}x{W}, patch_size={p}, stride={s}."
-        )
-    grid_h = ((H - p) // s) + 1
-    grid_w = ((W - p) // s) + 1
-    cols = F.unfold(x, kernel_size=p, stride=s)  # [B, C*p*p, grid_h*grid_w]
-    patches = cols.transpose(1, 2).contiguous().view(B * grid_h * grid_w, C, p, p)
-    return patches, grid_h, grid_w
-
-
-def fold_image_patches(
-    patches: torch.Tensor,
-    grid_h: int,
-    grid_w: int,
-    patch_size: int,
-    stride: int,
-) -> torch.Tensor:
-    """
-    Reconstruct images from patches with fold.
-    Expects patches in [B, grid_h*grid_w, C, patch_size, patch_size].
-    """
-    if patches.dim() != 5:
-        raise ValueError(f"Expected [B,P,C,H,W], got {tuple(patches.shape)}")
-    B, P, C, PH, PW = patches.shape
-    p = int(patch_size)
-    s = int(stride)
-    if PH != p or PW != p:
-        raise ValueError(f"Patch tensor size ({PH}, {PW}) does not match patch_size={p}")
-    expected_patches = int(grid_h) * int(grid_w)
-    if P != expected_patches:
-        raise ValueError(f"Expected P={expected_patches}, got P={P}")
-
-    out_h = (int(grid_h) - 1) * s + p
-    out_w = (int(grid_w) - 1) * s + p
-    cols = patches.contiguous().view(B, P, C * p * p).transpose(1, 2).contiguous()
-    imgs = F.fold(cols, output_size=(out_h, out_w), kernel_size=p, stride=s)
-
-    if s < p:
-        weight_cols = torch.ones((B, p * p, P), device=patches.device, dtype=patches.dtype)
-        weights = F.fold(weight_cols, output_size=(out_h, out_w), kernel_size=p, stride=s)
-        imgs = imgs / weights.clamp_min(1e-6)
-
-    return imgs
 
 
 def _resolve_wandb_logger(logger_obj):
@@ -1039,9 +972,6 @@ class TokenDataModule(pl.LightningDataModule):
         batch_size: int,
         num_workers: int = 2,
         coeffs_flat: Optional[torch.Tensor] = None,
-        patch_pos_flat: Optional[torch.Tensor] = None,
-        context_patches: int = 0,
-        pad_token_id: Optional[int] = None,
         sliding_window_shape: Optional[Tuple[int, int]] = None,
         full_latent_shape: Optional[Tuple[int, int]] = None,
         latent_depth: Optional[int] = None,
@@ -1052,9 +982,6 @@ class TokenDataModule(pl.LightningDataModule):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
         self.coeffs_flat = coeffs_flat
-        self.patch_pos_flat = patch_pos_flat
-        self.context_patches = max(0, int(context_patches))
-        self.pad_token_id = (None if pad_token_id is None else int(pad_token_id))
         self.sliding_window_shape = (
             None
             if sliding_window_shape is None
@@ -1090,24 +1017,10 @@ class TokenDataModule(pl.LightningDataModule):
                 ),
                 coeffs_flat=self.coeffs_flat,
             )
-        elif (
-            self.patch_pos_flat is not None
-            and self.context_patches > 0
-            and self.pad_token_id is not None
-            and self.coeffs_flat is None
-        ):
-            tok_ds = PatchCtxDataset(
-                tokens_flat=self.tokens_flat,
-                patch_pos_flat=self.patch_pos_flat,
-                context_patches=self.context_patches,
-                pad_token_id=self.pad_token_id,
-            )
         else:
             tensors = [self.tokens_flat]
             if self.coeffs_flat is not None:
                 tensors.append(self.coeffs_flat)
-            if self.patch_pos_flat is not None:
-                tensors.append(self.patch_pos_flat)
             tok_ds = TensorDataset(*tensors)
         return DataLoader(
             tok_ds,
@@ -1118,69 +1031,6 @@ class TokenDataModule(pl.LightningDataModule):
             drop_last=True,
             persistent_workers=(self.num_workers > 0),
         )
-
-
-class PatchCtxDataset(Dataset):
-    """
-    Training dataset for patch-grid stage-2 with local raster context.
-    Each sample yields:
-      tok_flat: [T]
-      patch_pos_id: scalar
-      ctx_tok_flat: [context_patches*T] (left-padded with pad_token_id)
-      ctx_patch_pos_flat: [context_patches*T]
-    """
-
-    def __init__(
-        self,
-        tokens_flat: torch.Tensor,
-        patch_pos_flat: torch.Tensor,
-        context_patches: int,
-        pad_token_id: int,
-    ):
-        if tokens_flat.dim() != 2:
-            raise ValueError(f"tokens_flat must be [N, T], got {tuple(tokens_flat.shape)}")
-        if patch_pos_flat.dim() != 1 or patch_pos_flat.shape[0] != tokens_flat.shape[0]:
-            raise ValueError(
-                f"patch_pos_flat must be [N] with N={tokens_flat.shape[0]}, got {tuple(patch_pos_flat.shape)}"
-            )
-        self.tokens_flat = tokens_flat
-        self.patch_pos_flat = patch_pos_flat.to(torch.long)
-        self.context_patches = max(0, int(context_patches))
-        self.pad_token_id = int(pad_token_id)
-        self.tokens_per_patch = int(tokens_flat.shape[1])
-
-    def __len__(self) -> int:
-        return int(self.tokens_flat.shape[0])
-
-    def __getitem__(self, idx: int):
-        tok = self.tokens_flat[idx]
-        patch_pos = self.patch_pos_flat[idx]
-
-        if self.context_patches <= 0:
-            return tok, patch_pos
-
-        ctx_len = self.context_patches * self.tokens_per_patch
-        ctx_tok = torch.full((ctx_len,), self.pad_token_id, dtype=self.tokens_flat.dtype)
-        ctx_patch_pos = torch.zeros((ctx_len,), dtype=torch.long)
-        cur_pos = int(patch_pos.item())
-
-        for k in range(self.context_patches):
-            prev_pos = cur_pos - self.context_patches + k
-            if prev_pos < 0:
-                continue
-            delta = cur_pos - prev_pos
-            src_idx = idx - delta
-            if src_idx < 0:
-                continue
-            if int(self.patch_pos_flat[src_idx].item()) != prev_pos:
-                # Different image boundary.
-                continue
-            start = k * self.tokens_per_patch
-            end = start + self.tokens_per_patch
-            ctx_tok[start:end] = self.tokens_flat[src_idx]
-            ctx_patch_pos[start:end] = prev_pos
-
-        return tok, patch_pos, ctx_tok, ctx_patch_pos
 
 
 class WindowTokenDataset(Dataset):
@@ -1372,12 +1222,12 @@ class Stage1Module(pl.LightningModule):
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # Normalize dictionary only after a full optimization step finishes.
-        # Doing this inside training_step can invalidate autograd versioning.
         with torch.no_grad():
-            self.ae.bottleneck.dictionary.copy_(
-                F.normalize(self.ae.bottleneck.dictionary, p=2, dim=0, eps=self.ae.bottleneck.epsilon)
-            )
+            bn = self.ae.bottleneck
+            bn.dictionary.copy_(F.normalize(bn.dictionary, p=2, dim=0, eps=bn.epsilon))
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast(bn.dictionary.data, src=0)
 
     def validation_step(self, batch, batch_idx):
         x, _ = batch
@@ -1509,15 +1359,13 @@ class Stage2Module(pl.LightningModule):
         sample_batch_size: int = 8,
         sample_latent_shape: Optional[Tuple[int, int]] = None,
         sample_window_stride_latent: int = 1,
-        patch_grid_shape: Optional[Tuple[int, int]] = None,
-        patch_size: int = 32,
-        patch_stride: int = 32,
-        patch_context_patches: int = 0,
         fid_real_images: Optional[torch.Tensor] = None,
         fid_num_samples: int = 64,
         fid_feature: int = 2048,
         fid_every_n_epochs: int = 1,
         coeff_loss_weight: float = 1.0,
+        coeff_mean: float = 0.0,
+        coeff_std: float = 1.0,
         lr_schedule: str = "cosine",
         warmup_epochs: int = 1,
         min_lr_ratio: float = 0.1,
@@ -1528,6 +1376,8 @@ class Stage2Module(pl.LightningModule):
         self.pad_token_id = int(pad_token_id)
         self.predict_coefficients = bool(self.transformer.cfg.predict_coefficients)
         self.coeff_loss_weight = float(coeff_loss_weight)
+        self.coeff_mean = float(coeff_mean)
+        self.coeff_std = max(float(coeff_std), 1e-8)
         self.out_dir = out_dir
         self.laser = laser
         self.H, self.W, self.D = int(H), int(W), int(D)
@@ -1541,15 +1391,6 @@ class Stage2Module(pl.LightningModule):
             self.sample_latent_w = int(sample_latent_shape[1])
         self.sample_window_stride_latent = max(1, int(sample_window_stride_latent))
         self.use_sliding_window_sampling = bool(sample_latent_shape is not None)
-        if patch_grid_shape is None:
-            self.patch_grid_h, self.patch_grid_w = 1, 1
-        else:
-            self.patch_grid_h, self.patch_grid_w = int(patch_grid_shape[0]), int(patch_grid_shape[1])
-        self.patch_size = int(patch_size)
-        self.patch_stride = int(patch_stride)
-        self.patch_context_patches = max(0, int(patch_context_patches))
-        self.use_patch_positions = bool(getattr(self.transformer.cfg, "num_patch_positions", 0) > 0)
-        self.context_tokens = int(getattr(self.transformer.cfg, "context_tokens", 0))
         self.fid_real_images = fid_real_images
         self.fid_num_samples = max(0, int(fid_num_samples))
         self.fid_feature = int(fid_feature)
@@ -1616,66 +1457,21 @@ class Stage2Module(pl.LightningModule):
         return self._fid_metric
 
     def training_step(self, batch, batch_idx):
-        patch_pos_ids = None
-        ctx_tokens = None
-        ctx_patch_pos = None
         if self.predict_coefficients:
-            if self.use_patch_positions:
-                if len(batch) == 3:
-                    tok_flat, coeff_flat, patch_pos_ids = batch
-                elif len(batch) == 5:
-                    tok_flat, coeff_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch
-                else:
-                    raise ValueError(f"Unexpected stage2 coefficient batch format with {len(batch)} entries.")
-            else:
-                tok_flat, coeff_flat = batch
+            tok_flat, coeff_flat = batch
             coeff_flat = coeff_flat.to(torch.float32)
         else:
-            if self.use_patch_positions:
-                if len(batch) == 2:
-                    tok_flat, patch_pos_ids = batch
-                elif len(batch) == 4:
-                    tok_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch
-                else:
-                    raise ValueError(f"Unexpected stage2 patch batch format with {len(batch)} entries.")
-            else:
-                (tok_flat,) = batch
+            (tok_flat,) = batch
             coeff_flat = None
         tok_flat = tok_flat.long()
-        if patch_pos_ids is not None:
-            patch_pos_ids = patch_pos_ids.long()
-        if ctx_tokens is not None:
-            ctx_tokens = ctx_tokens.long()
-        if ctx_patch_pos is not None:
-            ctx_patch_pos = ctx_patch_pos.long()
         B = tok_flat.size(0)
         bos = self.transformer.bos_token_id
 
-        if self.predict_coefficients and ctx_tokens is not None:
-            raise NotImplementedError("Patch context with coefficient regression is not supported yet.")
-
-        if ctx_tokens is not None:
-            seq = torch.cat(
-                [torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), ctx_tokens, tok_flat],
-                dim=1,
-            )
-            context_len = int(ctx_tokens.size(1))
-            y = seq[:, 1:]
-            y[:, :context_len] = self.pad_token_id
-            if patch_pos_ids is None:
-                raise ValueError("patch_pos_ids required when using patch context.")
-            bos_patch = patch_pos_ids.view(B, 1)
-            tok_patch = patch_pos_ids.view(B, 1).expand(B, tok_flat.size(1))
-            seq_patch = torch.cat([bos_patch, ctx_patch_pos, tok_patch], dim=1)
-            patch_pos_for_x = seq_patch[:, :-1]
-        else:
-            seq = torch.cat([torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), tok_flat], dim=1)
-            y = seq[:, 1:]
-            patch_pos_for_x = patch_pos_ids
-
+        seq = torch.cat([torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), tok_flat], dim=1)
+        y = seq[:, 1:]
         x_in = seq[:, :-1]
 
-        out = self.transformer(x_in, patch_pos_ids=patch_pos_for_x)
+        out = self.transformer(x_in, atom_targets=y if self.predict_coefficients else None)
         if self.predict_coefficients:
             logits, coeff_pred = out
             atom_loss = F.cross_entropy(
@@ -1683,7 +1479,8 @@ class Stage2Module(pl.LightningModule):
                 y.reshape(-1),
                 ignore_index=self.pad_token_id,
             )
-            coeff_loss = F.mse_loss(coeff_pred.reshape(-1), coeff_flat.to(logits.device).reshape(-1))
+            coeff_target = (coeff_flat.to(logits.device) - self.coeff_mean) / self.coeff_std
+            coeff_loss = F.mse_loss(coeff_pred.reshape(-1), coeff_target.reshape(-1))
             loss = atom_loss + self.coeff_loss_weight * coeff_loss
             self.log(
                 "train/coeff_loss",
@@ -1723,34 +1520,20 @@ class Stage2Module(pl.LightningModule):
             return
         if self.global_step <= 0 or (self.global_step % self.sample_every_steps) != 0:
             return
-        world_size = int(getattr(self.trainer, "world_size", 1))
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            # Keep ranks synchronized while rank0 generates/saves.
-            self.trainer.strategy.barrier()
-            if self.trainer.is_global_zero:
-                self._sample_and_save(step=self.global_step)
-            self.trainer.strategy.barrier()
-            return
         if self.trainer.is_global_zero:
             self._sample_and_save(step=self.global_step)
 
     def on_train_epoch_end(self):
-        world_size = int(getattr(self.trainer, "world_size", 1))
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            self.trainer.strategy.barrier()
-
         if self.trainer.is_global_zero:
             os.makedirs(self.out_dir, exist_ok=True)
             torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, "transformer_last.pt"))
-
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            self.trainer.strategy.barrier()
 
     def _decode_generated_batch(self, gen) -> torch.Tensor:
         if self.predict_coefficients:
             flat_gen, coeff_gen = gen
             atom_ids = flat_gen.view(-1, self.H, self.W, self.D).to(self.device)
             coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
+            coeff_gen = coeff_gen * self.coeff_std + self.coeff_mean
             return self.laser.decode(atom_ids, coeff_gen)
         tokens_gen = gen.view(-1, self.H, self.W, self.D)
         return self.laser.decode_tokens(tokens_gen.to(self.device))
@@ -1798,111 +1581,13 @@ class Stage2Module(pl.LightningModule):
             window_flat = generated[:, h0 : h0 + self.H, w0 : w0 + self.W, :].contiguous().view(B, win_tokens)
             ctx = window_flat[:, :local_t]
             seq = torch.cat([bos, ctx], dim=1)
-            logits = self.transformer(seq, patch_pos_ids=None)[:, -1, :]
+            logits = self.transformer(seq)[:, -1, :]
             logits[:, special_ids] = float("-inf")
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1).squeeze(1)
             generated[:, y, x, depth_idx] = nxt
 
         return self.laser.decode_tokens(generated.to(self.device))
-
-    @torch.no_grad()
-    def _generate_patch_tokens_with_context(
-        self,
-        patch_idx: int,
-        prev_patch_tokens: list[torch.Tensor],
-    ) -> torch.Tensor:
-        if self.predict_coefficients:
-            raise NotImplementedError("Patch-context sampling is only supported in quantized-token mode.")
-        T = self.H * self.W * self.D
-        B = self.sample_batch_size
-        bos = torch.full((B, 1), self.transformer.bos_token_id, dtype=torch.long, device=self.device)
-
-        ctx_needed = self.patch_context_patches
-        if ctx_needed <= 0:
-            seq = bos
-            if self.use_patch_positions:
-                patch_pos_seq = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-            else:
-                patch_pos_seq = None
-        else:
-            ctx_tokens = []
-            ctx_patch_pos = []
-            for pidx in range(patch_idx - ctx_needed, patch_idx):
-                if pidx < 0:
-                    ctx_tokens.append(torch.full((B, T), self.pad_token_id, dtype=torch.long, device=self.device))
-                else:
-                    ctx_tokens.append(prev_patch_tokens[pidx])
-                ctx_patch_pos.append(torch.full((B, T), max(pidx, 0), dtype=torch.long, device=self.device))
-            ctx_tok = torch.cat(ctx_tokens, dim=1) if ctx_tokens else torch.empty((B, 0), dtype=torch.long, device=self.device)
-            seq = torch.cat([bos, ctx_tok], dim=1)
-            if self.use_patch_positions:
-                bos_patch = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-                ctx_patch = torch.cat(ctx_patch_pos, dim=1) if ctx_patch_pos else torch.empty((B, 0), dtype=torch.long, device=self.device)
-                patch_pos_seq = torch.cat([bos_patch, ctx_patch], dim=1)
-            else:
-                patch_pos_seq = None
-
-        for _ in range(T):
-            out = self.transformer(seq, patch_pos_ids=patch_pos_seq)
-            logits = out[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1)
-            seq = torch.cat([seq, nxt], dim=1)
-            if patch_pos_seq is not None:
-                nxt_patch = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-                patch_pos_seq = torch.cat([patch_pos_seq, nxt_patch], dim=1)
-
-        return seq[:, -T:]
-
-    @torch.no_grad()
-    def _sample_patch_grid_batch(self, step: int) -> torch.Tensor:
-        total_patches = self.patch_grid_h * self.patch_grid_w
-        generated_patch_tokens: list[torch.Tensor] = []
-        patch_batches = []
-        for patch_idx in range(total_patches):
-            if self.patch_context_patches > 0:
-                patch_tokens = self._generate_patch_tokens_with_context(
-                    patch_idx=patch_idx,
-                    prev_patch_tokens=generated_patch_tokens,
-                )
-                generated_patch_tokens.append(patch_tokens)
-                patch_img = self.laser.decode_tokens(
-                    patch_tokens.view(-1, self.H, self.W, self.D).to(self.device)
-                )
-            else:
-                patch_pos_ids = None
-                if self.use_patch_positions:
-                    patch_pos_ids = torch.full(
-                        (self.sample_batch_size,),
-                        patch_idx,
-                        dtype=torch.long,
-                        device=self.device,
-                    )
-                gen_patch = self.transformer.generate(
-                    batch_size=self.sample_batch_size,
-                    show_progress=False,
-                    progress_desc=f"[Stage2] patch {patch_idx + 1}/{total_patches} step {step}",
-                    patch_pos_ids=patch_pos_ids,
-                )
-                patch_img = self._decode_generated_batch(gen_patch)
-            if patch_img.size(-2) != self.patch_size or patch_img.size(-1) != self.patch_size:
-                patch_img = F.interpolate(
-                    patch_img,
-                    size=(self.patch_size, self.patch_size),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            patch_batches.append(patch_img)
-
-        patches_bpc = torch.stack(patch_batches, dim=1)  # [B, P, C, patch, patch]
-        return fold_image_patches(
-            patches_bpc,
-            grid_h=self.patch_grid_h,
-            grid_w=self.patch_grid_w,
-            patch_size=self.patch_size,
-            stride=self.patch_stride,
-        )
 
     @torch.no_grad()
     def _sample_and_save(self, step: int):
@@ -1918,19 +1603,11 @@ class Stage2Module(pl.LightningModule):
                 f"(window={self.H}x{self.W}, full_latent={self.sample_latent_h}x{self.sample_latent_w})"
             )
             raw_imgs = self._sample_sliding_window_batch(step=step)
-        elif self.patch_grid_h > 1 or self.patch_grid_w > 1:
-            print(
-                f"[Stage2] patch-grid sampling enabled "
-                f"(grid={self.patch_grid_h}x{self.patch_grid_w}, patch={self.patch_size}, "
-                f"stride={self.patch_stride}, context_patches={self.patch_context_patches})"
-            )
-            raw_imgs = self._sample_patch_grid_batch(step=step)
         else:
             gen = self.transformer.generate(
                 batch_size=self.sample_batch_size,
                 show_progress=True,
                 progress_desc=f"[Stage2] sample step {step}",
-                patch_pos_ids=None,
             )
             raw_imgs = self._decode_generated_batch(gen)
         sample_imgs = raw_imgs
@@ -2076,85 +1753,6 @@ def precompute_tokens(
 
 
 @torch.no_grad()
-def precompute_patch_grid_tokens(
-    ae: LASER,
-    loader: DataLoader,
-    device: torch.device,
-    patch_size: int,
-    patch_stride: int,
-    patch_encode_batch_size: int = 512,
-    max_items: Optional[int] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, int, int, int, int, int]:
-    """
-    Encode full-resolution images as patch tokens for stage-2 patch-grid generation.
-    Returns:
-      tokens_flat: [N_patches, H*W*D] int32
-      coeffs_flat: [N_patches, H*W*D] float32 (None if quantized)
-      patch_pos_flat: [N_patches] int64 patch index in raster order
-      H, W, D: latent patch shape
-      grid_h, grid_w: patch grid shape over the full image
-    """
-    ae.eval()
-    all_tokens = []
-    all_coeffs = []
-    all_patch_pos = []
-    seen_images = 0
-    H = W = D = None
-    grid_h = grid_w = None
-    chunk_bs = max(1, int(patch_encode_batch_size))
-
-    for x, _ in tqdm(loader, desc="[Stage2] precompute patch-grid tokens"):
-        if max_items is not None:
-            remaining = int(max_items) - seen_images
-            if remaining <= 0:
-                break
-            if x.size(0) > remaining:
-                x = x[:remaining]
-        if x.numel() == 0:
-            continue
-
-        patches, gh, gw = unfold_image_patches(x, patch_size=int(patch_size), stride=int(patch_stride))
-        if grid_h is None:
-            grid_h, grid_w = gh, gw
-        elif gh != grid_h or gw != grid_w:
-            raise ValueError(
-                f"Inconsistent patch grid: expected {(grid_h, grid_w)}, got {(gh, gw)}"
-            )
-
-        patch_pos = torch.arange(gh * gw, dtype=torch.long).unsqueeze(0).expand(x.size(0), -1).reshape(-1)
-
-        for start in range(0, patches.size(0), chunk_bs):
-            end = min(start + chunk_bs, patches.size(0))
-            patch_batch = patches[start:end].to(device)
-            if ae.bottleneck.quantize_sparse_coeffs:
-                tokens, h, w = ae.encode_tokens(patch_batch)
-                coeffs = None
-            else:
-                tokens, coeffs, h, w = ae.encode(patch_batch)
-
-            if H is None:
-                H, W = h, w
-                D = tokens.shape[-1]
-
-            all_tokens.append(tokens.view(tokens.size(0), -1).to(torch.int32).cpu())
-            all_patch_pos.append(patch_pos[start:end].to(torch.long).cpu())
-            if coeffs is not None:
-                all_coeffs.append(coeffs.view(coeffs.size(0), -1).to(torch.float32).cpu())
-
-        seen_images += x.size(0)
-        if max_items is not None and seen_images >= max_items:
-            break
-
-    if not all_tokens:
-        raise RuntimeError("No patch tokens were generated.")
-
-    tokens_flat = torch.cat(all_tokens, dim=0)
-    patch_pos_flat = torch.cat(all_patch_pos, dim=0)
-    coeffs_flat = torch.cat(all_coeffs, dim=0) if len(all_coeffs) > 0 else None
-    return tokens_flat, coeffs_flat, patch_pos_flat, H, W, D, grid_h, grid_w
-
-
-@torch.no_grad()
 def collect_real_images_uint8(
     loader: DataLoader,
     max_items: int,
@@ -2199,7 +1797,7 @@ def main():
     parser.add_argument("--stage1_warmup_epochs", type=int, default=1)
     parser.add_argument("--stage1_min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=128)  # stage 1 batch size
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--stage1_devices", type=int, default=2, help="Number of GPUs for Lightning stage-1 training.")
     parser.add_argument("--stage1_precision", type=str, default="32-true", help="Lightning precision for stage-1.")
@@ -2224,16 +1822,17 @@ def main():
     parser.add_argument("--embedding_dim", type=int, default=64)
     parser.add_argument("--num_atoms", type=int, default=128)      # dictionary size K
     parser.add_argument("--sparsity_level", type=int, default=3)   # stack depth D
-    parser.add_argument("--n_bins", type=int, default=129, help="Coefficient quantization bins (higher = lower quantization error, larger vocab).")
-    parser.add_argument("--coef_max", type=float, default=3.0, help="Coefficient clipping range for quantization in [-coef_max, coef_max].")
+    parser.add_argument("--latent_patch_size", type=int, default=1, help="Patch size for dictionary learning in latent space (e.g. 4 for 4x4 patches).")
+    parser.add_argument("--n_bins", type=int, default=1024, help="Coefficient quantization bins (higher = lower quantization error, larger vocab).")
+    parser.add_argument("--coef_max", type=float, default=24.0, help="Coefficient clipping range for quantization in [-coef_max, coef_max].")
     parser.add_argument("--coef_quantization", type=str, default="mu_law", choices=["uniform", "mu_law"])
-    parser.add_argument("--coef_mu", type=float, default=50.0, help="Mu for mu-law quantization (only used when coef_quantization=mu_law).")
+    parser.add_argument("--coef_mu", type=float, default=255.0, help="Mu for mu-law quantization (only used when coef_quantization=mu_law).")
     parser.add_argument("--commitment_cost", type=float, default=0.25)
     parser.add_argument(
         "--quantize_sparse_coeffs",
         action="store_true",
-        default=True,
-        help="Quantize sparse coefficients into token IDs (legacy).",
+        default=False,
+        help="Quantize sparse coefficients into token IDs.",
     )
     parser.add_argument(
         "--no_quantize_sparse_coeffs",
@@ -2244,32 +1843,18 @@ def main():
 
     # Stage-2 (Transformer)
     parser.add_argument("--stage2_epochs", type=int, default=10)
-    parser.add_argument("--stage2_lr", type=float, default=3e-4)
+    parser.add_argument("--stage2_lr", type=float, default=1e-4)
     parser.add_argument("--stage2_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--stage2_warmup_epochs", type=int, default=1)
     parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--stage2_batch_size", type=int, default=16)
+    parser.add_argument("--stage2_batch_size", type=int, default=64)
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
-    parser.add_argument(
-        "--stage2_patchify",
-        action="store_true",
-        default=False,
-        help="Train stage-2 on full images split into patch tokens via unfold/fold.",
-    )
     parser.add_argument(
         "--stage2_sliding_window",
         action="store_true",
         default=False,
         help="Train stage-2 on full-image latent sequences with a fixed sliding attention window.",
-    )
-    parser.add_argument("--stage2_patch_size", type=int, default=32, help="Patch size for stage-2 patchify mode.")
-    parser.add_argument("--stage2_patch_stride", type=int, default=32, help="Patch stride for stage-2 patchify mode.")
-    parser.add_argument(
-        "--stage2_patch_context_patches",
-        type=int,
-        default=1,
-        help="Number of previous raster patches used as context during stage-2 patch sampling/training.",
     )
     parser.add_argument(
         "--stage2_window_latent_h",
@@ -2288,12 +1873,6 @@ def main():
         type=int,
         default=16,
         help="Stride in latent spatial positions between training windows in sliding-window mode.",
-    )
-    parser.add_argument(
-        "--stage2_patch_encode_batch_size",
-        type=int,
-        default=512,
-        help="Patch mini-batch size during stage-2 token precompute.",
     )
     parser.add_argument(
         "--stage2_fid_num_samples",
@@ -2317,8 +1896,9 @@ def main():
         default=1.0,
         help="Coefficient regression loss weight when using continuous coefficients.",
     )
-    parser.add_argument("--token_subset", type=int, default=50000, help="Use only first N tokens/images for speed (<=50000).")
+    parser.add_argument("--token_subset", type=int, default=0, help="Use only first N tokens/images (0 = use all).")
     parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for stage-2 token precompute loader.")
+    parser.add_argument("--force_retokenize", action="store_true", help="Recompute tokens even if cache exists.")
     parser.add_argument("--fid_num_samples", type=int, default=1024, help="Number of validation images for stage-1 FID.")
     parser.add_argument("--fid_feature", type=int, default=192, help="Inception feature dims for stage-1 FID.")
     parser.add_argument("--fid_compute_batch_size", type=int, default=32, help="Mini-batch size for stage-1 FID feature extraction.")
@@ -2337,23 +1917,6 @@ def main():
     args.image_size = int(args.image_size)
     if args.image_size <= 0:
         raise ValueError(f"image_size must be positive, got {args.image_size}")
-    if args.stage2_patchify and args.stage2_sliding_window:
-        raise ValueError("stage2_patchify and stage2_sliding_window are mutually exclusive.")
-    if args.stage2_patchify:
-        if args.stage2_patch_size <= 0 or args.stage2_patch_stride <= 0:
-            raise ValueError(
-                "stage2_patch_size and stage2_patch_stride must be positive."
-            )
-        if args.stage2_patch_context_patches < 0:
-            raise ValueError("stage2_patch_context_patches must be >= 0.")
-        if args.image_size < args.stage2_patch_size:
-            raise ValueError(
-                f"image_size ({args.image_size}) must be >= stage2_patch_size ({args.stage2_patch_size})."
-            )
-        if ((args.image_size - args.stage2_patch_size) % args.stage2_patch_stride) != 0:
-            raise ValueError(
-                "image_size, stage2_patch_size, and stage2_patch_stride produce a non-integer patch grid."
-            )
     if args.stage2_sliding_window:
         if args.stage2_window_latent_h <= 0 or args.stage2_window_latent_w <= 0:
             raise ValueError("stage2_window_latent_h and stage2_window_latent_w must be positive.")
@@ -2374,9 +1937,7 @@ def main():
     print(
         f"[Data] dataset={args.dataset} data_dir={args.data_dir} "
         f"image_size={args.image_size} "
-        f"stage2_patchify={args.stage2_patchify} "
-        f"stage2_sliding_window={args.stage2_sliding_window} "
-        f"context_patches={args.stage2_patch_context_patches if args.stage2_patchify else 0}"
+        f"stage2_sliding_window={args.stage2_sliding_window}"
     )
 
     stage1_dir = os.path.join(args.out_dir, "stage1")
@@ -2428,6 +1989,7 @@ def main():
             coef_mu=args.coef_mu,
             quantize_sparse_coeffs=quantize_sparse_coeffs,
             out_tanh=True,
+            latent_patch_size=args.latent_patch_size,
         )
 
     def _load_checkpoint(
@@ -2490,18 +2052,16 @@ def main():
     def _run_stage2(
         tokens_flat: torch.Tensor,
         coeffs_flat: Optional[torch.Tensor],
-        patch_pos_flat: Optional[torch.Tensor],
         quantize_sparse_coeffs: bool,
         H: int,
         W: int,
         D: int,
-        patch_grid_shape: Optional[Tuple[int, int]],
-        patch_size: int,
-        patch_stride: int,
         sample_latent_shape: Optional[Tuple[int, int]],
         sliding_window_stride_latent: Optional[int],
         ae_model: LASER,
         fid_real_images: Optional[torch.Tensor],
+        coeff_mean: float = 0.0,
+        coeff_std: float = 1.0,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-2 Lightning multi-GPU training requires CUDA.")
@@ -2511,10 +2071,6 @@ def main():
             )
         if not quantize_sparse_coeffs and coeffs_flat is None:
             raise ValueError("coeffs_flat is required when quantize_sparse_coeffs=False")
-        if patch_grid_shape is not None and args.stage2_patch_context_patches > 0 and patch_pos_flat is None:
-            raise ValueError("patch_pos_flat is required for patch context training.")
-        if sample_latent_shape is not None and patch_grid_shape is not None:
-            raise ValueError("sample_latent_shape and patch_grid_shape cannot both be set.")
         if sample_latent_shape is not None and (not quantize_sparse_coeffs) and args.stage2_sample_every_steps > 0:
             raise NotImplementedError(
                 "Sliding-window sampling currently supports quantized-token mode only. "
@@ -2525,9 +2081,6 @@ def main():
             tokens_flat=tokens_flat,
             batch_size=args.stage2_batch_size,
             coeffs_flat=None if coeffs_flat is None else coeffs_flat,
-            patch_pos_flat=patch_pos_flat,
-            context_patches=(args.stage2_patch_context_patches if patch_grid_shape is not None else 0),
-            pad_token_id=ae_model.bottleneck.pad_token_id,
             sliding_window_shape=((int(H), int(W)) if sample_latent_shape is not None else None),
             full_latent_shape=sample_latent_shape,
             latent_depth=(int(D) if sample_latent_shape is not None else None),
@@ -2539,17 +2092,11 @@ def main():
             num_workers=2,
         )
 
-        patch_positions = int(patch_grid_shape[0] * patch_grid_shape[1]) if patch_grid_shape is not None else 0
-        context_tokens = 0
-        if patch_grid_shape is not None and args.stage2_patch_context_patches > 0:
-            context_tokens = int(args.stage2_patch_context_patches) * int(H * W * D)
         cfg = PriorConfig(
             vocab_size=ae_model.bottleneck.vocab_size,
             H=H,
             W=W,
             D=D,
-            num_patch_positions=patch_positions,
-            context_tokens=context_tokens,
             predict_coefficients=not quantize_sparse_coeffs,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
             coeff_max=args.coef_max,
@@ -2583,10 +2130,6 @@ def main():
                 if (sample_latent_shape is not None and sliding_window_stride_latent is not None)
                 else 1
             ),
-            patch_grid_shape=patch_grid_shape,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patch_context_patches=(args.stage2_patch_context_patches if patch_grid_shape is not None else 0),
             fid_real_images=fid_real_images,
             fid_num_samples=args.stage2_fid_num_samples,
             fid_feature=args.stage2_fid_feature,
@@ -2595,12 +2138,15 @@ def main():
             warmup_epochs=args.stage2_warmup_epochs,
             min_lr_ratio=args.stage2_min_lr_ratio,
             coeff_loss_weight=args.stage2_coeff_loss_weight,
+            coeff_mean=coeff_mean,
+            coeff_std=coeff_std,
         )
 
-        effective_strategy = (args.stage2_strategy if args.stage2_devices > 1 else "auto")
-        if effective_strategy == "ddp_fork" and torch.cuda.is_initialized():
-            print("[Stage2] CUDA already initialized; falling back from ddp_fork to ddp.")
-            effective_strategy = "ddp"
+        if args.stage2_devices > 1:
+            from lightning.pytorch.strategies import DDPStrategy
+            effective_strategy = DDPStrategy(broadcast_buffers=False, find_unused_parameters=False)
+        else:
+            effective_strategy = "auto"
 
         trainer = pl.Trainer(
             accelerator="gpu",
@@ -2626,12 +2172,8 @@ def main():
             cache = torch.load(token_cache_path, map_location="cpu")
         tokens_flat = cache["tokens_flat"]
         coeffs_flat = cache.get("coeffs_flat")
-        patch_pos_flat = cache.get("patch_pos_flat")
         quantize_sparse_coeffs = cache.get("quantize_sparse_coeffs", True)
         H, W, D = cache["shape"]
-        patch_grid_shape = cache.get("patch_grid_shape")
-        patch_size = int(cache.get("patch_size", args.stage2_patch_size))
-        patch_stride = int(cache.get("patch_stride", args.stage2_patch_stride))
         sample_latent_shape = cache.get("sample_latent_shape")
         sliding_window_stride_latent = cache.get(
             "sliding_window_stride_latent",
@@ -2640,21 +2182,23 @@ def main():
         fid_real_images = cache.get("fid_real_images")
         ae = _build_ae(quantize_sparse_coeffs=quantize_sparse_coeffs)
         _load_laser_weights(ae, required=True, prefer_best=True)
+        _coeff_mean, _coeff_std = 0.0, 1.0
+        if coeffs_flat is not None:
+            _coeff_mean = float(coeffs_flat.mean().item())
+            _coeff_std = float(coeffs_flat.std().item())
         _run_stage2(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
-            patch_pos_flat=patch_pos_flat,
             quantize_sparse_coeffs=quantize_sparse_coeffs,
             H=H,
             W=W,
             D=D,
-            patch_grid_shape=patch_grid_shape,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
             sample_latent_shape=sample_latent_shape,
             sliding_window_stride_latent=sliding_window_stride_latent,
             ae_model=ae,
             fid_real_images=fid_real_images,
+            coeff_mean=_coeff_mean,
+            coeff_std=_coeff_std,
         )
         return
 
@@ -2683,7 +2227,7 @@ def main():
         train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_tfm)
         val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
         val_vis_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=val_vis_tfm)
-        if args.stage2_patchify or args.stage2_sliding_window:
+        if args.stage2_sliding_window:
             stage2_source_set = datasets.CIFAR10(
                 root=args.data_dir,
                 train=True,
@@ -2707,7 +2251,7 @@ def main():
         train_set = Subset(train_full, train_indices)
         val_set = Subset(val_full, val_indices)
         val_vis_set = Subset(val_vis_full, val_indices)
-        if args.stage2_patchify or args.stage2_sliding_window:
+        if args.stage2_sliding_window:
             stage2_source_set = Subset(stage2_source_full, train_indices)
         else:
             stage2_source_set = train_set
@@ -2777,130 +2321,151 @@ def main():
         _load_laser_weights(ae, required=True, prefer_best=True)
     else:
         _load_laser_weights(ae, required=False, prefer_best=True)
-    encode_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    ae = ae.to(encode_device)
-    token_loader_batch_size = int(args.batch_size)
-    if args.stage2_patchify or args.stage2_sliding_window:
-        token_loader_batch_size = max(1, min(token_loader_batch_size, 16))
-    token_loader = DataLoader(
-        stage2_source_set,
-        batch_size=token_loader_batch_size,
-        shuffle=False,
-        num_workers=args.token_num_workers,
-        pin_memory=True,
-        persistent_workers=(args.token_num_workers > 0),
+    # ------------------------------------------------------------------
+    # Token cache: load if available, otherwise recompute and save.
+    # Delete the cache file manually (or pass --force_retokenize) to
+    # force re-encoding after retraining stage 1.
+    # ------------------------------------------------------------------
+    _have_token_cache = (
+        not args.force_retokenize
+        and args.stage1_epochs <= 0
+        and os.path.exists(token_cache_path)
     )
-    patch_pos_flat = None
-    patch_grid_shape = None
-    patch_size = int(args.stage2_patch_size)
-    patch_stride = int(args.stage2_patch_stride)
-    sample_latent_shape = None
-    sliding_window_stride_latent = None
-    if args.stage2_patchify:
-        (
-            tokens_flat,
-            coeffs_flat,
-            patch_pos_flat,
-            H,
-            W,
-            D,
-            patch_grid_h,
-            patch_grid_w,
-        ) = precompute_patch_grid_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patch_encode_batch_size=args.stage2_patch_encode_batch_size,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-        patch_grid_shape = (patch_grid_h, patch_grid_w)
-    elif args.stage2_sliding_window:
-        tokens_flat, coeffs_flat, full_H, full_W, D = precompute_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-        H = int(args.stage2_window_latent_h)
-        W = int(args.stage2_window_latent_w)
-        if H > int(full_H) or W > int(full_W):
-            raise ValueError(
-                f"Sliding window latent size ({H}, {W}) exceeds full latent shape ({full_H}, {full_W})."
-            )
-        sample_latent_shape = (int(full_H), int(full_W))
-        sliding_window_stride_latent = int(args.stage2_window_stride_latent)
-    else:
-        tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-    fid_real_loader = DataLoader(
-        stage2_source_set if (args.stage2_patchify or args.stage2_sliding_window) else train_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
-    fid_real_images = collect_real_images_uint8(
-        fid_real_loader,
-        max_items=args.stage2_fid_num_samples,
-    )
-    ae = ae.cpu()
-    print(f"[Stage2] token dataset: {tokens_flat.shape}   (H={H}, W={W}, D={D})")
-    if patch_grid_shape is not None:
-        print(
-            f"[Stage2] patch grid: {patch_grid_shape[0]}x{patch_grid_shape[1]} "
-            f"(patch_size={patch_size}, stride={patch_stride})"
-        )
-    if sample_latent_shape is not None:
-        full_h, full_w = int(sample_latent_shape[0]), int(sample_latent_shape[1])
-        stride_lat = int(sliding_window_stride_latent or H)
-        grid_h = ((full_h - int(H)) // stride_lat) + 1
-        grid_w = ((full_w - int(W)) // stride_lat) + 1
-        windows_per_image = int(grid_h * grid_w)
-        print(
-            f"[Stage2] sliding-window mode: "
-            f"window_latent={H}x{W}, full_latent={sample_latent_shape[0]}x{sample_latent_shape[1]}, "
-            f"stride_latent={stride_lat}, windows_per_image={windows_per_image}"
-        )
 
-    torch.save(
-        {
-            "tokens_flat": tokens_flat,
-            "coeffs_flat": coeffs_flat,
-            "patch_pos_flat": patch_pos_flat,
-            "quantize_sparse_coeffs": args.quantize_sparse_coeffs,
-            "shape": (H, W, D),
-            "patch_grid_shape": patch_grid_shape,
-            "patch_size": patch_size,
-            "patch_stride": patch_stride,
-            "sample_latent_shape": sample_latent_shape,
-            "sliding_window_stride_latent": sliding_window_stride_latent,
-            "fid_real_images": fid_real_images,
-        },
-        token_cache_path,
-    )
+    if _have_token_cache:
+        print(f"[Stage2] loading token cache: {token_cache_path}")
+        try:
+            cache = torch.load(token_cache_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            cache = torch.load(token_cache_path, map_location="cpu")
+        tokens_flat = cache["tokens_flat"]
+        coeffs_flat = cache.get("coeffs_flat")
+        fid_real_images = cache.get("fid_real_images")
+
+        cached_H, cached_W, D = cache["shape"]
+        full_latent = cache.get("full_latent_shape") or cache.get("sample_latent_shape")
+
+        if args.stage2_sliding_window:
+            H = int(args.stage2_window_latent_h)
+            W = int(args.stage2_window_latent_w)
+            if full_latent is not None:
+                full_H, full_W = int(full_latent[0]), int(full_latent[1])
+            else:
+                full_H, full_W = cached_H, cached_W
+            if H > full_H or W > full_W:
+                raise ValueError(
+                    f"Sliding window ({H}, {W}) exceeds full latent ({full_H}, {full_W})."
+                )
+            sample_latent_shape = (full_H, full_W)
+            sliding_window_stride_latent = int(args.stage2_window_stride_latent)
+        else:
+            if full_latent is not None:
+                H, W = int(full_latent[0]), int(full_latent[1])
+            else:
+                H, W = cached_H, cached_W
+            sample_latent_shape = None
+            sliding_window_stride_latent = None
+
+        print(f"[Stage2] token dataset: {tokens_flat.shape}   (H={H}, W={W}, D={D})")
+    else:
+        encode_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        ae = ae.to(encode_device)
+        token_loader_batch_size = int(args.batch_size)
+        if args.stage2_sliding_window:
+            token_loader_batch_size = max(1, min(token_loader_batch_size, 16))
+        token_loader = DataLoader(
+            stage2_source_set,
+            batch_size=token_loader_batch_size,
+            shuffle=False,
+            num_workers=args.token_num_workers,
+            pin_memory=True,
+            persistent_workers=(args.token_num_workers > 0),
+        )
+        _token_max_items = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
+        sample_latent_shape = None
+        sliding_window_stride_latent = None
+        if args.stage2_sliding_window:
+            tokens_flat, coeffs_flat, full_H, full_W, D = precompute_tokens(
+                ae,
+                token_loader,
+                encode_device,
+                max_items=_token_max_items,
+            )
+            H = int(args.stage2_window_latent_h)
+            W = int(args.stage2_window_latent_w)
+            if H > int(full_H) or W > int(full_W):
+                raise ValueError(
+                    f"Sliding window latent size ({H}, {W}) exceeds full latent shape ({full_H}, {full_W})."
+                )
+            sample_latent_shape = (int(full_H), int(full_W))
+            sliding_window_stride_latent = int(args.stage2_window_stride_latent)
+        else:
+            tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
+                ae,
+                token_loader,
+                encode_device,
+                max_items=_token_max_items,
+            )
+        fid_real_loader = DataLoader(
+            stage2_source_set if args.stage2_sliding_window else train_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
+        fid_real_images = collect_real_images_uint8(
+            fid_real_loader,
+            max_items=args.stage2_fid_num_samples,
+        )
+        ae = ae.cpu()
+        print(f"[Stage2] token dataset: {tokens_flat.shape}   (H={H}, W={W}, D={D})")
+        if sample_latent_shape is not None:
+            full_h, full_w = int(sample_latent_shape[0]), int(sample_latent_shape[1])
+            stride_lat = int(sliding_window_stride_latent or H)
+            grid_h = ((full_h - int(H)) // stride_lat) + 1
+            grid_w = ((full_w - int(W)) // stride_lat) + 1
+            windows_per_image = int(grid_h * grid_w)
+            print(
+                f"[Stage2] sliding-window mode: "
+                f"window_latent={H}x{W}, full_latent={sample_latent_shape[0]}x{sample_latent_shape[1]}, "
+                f"stride_latent={stride_lat}, windows_per_image={windows_per_image}"
+            )
+
+        full_latent_shape = sample_latent_shape or (H, W)
+        torch.save(
+            {
+                "tokens_flat": tokens_flat,
+                "coeffs_flat": coeffs_flat,
+                "quantize_sparse_coeffs": args.quantize_sparse_coeffs,
+                "shape": (H, W, D),
+                "full_latent_shape": full_latent_shape,
+                "sample_latent_shape": sample_latent_shape,
+                "sliding_window_stride_latent": sliding_window_stride_latent,
+                "fid_real_images": fid_real_images,
+            },
+            token_cache_path,
+        )
+        print(f"[Stage2] token cache saved: {token_cache_path}")
+    coeff_mean, coeff_std = 0.0, 1.0
+    if coeffs_flat is not None:
+        coeff_mean = float(coeffs_flat.mean().item())
+        coeff_std = float(coeffs_flat.std().item())
+        print(f"[Stage2] coefficient stats: mean={coeff_mean:.4f}, std={coeff_std:.4f}")
+
     if args.stage1_epochs <= 0:
-        # If stage-1 is skipped, we don't need a process restart boundary.
         _run_stage2(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
-            patch_pos_flat=patch_pos_flat,
             quantize_sparse_coeffs=args.quantize_sparse_coeffs,
             H=H,
             W=W,
             D=D,
-            patch_grid_shape=patch_grid_shape,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
             sample_latent_shape=sample_latent_shape,
             sliding_window_stride_latent=sliding_window_stride_latent,
             ae_model=ae,
             fid_real_images=fid_real_images,
+            coeff_mean=coeff_mean,
+            coeff_std=coeff_std,
         )
         return
     # Re-exec into a clean process before launching stage-2 DDP.
