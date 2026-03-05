@@ -42,7 +42,7 @@ except Exception:
     wandb = None
 
 
-def _disable_lightning_cuda_matmul_capability_probe():
+def _disable_cuda_matmul_capability_probe():
     """
     Lightning probes device capability to suggest matmul precision settings.
     On some systems this probe can raise cudaGetDeviceCount error 304 even when
@@ -61,7 +61,7 @@ def _disable_lightning_cuda_matmul_capability_probe():
     fabric_cuda_accel._check_cuda_matmul_precision = _noop_check_cuda_matmul_precision
 
 
-_disable_lightning_cuda_matmul_capability_probe()
+_disable_cuda_matmul_capability_probe()
 
 
 # -----------------------------
@@ -845,8 +845,6 @@ class Prior(nn.Module):
     def generate(
         self,
         batch_size: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
         show_progress: bool = False,
         progress_desc: Optional[str] = None,
         patch_pos_ids: Optional[torch.Tensor] = None,
@@ -893,12 +891,7 @@ class Prior(nn.Module):
                     device=atom_logits.device,
                 )
                 atom_logits[:, :, special_ids] = float("-inf")
-            logits = atom_logits[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None and top_k > 0:
-                v, ix = torch.topk(logits, top_k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
+            logits = atom_logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
@@ -1507,15 +1500,13 @@ class Stage2Module(pl.LightningModule):
         lr: float,
         pad_token_id: int,
         out_dir: str,
-        ae_for_decode: LASER,
+        laser: LASER,
         H: int,
         W: int,
         D: int,
+        image_size: int,
         sample_every_steps: int = 200,
         sample_batch_size: int = 8,
-        sample_temperature: float = 0.9,
-        sample_top_k: int = 128,
-        sample_image_size: Optional[int] = None,
         sample_latent_shape: Optional[Tuple[int, int]] = None,
         sample_window_stride_latent: int = 1,
         patch_grid_shape: Optional[Tuple[int, int]] = None,
@@ -1538,17 +1529,11 @@ class Stage2Module(pl.LightningModule):
         self.predict_coefficients = bool(self.transformer.cfg.predict_coefficients)
         self.coeff_loss_weight = float(coeff_loss_weight)
         self.out_dir = out_dir
-        self.ae_for_decode = ae_for_decode
+        self.laser = laser
         self.H, self.W, self.D = int(H), int(W), int(D)
+        self.image_size = int(image_size)
         self.sample_every_steps = int(sample_every_steps)
         self.sample_batch_size = int(sample_batch_size)
-        self.sample_temperature = max(float(sample_temperature), 1e-8)
-        self.sample_top_k = None if int(sample_top_k) <= 0 else int(sample_top_k)
-        self.sample_image_size = (
-            None
-            if sample_image_size is None or int(sample_image_size) <= 0
-            else int(sample_image_size)
-        )
         if sample_latent_shape is None:
             self.sample_latent_h, self.sample_latent_w = self.H, self.W
         else:
@@ -1578,8 +1563,8 @@ class Stage2Module(pl.LightningModule):
         self._fid_metric = None
         self._fid_metric_feature = None
 
-        self.ae_for_decode.eval()
-        for p in self.ae_for_decode.parameters():
+        self.laser.eval()
+        for p in self.laser.parameters():
             p.requires_grad_(False)
 
     def configure_optimizers(self):
@@ -1730,8 +1715,8 @@ class Stage2Module(pl.LightningModule):
         return loss
 
     def on_fit_start(self):
-        self.ae_for_decode.to(self.device)
-        self.ae_for_decode.eval()
+        self.laser.to(self.device)
+        self.laser.eval()
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if self.sample_every_steps <= 0:
@@ -1761,26 +1746,14 @@ class Stage2Module(pl.LightningModule):
         if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
             self.trainer.strategy.barrier()
 
-    def _maybe_resize_samples(self, imgs: torch.Tensor) -> torch.Tensor:
-        if self.sample_image_size is None:
-            return imgs
-        if imgs.size(-2) == self.sample_image_size and imgs.size(-1) == self.sample_image_size:
-            return imgs
-        return F.interpolate(
-            imgs,
-            size=(self.sample_image_size, self.sample_image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
     def _decode_generated_batch(self, gen) -> torch.Tensor:
         if self.predict_coefficients:
             flat_gen, coeff_gen = gen
             atom_ids = flat_gen.view(-1, self.H, self.W, self.D).to(self.device)
             coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
-            return self.ae_for_decode.decode(atom_ids, coeff_gen)
+            return self.laser.decode(atom_ids, coeff_gen)
         tokens_gen = gen.view(-1, self.H, self.W, self.D)
-        return self.ae_for_decode.decode_tokens(tokens_gen.to(self.device))
+        return self.laser.decode_tokens(tokens_gen.to(self.device))
 
     @torch.no_grad()
     def _sample_sliding_window_batch(self, step: int) -> torch.Tensor:
@@ -1809,29 +1782,14 @@ class Stage2Module(pl.LightningModule):
             dynamic_ncols=True,
         )
 
-        def _earliest_overlapping_start(coord: int, window: int, full: int, stride: int) -> int:
-            """
-            Choose the earliest stride-aligned window start that still contains `coord`.
-            This maximizes already-generated local context and reduces block-boundary seams.
-            """
-            max_start = int(full - window)
-            low = max(0, int(coord - window + 1))
-            high = min(int(coord), max_start)
-            start = ((low + stride - 1) // stride) * stride
-            if start > high:
-                # Fallback for degenerate stride/window combinations.
-                start = min((int(coord) // stride) * stride, max_start)
-            return int(max(0, min(start, max_start)))
-
         for t in steps:
             spatial_idx = t // self.D
             depth_idx = t % self.D
             y = spatial_idx // full_w
             x = spatial_idx % full_w
 
-            stride_lat = int(self.sample_window_stride_latent)
-            h0 = _earliest_overlapping_start(y, self.H, full_h, stride_lat)
-            w0 = _earliest_overlapping_start(x, self.W, full_w, stride_lat)
+            h0 = max(0, min(y - self.H + 1, full_h - self.H))
+            w0 = max(0, min(x - self.W + 1, full_w - self.W))
             local_y = y - h0
             local_x = x - w0
             local_pos = (local_y * self.W) + local_x
@@ -1842,26 +1800,17 @@ class Stage2Module(pl.LightningModule):
             seq = torch.cat([bos, ctx], dim=1)
             logits = self.transformer(seq, patch_pos_ids=None)[:, -1, :]
             logits[:, special_ids] = float("-inf")
-            logits = logits / self.sample_temperature
-            if self.sample_top_k is not None:
-                k = min(self.sample_top_k, int(logits.size(-1)))
-                v, ix = torch.topk(logits, k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1).squeeze(1)
             generated[:, y, x, depth_idx] = nxt
 
-        return self.ae_for_decode.decode_tokens(generated.to(self.device))
+        return self.laser.decode_tokens(generated.to(self.device))
 
     @torch.no_grad()
     def _generate_patch_tokens_with_context(
         self,
         patch_idx: int,
         prev_patch_tokens: list[torch.Tensor],
-        temperature: float = 1.0,
-        top_k: Optional[int] = 256,
     ) -> torch.Tensor:
         if self.predict_coefficients:
             raise NotImplementedError("Patch-context sampling is only supported in quantized-token mode.")
@@ -1896,13 +1845,7 @@ class Stage2Module(pl.LightningModule):
 
         for _ in range(T):
             out = self.transformer(seq, patch_pos_ids=patch_pos_seq)
-            logits = out[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None and top_k > 0:
-                k = min(int(top_k), int(logits.size(-1)))
-                v, ix = torch.topk(logits, k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
+            logits = out[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
@@ -1922,11 +1865,9 @@ class Stage2Module(pl.LightningModule):
                 patch_tokens = self._generate_patch_tokens_with_context(
                     patch_idx=patch_idx,
                     prev_patch_tokens=generated_patch_tokens,
-                    temperature=self.sample_temperature,
-                    top_k=self.sample_top_k,
                 )
                 generated_patch_tokens.append(patch_tokens)
-                patch_img = self.ae_for_decode.decode_tokens(
+                patch_img = self.laser.decode_tokens(
                     patch_tokens.view(-1, self.H, self.W, self.D).to(self.device)
                 )
             else:
@@ -1940,8 +1881,6 @@ class Stage2Module(pl.LightningModule):
                     )
                 gen_patch = self.transformer.generate(
                     batch_size=self.sample_batch_size,
-                    temperature=self.sample_temperature,
-                    top_k=self.sample_top_k,
                     show_progress=False,
                     progress_desc=f"[Stage2] patch {patch_idx + 1}/{total_patches} step {step}",
                     patch_pos_ids=patch_pos_ids,
@@ -1968,16 +1907,10 @@ class Stage2Module(pl.LightningModule):
     @torch.no_grad()
     def _sample_and_save(self, step: int):
         self.transformer.eval()
-        self.ae_for_decode.eval()
-        sample_size_str = (
-            f"{self.sample_image_size}x{self.sample_image_size}"
-            if self.sample_image_size is not None
-            else "native"
-        )
+        self.laser.eval()
         print(
             f"[Stage2] sampling at step {step} "
-            f"(batch_size={self.sample_batch_size}, output_size={sample_size_str}, "
-            f"temp={self.sample_temperature:.3f}, top_k={self.sample_top_k if self.sample_top_k is not None else 'none'})..."
+            f"(batch_size={self.sample_batch_size}, output_size={self.image_size}x{self.image_size})..."
         )
         if self.use_sliding_window_sampling:
             print(
@@ -1995,14 +1928,19 @@ class Stage2Module(pl.LightningModule):
         else:
             gen = self.transformer.generate(
                 batch_size=self.sample_batch_size,
-                temperature=self.sample_temperature,
-                top_k=self.sample_top_k,
                 show_progress=True,
                 progress_desc=f"[Stage2] sample step {step}",
                 patch_pos_ids=None,
             )
             raw_imgs = self._decode_generated_batch(gen)
-        sample_imgs = self._maybe_resize_samples(raw_imgs)
+        sample_imgs = raw_imgs
+        if sample_imgs.size(-2) != self.image_size or sample_imgs.size(-1) != self.image_size:
+            sample_imgs = F.interpolate(
+                sample_imgs,
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
         print(f"[Stage2] sample tensor shape: {tuple(sample_imgs.shape)}")
         logged = log_image_grid_wandb(
             self.logger,
@@ -2060,7 +1998,7 @@ class Stage2Module(pl.LightningModule):
             effective_feature = adjusted_feature
 
         self.transformer.eval()
-        self.ae_for_decode.eval()
+        self.laser.eval()
 
         real_u8 = self.fid_real_images[:n].to(self.device)
         fake_u8 = seeded_u8[:n].to(self.device)
@@ -2314,18 +2252,6 @@ def main():
     parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
     parser.add_argument(
-        "--stage2_sample_temperature",
-        type=float,
-        default=0.9,
-        help="Sampling temperature for stage-2 previews (lower usually improves coherence).",
-    )
-    parser.add_argument(
-        "--stage2_sample_top_k",
-        type=int,
-        default=128,
-        help="Top-k for stage-2 preview sampling (<=0 disables top-k filtering).",
-    )
-    parser.add_argument(
         "--stage2_patchify",
         action="store_true",
         default=False,
@@ -2370,12 +2296,6 @@ def main():
         help="Patch mini-batch size during stage-2 token precompute.",
     )
     parser.add_argument(
-        "--stage2_sample_image_size",
-        type=int,
-        default=256,
-        help="Output size for stage-2 sample grids (upsampled if needed).",
-    )
-    parser.add_argument(
         "--stage2_fid_num_samples",
         type=int,
         default=None,
@@ -2412,8 +2332,6 @@ def main():
     args = parser.parse_args()
     if args.stage2_fid_num_samples is None:
         args.stage2_fid_num_samples = int(args.stage2_sample_batch_size)
-    if args.stage2_sample_temperature <= 0.0:
-        raise ValueError("stage2_sample_temperature must be > 0.")
     if args.ae_num_downsamples <= 0:
         raise ValueError(f"ae_num_downsamples must be positive, got {args.ae_num_downsamples}")
     args.image_size = int(args.image_size)
@@ -2512,18 +2430,64 @@ def main():
             out_tanh=True,
         )
 
-    def _load_best_ae_weights(ae_model: LASER):
-        best_path = os.path.join(stage1_dir, "ae_best.pt")
-        if os.path.exists(best_path):
+    def _load_checkpoint(
+        model: nn.Module,
+        candidates: list[str],
+        label: str,
+        required: bool = False,
+    ) -> Optional[str]:
+        last_error = None
+        for ckpt_path in candidates:
+            if not os.path.exists(ckpt_path):
+                continue
             try:
-                state_dict = torch.load(best_path, map_location="cpu", weights_only=True)
-            except TypeError:
-                state_dict = torch.load(best_path, map_location="cpu")
-            ae_model.load_state_dict(state_dict)
-        else:
-            raise FileNotFoundError(f"Stage-1 checkpoint not found at {best_path}")
+                try:
+                    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    state_dict = torch.load(ckpt_path, map_location="cpu")
+                model.load_state_dict(state_dict)
+                print(f"[{label}] loaded checkpoint: {ckpt_path}")
+                return ckpt_path
+            except Exception as exc:
+                last_error = exc
+                print(f"[{label}] failed to load checkpoint {ckpt_path}: {exc}")
+                continue
 
-    def _run_stage2_lightning(
+        if required:
+            tried = ", ".join(candidates)
+            if last_error is not None:
+                raise RuntimeError(
+                    f"{label} checkpoint not loadable. Tried: {tried}. Last error: {last_error}"
+                )
+            raise FileNotFoundError(f"{label} checkpoint not found. Tried: {tried}")
+        return None
+
+    def _load_laser_weights(
+        laser_model: LASER,
+        required: bool = False,
+        prefer_best: bool = False,
+    ) -> Optional[str]:
+        best_path = os.path.join(stage1_dir, "ae_best.pt")
+        last_path = os.path.join(stage1_dir, "ae_last.pt")
+        candidates = [best_path, last_path] if prefer_best else [last_path, best_path]
+        return _load_checkpoint(
+            model=laser_model,
+            candidates=candidates,
+            label="Stage1",
+            required=required,
+        )
+
+    def _load_transformer_weights(transformer_model: Prior) -> Optional[str]:
+        last_path = os.path.join(stage2_dir, "transformer_last.pt")
+        best_path = os.path.join(stage2_dir, "transformer_best.pt")
+        return _load_checkpoint(
+            model=transformer_model,
+            candidates=[last_path, best_path],
+            label="Stage2",
+            required=False,
+        )
+
+    def _run_stage2(
         tokens_flat: torch.Tensor,
         coeffs_flat: Optional[torch.Tensor],
         patch_pos_flat: Optional[torch.Tensor],
@@ -2600,20 +2564,19 @@ def main():
             bos_token_id=ae_model.bottleneck.bos_token_id,
             pad_token_id=ae_model.bottleneck.pad_token_id,
         )
+        _load_transformer_weights(transformer)
         module = Stage2Module(
             transformer=transformer,
             lr=args.stage2_lr,
             pad_token_id=ae_model.bottleneck.pad_token_id,
             out_dir=stage2_dir,
-            ae_for_decode=ae_model,
+            laser=ae_model,
             H=H,
             W=W,
             D=D,
+            image_size=args.image_size,
             sample_every_steps=args.stage2_sample_every_steps,
             sample_batch_size=args.stage2_sample_batch_size,
-            sample_temperature=args.stage2_sample_temperature,
-            sample_top_k=args.stage2_sample_top_k,
-            sample_image_size=args.stage2_sample_image_size,
             sample_latent_shape=sample_latent_shape,
             sample_window_stride_latent=(
                 int(sliding_window_stride_latent)
@@ -2676,8 +2639,8 @@ def main():
         )
         fid_real_images = cache.get("fid_real_images")
         ae = _build_ae(quantize_sparse_coeffs=quantize_sparse_coeffs)
-        _load_best_ae_weights(ae)
-        _run_stage2_lightning(
+        _load_laser_weights(ae, required=True, prefer_best=True)
+        _run_stage2(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
             patch_pos_flat=patch_pos_flat,
@@ -2767,6 +2730,9 @@ def main():
 
     ae = _build_ae()
     if args.stage1_epochs > 0:
+        # Resume stage-1 from the most recent saved checkpoint when available.
+        _load_laser_weights(ae, required=False, prefer_best=False)
+    if args.stage1_epochs > 0:
         if not torch.cuda.is_available():
             raise RuntimeError("Stage-1 Lightning multi-GPU training requires CUDA.")
         if torch.cuda.device_count() < args.stage1_devices:
@@ -2805,7 +2771,12 @@ def main():
             # proceeds to tokenization and stage-2 launch.
             return
 
-    _load_best_ae_weights(ae)
+    # For stage-2 tokenization, use the best available LASER checkpoint if present.
+    # If stage-1 is skipped, require an existing checkpoint.
+    if args.stage1_epochs <= 0:
+        _load_laser_weights(ae, required=True, prefer_best=True)
+    else:
+        _load_laser_weights(ae, required=False, prefer_best=True)
     encode_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ae = ae.to(encode_device)
     token_loader_batch_size = int(args.batch_size)
@@ -2915,7 +2886,7 @@ def main():
     )
     if args.stage1_epochs <= 0:
         # If stage-1 is skipped, we don't need a process restart boundary.
-        _run_stage2_lightning(
+        _run_stage2(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
             patch_pos_flat=patch_pos_flat,
