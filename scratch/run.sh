@@ -154,9 +154,12 @@ if [[ ! -d "$DATA_DIR" ]]; then
   exit 1
 fi
 
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"
+
 nvidia-smi
 
 mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 DATA_BIND_DIR="$DATA_DIR"
 if [[ ! -d "$DATA_BIND_DIR" ]]; then
