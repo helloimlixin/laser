@@ -22,6 +22,17 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 STAGE1_DEVICES="${STAGE1_DEVICES:-4}"
 STAGE2_DEVICES="${STAGE2_DEVICES:-4}"
 STAGE1_STRATEGY="${STAGE1_STRATEGY:-ddp}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-16}"
+FID_NUM_SAMPLES="${FID_NUM_SAMPLES:-0}"
+STAGE2_FID_NUM_SAMPLES="${STAGE2_FID_NUM_SAMPLES:-0}"
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_PROJECT="${WANDB_PROJECT:-laser-scratch}"
+
+if [[ "$WANDB_MODE" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
+  echo "WANDB_API_KEY is not set; falling back to WANDB_MODE=offline to avoid login stalls."
+  WANDB_MODE="offline"
+fi
 
 # Try to initialize environment modules if needed.
 if ! command -v module >/dev/null 2>&1; then
@@ -185,6 +196,12 @@ echo "PWD=$PWD"
 echo "STAGE1_DEVICES=$STAGE1_DEVICES"
 echo "STAGE2_DEVICES=$STAGE2_DEVICES"
 echo "STAGE1_STRATEGY=$STAGE1_STRATEGY"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "STAGE2_BATCH_SIZE=$STAGE2_BATCH_SIZE"
+echo "FID_NUM_SAMPLES=$FID_NUM_SAMPLES"
+echo "STAGE2_FID_NUM_SAMPLES=$STAGE2_FID_NUM_SAMPLES"
+echo "WANDB_MODE=$WANDB_MODE"
+echo "WANDB_PROJECT=$WANDB_PROJECT"
 
 srun singularity exec --nv \
   --bind "$PROJECT_DIR" \
@@ -197,6 +214,12 @@ srun singularity exec --nv \
   --data_dir "$DATA_DIR" \
   --image_size 128 \
   --out_dir "$OUT_DIR" \
+  --batch_size "$BATCH_SIZE" \
+  --stage2_batch_size "$STAGE2_BATCH_SIZE" \
+  --fid_num_samples "$FID_NUM_SAMPLES" \
+  --stage2_fid_num_samples "$STAGE2_FID_NUM_SAMPLES" \
+  --wandb_mode "$WANDB_MODE" \
+  --wandb_project "$WANDB_PROJECT" \
   --stage1_devices "$STAGE1_DEVICES" \
   --stage2_devices "$STAGE2_DEVICES" \
   --stage1_strategy "$STAGE1_STRATEGY" \
