@@ -128,8 +128,7 @@ if [[ ! -d "$DATA_DIR" ]]; then
     "/scratch/$USER/data/celeba" \
     "/scratch/$USER/data/CelebA" \
     "/scratch/$USER/data/img_align_celeba" \
-    "$BASE_DIR/../../data/celeba" \
-    "$BASE_DIR/../data/celeba"
+    "../../data/celeba"
   do
     if [[ -d "$cand" ]]; then
       DATA_DIR="$cand"
