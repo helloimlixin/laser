@@ -18,6 +18,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,11 +118,20 @@ class FlatImageDataset(Dataset):
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset directory not found: {self.root}")
 
-        image_paths = [
-            p for p in self.root.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
-        ]
+        scan_root = self.root / "img_align_celeba"
+        if not scan_root.is_dir():
+            scan_root = self.root
+        t0 = time.time()
+        print(f"[Data] scanning image tree: {scan_root}")
+        image_paths = []
+        for dirpath, _, filenames in os.walk(scan_root, followlinks=False):
+            for name in filenames:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in IMG_EXTENSIONS:
+                    image_paths.append(Path(dirpath) / name)
         image_paths.sort()
+        dt = time.time() - t0
+        print(f"[Data] indexed {len(image_paths)} images from {scan_root} in {dt:.1f}s")
         if not image_paths:
             raise RuntimeError(f"No images found under: {self.root}")
         self.image_paths = image_paths
@@ -1592,10 +1602,35 @@ class Stage2Module(pl.LightningModule):
         self.laser.to(self.device)
         self.laser.eval()
 
+    @staticmethod
+    def _dist_initialized() -> bool:
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if self.sample_every_steps <= 0:
             return
         if self.global_step <= 0 or (self.global_step % self.sample_every_steps) != 0:
+            return
+        if self._dist_initialized():
+            torch.distributed.barrier()
+            sample_error = torch.zeros(1, dtype=torch.int32, device=self.device)
+            if self.trainer.is_global_zero:
+                try:
+                    self._log_gt_recons(batch, step=self.global_step)
+                    self._sample_and_save(step=self.global_step)
+                except Exception as exc:
+                    sample_error.fill_(1)
+                    print(f"[Stage2] sampling failed at step {self.global_step}: {exc}")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            torch.distributed.all_reduce(sample_error, op=torch.distributed.ReduceOp.MAX)
+            torch.distributed.barrier()
+            if int(sample_error.item()) != 0:
+                raise RuntimeError(
+                    f"Stage-2 sampling failed at step {self.global_step} on at least one rank."
+                )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return
         if self.trainer.is_global_zero:
             self._log_gt_recons(batch, step=self.global_step)
@@ -1634,10 +1669,14 @@ class Stage2Module(pl.LightningModule):
             save_image_grid(gt_imgs, os.path.join(self.out_dir, f"stage2_step{step:06d}_gt_recons.png"))
 
     def on_train_epoch_end(self):
+        if self._dist_initialized():
+            torch.distributed.barrier()
         if self.trainer.is_global_zero:
             os.makedirs(self.out_dir, exist_ok=True)
             arch_tag = "spatial_depth" if self.is_spatial_depth else "flat"
             torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, f"transformer_{arch_tag}_last.pt"))
+        if self._dist_initialized():
+            torch.distributed.barrier()
 
     def _decode_generated_batch(self, gen) -> torch.Tensor:
         if self.is_spatial_depth or self.is_diffusion:
@@ -2422,6 +2461,7 @@ def main():
         else:
             stage2_source_set = train_set
     elif args.dataset == "celeba":
+        print(f"[Data] building FlatImageDataset from: {args.data_dir}")
         train_full = FlatImageDataset(root=args.data_dir, transform=train_tfm)
         val_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
         val_vis_full = FlatImageDataset(root=args.data_dir, transform=val_vis_tfm)
@@ -2442,6 +2482,7 @@ def main():
             stage2_source_set = train_set
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
+    print(f"[Data] dataset objects ready: train={len(train_set)} val={len(val_set)}")
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
