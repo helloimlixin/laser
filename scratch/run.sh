@@ -71,7 +71,7 @@ if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* 
   fi
 fi
 
-PROJECT_DIR="/sratch/$USER/Projects/laser"
+PROJECT_DIR="/scratch/$USER/Projects/laser"
 DATA_DIR="/scratch/$USER/Projects/data/celeba"
 OUT_DIR="/scratch/$USER/Projects/laser/scratch/runs/laser_celeba_128"
 
