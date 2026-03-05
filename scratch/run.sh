@@ -21,6 +21,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 STAGE1_DEVICES="${STAGE1_DEVICES:-4}"
 STAGE2_DEVICES="${STAGE2_DEVICES:-4}"
+STAGE1_STRATEGY="${STAGE1_STRATEGY:-auto}"
 
 # Try to initialize environment modules if needed.
 if ! command -v module >/dev/null 2>&1; then
@@ -90,19 +91,7 @@ OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
 if [[ -n "${DATA_DIR:-}" ]]; then
   DATA_DIR_INPUT="$DATA_DIR"
 else
-  DATA_DIR_INPUT=""
-  for cand in \
-    "/scratch/$USER/Projects/data/celeba" \
-    "$BASE_DIR/../../data/celeba"
-  do
-    if [[ -d "$cand" ]]; then
-      DATA_DIR_INPUT="$cand"
-      break
-    fi
-  done
-  if [[ -z "$DATA_DIR_INPUT" ]]; then
-    DATA_DIR_INPUT="/scratch/$USER/Projects/data/celeba"
-  fi
+  DATA_DIR_INPUT="/scratch/$USER/Projects/data/celeba"
 fi
 
 if [[ "$PROJECT_DIR_INPUT" != /* ]]; then
@@ -155,6 +144,7 @@ echo "IMAGE=$IMAGE"
 echo "BASE_DIR=$BASE_DIR"
 echo "STAGE1_DEVICES=$STAGE1_DEVICES"
 echo "STAGE2_DEVICES=$STAGE2_DEVICES"
+echo "STAGE1_STRATEGY=$STAGE1_STRATEGY"
 
 srun singularity exec --nv \
   --bind "$PROJECT_DIR" \
@@ -169,6 +159,6 @@ srun singularity exec --nv \
   --out_dir "$OUT_DIR" \
   --stage1_devices "$STAGE1_DEVICES" \
   --stage2_devices "$STAGE2_DEVICES" \
-  --stage1_strategy ddp \
+  --stage1_strategy "$STAGE1_STRATEGY" \
   --stage2_arch spatial_depth \
   --no_quantize_sparse_coeffs
