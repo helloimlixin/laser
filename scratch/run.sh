@@ -71,9 +71,9 @@ if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* 
   fi
 fi
 
-PROJECT_DIR="/scratch/$USER/Projects/laser"
-DATA_DIR="/scratch/$USER/Projects/data/celeba"
-OUT_DIR="/scratch/$USER/Projects/laser/scratch/runs/laser_celeba_128"
+PROJECT_DIR="."
+DATA_DIR="../../data/celeba"
+OUT_DIR="./runs/laser_celeba_128"
 
 nvidia-smi
 
@@ -83,7 +83,7 @@ srun singularity exec --nv \
   --bind "$PROJECT_DIR":"$PROJECT_DIR" \
   --bind "/scratch/$USER":"/scratch/$USER" \
   "$IMAGE" \
-  python3 "$PROJECT_DIR/scratch/laser.py" \
+  python3 "laser.py" \
   --dataset celeba \
   --data_dir "$DATA_DIR" \
   --image_size 128 \
