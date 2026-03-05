@@ -91,7 +91,7 @@ OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
 if [[ -n "${DATA_DIR:-}" ]]; then
   DATA_DIR_INPUT="$DATA_DIR"
 else
-  DATA_DIR_INPUT="$BASE_DIR/../../data/celeba"
+  DATA_DIR_INPUT="/scratch/$USER/Projects/data/celeba"
 fi
 
 if [[ "$PROJECT_DIR_INPUT" != /* ]]; then
@@ -155,6 +155,15 @@ if [[ ! -d "$DATA_DIR" ]]; then
 fi
 
 DATA_DIR="$(cd "$DATA_DIR" && pwd)"
+
+IMG_COUNT="$(find "$DATA_DIR" -maxdepth 3 -type f \
+  \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.bmp" \) \
+  2>/dev/null | wc -l | tr -d ' ')"
+echo "DATA_IMAGE_COUNT(maxdepth=3)=$IMG_COUNT"
+if [[ "${IMG_COUNT:-0}" -eq 0 ]]; then
+  echo "ERROR: no image files found under DATA_DIR=$DATA_DIR (maxdepth=3)." >&2
+  exit 1
+fi
 
 nvidia-smi
 
