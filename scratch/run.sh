@@ -47,8 +47,16 @@ fi
 # 1) local path to .sif (recommended), or
 # 2) URI like docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 #
-# Default is a local .sif path.
-IMAGE="${IMAGE:-/scratch/$USER/containers/pytorch_24.02.sif}"
+# If IMAGE is unset, prefer local .sif if present, else fall back to docker:// URI.
+DEFAULT_LOCAL_IMAGE="/scratch/$USER/containers/pytorch_24.02.sif"
+DEFAULT_REMOTE_IMAGE="docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime"
+if [[ -z "${IMAGE:-}" ]]; then
+  if [[ -f "$DEFAULT_LOCAL_IMAGE" ]]; then
+    IMAGE="$DEFAULT_LOCAL_IMAGE"
+  else
+    IMAGE="$DEFAULT_REMOTE_IMAGE"
+  fi
+fi
 
 if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* ]]; then
   if [[ ! -f "$IMAGE" ]]; then
