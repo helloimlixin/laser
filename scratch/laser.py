@@ -309,7 +309,7 @@ class DictionaryLearningTokenized(nn.Module):
             raise ValueError(
                 "coef_quantization must be one of {'uniform', 'mu_law'}"
             )
-        if self.coef_mu <= 0.0:
+        if self.coef_quantization == "mu_law" and self.coef_mu <= 0.0:
             raise ValueError(f"coef_mu must be > 0, got {self.coef_mu}")
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
@@ -320,9 +320,12 @@ class DictionaryLearningTokenized(nn.Module):
         # Coefficient bin centers (uniform)
         centers = torch.linspace(-self.coef_max, self.coef_max, steps=self.n_bins)
         self.register_buffer("coef_bin_centers", centers)
+        mu_invlog1p = 1.0
+        if self.coef_quantization == "mu_law":
+            mu_invlog1p = 1.0 / math.log1p(self.coef_mu)
         self.register_buffer(
             "coef_mu_invlog1p",
-            torch.tensor(1.0 / (math.log1p(self.coef_mu))),
+            torch.tensor(mu_invlog1p),
         )
 
         # Special tokens (for the transformer)
@@ -1548,6 +1551,8 @@ def main():
 
     if args.ae_num_downsamples <= 0:
         raise ValueError(f"ae_num_downsamples must be positive, got {args.ae_num_downsamples}")
+    if args.coef_quantization == "mu_law" and args.coef_mu <= 0.0:
+        raise ValueError(f"coef_mu must be > 0 when coef_quantization='mu_law', got {args.coef_mu}")
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0.")
     if args.token_subset < 0:
