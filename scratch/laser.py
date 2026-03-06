@@ -1,36 +1,34 @@
 
 """
-cifar10_sparse_dict_rqtransformer.py
+laser.py
 
-A minimal, end-to-end "RQ-VAE-ish" pipeline using:
-  - VQ-VAE-style Encoder/Decoder (conv + residual stack) (from LASER's VQ-VAE baseline)
-  - Dictionary-learning bottleneck with batched OMP sparse coding (LASER-style)
-  - Option A tokenization: token = atom_id * n_bins + coef_bin
-  - A simple "RQTransformer prior" (GPT-style causal transformer) over (H,W,D) stacks
-  - CIFAR-10 quick test
+Minimal LASER training script.
 
-Run:
-  python cifar10_sparse_dict_rqtransformer.py --stage1_epochs 5 --stage2_epochs 10
+It keeps the core two-stage workflow:
+  - stage 1: train the LASER autoencoder
+  - stage 2: train a transformer prior on flattened sparse tokens
 
-This is intentionally compact and hackable, not "best possible" training.
+The default dataset is CelebA under ../../data/celeba relative to this file.
+For multi-GPU runs, launch with torchrun.
 """
 import argparse
 import math
 import os
-import subprocess
-import sys
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import lightning as pl
-from lightning.pytorch.loggers import WandbLogger
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
+from scipy.linalg import sqrtm
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
+from torchvision.models import Inception_V3_Weights, inception_v3
 from torchvision import datasets, transforms, utils
 from tqdm import tqdm
 try:
@@ -43,33 +41,79 @@ except Exception:
     wandb = None
 
 
-def _disable_lightning_cuda_matmul_capability_probe():
-    """
-    Lightning probes device capability to suggest matmul precision settings.
-    On some systems this probe can raise cudaGetDeviceCount error 304 even when
-    CUDA training itself works. Disable the probe to avoid false startup crashes.
-    """
-    try:
-        import lightning.pytorch.accelerators.cuda as pl_cuda_accel
-        import lightning.fabric.accelerators.cuda as fabric_cuda_accel
-    except Exception:
-        return
-
-    def _noop_check_cuda_matmul_precision(device):
-        return
-
-    pl_cuda_accel._check_cuda_matmul_precision = _noop_check_cuda_matmul_precision
-    fabric_cuda_accel._check_cuda_matmul_precision = _noop_check_cuda_matmul_precision
-
-
-_disable_lightning_cuda_matmul_capability_probe()
-
-
 # -----------------------------
 # VQ-VAE style building blocks
 # -----------------------------
 
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CELEBA_DIR = (SCRIPT_DIR / "../../data/celeba").resolve()
+
+
+def _default_image_size(dataset: str) -> int:
+    return 128 if dataset == "celeba" else 32
+
+
+def _default_data_dir(dataset: str) -> Path:
+    if dataset == "celeba":
+        return DEFAULT_CELEBA_DIR
+    return (SCRIPT_DIR / "data").resolve()
+
+
+def _default_out_dir(dataset: str, image_size: int) -> Path:
+    return (SCRIPT_DIR / "runs" / f"laser_{dataset}_{image_size}").resolve()
+
+
+def _init_distributed() -> Tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False, 0, 0, 1
+    if not torch.cuda.is_available():
+        raise RuntimeError("Multi-GPU training requires CUDA.")
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    return True, rank, local_rank, world_size
+
+
+def _cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _barrier():
+    if _is_distributed():
+        if torch.cuda.is_available():
+            # NCCL warns if barrier cannot infer the rank-to-device mapping.
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
+
+
+def _distributed_mean(value: torch.Tensor) -> torch.Tensor:
+    if not _is_distributed():
+        return value.detach()
+    reduced = value.detach().clone()
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    reduced /= dist.get_world_size()
+    return reduced
+
+
+def _unwrap_module(module: nn.Module) -> nn.Module:
+    return module.module if isinstance(module, DDP) else module
+
+
+_RFID_MODEL = None
+_RFID_MODEL_DEVICE = None
+_RFID_METRIC = None
+_RFID_METRIC_DEVICE = None
 
 
 class FlatImageDataset(Dataset):
@@ -244,7 +288,7 @@ class DictionaryLearningTokenized(nn.Module):
         num_embeddings: int = 256,
         embedding_dim: int = 64,
         sparsity_level: int = 4,
-        n_bins: int = 129,
+        n_bins: int = 16,
         coef_max: float = 3.0,
         quantize_sparse_coeffs: bool = True,
         coef_quantization: str = "mu_law",
@@ -540,11 +584,14 @@ class DictionaryLearningTokenized(nn.Module):
         return self._reconstruct_sparse(tokens.to(torch.long), coeffs.to(self._normalize_dict().dtype))
 
 
+SparseBottleneck = DictionaryLearningTokenized
+
+
 # -----------------------------
 # Stage-1 model: Encoder + Dictionary bottleneck + Decoder
 # -----------------------------
 
-class SparseDictAE(nn.Module):
+class LASER(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
@@ -556,7 +603,7 @@ class SparseDictAE(nn.Module):
         num_embeddings: int = 256,
         sparsity_level: int = 4,
         commitment_cost: float = 0.25,
-        n_bins: int = 129,
+        n_bins: int = 16,
         coef_max: float = 3.0,
         coef_quantization: str = "mu_law",
         coef_mu: float = 50.0,
@@ -638,6 +685,10 @@ class SparseDictAE(nn.Module):
         return recon
 
 
+# Backward-compatible alias for older scratch experiments.
+SparseDictAE = LASER
+
+
 # -----------------------------
 # Stage-2: RQTransformer prior (GPT-style causal transformer over stacks)
 # -----------------------------
@@ -703,11 +754,6 @@ class RQTransformerConfig:
     H: int
     W: int
     D: int
-    num_patch_positions: int = 0
-    context_tokens: int = 0
-    predict_coefficients: bool = False
-    coeff_loss_weight: float = 1.0
-    coeff_max: float = 3.0
     d_model: int = 256
     n_heads: int = 8
     n_layers: int = 6
@@ -717,30 +763,21 @@ class RQTransformerConfig:
 
 class RQTransformerPrior(nn.Module):
     """
-    A simple RQ-style prior:
-      - The full sequence is: [BOS] + raster_scan(H*W) each with depth D tokens.
-      - Embedding = token + spatial_pos + depth_pos + type(BOS vs normal)
-      - GPT-style causal blocks.
+    Autoregressive prior over a flattened H x W x D token grid.
     """
     def __init__(self, cfg: RQTransformerConfig, bos_token_id: int, pad_token_id: int):
         super().__init__()
         self.cfg = cfg
-        self.predict_coefficients = bool(cfg.predict_coefficients)
         self.bos_token_id = int(bos_token_id)
         self.pad_token_id = int(pad_token_id)
 
         self.tokens_per_patch = cfg.H * cfg.W * cfg.D
-        self.max_len = 1 + int(cfg.context_tokens) + self.tokens_per_patch
+        self.max_len = 1 + self.tokens_per_patch
 
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.spatial_emb = nn.Embedding(cfg.H * cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
         self.type_emb = nn.Embedding(2, cfg.d_model)
-        self.patch_pos_emb = (
-            nn.Embedding(cfg.num_patch_positions, cfg.d_model)
-            if cfg.num_patch_positions > 0
-            else None
-        )
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([
@@ -748,40 +785,29 @@ class RQTransformerPrior(nn.Module):
             for _ in range(cfg.n_layers)
         ])
         self.ln_f = nn.LayerNorm(cfg.d_model)
-        self.atom_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if self.predict_coefficients:
-            self.coeff_head = nn.Linear(cfg.d_model, 1)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
-        # Precompute position ids for [BOS] + optional context + current patch tokens.
-        # For context tokens, repeat the local (spatial, depth) pattern per patch.
+        # Position ids for [BOS] + flattened token sequence.
         spatial_ids = torch.zeros(self.max_len, dtype=torch.long)
         depth_ids = torch.zeros(self.max_len, dtype=torch.long)
-        type_ids = torch.zeros(self.max_len, dtype=torch.long)  # 0 for BOS, 1 for normal
+        type_ids = torch.zeros(self.max_len, dtype=torch.long)
         if self.max_len > 1:
             idx = torch.arange(self.max_len - 1)
-            local_idx = idx % self.tokens_per_patch
-            spatial_ids[1:] = local_idx // cfg.D
-            depth_ids[1:] = local_idx % cfg.D
+            spatial_ids[1:] = idx // cfg.D
+            depth_ids[1:] = idx % cfg.D
             type_ids[1:] = 1
         self.register_buffer("_spatial_ids", spatial_ids)
         self.register_buffer("_depth_ids", depth_ids)
         self.register_buffer("_type_ids", type_ids)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        patch_pos_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, L] tokens, L <= max_len
         Returns:
-            If predict_coefficients=False:
-                logits: [B, L, vocab]
-            If predict_coefficients=True:
-                atom_logits: [B, L, vocab], coeff: [B, L]
+            logits: [B, L, vocab]
         """
-        B, L = x.shape
+        _, L = x.shape
         if L > self.max_len:
             raise ValueError(f"Got L={L}, but max_len={self.max_len}")
 
@@ -791,38 +817,13 @@ class RQTransformerPrior(nn.Module):
         tp = self.type_emb(self._type_ids[:L])
 
         h = tok + sp.unsqueeze(0) + dp.unsqueeze(0) + tp.unsqueeze(0)
-        if self.patch_pos_emb is not None:
-            if patch_pos_ids is None:
-                raise ValueError("patch_pos_ids must be provided when num_patch_positions > 0")
-            patch_pos_ids = patch_pos_ids.to(device=x.device, dtype=torch.long)
-            if patch_pos_ids.dim() == 1:
-                if patch_pos_ids.shape[0] != B:
-                    raise ValueError(
-                        f"patch_pos_ids must have shape [B], got {tuple(patch_pos_ids.shape)} for B={B}"
-                    )
-                h = h + self.patch_pos_emb(patch_pos_ids).unsqueeze(1)
-            elif patch_pos_ids.dim() == 2:
-                if patch_pos_ids.shape != (B, L):
-                    raise ValueError(
-                        f"patch_pos_ids must have shape [B, L]={B, L}, got {tuple(patch_pos_ids.shape)}"
-                    )
-                h = h + self.patch_pos_emb(patch_pos_ids)
-            else:
-                raise ValueError(
-                    f"patch_pos_ids must have rank 1 or 2, got rank {patch_pos_ids.dim()}"
-                )
         h = self.drop(h)
 
         for block in self.blocks:
             h = block(h)
 
         h = self.ln_f(h)
-        atom_logits = self.atom_head(h)
-        if not self.predict_coefficients:
-            return atom_logits
-
-        coeff = self.coeff_head(h).squeeze(-1)
-        return atom_logits, coeff
+        return self.head(h)
 
     @torch.no_grad()
     def generate(
@@ -832,29 +833,12 @@ class RQTransformerPrior(nn.Module):
         top_k: Optional[int] = None,
         show_progress: bool = False,
         progress_desc: Optional[str] = None,
-        patch_pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Unconditional generation.
-        Returns:
-            If predict_coefficients=False:
-                flat_tokens: [B, H*W*D] (without BOS)
-            If predict_coefficients=True:
-                flat_tokens, flat_coeffs
-        """
+        """Sample a batch of flattened token sequences."""
         device = next(self.parameters()).device
         T = self.cfg.H * self.cfg.W * self.cfg.D
 
         seq = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
-        if self.patch_pos_emb is not None:
-            if patch_pos_ids is None:
-                raise ValueError("patch_pos_ids must be provided when num_patch_positions > 0")
-            patch_pos_ids = patch_pos_ids.to(device=device, dtype=torch.long)
-            if patch_pos_ids.dim() != 1 or patch_pos_ids.shape[0] != batch_size:
-                raise ValueError(
-                    f"patch_pos_ids must have shape [batch_size], got {tuple(patch_pos_ids.shape)}"
-                )
-        coeffs: list[torch.Tensor] = []
         steps = tqdm(
             range(T),
             desc=(progress_desc or "[Stage2] sampling tokens"),
@@ -863,36 +847,21 @@ class RQTransformerPrior(nn.Module):
             disable=(not show_progress),
         )
         for _ in steps:
-            out = self(seq, patch_pos_ids=patch_pos_ids)
-            if self.predict_coefficients:
-                atom_logits, coeff_step = out
-                coeff_step = coeff_step[:, -1]
-            else:
-                atom_logits = out
-            if self.predict_coefficients:
-                # Keep atom predictions in [0, num_atoms) so decode is well-defined.
-                special_ids = torch.tensor(
-                    [self.bos_token_id, self.pad_token_id],
-                    device=atom_logits.device,
-                )
-                atom_logits[:, :, special_ids] = float("-inf")
-            logits = atom_logits[:, -1, :] / max(temperature, 1e-8)
+            logits = self(seq)[:, -1, :] / max(temperature, 1e-8)
             if top_k is not None and top_k > 0:
-                v, ix = torch.topk(logits, top_k, dim=-1)
+                k = min(int(top_k), int(logits.size(-1)))
+                v, ix = torch.topk(logits, k, dim=-1)
                 mask = torch.full_like(logits, float("-inf"))
                 mask.scatter_(1, ix, v)
                 logits = mask
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
             seq = torch.cat([seq, nxt], dim=1)
-            if self.predict_coefficients:
-                coeffs.append(coeff_step)
-
-        if self.predict_coefficients:
-            coeff_flat = torch.stack(coeffs, dim=1)
-            coeff_flat = coeff_flat.clamp(-self.cfg.coeff_max, self.cfg.coeff_max)
-            return seq[:, 1:], coeff_flat
         return seq[:, 1:]
+
+
+PriorConfig = RQTransformerConfig
+Prior = RQTransformerPrior
 
 
 # -----------------------------
@@ -907,1189 +876,243 @@ def _make_image_grid(x: torch.Tensor, nrow: int = 8) -> torch.Tensor:
 
 
 def save_image_grid(x: torch.Tensor, path: str, nrow: int = 8):
-    """
-    Save a grid of images. Expects x in [-1,1] (we'll map to [0,1]).
-    """
+    """Save a batch in [-1, 1] as a single image grid."""
     grid = _make_image_grid(x, nrow=nrow)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     utils.save_image(grid, path)
 
 
-def unfold_image_patches(
-    x: torch.Tensor,
-    patch_size: int,
-    stride: int,
-) -> Tuple[torch.Tensor, int, int]:
-    """
-    Split images into patches with unfold.
-    Returns:
-      patches: [B * (grid_h*grid_w), C, patch_size, patch_size]
-      grid_h, grid_w
-    """
-    if x.dim() != 4:
-        raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
-    B, C, H, W = x.shape
-    p = int(patch_size)
-    s = int(stride)
-    if p <= 0 or s <= 0:
-        raise ValueError(f"patch_size and stride must be positive, got patch_size={p}, stride={s}")
-    if H < p or W < p:
-        raise ValueError(f"Image size {(H, W)} is smaller than patch_size={p}")
-    if ((H - p) % s) != 0 or ((W - p) % s) != 0:
-        raise ValueError(
-            f"Invalid patch grid for HxW={H}x{W}, patch_size={p}, stride={s}."
+def _to_unit_range(x: torch.Tensor) -> torch.Tensor:
+    """Map images from [-1, 1] to [0, 1] for reconstruction metrics."""
+    return x.detach().clamp(-1, 1).add(1.0).mul(0.5)
+
+
+def _batch_psnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Average PSNR over a batch of images in [0, 1]."""
+    mse = F.mse_loss(x, y, reduction="none").mean(dim=(1, 2, 3))
+    return 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10)).mean()
+
+
+def _batch_ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Average SSIM over a batch of images in [0, 1] using a Gaussian window."""
+    _, channels, height, width = x.shape
+    window_size = min(11, height, width)
+    if window_size % 2 == 0:
+        window_size -= 1
+    window_size = max(1, window_size)
+    radius = window_size // 2
+
+    coords = torch.arange(window_size, device=x.device, dtype=x.dtype) - radius
+    kernel_1d = torch.exp(-(coords ** 2) / (2 * (1.5 ** 2)))
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(1e-12)
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    kernel = kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
+
+    mu_x = F.conv2d(x, kernel, padding=radius, groups=channels)
+    mu_y = F.conv2d(y, kernel, padding=radius, groups=channels)
+    mu_x_sq = mu_x.square()
+    mu_y_sq = mu_y.square()
+    mu_xy = mu_x * mu_y
+
+    sigma_x = F.conv2d(x * x, kernel, padding=radius, groups=channels) - mu_x_sq
+    sigma_y = F.conv2d(y * y, kernel, padding=radius, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, kernel, padding=radius, groups=channels) - mu_xy
+
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    num = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
+    den = (mu_x_sq + mu_y_sq + c1) * (sigma_x + sigma_y + c2)
+    ssim_map = num / den.clamp_min(1e-10)
+    return ssim_map.mean(dim=(1, 2, 3)).mean()
+
+
+def _get_rfid_model(device: torch.device) -> nn.Module:
+    """Build and cache the fallback Inception-V3 feature extractor used for reconstruction FID."""
+    global _RFID_MODEL, _RFID_MODEL_DEVICE
+    device_key = str(device)
+    if _RFID_MODEL is None or _RFID_MODEL_DEVICE != device_key:
+        model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
+        model.fc = nn.Identity()
+        model.eval().to(device)
+        _RFID_MODEL = model
+        _RFID_MODEL_DEVICE = device_key
+    return _RFID_MODEL
+
+
+def _get_rfid_metric(device: torch.device, feature: int = 64):
+    """Build and cache the canonical torchmetrics FID metric when available."""
+    global _RFID_METRIC, _RFID_METRIC_DEVICE
+    if FrechetInceptionDistance is None:
+        return None
+    device_key = f"{device}:{int(feature)}"
+    if _RFID_METRIC is None or _RFID_METRIC_DEVICE != device_key:
+        _RFID_METRIC = FrechetInceptionDistance(
+            feature=int(feature),
+            sync_on_compute=False,
+            normalize=False,
+        ).to(device)
+        _RFID_METRIC_DEVICE = device_key
+    _RFID_METRIC.reset()
+    return _RFID_METRIC
+
+
+@torch.no_grad()
+def _extract_rfid_features(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Extract pooled Inception-V3 features from images in [-1, 1]."""
+    x = _to_unit_range(x)
+    if x.size(-2) != 299 or x.size(-1) != 299:
+        x = F.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
+    mean = x.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = x.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    feats = model(x)
+    if isinstance(feats, tuple):
+        feats = feats[0]
+    return feats.float()
+
+
+def _to_uint8_images(x: torch.Tensor) -> torch.Tensor:
+    """Convert images from [-1, 1] to uint8 RGB tensors for FID."""
+    return ((x.detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
+
+
+def _frechet_distance_from_features(real_feats: torch.Tensor, fake_feats: torch.Tensor) -> float:
+    """Compute Fréchet distance between two feature clouds."""
+    real_np = real_feats.detach().cpu().numpy().astype(np.float64, copy=False)
+    fake_np = fake_feats.detach().cpu().numpy().astype(np.float64, copy=False)
+    mu_real = np.mean(real_np, axis=0)
+    mu_fake = np.mean(fake_np, axis=0)
+    sigma_real = np.cov(real_np, rowvar=False)
+    sigma_fake = np.cov(fake_np, rowvar=False)
+
+    cov_prod = sigma_real @ sigma_fake
+    cov_mean = sqrtm(cov_prod)
+    if not np.isfinite(cov_mean).all():
+        eps = 1e-6
+        eye = np.eye(sigma_real.shape[0], dtype=np.float64)
+        cov_mean = sqrtm((sigma_real + eps * eye) @ (sigma_fake + eps * eye))
+    if np.iscomplexobj(cov_mean):
+        cov_mean = cov_mean.real
+
+    diff = mu_real - mu_fake
+    fid = diff.dot(diff) + np.trace(sigma_real + sigma_fake - 2.0 * cov_mean)
+    return float(max(fid, 0.0))
+
+
+@torch.no_grad()
+def _compute_reconstruction_fid(
+    ae: LASER,
+    loader: Optional[DataLoader],
+    device: torch.device,
+    max_items: int,
+) -> Optional[float]:
+    """Compute reconstruction FID between validation images and their reconstructions."""
+    if loader is None or max_items <= 1:
+        return None
+
+    ae.eval()
+    fid_metric = _get_rfid_metric(device, feature=64)
+    if fid_metric is not None:
+        seen = 0
+        for x, _ in tqdm(loader, desc="[Stage1] compute rFID", leave=False, dynamic_ncols=True):
+            x = x.to(device)
+            recon, _, _ = ae(x)
+            keep = min(x.size(0), max_items - seen)
+            if keep <= 0:
+                break
+            fid_metric.update(_to_uint8_images(x[:keep]).to(device), real=True)
+            fid_metric.update(_to_uint8_images(recon[:keep]).to(device), real=False)
+            seen += keep
+            if seen >= max_items:
+                break
+        if seen <= 1:
+            return None
+        return float(fid_metric.compute().detach().cpu().item())
+
+    model = _get_rfid_model(device)
+    real_feats = []
+    fake_feats = []
+    seen = 0
+
+    for x, _ in tqdm(loader, desc="[Stage1] compute rFID", leave=False, dynamic_ncols=True):
+        x = x.to(device)
+        recon, _, _ = ae(x)
+        keep = min(x.size(0), max_items - seen)
+        if keep <= 0:
+            break
+        real_feats.append(_extract_rfid_features(model, x[:keep]).cpu())
+        fake_feats.append(_extract_rfid_features(model, recon[:keep]).cpu())
+        seen += keep
+        if seen >= max_items:
+            break
+
+    if seen <= 1:
+        return None
+    return _frechet_distance_from_features(torch.cat(real_feats, dim=0), torch.cat(fake_feats, dim=0))
+
+
+def _init_wandb(args) -> Optional[object]:
+    if not getattr(args, "wandb", True):
+        return None
+    if wandb is None:
+        print("[W&B] wandb is not installed; continuing without logging.")
+        return None
+    try:
+        return wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            dir=args.wandb_dir,
+            mode=args.wandb_mode,
+            config=dict(vars(args)),
         )
-    grid_h = ((H - p) // s) + 1
-    grid_w = ((W - p) // s) + 1
-    cols = F.unfold(x, kernel_size=p, stride=s)  # [B, C*p*p, grid_h*grid_w]
-    patches = cols.transpose(1, 2).contiguous().view(B * grid_h * grid_w, C, p, p)
-    return patches, grid_h, grid_w
-
-
-def fold_image_patches(
-    patches: torch.Tensor,
-    grid_h: int,
-    grid_w: int,
-    patch_size: int,
-    stride: int,
-) -> torch.Tensor:
-    """
-    Reconstruct images from patches with fold.
-    Expects patches in [B, grid_h*grid_w, C, patch_size, patch_size].
-    """
-    if patches.dim() != 5:
-        raise ValueError(f"Expected [B,P,C,H,W], got {tuple(patches.shape)}")
-    B, P, C, PH, PW = patches.shape
-    p = int(patch_size)
-    s = int(stride)
-    if PH != p or PW != p:
-        raise ValueError(f"Patch tensor size ({PH}, {PW}) does not match patch_size={p}")
-    expected_patches = int(grid_h) * int(grid_w)
-    if P != expected_patches:
-        raise ValueError(f"Expected P={expected_patches}, got P={P}")
-
-    out_h = (int(grid_h) - 1) * s + p
-    out_w = (int(grid_w) - 1) * s + p
-    cols = patches.contiguous().view(B, P, C * p * p).transpose(1, 2).contiguous()
-    imgs = F.fold(cols, output_size=(out_h, out_w), kernel_size=p, stride=s)
-
-    if s < p:
-        weight_cols = torch.ones((B, p * p, P), device=patches.device, dtype=patches.dtype)
-        weights = F.fold(weight_cols, output_size=(out_h, out_w), kernel_size=p, stride=s)
-        imgs = imgs / weights.clamp_min(1e-6)
-
-    return imgs
-
-
-def _resolve_wandb_logger(logger_obj):
-    if isinstance(logger_obj, WandbLogger):
-        return logger_obj
-    for lg in getattr(logger_obj, "loggers", []):
-        if isinstance(lg, WandbLogger):
-            return lg
-    return None
-
-
-def log_image_grid_wandb(
-    logger_obj,
-    key: str,
-    x: torch.Tensor,
-    step: int,
-    nrow: int = 8,
-    caption: Optional[str] = None,
-) -> bool:
-    wb_logger = _resolve_wandb_logger(logger_obj)
-    if wb_logger is None or wandb is None:
-        return False
-
-    grid = _make_image_grid(x, nrow=nrow)
-    grid_np = grid.permute(1, 2, 0).mul(255).clamp(0, 255).byte().numpy()
-    wb_image = wandb.Image(grid_np, caption=caption) if caption else wandb.Image(grid_np)
-    wb_logger.experiment.log({key: wb_image}, step=int(step))
-    return True
-
-
-def log_scalar_wandb(
-    logger_obj,
-    key: str,
-    value: float,
-    step: int,
-) -> bool:
-    wb_logger = _resolve_wandb_logger(logger_obj)
-    if wb_logger is None or wandb is None:
-        return False
-    wb_logger.experiment.log({key: float(value)}, step=int(step))
-    return True
-
-
-class Stage2TokenDataModule(pl.LightningDataModule):
-    def __init__(
-        self,
-        tokens_flat: torch.Tensor,
-        batch_size: int,
-        num_workers: int = 2,
-        coeffs_flat: Optional[torch.Tensor] = None,
-        patch_pos_flat: Optional[torch.Tensor] = None,
-        context_patches: int = 0,
-        pad_token_id: Optional[int] = None,
-        sliding_window_shape: Optional[Tuple[int, int]] = None,
-        full_latent_shape: Optional[Tuple[int, int]] = None,
-        latent_depth: Optional[int] = None,
-        sliding_window_stride_latent: Optional[int] = None,
-    ):
-        super().__init__()
-        self.tokens_flat = tokens_flat
-        self.batch_size = int(batch_size)
-        self.num_workers = int(num_workers)
-        self.coeffs_flat = coeffs_flat
-        self.patch_pos_flat = patch_pos_flat
-        self.context_patches = max(0, int(context_patches))
-        self.pad_token_id = (None if pad_token_id is None else int(pad_token_id))
-        self.sliding_window_shape = (
-            None
-            if sliding_window_shape is None
-            else (int(sliding_window_shape[0]), int(sliding_window_shape[1]))
-        )
-        self.full_latent_shape = (
-            None
-            if full_latent_shape is None
-            else (int(full_latent_shape[0]), int(full_latent_shape[1]))
-        )
-        self.latent_depth = (None if latent_depth is None else int(latent_depth))
-        self.sliding_window_stride_latent = (
-            None
-            if sliding_window_stride_latent is None
-            else max(1, int(sliding_window_stride_latent))
-        )
-
-    def train_dataloader(self):
-        if self.sliding_window_shape is not None:
-            if self.full_latent_shape is None or self.latent_depth is None:
-                raise ValueError("full_latent_shape and latent_depth are required for sliding-window mode.")
-            tok_ds = SlidingWindowTokenDataset(
-                tokens_flat=self.tokens_flat,
-                full_latent_h=self.full_latent_shape[0],
-                full_latent_w=self.full_latent_shape[1],
-                latent_depth=self.latent_depth,
-                window_latent_h=self.sliding_window_shape[0],
-                window_latent_w=self.sliding_window_shape[1],
-                stride_latent=(
-                    self.sliding_window_stride_latent
-                    if self.sliding_window_stride_latent is not None
-                    else self.sliding_window_shape[0]
-                ),
-                coeffs_flat=self.coeffs_flat,
-            )
-        elif (
-            self.patch_pos_flat is not None
-            and self.context_patches > 0
-            and self.pad_token_id is not None
-            and self.coeffs_flat is None
-        ):
-            tok_ds = PatchContextTokenDataset(
-                tokens_flat=self.tokens_flat,
-                patch_pos_flat=self.patch_pos_flat,
-                context_patches=self.context_patches,
-                pad_token_id=self.pad_token_id,
-            )
-        else:
-            tensors = [self.tokens_flat]
-            if self.coeffs_flat is not None:
-                tensors.append(self.coeffs_flat)
-            if self.patch_pos_flat is not None:
-                tensors.append(self.patch_pos_flat)
-            tok_ds = TensorDataset(*tensors)
-        return DataLoader(
-            tok_ds,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=(self.num_workers > 0),
-        )
-
-
-class PatchContextTokenDataset(Dataset):
-    """
-    Training dataset for patch-grid stage-2 with local raster context.
-    Each sample yields:
-      tok_flat: [T]
-      patch_pos_id: scalar
-      ctx_tok_flat: [context_patches*T] (left-padded with pad_token_id)
-      ctx_patch_pos_flat: [context_patches*T]
-    """
-
-    def __init__(
-        self,
-        tokens_flat: torch.Tensor,
-        patch_pos_flat: torch.Tensor,
-        context_patches: int,
-        pad_token_id: int,
-    ):
-        if tokens_flat.dim() != 2:
-            raise ValueError(f"tokens_flat must be [N, T], got {tuple(tokens_flat.shape)}")
-        if patch_pos_flat.dim() != 1 or patch_pos_flat.shape[0] != tokens_flat.shape[0]:
-            raise ValueError(
-                f"patch_pos_flat must be [N] with N={tokens_flat.shape[0]}, got {tuple(patch_pos_flat.shape)}"
-            )
-        self.tokens_flat = tokens_flat
-        self.patch_pos_flat = patch_pos_flat.to(torch.long)
-        self.context_patches = max(0, int(context_patches))
-        self.pad_token_id = int(pad_token_id)
-        self.tokens_per_patch = int(tokens_flat.shape[1])
-
-    def __len__(self) -> int:
-        return int(self.tokens_flat.shape[0])
-
-    def __getitem__(self, idx: int):
-        tok = self.tokens_flat[idx]
-        patch_pos = self.patch_pos_flat[idx]
-
-        if self.context_patches <= 0:
-            return tok, patch_pos
-
-        ctx_len = self.context_patches * self.tokens_per_patch
-        ctx_tok = torch.full((ctx_len,), self.pad_token_id, dtype=self.tokens_flat.dtype)
-        ctx_patch_pos = torch.zeros((ctx_len,), dtype=torch.long)
-        cur_pos = int(patch_pos.item())
-
-        for k in range(self.context_patches):
-            prev_pos = cur_pos - self.context_patches + k
-            if prev_pos < 0:
-                continue
-            delta = cur_pos - prev_pos
-            src_idx = idx - delta
-            if src_idx < 0:
-                continue
-            if int(self.patch_pos_flat[src_idx].item()) != prev_pos:
-                # Different image boundary.
-                continue
-            start = k * self.tokens_per_patch
-            end = start + self.tokens_per_patch
-            ctx_tok[start:end] = self.tokens_flat[src_idx]
-            ctx_patch_pos[start:end] = prev_pos
-
-        return tok, patch_pos, ctx_tok, ctx_patch_pos
-
-
-class SlidingWindowTokenDataset(Dataset):
-    """
-    Builds fixed-length autoregressive training windows from full latent-token sequences.
-    Each sample yields:
-      tok_flat: [window_tokens]
-      coeff_flat: [window_tokens] (optional)
-    """
-
-    def __init__(
-        self,
-        tokens_flat: torch.Tensor,
-        full_latent_h: int,
-        full_latent_w: int,
-        latent_depth: int,
-        window_latent_h: int,
-        window_latent_w: int,
-        stride_latent: int,
-        coeffs_flat: Optional[torch.Tensor] = None,
-    ):
-        if tokens_flat.dim() != 2:
-            raise ValueError(f"tokens_flat must be [N, T], got {tuple(tokens_flat.shape)}")
-        self.tokens_flat = tokens_flat
-        self.coeffs_flat = coeffs_flat
-        self.full_latent_h = int(full_latent_h)
-        self.full_latent_w = int(full_latent_w)
-        self.latent_depth = int(latent_depth)
-        self.window_latent_h = int(window_latent_h)
-        self.window_latent_w = int(window_latent_w)
-        self.stride_latent = max(1, int(stride_latent))
-        self.full_tokens = int(tokens_flat.shape[1])
-        expected_tokens = self.full_latent_h * self.full_latent_w * self.latent_depth
-        if self.full_tokens != expected_tokens:
-            raise ValueError(
-                f"tokens_flat has T={self.full_tokens}, but expected full_latent_h*full_latent_w*latent_depth="
-                f"{self.full_latent_h}*{self.full_latent_w}*{self.latent_depth}={expected_tokens}"
-            )
-        if self.window_latent_h <= 0 or self.window_latent_w <= 0:
-            raise ValueError("window_latent_h and window_latent_w must be positive.")
-        if self.window_latent_h > self.full_latent_h or self.window_latent_w > self.full_latent_w:
-            raise ValueError(
-                f"Window latent shape {(self.window_latent_h, self.window_latent_w)} exceeds "
-                f"full latent shape {(self.full_latent_h, self.full_latent_w)}."
-            )
-        if coeffs_flat is not None and coeffs_flat.shape != tokens_flat.shape:
-            raise ValueError(
-                f"coeffs_flat shape mismatch: expected {tuple(tokens_flat.shape)}, got {tuple(coeffs_flat.shape)}"
-            )
-        if ((self.full_latent_h - self.window_latent_h) % self.stride_latent) != 0:
-            raise ValueError(
-                f"Incompatible latent height window/stride: full_h={self.full_latent_h}, "
-                f"window_h={self.window_latent_h}, stride={self.stride_latent}"
-            )
-        if ((self.full_latent_w - self.window_latent_w) % self.stride_latent) != 0:
-            raise ValueError(
-                f"Incompatible latent width window/stride: full_w={self.full_latent_w}, "
-                f"window_w={self.window_latent_w}, stride={self.stride_latent}"
-            )
-        self.grid_h = ((self.full_latent_h - self.window_latent_h) // self.stride_latent) + 1
-        self.grid_w = ((self.full_latent_w - self.window_latent_w) // self.stride_latent) + 1
-        self.windows_per_image = int(self.grid_h * self.grid_w)
-        if self.windows_per_image <= 0:
-            raise ValueError("No valid sliding windows produced for the requested configuration.")
-        self.window_tokens = int(self.window_latent_h * self.window_latent_w * self.latent_depth)
-
-    def __len__(self) -> int:
-        return int(self.tokens_flat.shape[0]) * int(self.windows_per_image)
-
-    def __getitem__(self, idx: int):
-        image_idx = int(idx) // self.windows_per_image
-        window_idx = int(idx) % self.windows_per_image
-        wy = window_idx // self.grid_w
-        wx = window_idx % self.grid_w
-        h0 = int(wy * self.stride_latent)
-        w0 = int(wx * self.stride_latent)
-        h1 = h0 + self.window_latent_h
-        w1 = w0 + self.window_latent_w
-
-        tok_img = self.tokens_flat[image_idx].view(
-            self.full_latent_h, self.full_latent_w, self.latent_depth
-        )
-        tok = tok_img[h0:h1, w0:w1, :].contiguous().view(self.window_tokens)
-        if self.coeffs_flat is None:
-            return (tok,)
-        coeff_img = self.coeffs_flat[image_idx].view(
-            self.full_latent_h, self.full_latent_w, self.latent_depth
-        )
-        coeff = coeff_img[h0:h1, w0:w1, :].contiguous().view(self.window_tokens)
-        return tok, coeff
-
-
-class Stage1LightningModule(pl.LightningModule):
-    def __init__(
-        self,
-        ae: SparseDictAE,
-        lr: float,
-        bottleneck_weight: float,
-        out_dir: str,
-        val_vis_images: Optional[torch.Tensor] = None,
-        fid_num_samples: int = 1024,
-        fid_feature: int = 2048,
-        fid_compute_batch_size: int = 32,
-        lr_schedule: str = "cosine",
-        warmup_epochs: int = 1,
-        min_lr_ratio: float = 0.1,
-    ):
-        super().__init__()
-        self.ae = ae
-        self.lr = float(lr)
-        self.bottleneck_weight = float(bottleneck_weight)
-        self.out_dir = out_dir
-        self.best_val = float("inf")
-        self.val_vis_images = val_vis_images
-        self.fid_num_samples = max(0, int(fid_num_samples))
-        self.fid_feature = int(fid_feature)
-        self.fid_compute_batch_size = max(1, int(fid_compute_batch_size))
-        self.lr_schedule = str(lr_schedule)
-        self.warmup_epochs = max(0, int(warmup_epochs))
-        self.min_lr_ratio = float(max(0.0, min(min_lr_ratio, 1.0)))
-        self._fid_real = []
-        self._fid_fake = []
-        self._fid_seen = 0
-        self._fid_warned_unavailable = False
-        self._fid_warned_adjusted_feature = False
-        self._fid_metric = None
-        self._fid_metric_feature = None
-
-    def configure_optimizers(self):
-        opt = torch.optim.Adam(self.ae.parameters(), lr=self.lr)
-        if self.lr_schedule != "cosine":
-            return opt
-
-        max_epochs = 1
-        if getattr(self, "_trainer", None) is not None:
-            max_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1)
-        max_epochs = max(1, max_epochs)
-        warmup_epochs = min(self.warmup_epochs, max_epochs - 1)
-        min_ratio = self.min_lr_ratio
-
-        def lr_lambda(epoch: int) -> float:
-            # Lightning steps epoch schedulers once per epoch; use 1-indexed step count.
-            step_idx = int(epoch) + 1
-            if warmup_epochs > 0 and step_idx <= warmup_epochs:
-                return 0.1 + 0.9 * (step_idx / float(max(1, warmup_epochs)))
-
-            decay_steps = max(1, max_epochs - warmup_epochs)
-            decay_idx = min(max(step_idx - warmup_epochs, 0), decay_steps)
-            t = decay_idx / float(decay_steps)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * t))
-            return min_ratio + (1.0 - min_ratio) * cosine
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
-
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-    def _get_or_create_fid_metric(self, feature: int):
-        feat = int(feature)
-        if self._fid_metric is None or self._fid_metric_feature != feat:
-            self._fid_metric = FrechetInceptionDistance(
-                feature=feat,
-                sync_on_compute=True,
-            ).to(self.device)
-            self._fid_metric_feature = feat
-        else:
-            self._fid_metric = self._fid_metric.to(self.device)
-        self._fid_metric.reset()
-        return self._fid_metric
-
-    def on_validation_epoch_start(self):
-        self._fid_real = []
-        self._fid_fake = []
-        self._fid_seen = 0
-
-    def training_step(self, batch, batch_idx):
-        x, _ = batch
-        recon, b_loss, _ = self.ae(x)
-        recon_loss = F.mse_loss(recon, x)
-        loss = recon_loss + self.bottleneck_weight * b_loss
-        self.log("stage1/train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
-        self.log("stage1/recon_loss", recon_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
-        self.log("stage1/b_loss", b_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
-        return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        # Normalize dictionary only after a full optimization step finishes.
-        # Doing this inside training_step can invalidate autograd versioning.
-        with torch.no_grad():
-            self.ae.bottleneck.dictionary.copy_(
-                F.normalize(self.ae.bottleneck.dictionary, p=2, dim=0, eps=self.ae.bottleneck.epsilon)
-            )
-
-    def validation_step(self, batch, batch_idx):
-        x, _ = batch
-        recon, b_loss, _ = self.ae(x)
-        recon_loss = F.mse_loss(recon, x)
-        loss = recon_loss + self.bottleneck_weight * b_loss
-        # Inputs/recon are normalized to [-1, 1], so peak value for PSNR is 2.0.
-        psnr = 10.0 * torch.log10(4.0 / torch.clamp(recon_loss.detach(), min=1e-8))
-        self.log("stage1/val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
-        self.log("stage1/val_psnr", psnr, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
-
-        if (not self.trainer.sanity_checking) and self.fid_num_samples > 0:
-            if FrechetInceptionDistance is None:
-                if self.trainer.is_global_zero and not self._fid_warned_unavailable:
-                    print("[Stage1] FID unavailable: torchmetrics.image.fid not installed.")
-                    self._fid_warned_unavailable = True
-            else:
-                world_size = max(1, int(getattr(self.trainer, "world_size", 1)))
-                local_cap = int(math.ceil(float(self.fid_num_samples) / float(world_size)))
-                if self._fid_seen >= local_cap:
-                    return loss
-                keep = min(x.size(0), local_cap - self._fid_seen)
-                if keep > 0:
-                    real_u8 = ((x[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
-                    fake_u8 = ((recon[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
-                    self._fid_real.append(real_u8)
-                    self._fid_fake.append(fake_u8)
-                    self._fid_seen += keep
-        return loss
-
-    def on_validation_epoch_end(self):
-        if self.trainer.is_global_zero and not self.trainer.sanity_checking:
-            os.makedirs(self.out_dir, exist_ok=True)
-            cur = self.trainer.callback_metrics.get("stage1/val_loss")
-            if cur is not None:
-                cur_val = float(cur.detach().cpu().item())
-
-                torch.save(self.ae.state_dict(), os.path.join(self.out_dir, "ae_last.pt"))
-                if cur_val < self.best_val:
-                    self.best_val = cur_val
-                    torch.save(self.ae.state_dict(), os.path.join(self.out_dir, "ae_best.pt"))
-
-            if self.val_vis_images is not None and self.val_vis_images.numel() > 0:
-                x_vis = self.val_vis_images.to(self.device)
-                with torch.no_grad():
-                    recon_vis, _, _ = self.ae(x_vis)
-                epoch = int(self.current_epoch + 1)
-                log_step = int(self.global_step)
-                logged_real = log_image_grid_wandb(
-                    self.logger,
-                    key="stage1/real",
-                    x=x_vis,
-                    step=log_step,
-                    caption=f"epoch={epoch} real",
-                )
-                logged_recon = log_image_grid_wandb(
-                    self.logger,
-                    key="stage1/recon",
-                    x=recon_vis,
-                    step=log_step,
-                    caption=f"epoch={epoch} recon",
-                )
-                if not (logged_real and logged_recon):
-                    save_image_grid(x_vis, os.path.join(self.out_dir, f"stage1_epoch{epoch:03d}_real.png"))
-                    save_image_grid(recon_vis, os.path.join(self.out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
-
-        if (
-            not self.trainer.sanity_checking
-            and
-            self.fid_num_samples > 0
-            and FrechetInceptionDistance is not None
-            and self._fid_seen > 0
-            and self._fid_real
-            and self._fid_fake
-        ):
-            with torch.no_grad():
-                global_seen = int(self._fid_seen)
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    seen_tensor = torch.tensor([global_seen], device=self.device, dtype=torch.long)
-                    torch.distributed.all_reduce(seen_tensor, op=torch.distributed.ReduceOp.SUM)
-                    global_seen = int(seen_tensor.item())
-
-                effective_feature = self.fid_feature
-                valid_features = [64, 192, 768, 2048]
-                if effective_feature not in valid_features:
-                    effective_feature = 64
-                if global_seen < effective_feature:
-                    adjusted_feature = 64
-                    if (
-                        self.trainer.is_global_zero
-                        and adjusted_feature != effective_feature
-                        and not self._fid_warned_adjusted_feature
-                    ):
-                        print(
-                            f"[Stage1] adjusting FID feature from {effective_feature} "
-                            f"to {adjusted_feature} for n={global_seen}."
-                        )
-                        self._fid_warned_adjusted_feature = True
-                    effective_feature = adjusted_feature
-
-                fid_metric = self._get_or_create_fid_metric(effective_feature)
-                for real_cpu, fake_cpu in zip(self._fid_real, self._fid_fake):
-                    bs = int(self.fid_compute_batch_size)
-                    for start in range(0, real_cpu.size(0), bs):
-                        end = start + bs
-                        real_chunk = real_cpu[start:end].to(self.device)
-                        fake_chunk = fake_cpu[start:end].to(self.device)
-                        fid_metric.update(real_chunk, real=True)
-                        fid_metric.update(fake_chunk, real=False)
-                fid_value = fid_metric.compute().detach()
-                fid_metric.reset()
-            self.log("stage1/fid", fid_value, on_epoch=True, prog_bar=True, sync_dist=True)
-            self._fid_real = []
-            self._fid_fake = []
-            self._fid_seen = 0
-
-
-class Stage2LightningModule(pl.LightningModule):
-    def __init__(
-        self,
-        transformer: RQTransformerPrior,
-        lr: float,
-        pad_token_id: int,
-        out_dir: str,
-        ae_for_decode: SparseDictAE,
-        H: int,
-        W: int,
-        D: int,
-        sample_every_steps: int = 200,
-        sample_batch_size: int = 8,
-        sample_temperature: float = 0.9,
-        sample_top_k: int = 128,
-        sample_image_size: Optional[int] = None,
-        sample_latent_shape: Optional[Tuple[int, int]] = None,
-        sample_window_stride_latent: int = 1,
-        patch_grid_shape: Optional[Tuple[int, int]] = None,
-        patch_size: int = 32,
-        patch_stride: int = 32,
-        patch_context_patches: int = 0,
-        fid_real_images: Optional[torch.Tensor] = None,
-        fid_num_samples: int = 64,
-        fid_feature: int = 2048,
-        fid_every_n_epochs: int = 1,
-        coeff_loss_weight: float = 1.0,
-        lr_schedule: str = "cosine",
-        warmup_epochs: int = 1,
-        min_lr_ratio: float = 0.1,
-    ):
-        super().__init__()
-        self.transformer = transformer
-        self.lr = float(lr)
-        self.pad_token_id = int(pad_token_id)
-        self.predict_coefficients = bool(self.transformer.cfg.predict_coefficients)
-        self.coeff_loss_weight = float(coeff_loss_weight)
-        self.out_dir = out_dir
-        self.ae_for_decode = ae_for_decode
-        self.H, self.W, self.D = int(H), int(W), int(D)
-        self.sample_every_steps = int(sample_every_steps)
-        self.sample_batch_size = int(sample_batch_size)
-        self.sample_temperature = max(float(sample_temperature), 1e-8)
-        self.sample_top_k = None if int(sample_top_k) <= 0 else int(sample_top_k)
-        self.sample_image_size = (
-            None
-            if sample_image_size is None or int(sample_image_size) <= 0
-            else int(sample_image_size)
-        )
-        if sample_latent_shape is None:
-            self.sample_latent_h, self.sample_latent_w = self.H, self.W
-        else:
-            self.sample_latent_h = int(sample_latent_shape[0])
-            self.sample_latent_w = int(sample_latent_shape[1])
-        self.sample_window_stride_latent = max(1, int(sample_window_stride_latent))
-        self.use_sliding_window_sampling = bool(sample_latent_shape is not None)
-        if patch_grid_shape is None:
-            self.patch_grid_h, self.patch_grid_w = 1, 1
-        else:
-            self.patch_grid_h, self.patch_grid_w = int(patch_grid_shape[0]), int(patch_grid_shape[1])
-        self.patch_size = int(patch_size)
-        self.patch_stride = int(patch_stride)
-        self.patch_context_patches = max(0, int(patch_context_patches))
-        self.use_patch_positions = bool(getattr(self.transformer.cfg, "num_patch_positions", 0) > 0)
-        self.context_tokens = int(getattr(self.transformer.cfg, "context_tokens", 0))
-        self.fid_real_images = fid_real_images
-        self.fid_num_samples = max(0, int(fid_num_samples))
-        self.fid_feature = int(fid_feature)
-        self.fid_every_n_epochs = max(1, int(fid_every_n_epochs))
-        self.lr_schedule = str(lr_schedule)
-        self.warmup_epochs = max(0, int(warmup_epochs))
-        self.min_lr_ratio = float(max(0.0, min(min_lr_ratio, 1.0)))
-        self._fid_warned_unavailable = False
-        self._fid_warned_adjusted_feature = False
-        self._fid_warned_compute_failed = False
-        self._fid_metric = None
-        self._fid_metric_feature = None
-
-        self.ae_for_decode.eval()
-        for p in self.ae_for_decode.parameters():
-            p.requires_grad_(False)
-
-    def configure_optimizers(self):
-        opt = torch.optim.Adam(self.transformer.parameters(), lr=self.lr)
-        if self.lr_schedule != "cosine":
-            return opt
-
-        max_epochs = 1
-        if getattr(self, "_trainer", None) is not None:
-            max_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1)
-        max_epochs = max(1, max_epochs)
-        warmup_epochs = min(self.warmup_epochs, max_epochs - 1)
-        min_ratio = self.min_lr_ratio
-
-        def lr_lambda(epoch: int) -> float:
-            # Lightning steps epoch schedulers once per epoch; use 1-indexed step count.
-            step_idx = int(epoch) + 1
-            if warmup_epochs > 0 and step_idx <= warmup_epochs:
-                return 0.1 + 0.9 * (step_idx / float(max(1, warmup_epochs)))
-
-            decay_steps = max(1, max_epochs - warmup_epochs)
-            decay_idx = min(max(step_idx - warmup_epochs, 0), decay_steps)
-            t = decay_idx / float(decay_steps)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * t))
-            return min_ratio + (1.0 - min_ratio) * cosine
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
-
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-    def _get_or_create_fid_metric(self, feature: int):
-        feat = int(feature)
-        if self._fid_metric is None or self._fid_metric_feature != feat:
-            self._fid_metric = FrechetInceptionDistance(
-                feature=feat,
-                sync_on_compute=False,
-            ).to(self.device)
-            self._fid_metric_feature = feat
-        else:
-            self._fid_metric = self._fid_metric.to(self.device)
-        self._fid_metric.reset()
-        return self._fid_metric
-
-    def training_step(self, batch, batch_idx):
-        patch_pos_ids = None
-        ctx_tokens = None
-        ctx_patch_pos = None
-        if self.predict_coefficients:
-            if self.use_patch_positions:
-                if len(batch) == 3:
-                    tok_flat, coeff_flat, patch_pos_ids = batch
-                elif len(batch) == 5:
-                    tok_flat, coeff_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch
-                else:
-                    raise ValueError(f"Unexpected stage2 coefficient batch format with {len(batch)} entries.")
-            else:
-                tok_flat, coeff_flat = batch
-            coeff_flat = coeff_flat.to(torch.float32)
-        else:
-            if self.use_patch_positions:
-                if len(batch) == 2:
-                    tok_flat, patch_pos_ids = batch
-                elif len(batch) == 4:
-                    tok_flat, patch_pos_ids, ctx_tokens, ctx_patch_pos = batch
-                else:
-                    raise ValueError(f"Unexpected stage2 patch batch format with {len(batch)} entries.")
-            else:
-                (tok_flat,) = batch
-            coeff_flat = None
-        tok_flat = tok_flat.long()
-        if patch_pos_ids is not None:
-            patch_pos_ids = patch_pos_ids.long()
-        if ctx_tokens is not None:
-            ctx_tokens = ctx_tokens.long()
-        if ctx_patch_pos is not None:
-            ctx_patch_pos = ctx_patch_pos.long()
-        B = tok_flat.size(0)
-        bos = self.transformer.bos_token_id
-
-        if self.predict_coefficients and ctx_tokens is not None:
-            raise NotImplementedError("Patch context with coefficient regression is not supported yet.")
-
-        if ctx_tokens is not None:
-            seq = torch.cat(
-                [torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), ctx_tokens, tok_flat],
-                dim=1,
-            )
-            context_len = int(ctx_tokens.size(1))
-            y = seq[:, 1:]
-            y[:, :context_len] = self.pad_token_id
-            if patch_pos_ids is None:
-                raise ValueError("patch_pos_ids required when using patch context.")
-            bos_patch = patch_pos_ids.view(B, 1)
-            tok_patch = patch_pos_ids.view(B, 1).expand(B, tok_flat.size(1))
-            seq_patch = torch.cat([bos_patch, ctx_patch_pos, tok_patch], dim=1)
-            patch_pos_for_x = seq_patch[:, :-1]
-        else:
-            seq = torch.cat([torch.full((B, 1), bos, device=tok_flat.device, dtype=torch.long), tok_flat], dim=1)
-            y = seq[:, 1:]
-            patch_pos_for_x = patch_pos_ids
-
-        x_in = seq[:, :-1]
-
-        out = self.transformer(x_in, patch_pos_ids=patch_pos_for_x)
-        if self.predict_coefficients:
-            logits, coeff_pred = out
-            atom_loss = F.cross_entropy(
-                logits.reshape(-1, self.transformer.cfg.vocab_size),
-                y.reshape(-1),
-                ignore_index=self.pad_token_id,
-            )
-            coeff_loss = F.mse_loss(coeff_pred.reshape(-1), coeff_flat.to(logits.device).reshape(-1))
-            loss = atom_loss + self.coeff_loss_weight * coeff_loss
-            self.log(
-                "train/coeff_loss",
-                coeff_loss,
-                prog_bar=True,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=B,
-            )
-        else:
-            atom_loss = F.cross_entropy(
-                out.reshape(-1, self.transformer.cfg.vocab_size),
-                y.reshape(-1),
-                ignore_index=self.pad_token_id,
-            )
-            coeff_loss = torch.tensor(0.0, device=out.device, dtype=out.dtype)
-            loss = atom_loss
-        self.log(
-            "train/atom_loss",
-            atom_loss,
-            prog_bar=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=B,
-        )
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=B)
-        return loss
-
-    def on_fit_start(self):
-        self.ae_for_decode.to(self.device)
-        self.ae_for_decode.eval()
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        if self.sample_every_steps <= 0:
-            return
-        if self.global_step <= 0 or (self.global_step % self.sample_every_steps) != 0:
-            return
-        world_size = int(getattr(self.trainer, "world_size", 1))
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            # Keep ranks synchronized while rank0 generates/saves.
-            self.trainer.strategy.barrier()
-            if self.trainer.is_global_zero:
-                self._sample_and_save(step=self.global_step)
-            self.trainer.strategy.barrier()
-            return
-        if self.trainer.is_global_zero:
-            self._sample_and_save(step=self.global_step)
-
-    def on_train_epoch_end(self):
-        world_size = int(getattr(self.trainer, "world_size", 1))
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            self.trainer.strategy.barrier()
-
-        if self.trainer.is_global_zero:
-            os.makedirs(self.out_dir, exist_ok=True)
-            torch.save(self.transformer.state_dict(), os.path.join(self.out_dir, "transformer_last.pt"))
-
-        if world_size > 1 and getattr(self.trainer, "strategy", None) and hasattr(self.trainer.strategy, "barrier"):
-            self.trainer.strategy.barrier()
-
-    def _maybe_resize_samples(self, imgs: torch.Tensor) -> torch.Tensor:
-        if self.sample_image_size is None:
-            return imgs
-        if imgs.size(-2) == self.sample_image_size and imgs.size(-1) == self.sample_image_size:
-            return imgs
-        return F.interpolate(
-            imgs,
-            size=(self.sample_image_size, self.sample_image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-    def _decode_generated_batch(self, gen) -> torch.Tensor:
-        if self.predict_coefficients:
-            flat_gen, coeff_gen = gen
-            atoms_gen = flat_gen.view(-1, self.H, self.W, self.D).to(self.device)
-            coeff_gen = coeff_gen.view(-1, self.H, self.W, self.D).to(self.device)
-            return self.ae_for_decode.decode_from_atoms_and_coeffs(atoms_gen, coeff_gen)
-        tokens_gen = gen.view(-1, self.H, self.W, self.D)
-        return self.ae_for_decode.decode_from_tokens(tokens_gen.to(self.device))
-
-    @torch.no_grad()
-    def _sample_sliding_window_batch(self, step: int) -> torch.Tensor:
-        if self.predict_coefficients:
-            raise NotImplementedError("Sliding-window sampling is only supported in quantized-token mode.")
-
-        B = self.sample_batch_size
-        bos_id = int(self.transformer.bos_token_id)
-        pad_id = int(self.pad_token_id)
-        win_tokens = int(self.H * self.W * self.D)
-        full_h = int(self.sample_latent_h)
-        full_w = int(self.sample_latent_w)
-        if self.H > full_h or self.W > full_w:
-            raise ValueError(
-                f"Sliding window {(self.H, self.W)} must fit within full latent {(full_h, full_w)}"
-            )
-        full_tokens = int(self.sample_latent_h * self.sample_latent_w * self.D)
-        generated = torch.zeros((B, full_h, full_w, self.D), dtype=torch.long, device=self.device)
-        bos = torch.full((B, 1), bos_id, dtype=torch.long, device=self.device)
-        special_ids = torch.tensor([bos_id, pad_id], dtype=torch.long, device=self.device)
-
-        steps = tqdm(
-            range(full_tokens),
-            desc=f"[Stage2] sliding-window sample step {step}",
-            leave=False,
-            dynamic_ncols=True,
-        )
-
-        def _earliest_overlapping_start(coord: int, window: int, full: int, stride: int) -> int:
-            """
-            Choose the earliest stride-aligned window start that still contains `coord`.
-            This maximizes already-generated local context and reduces block-boundary seams.
-            """
-            max_start = int(full - window)
-            low = max(0, int(coord - window + 1))
-            high = min(int(coord), max_start)
-            start = ((low + stride - 1) // stride) * stride
-            if start > high:
-                # Fallback for degenerate stride/window combinations.
-                start = min((int(coord) // stride) * stride, max_start)
-            return int(max(0, min(start, max_start)))
-
-        for t in steps:
-            spatial_idx = t // self.D
-            depth_idx = t % self.D
-            y = spatial_idx // full_w
-            x = spatial_idx % full_w
-
-            stride_lat = int(self.sample_window_stride_latent)
-            h0 = _earliest_overlapping_start(y, self.H, full_h, stride_lat)
-            w0 = _earliest_overlapping_start(x, self.W, full_w, stride_lat)
-            local_y = y - h0
-            local_x = x - w0
-            local_pos = (local_y * self.W) + local_x
-            local_t = (local_pos * self.D) + depth_idx
-
-            window_flat = generated[:, h0 : h0 + self.H, w0 : w0 + self.W, :].contiguous().view(B, win_tokens)
-            ctx = window_flat[:, :local_t]
-            seq = torch.cat([bos, ctx], dim=1)
-            logits = self.transformer(seq, patch_pos_ids=None)[:, -1, :]
-            logits[:, special_ids] = float("-inf")
-            logits = logits / self.sample_temperature
-            if self.sample_top_k is not None:
-                k = min(self.sample_top_k, int(logits.size(-1)))
-                v, ix = torch.topk(logits, k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1).squeeze(1)
-            generated[:, y, x, depth_idx] = nxt
-
-        return self.ae_for_decode.decode_from_tokens(generated.to(self.device))
-
-    @torch.no_grad()
-    def _generate_patch_tokens_with_context(
-        self,
-        patch_idx: int,
-        prev_patch_tokens: list[torch.Tensor],
-        temperature: float = 1.0,
-        top_k: Optional[int] = 256,
-    ) -> torch.Tensor:
-        if self.predict_coefficients:
-            raise NotImplementedError("Patch-context sampling is only supported in quantized-token mode.")
-        T = self.H * self.W * self.D
-        B = self.sample_batch_size
-        bos = torch.full((B, 1), self.transformer.bos_token_id, dtype=torch.long, device=self.device)
-
-        ctx_needed = self.patch_context_patches
-        if ctx_needed <= 0:
-            seq = bos
-            if self.use_patch_positions:
-                patch_pos_seq = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-            else:
-                patch_pos_seq = None
-        else:
-            ctx_tokens = []
-            ctx_patch_pos = []
-            for pidx in range(patch_idx - ctx_needed, patch_idx):
-                if pidx < 0:
-                    ctx_tokens.append(torch.full((B, T), self.pad_token_id, dtype=torch.long, device=self.device))
-                else:
-                    ctx_tokens.append(prev_patch_tokens[pidx])
-                ctx_patch_pos.append(torch.full((B, T), max(pidx, 0), dtype=torch.long, device=self.device))
-            ctx_tok = torch.cat(ctx_tokens, dim=1) if ctx_tokens else torch.empty((B, 0), dtype=torch.long, device=self.device)
-            seq = torch.cat([bos, ctx_tok], dim=1)
-            if self.use_patch_positions:
-                bos_patch = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-                ctx_patch = torch.cat(ctx_patch_pos, dim=1) if ctx_patch_pos else torch.empty((B, 0), dtype=torch.long, device=self.device)
-                patch_pos_seq = torch.cat([bos_patch, ctx_patch], dim=1)
-            else:
-                patch_pos_seq = None
-
-        for _ in range(T):
-            out = self.transformer(seq, patch_pos_ids=patch_pos_seq)
-            logits = out[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None and top_k > 0:
-                k = min(int(top_k), int(logits.size(-1)))
-                v, ix = torch.topk(logits, k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1)
-            seq = torch.cat([seq, nxt], dim=1)
-            if patch_pos_seq is not None:
-                nxt_patch = torch.full((B, 1), patch_idx, dtype=torch.long, device=self.device)
-                patch_pos_seq = torch.cat([patch_pos_seq, nxt_patch], dim=1)
-
-        return seq[:, -T:]
-
-    @torch.no_grad()
-    def _sample_patch_grid_batch(self, step: int) -> torch.Tensor:
-        total_patches = self.patch_grid_h * self.patch_grid_w
-        generated_patch_tokens: list[torch.Tensor] = []
-        patch_batches = []
-        for patch_idx in range(total_patches):
-            if self.patch_context_patches > 0:
-                patch_tokens = self._generate_patch_tokens_with_context(
-                    patch_idx=patch_idx,
-                    prev_patch_tokens=generated_patch_tokens,
-                    temperature=self.sample_temperature,
-                    top_k=self.sample_top_k,
-                )
-                generated_patch_tokens.append(patch_tokens)
-                patch_img = self.ae_for_decode.decode_from_tokens(
-                    patch_tokens.view(-1, self.H, self.W, self.D).to(self.device)
-                )
-            else:
-                patch_pos_ids = None
-                if self.use_patch_positions:
-                    patch_pos_ids = torch.full(
-                        (self.sample_batch_size,),
-                        patch_idx,
-                        dtype=torch.long,
-                        device=self.device,
-                    )
-                gen_patch = self.transformer.generate(
-                    batch_size=self.sample_batch_size,
-                    temperature=self.sample_temperature,
-                    top_k=self.sample_top_k,
-                    show_progress=False,
-                    progress_desc=f"[Stage2] patch {patch_idx + 1}/{total_patches} step {step}",
-                    patch_pos_ids=patch_pos_ids,
-                )
-                patch_img = self._decode_generated_batch(gen_patch)
-            if patch_img.size(-2) != self.patch_size or patch_img.size(-1) != self.patch_size:
-                patch_img = F.interpolate(
-                    patch_img,
-                    size=(self.patch_size, self.patch_size),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            patch_batches.append(patch_img)
-
-        patches_bpc = torch.stack(patch_batches, dim=1)  # [B, P, C, patch, patch]
-        return fold_image_patches(
-            patches_bpc,
-            grid_h=self.patch_grid_h,
-            grid_w=self.patch_grid_w,
-            patch_size=self.patch_size,
-            stride=self.patch_stride,
-        )
-
-    @torch.no_grad()
-    def _sample_and_save(self, step: int):
-        self.transformer.eval()
-        self.ae_for_decode.eval()
-        sample_size_str = (
-            f"{self.sample_image_size}x{self.sample_image_size}"
-            if self.sample_image_size is not None
-            else "native"
-        )
-        print(
-            f"[Stage2] sampling at step {step} "
-            f"(batch_size={self.sample_batch_size}, output_size={sample_size_str}, "
-            f"temp={self.sample_temperature:.3f}, top_k={self.sample_top_k if self.sample_top_k is not None else 'none'})..."
-        )
-        if self.use_sliding_window_sampling:
-            print(
-                f"[Stage2] latent sliding-window sampling enabled "
-                f"(window={self.H}x{self.W}, full_latent={self.sample_latent_h}x{self.sample_latent_w})"
-            )
-            raw_imgs = self._sample_sliding_window_batch(step=step)
-        elif self.patch_grid_h > 1 or self.patch_grid_w > 1:
-            print(
-                f"[Stage2] patch-grid sampling enabled "
-                f"(grid={self.patch_grid_h}x{self.patch_grid_w}, patch={self.patch_size}, "
-                f"stride={self.patch_stride}, context_patches={self.patch_context_patches})"
-            )
-            raw_imgs = self._sample_patch_grid_batch(step=step)
-        else:
-            gen = self.transformer.generate(
-                batch_size=self.sample_batch_size,
-                temperature=self.sample_temperature,
-                top_k=self.sample_top_k,
-                show_progress=True,
-                progress_desc=f"[Stage2] sample step {step}",
-                patch_pos_ids=None,
-            )
-            raw_imgs = self._decode_generated_batch(gen)
-        sample_imgs = self._maybe_resize_samples(raw_imgs)
-        print(f"[Stage2] sample tensor shape: {tuple(sample_imgs.shape)}")
-        logged = log_image_grid_wandb(
-            self.logger,
-            key="stage2/samples",
-            x=sample_imgs,
-            step=step,
-            caption=f"step={step}",
-        )
-        if not logged:
-            save_image_grid(sample_imgs, os.path.join(self.out_dir, f"stage2_step{step:06d}_samples.png"))
-        self._compute_and_log_fid(step=step, initial_fake_imgs=raw_imgs)
-        print(f"[Stage2] sampling done at step {step}")
-        self.transformer.train()
-
-    @torch.no_grad()
-    def _compute_and_log_fid(self, step: int, initial_fake_imgs: Optional[torch.Tensor] = None):
-        if self.fid_num_samples <= 0:
-            return
-        epoch = int(self.current_epoch + 1)
-        if (epoch % self.fid_every_n_epochs) != 0:
-            return
-        if FrechetInceptionDistance is None:
-            if not self._fid_warned_unavailable:
-                print("[Stage2] FID unavailable: torchmetrics.image.fid not installed.")
-                self._fid_warned_unavailable = True
-            return
-        if self.fid_real_images is None or self.fid_real_images.numel() == 0:
-            return
-        if initial_fake_imgs is None or initial_fake_imgs.numel() == 0:
-            return
-
-        seeded_u8 = ((initial_fake_imgs.detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
-        n = min(
-            self.fid_num_samples,
-            int(self.fid_real_images.shape[0]),
-            int(seeded_u8.size(0)),
-        )
-        if n <= 0:
-            return
-        if n < 2:
-            return
-
-        effective_feature = self.fid_feature
-        valid_features = [64, 192, 768, 2048]
-        if effective_feature not in valid_features:
-            effective_feature = 64
-        if n < effective_feature:
-            adjusted_feature = 64
-            if adjusted_feature != effective_feature and not self._fid_warned_adjusted_feature:
-                print(
-                    f"[Stage2] adjusting FID feature from {effective_feature} "
-                    f"to {adjusted_feature} for n={n}."
-                )
-                self._fid_warned_adjusted_feature = True
-            effective_feature = adjusted_feature
-
-        self.transformer.eval()
-        self.ae_for_decode.eval()
-
-        real_u8 = self.fid_real_images[:n].to(self.device)
-        fake_u8 = seeded_u8[:n].to(self.device)
-
-        try:
-            fid_metric = self._get_or_create_fid_metric(effective_feature)
-            fid_metric.update(real_u8, real=True)
-            fid_metric.update(fake_u8, real=False)
-            fid_value = float(fid_metric.compute().detach().cpu().item())
-            fid_metric.reset()
-        except Exception as exc:
-            if not self._fid_warned_compute_failed:
-                print(f"[Stage2] FID compute failed at step {step}: {exc}")
-                self._fid_warned_compute_failed = True
-            fid_value = -1.0
-        logged = log_scalar_wandb(
-            self.logger,
-            key="stage2/fid",
-            value=fid_value,
-            step=step,
-        )
-        if not logged:
-            self.log("stage2/fid", fid_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False, rank_zero_only=True)
-        self.transformer.train()
+    except Exception as exc:
+        print(f"[W&B] init failed ({exc}); continuing without logging.")
+        return None
+
+
+def _log_wandb(run: Optional[object], data: dict, step: Optional[int] = None):
+    if run is None:
+        return
+    run.log(data, step=step)
+
+
+def _log_wandb_image(run: Optional[object], key: str, x: torch.Tensor, step: int, caption: Optional[str] = None):
+    if run is None or wandb is None:
+        return
+    grid = _make_image_grid(x)
+    image = grid.permute(1, 2, 0).mul(255).clamp(0, 255).byte().numpy()
+    run.log({key: wandb.Image(image, caption=caption)}, step=step)
 
 
 def train_stage1_ae(
-    ae: SparseDictAE,
+    ae: LASER,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    rfid_loader: Optional[DataLoader],
     device: torch.device,
     epochs: int,
     lr: float,
     bottleneck_weight: float,
     grad_clip: float,
     out_dir: str,
+    rfid_num_samples: int = 0,
+    train_sampler: Optional[DistributedSampler] = None,
+    is_main_process: bool = True,
+    wandb_run: Optional[object] = None,
 ):
+    """Train stage 1 with optional DDP and rank-0-only artifacts."""
+    ae_module = _unwrap_module(ae)
     opt = torch.optim.Adam(ae.parameters(), lr=lr)
     best_val = float("inf")
+    global_step = 0
+    rfid_warned = False
 
     for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         ae.train()
-        pbar = tqdm(train_loader, desc=f"[Stage1] epoch {epoch}/{epochs}")
+        pbar = tqdm(train_loader, desc=f"[Stage1] epoch {epoch}/{epochs}", disable=(not is_main_process))
         running = 0.0
         for x, _ in pbar:
             x = x.to(device)
@@ -2103,47 +1126,144 @@ def train_stage1_ae(
                 torch.nn.utils.clip_grad_norm_(ae.parameters(), grad_clip)
             opt.step()
 
-            # Optional: keep dictionary columns bounded (helps stability)
+            # Keep dictionary atoms normalized after each optimizer step.
             with torch.no_grad():
-                ae.bottleneck.dictionary.copy_(F.normalize(ae.bottleneck.dictionary, p=2, dim=0, eps=ae.bottleneck.epsilon))
+                ae_module.bottleneck.dictionary.copy_(
+                    F.normalize(
+                        ae_module.bottleneck.dictionary,
+                        p=2,
+                        dim=0,
+                        eps=ae_module.bottleneck.epsilon,
+                    )
+                )
 
-            running += loss.item()
-            pbar.set_postfix(loss=loss.item(), recon=recon_loss.item(), b=b_loss.item())
+            loss_log = _distributed_mean(loss)
+            recon_log = _distributed_mean(recon_loss)
+            b_log = _distributed_mean(b_loss)
+            running += float(loss_log.item())
+            global_step += 1
+            if is_main_process:
+                pbar.set_postfix(
+                    loss=float(loss_log.item()),
+                    recon=float(recon_log.item()),
+                    b=float(b_log.item()),
+                )
+                _log_wandb(
+                    wandb_run,
+                    {
+                        "stage1/train_loss": float(loss_log.item()),
+                        "stage1/recon_loss": float(recon_log.item()),
+                        "stage1/bottleneck_loss": float(b_log.item()),
+                        "stage1/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
         # Validation
         ae.eval()
-        val_loss = 0.0
+        val_loss_sum = torch.zeros(1, device=device)
+        val_psnr_sum = torch.zeros(1, device=device)
+        val_ssim_sum = torch.zeros(1, device=device)
+        val_count = torch.zeros(1, device=device)
         with torch.no_grad():
             for x, _ in val_loader:
                 x = x.to(device)
                 recon, b_loss, _ = ae(x)
                 recon_loss = F.mse_loss(recon, x)
                 loss = recon_loss + bottleneck_weight * b_loss
-                val_loss += loss.item() * x.size(0)
-        val_loss /= len(val_loader.dataset)
+                x_unit = _to_unit_range(x)
+                recon_unit = _to_unit_range(recon)
+                psnr = _batch_psnr(recon_unit, x_unit)
+                ssim = _batch_ssim(recon_unit, x_unit)
+                val_loss_sum += loss.detach() * x.size(0)
+                val_psnr_sum += psnr.detach() * x.size(0)
+                val_ssim_sum += ssim.detach() * x.size(0)
+                val_count += x.size(0)
+        if _is_distributed():
+            dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_psnr_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_ssim_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_count, op=dist.ReduceOp.SUM)
+        val_loss = float((val_loss_sum / val_count.clamp_min(1)).item())
+        val_psnr = float((val_psnr_sum / val_count.clamp_min(1)).item())
+        val_ssim = float((val_ssim_sum / val_count.clamp_min(1)).item())
 
-        print(f"[Stage1] epoch {epoch} val_loss={val_loss:.6f}")
+        if is_main_process:
+            print(
+                f"[Stage1] epoch {epoch} val_loss={val_loss:.6f} "
+                f"psnr={val_psnr:.3f} ssim={val_ssim:.4f}"
+            )
+            _log_wandb(
+                wandb_run,
+                {
+                    "stage1/val_loss": float(val_loss),
+                    "stage1/val_psnr": float(val_psnr),
+                    "stage1/val_ssim": float(val_ssim),
+                    "stage1/epoch": epoch,
+                },
+                step=global_step,
+            )
 
-        # Save recon sample
-        x_vis, _ = next(iter(val_loader))
-        x_vis = x_vis.to(device)[:64]
-        with torch.no_grad():
-            recon_vis, _, _ = ae(x_vis)
-        save_image_grid(x_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_real.png"))
-        save_image_grid(recon_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
+        _barrier()
+        if is_main_process:
+            val_rfid = None
+            if rfid_num_samples > 0:
+                try:
+                    val_rfid = _compute_reconstruction_fid(
+                        ae_module,
+                        rfid_loader,
+                        device,
+                        max_items=rfid_num_samples,
+                    )
+                except Exception as exc:
+                    if not rfid_warned:
+                        print(f"[Stage1] rFID unavailable: {exc}")
+                        rfid_warned = True
+                    val_rfid = None
+                if val_rfid is not None:
+                    print(f"[Stage1] epoch {epoch} rfid={val_rfid:.4f}")
+                    _log_wandb(
+                        wandb_run,
+                        {
+                            "stage1/rfid": float(val_rfid),
+                            "stage1/epoch": epoch,
+                        },
+                        step=global_step,
+                    )
 
-        # Save best ckpt
-        os.makedirs(out_dir, exist_ok=True)
-        ckpt_path = os.path.join(out_dir, "ae_last.pt")
-        torch.save(ae.state_dict(), ckpt_path)
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(ae.state_dict(), os.path.join(out_dir, "ae_best.pt"))
+            x_vis, _ = next(iter(val_loader))
+            x_vis = x_vis.to(device)[:64]
+            with torch.no_grad():
+                recon_vis, _, _ = ae_module(x_vis)
+            save_image_grid(x_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_real.png"))
+            save_image_grid(recon_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
+            _log_wandb_image(
+                wandb_run,
+                "stage1/real",
+                x_vis,
+                step=global_step,
+                caption=f"epoch={epoch} real",
+            )
+            _log_wandb_image(
+                wandb_run,
+                "stage1/recon",
+                recon_vis,
+                step=global_step,
+                caption=f"epoch={epoch} recon",
+            )
+
+            os.makedirs(out_dir, exist_ok=True)
+            ckpt_path = os.path.join(out_dir, "ae_last.pt")
+            torch.save(ae_module.state_dict(), ckpt_path)
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(ae_module.state_dict(), os.path.join(out_dir, "ae_best.pt"))
+        _barrier()
 
 
 @torch.no_grad()
 def precompute_tokens(
-    ae: SparseDictAE,
+    ae: LASER,
     loader: DataLoader,
     device: torch.device,
     max_items: Optional[int] = None,
@@ -2191,111 +1311,6 @@ def precompute_tokens(
     return tokens_flat, coeffs_flat, H, W, D
 
 
-@torch.no_grad()
-def precompute_patch_grid_tokens(
-    ae: SparseDictAE,
-    loader: DataLoader,
-    device: torch.device,
-    patch_size: int,
-    patch_stride: int,
-    patch_encode_batch_size: int = 512,
-    max_items: Optional[int] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, int, int, int, int, int]:
-    """
-    Encode full-resolution images as patch tokens for stage-2 patch-grid generation.
-    Returns:
-      tokens_flat: [N_patches, H*W*D] int32
-      coeffs_flat: [N_patches, H*W*D] float32 (None if quantized)
-      patch_pos_flat: [N_patches] int64 patch index in raster order
-      H, W, D: latent patch shape
-      grid_h, grid_w: patch grid shape over the full image
-    """
-    ae.eval()
-    all_tokens = []
-    all_coeffs = []
-    all_patch_pos = []
-    seen_images = 0
-    H = W = D = None
-    grid_h = grid_w = None
-    chunk_bs = max(1, int(patch_encode_batch_size))
-
-    for x, _ in tqdm(loader, desc="[Stage2] precompute patch-grid tokens"):
-        if max_items is not None:
-            remaining = int(max_items) - seen_images
-            if remaining <= 0:
-                break
-            if x.size(0) > remaining:
-                x = x[:remaining]
-        if x.numel() == 0:
-            continue
-
-        patches, gh, gw = unfold_image_patches(x, patch_size=int(patch_size), stride=int(patch_stride))
-        if grid_h is None:
-            grid_h, grid_w = gh, gw
-        elif gh != grid_h or gw != grid_w:
-            raise ValueError(
-                f"Inconsistent patch grid: expected {(grid_h, grid_w)}, got {(gh, gw)}"
-            )
-
-        patch_pos = torch.arange(gh * gw, dtype=torch.long).unsqueeze(0).expand(x.size(0), -1).reshape(-1)
-
-        for start in range(0, patches.size(0), chunk_bs):
-            end = min(start + chunk_bs, patches.size(0))
-            patch_batch = patches[start:end].to(device)
-            if ae.bottleneck.quantize_sparse_coeffs:
-                tokens, h, w = ae.encode_to_tokens(patch_batch)
-                coeffs = None
-            else:
-                tokens, coeffs, h, w = ae.encode_to_atoms_and_coeffs(patch_batch)
-
-            if H is None:
-                H, W = h, w
-                D = tokens.shape[-1]
-
-            all_tokens.append(tokens.view(tokens.size(0), -1).to(torch.int32).cpu())
-            all_patch_pos.append(patch_pos[start:end].to(torch.long).cpu())
-            if coeffs is not None:
-                all_coeffs.append(coeffs.view(coeffs.size(0), -1).to(torch.float32).cpu())
-
-        seen_images += x.size(0)
-        if max_items is not None and seen_images >= max_items:
-            break
-
-    if not all_tokens:
-        raise RuntimeError("No patch tokens were generated.")
-
-    tokens_flat = torch.cat(all_tokens, dim=0)
-    patch_pos_flat = torch.cat(all_patch_pos, dim=0)
-    coeffs_flat = torch.cat(all_coeffs, dim=0) if len(all_coeffs) > 0 else None
-    return tokens_flat, coeffs_flat, patch_pos_flat, H, W, D, grid_h, grid_w
-
-
-@torch.no_grad()
-def collect_real_images_uint8(
-    loader: DataLoader,
-    max_items: int,
-) -> Optional[torch.Tensor]:
-    """Collect real images as uint8 tensors for FID reference."""
-    if max_items <= 0:
-        return None
-
-    images = []
-    seen = 0
-    for x, _ in tqdm(loader, desc="[Stage2] collect FID real images"):
-        keep = min(x.size(0), max_items - seen)
-        if keep <= 0:
-            break
-        real_u8 = ((x[:keep].detach().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
-        images.append(real_u8)
-        seen += keep
-        if seen >= max_items:
-            break
-
-    if not images:
-        return None
-    return torch.cat(images, dim=0)
-
-
 def train_stage2_transformer(
     transformer: RQTransformerPrior,
     token_loader: DataLoader,
@@ -2304,53 +1319,50 @@ def train_stage2_transformer(
     lr: float,
     pad_token_id: int,
     out_dir: str,
-    ae_for_decode: SparseDictAE,
+    ae_for_decode: LASER,
     H: int,
     W: int,
     D: int,
     sample_every_steps: int = 200,
     sample_batch_size: int = 8,
+    sample_temperature: float = 1.0,
+    sample_top_k: Optional[int] = 256,
     sample_image_size: Optional[int] = None,
+    token_sampler: Optional[DistributedSampler] = None,
+    is_main_process: bool = True,
+    wandb_run: Optional[object] = None,
 ):
+    """Train stage 2 with optional DDP and synchronized rank-0 sampling."""
+    transformer_module = _unwrap_module(transformer)
+    ae_decode = _unwrap_module(ae_for_decode)
     opt = torch.optim.Adam(transformer.parameters(), lr=lr)
-    vocab = transformer.cfg.vocab_size
-    bos = transformer.bos_token_id
+    vocab = transformer_module.cfg.vocab_size
+    bos = transformer_module.bos_token_id
     global_step = 0
+    sample_top_k = None if sample_top_k is None or int(sample_top_k) <= 0 else int(sample_top_k)
 
     for epoch in range(1, epochs + 1):
+        if token_sampler is not None:
+            token_sampler.set_epoch(epoch)
         transformer.train()
-        pbar = tqdm(token_loader, desc=f"[Stage2] epoch {epoch}/{epochs}")
+        pbar = tqdm(token_loader, desc=f"[Stage2] epoch {epoch}/{epochs}", disable=(not is_main_process))
         running = 0.0
+        steps = 0
 
         for batch in pbar:
-            if isinstance(batch, (tuple, list)):
-                tok_flat = batch[0]
-                if (
-                    len(batch) >= 2
-                    and torch.is_tensor(batch[-1])
-                    and batch[-1].dtype in (torch.int8, torch.int16, torch.int32, torch.int64)
-                ):
-                    patch_pos_ids = batch[-1]
-                else:
-                    patch_pos_ids = None
-            else:
-                tok_flat = batch
-                patch_pos_ids = None
-            tok_flat = tok_flat.to(device).long()  # [B, T]
-            if patch_pos_ids is not None:
-                patch_pos_ids = patch_pos_ids.to(device).long()
+            tok_flat = batch[0] if isinstance(batch, (tuple, list)) else batch
+            tok_flat = tok_flat.to(device).long()
             B = tok_flat.size(0)
 
-            # Prepend BOS: [B, 1+T]
             seq = torch.cat([torch.full((B, 1), bos, device=device, dtype=torch.long), tok_flat], dim=1)
             x_in = seq[:, :-1]
             y = seq[:, 1:]
 
-            logits = transformer(x_in, patch_pos_ids=patch_pos_ids)  # [B, L, vocab]
+            logits = transformer(x_in)
             loss = F.cross_entropy(
                 logits.reshape(-1, vocab),
                 y.reshape(-1),
-                ignore_index=pad_token_id
+                ignore_index=pad_token_id,
             )
 
             opt.zero_grad(set_to_none=True)
@@ -2359,40 +1371,74 @@ def train_stage2_transformer(
             opt.step()
             global_step += 1
 
-            running += loss.item()
-            pbar.set_postfix(loss=loss.item())
+            loss_log = _distributed_mean(loss)
+            running += float(loss_log.item())
+            steps += 1
+            if is_main_process:
+                pbar.set_postfix(loss=float(loss_log.item()))
+                _log_wandb(
+                    wandb_run,
+                    {
+                        "stage2/train_loss": float(loss_log.item()),
+                        "stage2/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
             if sample_every_steps > 0 and (global_step % sample_every_steps == 0):
-                transformer.eval()
-                ae_for_decode.eval()
-                print(f"[Stage2] sampling at step {global_step} (batch_size={sample_batch_size})...")
-                with torch.no_grad():
-                    flat_gen = transformer.generate(
-                        batch_size=sample_batch_size,
-                        temperature=1.0,
-                        top_k=256,
-                        show_progress=True,
-                        progress_desc=f"[Stage2] sample step {global_step}",
-                        patch_pos_ids=None,
-                    )  # [B, T]
-                    tokens_gen = flat_gen.view(-1, H, W, D)
-                    imgs = ae_for_decode.decode_from_tokens(tokens_gen.to(device))
-                    if sample_image_size is not None and int(sample_image_size) > 0:
-                        if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
-                            imgs = F.interpolate(
-                                imgs,
-                                size=(int(sample_image_size), int(sample_image_size)),
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                save_image_grid(imgs, os.path.join(out_dir, f"stage2_step{global_step:06d}_samples.png"))
-                print(f"[Stage2] sampling done at step {global_step}")
+                _barrier()
+                if is_main_process:
+                    transformer.eval()
+                    ae_decode.eval()
+                    print(f"[Stage2] sampling at step {global_step} (batch_size={sample_batch_size})...")
+                    with torch.no_grad():
+                        flat_gen = transformer_module.generate(
+                            batch_size=sample_batch_size,
+                            temperature=sample_temperature,
+                            top_k=sample_top_k,
+                            show_progress=True,
+                            progress_desc=f"[Stage2] sample step {global_step}",
+                        )
+                        tokens_gen = flat_gen.view(-1, H, W, D)
+                        imgs = ae_decode.decode_from_tokens(tokens_gen.to(device))
+                        if sample_image_size is not None and int(sample_image_size) > 0:
+                            if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
+                                imgs = F.interpolate(
+                                    imgs,
+                                    size=(int(sample_image_size), int(sample_image_size)),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                )
+                    save_image_grid(imgs, os.path.join(out_dir, f"stage2_step{global_step:06d}_samples.png"))
+                    _log_wandb_image(
+                        wandb_run,
+                        "stage2/samples",
+                        imgs,
+                        step=global_step,
+                        caption=f"step={global_step}",
+                    )
+                    print(f"[Stage2] sampling done at step {global_step}")
+                _barrier()
                 transformer.train()
 
-        print(f"[Stage2] epoch {epoch} train_loss={running/len(token_loader):.6f}")
+        epoch_loss = running / max(1, steps)
+        if is_main_process:
+            print(f"[Stage2] epoch {epoch} train_loss={epoch_loss:.6f}")
+            _log_wandb(
+                wandb_run,
+                {
+                    "stage2/epoch_loss": float(epoch_loss),
+                    "stage2/epoch": epoch,
+                },
+                step=global_step,
+            )
 
-        os.makedirs(out_dir, exist_ok=True)
-        torch.save(transformer.state_dict(), os.path.join(out_dir, "transformer_last.pt"))
+        _barrier()
+        if is_main_process:
+            os.makedirs(out_dir, exist_ok=True)
+            torch.save(transformer_module.state_dict(), os.path.join(out_dir, "transformer_last.pt"))
+        _barrier()
+
 
 
 # -----------------------------
@@ -2400,270 +1446,130 @@ def train_stage2_transformer(
 # -----------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "celeba"])
+    parser = argparse.ArgumentParser(description="Train the core LASER pipeline.")
+    parser.add_argument("--dataset", type=str, default="celeba", choices=["cifar10", "celeba"])
     parser.add_argument("--data_dir", type=str, default=None, help="Root directory for dataset files.")
-    parser.add_argument("--image_size", type=int, default=None, help="Legacy alias for --crop_size.")
     parser.add_argument(
-        "--resize_size",
+        "--image_size",
         type=int,
-        default=256,
-        help="Resize shortest side to this size (keep aspect ratio) before cropping.",
+        default=None,
+        help="Resize every image to this square size.",
     )
-    parser.add_argument("--crop_size", type=int, default=32, help="Random crop size used for training/tokenization.")
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=4, help="Workers for image dataloaders.")
+    parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for token precompute.")
+    parser.add_argument("--wandb", dest="wandb", action="store_true", default=True, help="Enable Weights & Biases logging.")
+    parser.add_argument("--no_wandb", dest="wandb", action="store_false", help="Disable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", type=str, default="laser-scratch")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
-    # Stage-1 (AE)
     parser.add_argument("--stage1_epochs", type=int, default=5)
     parser.add_argument("--stage1_lr", type=float, default=2e-4)
-    parser.add_argument("--stage1_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
-    parser.add_argument("--stage1_warmup_epochs", type=int, default=1)
-    parser.add_argument("--stage1_min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--bottleneck_weight", type=float, default=1.0)
+    parser.add_argument("--stage2_epochs", type=int, default=10)
+    parser.add_argument("--stage2_lr", type=float, default=3e-4)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--stage2_batch_size", type=int, default=4)
+    parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--stage1_devices", type=int, default=2, help="Number of GPUs for Lightning stage-1 training.")
-    parser.add_argument("--stage1_precision", type=str, default="32-true", help="Lightning precision for stage-1.")
-    parser.add_argument("--stage1_strategy", type=str, default="ddp", choices=["ddp", "auto"])
-    parser.add_argument(
-        "--stage1_val_vis_batch_size",
-        type=int,
-        default=32,
-        help="Number of full-resolution validation images logged each stage-1 epoch.",
-    )
 
-    # Model sizes
     parser.add_argument("--num_hiddens", type=int, default=128)
-    parser.add_argument(
-        "--ae_num_downsamples",
-        type=int,
-        default=2,
-        help="Number of stride-2 downsampling stages in stage-1 AE.",
-    )
+    parser.add_argument("--ae_num_downsamples", type=int, default=2)
     parser.add_argument("--num_res_layers", type=int, default=2)
     parser.add_argument("--num_res_hiddens", type=int, default=32)
     parser.add_argument("--embedding_dim", type=int, default=64)
-    parser.add_argument("--num_atoms", type=int, default=128)      # dictionary size K
-    parser.add_argument("--sparsity_level", type=int, default=3)   # stack depth D
-    parser.add_argument("--n_bins", type=int, default=129, help="Coefficient quantization bins (higher = lower quantization error, larger vocab).")
-    parser.add_argument("--coef_max", type=float, default=3.0, help="Coefficient clipping range for quantization in [-coef_max, coef_max].")
+    parser.add_argument("--num_atoms", type=int, default=128)
+    parser.add_argument("--sparsity_level", type=int, default=3)
+    parser.add_argument("--n_bins", type=int, default=16)
+    parser.add_argument("--coef_max", type=float, default=3.0)
     parser.add_argument("--coef_quantization", type=str, default="mu_law", choices=["uniform", "mu_law"])
-    parser.add_argument("--coef_mu", type=float, default=50.0, help="Mu for mu-law quantization (only used when coef_quantization=mu_law).")
+    parser.add_argument("--coef_mu", type=float, default=50.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
-    parser.add_argument(
-        "--quantize_sparse_coeffs",
-        action="store_true",
-        default=True,
-        help="Quantize sparse coefficients into token IDs (legacy).",
-    )
-    parser.add_argument(
-        "--no_quantize_sparse_coeffs",
-        action="store_false",
-        dest="quantize_sparse_coeffs",
-        help="Disable quantized coefficients and use a coefficient regressor head.",
-    )
 
-    # Stage-2 (Transformer)
-    parser.add_argument("--stage2_epochs", type=int, default=10)
-    parser.add_argument("--stage2_lr", type=float, default=3e-4)
-    parser.add_argument("--stage2_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
-    parser.add_argument("--stage2_warmup_epochs", type=int, default=1)
-    parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--stage2_batch_size", type=int, default=16)
-    parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
-    parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
-    parser.add_argument(
-        "--stage2_sample_temperature",
-        type=float,
-        default=0.9,
-        help="Sampling temperature for stage-2 previews (lower usually improves coherence).",
-    )
-    parser.add_argument(
-        "--stage2_sample_top_k",
-        type=int,
-        default=128,
-        help="Top-k for stage-2 preview sampling (<=0 disables top-k filtering).",
-    )
-    parser.add_argument(
-        "--stage2_patchify",
-        action="store_true",
-        default=False,
-        help="Train stage-2 on full images split into patch tokens via unfold/fold.",
-    )
-    parser.add_argument(
-        "--stage2_sliding_window",
-        action="store_true",
-        default=False,
-        help="Train stage-2 on full-image latent sequences with a fixed sliding attention window.",
-    )
-    parser.add_argument("--stage2_patch_size", type=int, default=32, help="Patch size for stage-2 patchify mode.")
-    parser.add_argument("--stage2_patch_stride", type=int, default=32, help="Patch stride for stage-2 patchify mode.")
-    parser.add_argument(
-        "--stage2_patch_context_patches",
-        type=int,
-        default=1,
-        help="Number of previous raster patches used as context during stage-2 patch sampling/training.",
-    )
-    parser.add_argument(
-        "--stage2_window_latent_h",
-        type=int,
-        default=16,
-        help="Latent window height for stage-2 sliding-window mode.",
-    )
-    parser.add_argument(
-        "--stage2_window_latent_w",
-        type=int,
-        default=16,
-        help="Latent window width for stage-2 sliding-window mode.",
-    )
-    parser.add_argument(
-        "--stage2_window_stride_latent",
-        type=int,
-        default=16,
-        help="Stride in latent spatial positions between training windows in sliding-window mode.",
-    )
-    parser.add_argument(
-        "--stage2_patch_encode_batch_size",
-        type=int,
-        default=512,
-        help="Patch mini-batch size during stage-2 token precompute.",
-    )
-    parser.add_argument(
-        "--stage2_sample_image_size",
-        type=int,
-        default=256,
-        help="Output size for stage-2 sample grids (upsampled if needed).",
-    )
-    parser.add_argument(
-        "--stage2_fid_num_samples",
-        type=int,
-        default=None,
-        help="Number of images used for stage-2 FID (default: stage2_sample_batch_size).",
-    )
-    parser.add_argument("--stage2_fid_feature", type=int, default=64, help="Inception feature dims for stage-2 FID.")
-    parser.add_argument("--stage2_fid_every_n_epochs", type=int, default=1, help="Log stage-2 FID every N epochs.")
-    parser.add_argument("--stage2_devices", type=int, default=2, help="Number of GPUs for Lightning stage-2 training.")
-    parser.add_argument("--stage2_precision", type=str, default="32-true", help="Lightning precision, e.g. 32-true or 16-mixed.")
-    parser.add_argument("--stage2_strategy", type=str, default="ddp_fork", choices=["ddp", "ddp_fork", "auto"])
     parser.add_argument("--tf_d_model", type=int, default=256)
     parser.add_argument("--tf_heads", type=int, default=8)
     parser.add_argument("--tf_layers", type=int, default=6)
     parser.add_argument("--tf_ff", type=int, default=1024)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument(
-        "--stage2_coeff_loss_weight",
-        type=float,
-        default=1.0,
-        help="Coefficient regression loss weight when using continuous coefficients.",
+        "--token_subset",
+        type=int,
+        default=2048,
+        help="Number of stage-1 token grids to encode and use for stage-2 training.",
     )
-    parser.add_argument("--token_subset", type=int, default=50000, help="Use only first N tokens/images for speed (<=50000).")
-    parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for stage-2 token precompute loader.")
-    parser.add_argument("--fid_num_samples", type=int, default=1024, help="Number of validation images for stage-1 FID.")
-    parser.add_argument("--fid_feature", type=int, default=192, help="Inception feature dims for stage-1 FID.")
-    parser.add_argument("--fid_compute_batch_size", type=int, default=32, help="Mini-batch size for stage-1 FID feature extraction.")
-    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
-    parser.add_argument("--wandb_project", type=str, default="laser-scratch")
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_name", type=str, default=None, help="Base run name (stage suffix added automatically).")
-    parser.add_argument("--wandb_group", type=str, default=None, help="Group runs for stage1/stage2 in W&B.")
-    parser.add_argument("--wandb_dir", type=str, default="./wandb")
+    parser.add_argument(
+        "--rfid_num_samples",
+        type=int,
+        default=256,
+        help="Number of validation images used for stage-1 reconstruction FID (0 disables it).",
+    )
+    parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
+    parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
+    parser.add_argument("--stage2_sample_temperature", type=float, default=0.9)
+    parser.add_argument("--stage2_sample_top_k", type=int, default=128)
+    parser.add_argument("--stage2_sample_image_size", type=int, default=256)
 
     args = parser.parse_args()
-    if args.stage2_fid_num_samples is None:
-        args.stage2_fid_num_samples = int(args.stage2_sample_batch_size)
-    if args.stage2_sample_temperature <= 0.0:
-        raise ValueError("stage2_sample_temperature must be > 0.")
+    wandb_run = None
+    distributed = False
+
     if args.ae_num_downsamples <= 0:
         raise ValueError(f"ae_num_downsamples must be positive, got {args.ae_num_downsamples}")
-    if args.image_size is not None:
-        args.crop_size = int(args.image_size)
-    args.image_size = int(args.crop_size)
-    if args.resize_size < args.image_size:
-        raise ValueError(
-            f"resize_size ({args.resize_size}) must be >= crop_size ({args.image_size})."
-        )
-    if args.resize_size >= (2 * args.image_size):
-        print(
-            f"[Data] WARNING: resize_size={args.resize_size} is much larger than crop_size={args.image_size}. "
-            "This can make stage-1 reconstruction harder and depress PSNR."
-        )
-    if args.stage2_patchify and args.stage2_sliding_window:
-        raise ValueError("stage2_patchify and stage2_sliding_window are mutually exclusive.")
-    if args.stage2_patchify:
-        if args.stage2_patch_size <= 0 or args.stage2_patch_stride <= 0:
-            raise ValueError(
-                "stage2_patch_size and stage2_patch_stride must be positive."
-            )
-        if args.stage2_patch_context_patches < 0:
-            raise ValueError("stage2_patch_context_patches must be >= 0.")
-        if args.resize_size < args.stage2_patch_size:
-            raise ValueError(
-                f"resize_size ({args.resize_size}) must be >= stage2_patch_size ({args.stage2_patch_size})."
-            )
-        if ((args.resize_size - args.stage2_patch_size) % args.stage2_patch_stride) != 0:
-            raise ValueError(
-                "resize_size, stage2_patch_size, and stage2_patch_stride produce a non-integer patch grid."
-            )
-    if args.stage2_sliding_window:
-        if args.stage2_window_latent_h <= 0 or args.stage2_window_latent_w <= 0:
-            raise ValueError("stage2_window_latent_h and stage2_window_latent_w must be positive.")
-        if args.stage2_window_stride_latent <= 0:
-            raise ValueError("stage2_window_stride_latent must be positive.")
+    if args.stage2_sample_temperature <= 0.0:
+        raise ValueError("stage2_sample_temperature must be > 0.")
+    if args.image_size is None:
+        args.image_size = _default_image_size(args.dataset)
+    args.image_size = int(args.image_size)
     if args.data_dir is None:
-        args.data_dir = "../../data/celeba" if args.dataset == "celeba" else "./data"
+        args.data_dir = str(_default_data_dir(args.dataset))
     if args.out_dir is None:
-        args.out_dir = f"./runs/sparse_dict_rq_{args.dataset}_{args.image_size}"
+        args.out_dir = str(_default_out_dir(args.dataset, args.image_size))
 
-    pl.seed_everything(args.seed, workers=True)
+    distributed, rank, local_rank, world_size = _init_distributed()
+    is_main_process = (rank == 0)
+
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("medium")
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    print(
-        f"[Data] dataset={args.dataset} data_dir={args.data_dir} "
-        f"resize_size={args.resize_size} crop_size={args.image_size} "
-        f"stage2_patchify={args.stage2_patchify} "
-        f"stage2_sliding_window={args.stage2_sliding_window} "
-        f"context_patches={args.stage2_patch_context_patches if args.stage2_patchify else 0}"
-    )
+    if distributed:
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin_memory = device.type == "cuda"
 
+    if is_main_process:
+        os.makedirs(args.out_dir, exist_ok=True)
     stage1_dir = os.path.join(args.out_dir, "stage1")
     stage2_dir = os.path.join(args.out_dir, "stage2")
-    os.makedirs(stage1_dir, exist_ok=True)
-    os.makedirs(stage2_dir, exist_ok=True)
-    token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
-    run_base_name = args.wandb_name or f"sparse_dict_rq_{args.dataset}_{args.image_size}"
-    if "LASER_WANDB_GROUP" in os.environ:
-        wandb_group = os.environ["LASER_WANDB_GROUP"]
-    else:
-        wandb_group = args.wandb_group or f"{run_base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        os.environ["LASER_WANDB_GROUP"] = wandb_group
+    if is_main_process:
+        os.makedirs(stage1_dir, exist_ok=True)
+        os.makedirs(stage2_dir, exist_ok=True)
+    _barrier()
 
-    def _build_wandb_logger(stage_tag: str):
-        if args.wandb_mode == "disabled":
-            return False
-        local_rank = os.environ.get("LOCAL_RANK")
-        if local_rank not in (None, "0"):
-            return False
-        try:
-            return WandbLogger(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                name=f"{run_base_name}_{stage_tag}",
-                group=wandb_group,
-                save_dir=args.wandb_dir,
-                offline=(args.wandb_mode == "offline"),
-                log_model=False,
-            )
-        except Exception as exc:
-            print(f"[WandB] logger init failed ({exc}); continuing without W&B.")
-            return False
+    if is_main_process:
+        print(
+            f"[Setup] device={device} world_size={world_size} dataset={args.dataset} "
+            f"data_dir={args.data_dir} image_size={args.image_size}"
+        )
+        wandb_run = _init_wandb(args)
+    if wandb_run is not None:
+        _log_wandb(
+            wandb_run,
+            {
+                "setup/device": str(device),
+                "setup/dataset": args.dataset,
+            },
+            step=0,
+        )
 
-    def _build_ae(quantize_sparse_coeffs: bool = args.quantize_sparse_coeffs) -> SparseDictAE:
-        return SparseDictAE(
+    def _build_laser() -> LASER:
+        return LASER(
             in_channels=3,
             num_hiddens=args.num_hiddens,
             num_downsamples=args.ae_num_downsamples,
@@ -2677,465 +1583,197 @@ def main():
             coef_max=args.coef_max,
             coef_quantization=args.coef_quantization,
             coef_mu=args.coef_mu,
-            quantize_sparse_coeffs=quantize_sparse_coeffs,
             out_tanh=True,
         )
 
-    def _load_best_ae_weights(ae_model: SparseDictAE):
+    def _load_best_laser_weights(laser_model: LASER):
         best_path = os.path.join(stage1_dir, "ae_best.pt")
-        if os.path.exists(best_path):
-            try:
-                state_dict = torch.load(best_path, map_location="cpu", weights_only=True)
-            except TypeError:
-                state_dict = torch.load(best_path, map_location="cpu")
-            ae_model.load_state_dict(state_dict)
-        else:
+        if not os.path.exists(best_path):
             raise FileNotFoundError(f"Stage-1 checkpoint not found at {best_path}")
+        try:
+            state_dict = torch.load(best_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            state_dict = torch.load(best_path, map_location="cpu")
+        laser_model.load_state_dict(state_dict)
 
-    def _run_stage2_lightning(
-        tokens_flat: torch.Tensor,
-        coeffs_flat: Optional[torch.Tensor],
-        patch_pos_flat: Optional[torch.Tensor],
-        quantize_sparse_coeffs: bool,
-        H: int,
-        W: int,
-        D: int,
-        patch_grid_shape: Optional[Tuple[int, int]],
-        patch_size: int,
-        patch_stride: int,
-        sample_latent_shape: Optional[Tuple[int, int]],
-        sliding_window_stride_latent: Optional[int],
-        ae_model: SparseDictAE,
-        fid_real_images: Optional[torch.Tensor],
-    ):
-        if not torch.cuda.is_available():
-            raise RuntimeError("Stage-2 Lightning multi-GPU training requires CUDA.")
-        if torch.cuda.device_count() < args.stage2_devices:
-            raise RuntimeError(
-                f"Requested {args.stage2_devices} GPUs, but only {torch.cuda.device_count()} detected."
-            )
-        if not quantize_sparse_coeffs and coeffs_flat is None:
-            raise ValueError("coeffs_flat is required when quantize_sparse_coeffs=False")
-        if patch_grid_shape is not None and args.stage2_patch_context_patches > 0 and patch_pos_flat is None:
-            raise ValueError("patch_pos_flat is required for patch context training.")
-        if sample_latent_shape is not None and patch_grid_shape is not None:
-            raise ValueError("sample_latent_shape and patch_grid_shape cannot both be set.")
-        if sample_latent_shape is not None and (not quantize_sparse_coeffs) and args.stage2_sample_every_steps > 0:
-            raise NotImplementedError(
-                "Sliding-window sampling currently supports quantized-token mode only. "
-                "Set --stage2_sample_every_steps 0 to train in coefficient-regression mode."
-            )
+    normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    train_tfm = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    eval_tfm = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        normalize,
+    ])
 
-        stage2_dm = Stage2TokenDataModule(
-            tokens_flat=tokens_flat,
-            batch_size=args.stage2_batch_size,
-            coeffs_flat=None if coeffs_flat is None else coeffs_flat,
-            patch_pos_flat=patch_pos_flat,
-            context_patches=(args.stage2_patch_context_patches if patch_grid_shape is not None else 0),
-            pad_token_id=ae_model.bottleneck.pad_token_id,
-            sliding_window_shape=((int(H), int(W)) if sample_latent_shape is not None else None),
-            full_latent_shape=sample_latent_shape,
-            latent_depth=(int(D) if sample_latent_shape is not None else None),
-            sliding_window_stride_latent=(
-                int(sliding_window_stride_latent)
-                if (sample_latent_shape is not None and sliding_window_stride_latent is not None)
-                else None
-            ),
-            num_workers=2,
+    if args.dataset == "cifar10":
+        train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_tfm)
+        val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
+        stage2_source_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=eval_tfm)
+    elif args.dataset == "celeba":
+        train_full = FlatImageDataset(root=args.data_dir, transform=train_tfm)
+        val_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
+        token_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
+        if len(train_full) < 2:
+            raise RuntimeError("CelebA dataset needs at least 2 images for train/val split.")
+        val_size = max(1, int(0.05 * len(train_full)))
+        train_size = len(train_full) - val_size
+        indices = torch.randperm(len(train_full), generator=torch.Generator().manual_seed(args.seed)).tolist()
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+        train_set = Subset(train_full, train_indices)
+        val_set = Subset(val_full, val_indices)
+        stage2_source_set = Subset(token_full, train_indices)
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
+    train_sampler = DistributedSampler(train_set, shuffle=True) if distributed else None
+    val_sampler = DistributedSampler(val_set, shuffle=False) if distributed else None
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=min(64, args.batch_size),
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=max(0, args.num_workers // 2),
+        pin_memory=pin_memory,
+    )
+    rfid_loader = None
+    if is_main_process and args.rfid_num_samples > 0:
+        rfid_loader = DataLoader(
+            val_set,
+            batch_size=min(32, min(64, args.batch_size)),
+            shuffle=False,
+            num_workers=max(0, args.num_workers // 2),
+            pin_memory=pin_memory,
         )
 
-        patch_positions = int(patch_grid_shape[0] * patch_grid_shape[1]) if patch_grid_shape is not None else 0
-        context_tokens = 0
-        if patch_grid_shape is not None and args.stage2_patch_context_patches > 0:
-            context_tokens = int(args.stage2_patch_context_patches) * int(H * W * D)
-        cfg = RQTransformerConfig(
-            vocab_size=ae_model.bottleneck.vocab_size,
+    laser = _build_laser().to(device)
+    laser_stage1 = DDP(laser, device_ids=[local_rank], output_device=local_rank) if distributed else laser
+    if args.stage1_epochs > 0:
+        train_stage1_ae(
+            ae=laser_stage1,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            rfid_loader=rfid_loader,
+            device=device,
+            epochs=args.stage1_epochs,
+            lr=args.stage1_lr,
+            bottleneck_weight=args.bottleneck_weight,
+            grad_clip=args.grad_clip,
+            out_dir=stage1_dir,
+            rfid_num_samples=args.rfid_num_samples,
+            train_sampler=train_sampler,
+            is_main_process=is_main_process,
+            wandb_run=wandb_run,
+        )
+    _barrier()
+
+    _load_best_laser_weights(laser)
+    laser = laser.to(device)
+
+    token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
+    if is_main_process:
+        token_source_loader = DataLoader(
+            stage2_source_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.token_num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(args.token_num_workers > 0),
+        )
+        tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
+            laser,
+            token_source_loader,
+            device,
+            max_items=min(args.token_subset, len(stage2_source_set)),
+        )
+        if coeffs_flat is not None:
+            raise RuntimeError("The simplified script only trains the quantized-token stage-2 prior.")
+        torch.save({"tokens_flat": tokens_flat, "shape": (H, W, D)}, token_cache_path)
+        print(f"[Stage2] token dataset: {tokens_flat.shape} (H={H}, W={W}, D={D})")
+    _barrier()
+    try:
+        token_cache = torch.load(token_cache_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        token_cache = torch.load(token_cache_path, map_location="cpu")
+    tokens_flat = token_cache["tokens_flat"]
+    H, W, D = token_cache["shape"]
+
+    if args.stage2_epochs <= 0:
+        _barrier()
+        if is_main_process:
+            if wandb_run is not None:
+                wandb_run.finish()
+            print(f"Outputs saved to: {args.out_dir}")
+        _cleanup_distributed()
+        return
+
+    token_sampler = DistributedSampler(tokens_flat, shuffle=True) if distributed else None
+    token_loader = DataLoader(
+        tokens_flat,
+        batch_size=args.stage2_batch_size,
+        shuffle=(token_sampler is None),
+        sampler=token_sampler,
+        num_workers=0,
+        pin_memory=pin_memory,
+        drop_last=(len(tokens_flat) >= args.stage2_batch_size),
+    )
+    transformer = RQTransformerPrior(
+        RQTransformerConfig(
+            vocab_size=laser.bottleneck.vocab_size,
             H=H,
             W=W,
             D=D,
-            num_patch_positions=patch_positions,
-            context_tokens=context_tokens,
-            predict_coefficients=not quantize_sparse_coeffs,
-            coeff_loss_weight=args.stage2_coeff_loss_weight,
-            coeff_max=args.coef_max,
             d_model=args.tf_d_model,
             n_heads=args.tf_heads,
             n_layers=args.tf_layers,
             d_ff=args.tf_ff,
             dropout=args.tf_dropout,
-        )
-        transformer = RQTransformerPrior(
-            cfg,
-            bos_token_id=ae_model.bottleneck.bos_token_id,
-            pad_token_id=ae_model.bottleneck.pad_token_id,
-        )
-        stage2_module = Stage2LightningModule(
-            transformer=transformer,
-            lr=args.stage2_lr,
-            pad_token_id=ae_model.bottleneck.pad_token_id,
-            out_dir=stage2_dir,
-            ae_for_decode=ae_model,
-            H=H,
-            W=W,
-            D=D,
-            sample_every_steps=args.stage2_sample_every_steps,
-            sample_batch_size=args.stage2_sample_batch_size,
-            sample_temperature=args.stage2_sample_temperature,
-            sample_top_k=args.stage2_sample_top_k,
-            sample_image_size=args.stage2_sample_image_size,
-            sample_latent_shape=sample_latent_shape,
-            sample_window_stride_latent=(
-                int(sliding_window_stride_latent)
-                if (sample_latent_shape is not None and sliding_window_stride_latent is not None)
-                else 1
-            ),
-            patch_grid_shape=patch_grid_shape,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patch_context_patches=(args.stage2_patch_context_patches if patch_grid_shape is not None else 0),
-            fid_real_images=fid_real_images,
-            fid_num_samples=args.stage2_fid_num_samples,
-            fid_feature=args.stage2_fid_feature,
-            fid_every_n_epochs=args.stage2_fid_every_n_epochs,
-            lr_schedule=args.stage2_lr_schedule,
-            warmup_epochs=args.stage2_warmup_epochs,
-            min_lr_ratio=args.stage2_min_lr_ratio,
-            coeff_loss_weight=args.stage2_coeff_loss_weight,
-        )
+        ),
+        bos_token_id=laser.bottleneck.bos_token_id,
+        pad_token_id=laser.bottleneck.pad_token_id,
+    ).to(device)
+    transformer_stage2 = DDP(transformer, device_ids=[local_rank], output_device=local_rank) if distributed else transformer
 
-        effective_strategy = (args.stage2_strategy if args.stage2_devices > 1 else "auto")
-        if effective_strategy == "ddp_fork" and torch.cuda.is_initialized():
-            print("[Stage2] CUDA already initialized; falling back from ddp_fork to ddp.")
-            effective_strategy = "ddp"
-
-        trainer = pl.Trainer(
-            accelerator="gpu",
-            devices=args.stage2_devices,
-            strategy=effective_strategy,
-            max_epochs=args.stage2_epochs,
-            logger=_build_wandb_logger("stage2"),
-            enable_checkpointing=False,
-            gradient_clip_val=1.0,
-            precision=args.stage2_precision,
-            log_every_n_steps=10,
-            deterministic=False,
-        )
-        trainer.fit(stage2_module, datamodule=stage2_dm)
-
-    # During stage-2 DDP script re-entry, skip stage-1 and tokenization work.
-    if os.environ.get("LASER_DDP_PHASE") == "stage2":
-        if not os.path.exists(token_cache_path):
-            raise FileNotFoundError(f"Missing token cache: {token_cache_path}")
-        try:
-            cache = torch.load(token_cache_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            cache = torch.load(token_cache_path, map_location="cpu")
-        tokens_flat = cache["tokens_flat"]
-        coeffs_flat = cache.get("coeffs_flat")
-        patch_pos_flat = cache.get("patch_pos_flat")
-        quantize_sparse_coeffs = cache.get("quantize_sparse_coeffs", True)
-        H, W, D = cache["shape"]
-        patch_grid_shape = cache.get("patch_grid_shape")
-        patch_size = int(cache.get("patch_size", args.stage2_patch_size))
-        patch_stride = int(cache.get("patch_stride", args.stage2_patch_stride))
-        sample_latent_shape = cache.get("sample_latent_shape")
-        sliding_window_stride_latent = cache.get(
-            "sliding_window_stride_latent",
-            cache.get("sliding_window_stride_tokens"),
-        )
-        fid_real_images = cache.get("fid_real_images")
-        ae = _build_ae(quantize_sparse_coeffs=quantize_sparse_coeffs)
-        _load_best_ae_weights(ae)
-        _run_stage2_lightning(
-            tokens_flat=tokens_flat,
-            coeffs_flat=coeffs_flat,
-            patch_pos_flat=patch_pos_flat,
-            quantize_sparse_coeffs=quantize_sparse_coeffs,
-            H=H,
-            W=W,
-            D=D,
-            patch_grid_shape=patch_grid_shape,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            sample_latent_shape=sample_latent_shape,
-            sliding_window_stride_latent=sliding_window_stride_latent,
-            ae_model=ae,
-            fid_real_images=fid_real_images,
-        )
-        return
-
-    # Normalize to [-1, 1].
-    # Keep aspect ratio on resize, then center-crop to a square canvas so
-    # stage-1 random crops come from a more stable distribution.
-    train_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.RandomCrop((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    eval_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.CenterCrop((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    val_vis_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.CenterCrop((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    stage2_source_tfm = transforms.Compose([
-        transforms.Resize(args.resize_size),
-        transforms.CenterCrop((args.resize_size, args.resize_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    if args.dataset == "cifar10":
-        train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_tfm)
-        val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
-        val_vis_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=val_vis_tfm)
-        if args.stage2_patchify or args.stage2_sliding_window:
-            stage2_source_set = datasets.CIFAR10(
-                root=args.data_dir,
-                train=True,
-                download=True,
-                transform=stage2_source_tfm,
-            )
-        else:
-            stage2_source_set = train_set
-    elif args.dataset == "celeba":
-        train_full = FlatImageDataset(root=args.data_dir, transform=train_tfm)
-        val_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
-        val_vis_full = FlatImageDataset(root=args.data_dir, transform=val_vis_tfm)
-        stage2_source_full = FlatImageDataset(root=args.data_dir, transform=stage2_source_tfm)
-        if len(train_full) < 2:
-            raise RuntimeError("CelebA dataset needs at least 2 images for train/val split.")
-        val_size = max(1, int(0.05 * len(train_full)))
-        train_size = len(train_full) - val_size
-        all_indices = torch.randperm(len(train_full), generator=torch.Generator().manual_seed(args.seed))
-        train_indices = all_indices[:train_size].tolist()
-        val_indices = all_indices[train_size:].tolist()
-        train_set = Subset(train_full, train_indices)
-        val_set = Subset(val_full, val_indices)
-        val_vis_set = Subset(val_vis_full, val_indices)
-        if args.stage2_patchify or args.stage2_sliding_window:
-            stage2_source_set = Subset(stage2_source_full, train_indices)
-        else:
-            stage2_source_set = train_set
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
-
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
-
-    stage1_val_vis_images = None
-    if args.stage1_val_vis_batch_size > 0 and len(val_vis_set) > 0:
-        vis_bs = min(int(args.stage1_val_vis_batch_size), len(val_vis_set))
-        vis_loader = DataLoader(val_vis_set, batch_size=vis_bs, shuffle=False, num_workers=0, pin_memory=False)
-        vis_images, _ = next(iter(vis_loader))
-        stage1_val_vis_images = vis_images
-        print(
-            f"[Stage1] full-res validation visuals: "
-            f"batch={stage1_val_vis_images.size(0)} size={stage1_val_vis_images.size(-2)}x{stage1_val_vis_images.size(-1)}"
-        )
-
-    ae = _build_ae()
-    if args.stage1_epochs > 0:
-        if not torch.cuda.is_available():
-            raise RuntimeError("Stage-1 Lightning multi-GPU training requires CUDA.")
-        if torch.cuda.device_count() < args.stage1_devices:
-            raise RuntimeError(
-                f"Requested {args.stage1_devices} GPUs for stage-1, but only {torch.cuda.device_count()} detected."
-            )
-        stage1_module = Stage1LightningModule(
-            ae=ae,
-            lr=args.stage1_lr,
-            bottleneck_weight=args.bottleneck_weight,
-            out_dir=stage1_dir,
-            val_vis_images=stage1_val_vis_images,
-            fid_num_samples=args.fid_num_samples,
-            fid_feature=args.fid_feature,
-            fid_compute_batch_size=args.fid_compute_batch_size,
-            lr_schedule=args.stage1_lr_schedule,
-            warmup_epochs=args.stage1_warmup_epochs,
-            min_lr_ratio=args.stage1_min_lr_ratio,
-        )
-        stage1_trainer = pl.Trainer(
-            accelerator="gpu",
-            devices=args.stage1_devices,
-            strategy=(args.stage1_strategy if args.stage1_devices > 1 else "auto"),
-            max_epochs=args.stage1_epochs,
-            logger=_build_wandb_logger("stage1"),
-            enable_checkpointing=False,
-            gradient_clip_val=args.grad_clip,
-            precision=args.stage1_precision,
-            log_every_n_steps=10,
-            deterministic=False,
-        )
-        stage1_trainer.fit(stage1_module, train_dataloaders=train_loader, val_dataloaders=val_loader)
-        local_rank = os.environ.get("LOCAL_RANK")
-        if local_rank not in (None, "0"):
-            # In stage-1 DDP non-zero ranks, stop here so only rank 0
-            # proceeds to tokenization and stage-2 launch.
-            return
-
-    _load_best_ae_weights(ae)
-    encode_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    ae = ae.to(encode_device)
-    token_loader_batch_size = int(args.batch_size)
-    if args.stage2_patchify or args.stage2_sliding_window:
-        token_loader_batch_size = max(1, min(token_loader_batch_size, 16))
-    token_loader = DataLoader(
-        stage2_source_set,
-        batch_size=token_loader_batch_size,
-        shuffle=False,
-        num_workers=args.token_num_workers,
-        pin_memory=True,
-        persistent_workers=(args.token_num_workers > 0),
+    train_stage2_transformer(
+        transformer=transformer_stage2,
+        token_loader=token_loader,
+        device=device,
+        epochs=args.stage2_epochs,
+        lr=args.stage2_lr,
+        pad_token_id=laser.bottleneck.pad_token_id,
+        out_dir=stage2_dir,
+        ae_for_decode=laser,
+        H=H,
+        W=W,
+        D=D,
+        sample_every_steps=args.stage2_sample_every_steps,
+        sample_batch_size=args.stage2_sample_batch_size,
+        sample_temperature=args.stage2_sample_temperature,
+        sample_top_k=(None if args.stage2_sample_top_k <= 0 else args.stage2_sample_top_k),
+        sample_image_size=args.stage2_sample_image_size,
+        token_sampler=token_sampler,
+        is_main_process=is_main_process,
+        wandb_run=wandb_run,
     )
-    patch_pos_flat = None
-    patch_grid_shape = None
-    patch_size = int(args.stage2_patch_size)
-    patch_stride = int(args.stage2_patch_stride)
-    sample_latent_shape = None
-    sliding_window_stride_latent = None
-    if args.stage2_patchify:
-        (
-            tokens_flat,
-            coeffs_flat,
-            patch_pos_flat,
-            H,
-            W,
-            D,
-            patch_grid_h,
-            patch_grid_w,
-        ) = precompute_patch_grid_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patch_encode_batch_size=args.stage2_patch_encode_batch_size,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-        patch_grid_shape = (patch_grid_h, patch_grid_w)
-    elif args.stage2_sliding_window:
-        tokens_flat, coeffs_flat, full_H, full_W, D = precompute_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-        H = int(args.stage2_window_latent_h)
-        W = int(args.stage2_window_latent_w)
-        if H > int(full_H) or W > int(full_W):
-            raise ValueError(
-                f"Sliding window latent size ({H}, {W}) exceeds full latent shape ({full_H}, {full_W})."
-            )
-        sample_latent_shape = (int(full_H), int(full_W))
-        sliding_window_stride_latent = int(args.stage2_window_stride_latent)
-    else:
-        tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
-            ae,
-            token_loader,
-            encode_device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
-        )
-    fid_real_loader = DataLoader(
-        stage2_source_set if (args.stage2_patchify or args.stage2_sliding_window) else train_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
-    fid_real_images = collect_real_images_uint8(
-        fid_real_loader,
-        max_items=args.stage2_fid_num_samples,
-    )
-    ae = ae.cpu()
-    print(f"[Stage2] token dataset: {tokens_flat.shape}   (H={H}, W={W}, D={D})")
-    if patch_grid_shape is not None:
-        print(
-            f"[Stage2] patch grid: {patch_grid_shape[0]}x{patch_grid_shape[1]} "
-            f"(patch_size={patch_size}, stride={patch_stride})"
-        )
-    if sample_latent_shape is not None:
-        full_h, full_w = int(sample_latent_shape[0]), int(sample_latent_shape[1])
-        stride_lat = int(sliding_window_stride_latent or H)
-        grid_h = ((full_h - int(H)) // stride_lat) + 1
-        grid_w = ((full_w - int(W)) // stride_lat) + 1
-        windows_per_image = int(grid_h * grid_w)
-        print(
-            f"[Stage2] sliding-window mode: "
-            f"window_latent={H}x{W}, full_latent={sample_latent_shape[0]}x{sample_latent_shape[1]}, "
-            f"stride_latent={stride_lat}, windows_per_image={windows_per_image}"
-        )
 
-    torch.save(
-        {
-            "tokens_flat": tokens_flat,
-            "coeffs_flat": coeffs_flat,
-            "patch_pos_flat": patch_pos_flat,
-            "quantize_sparse_coeffs": args.quantize_sparse_coeffs,
-            "shape": (H, W, D),
-            "patch_grid_shape": patch_grid_shape,
-            "patch_size": patch_size,
-            "patch_stride": patch_stride,
-            "sample_latent_shape": sample_latent_shape,
-            "sliding_window_stride_latent": sliding_window_stride_latent,
-            "fid_real_images": fid_real_images,
-        },
-        token_cache_path,
-    )
-    if args.stage1_epochs <= 0:
-        # If stage-1 is skipped, we don't need a process restart boundary.
-        _run_stage2_lightning(
-            tokens_flat=tokens_flat,
-            coeffs_flat=coeffs_flat,
-            patch_pos_flat=patch_pos_flat,
-            quantize_sparse_coeffs=args.quantize_sparse_coeffs,
-            H=H,
-            W=W,
-            D=D,
-            patch_grid_shape=patch_grid_shape,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            sample_latent_shape=sample_latent_shape,
-            sliding_window_stride_latent=sliding_window_stride_latent,
-            ae_model=ae,
-            fid_real_images=fid_real_images,
-        )
-        return
-    # Re-exec into a clean process before launching stage-2 DDP.
-    # This avoids hangs from initializing two different DDP trainers in one process.
-    # Also clear stale DDP env from stage-1 so stage-2 can launch all ranks.
-    os.environ["LASER_DDP_PHASE"] = "stage2"
-    for k in (
-        "LOCAL_RANK",
-        "RANK",
-        "WORLD_SIZE",
-        "LOCAL_WORLD_SIZE",
-        "GROUP_RANK",
-        "ROLE_RANK",
-        "NODE_RANK",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-    ):
-        os.environ.pop(k, None)
-    print("[Stage2] restarting process for clean DDP launch...")
-    cmd = [sys.executable, __file__, *sys.argv[1:]]
-    env = os.environ.copy()
-    ret = subprocess.call(cmd, env=env, close_fds=True)
-    if ret != 0:
-        raise RuntimeError(f"Stage-2 restart process failed with exit code {ret}.")
-    return
-
-    print("Done.")
-    print(f"Outputs saved to: {args.out_dir}")
+    if is_main_process:
+        if wandb_run is not None:
+            wandb_run.finish()
+        print(f"Outputs saved to: {args.out_dir}")
+    _barrier()
+    _cleanup_distributed()
 
 
 if __name__ == "__main__":
