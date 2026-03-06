@@ -273,10 +273,12 @@ class DictionaryLearningTokenized(nn.Module):
     """
     Dictionary-learning bottleneck with batched Orthogonal Matching Pursuit (OMP) sparse coding.
     Tokenization modes:
-    - Quantized-mode: token = atom_id * n_bins + coefficient_bin (backward compatible).
+    - Quantized-mode: alternating token pairs [atom_id, coeff_bin + num_atoms].
     - Regressor-mode: token = atom_id only, coefficients are modeled with a separate head.
 
-    Outputs, per latent pixel, a *stack* of length D=sparsity_level.
+    Outputs, per latent pixel, a token stack of length:
+    - 2 * sparsity_level in quantized mode
+    - sparsity_level in regressor mode
 
     Important simplifications (good for a quick test):
       - OMP runs under torch.no_grad() like in LASER: we do NOT backprop through sparse coding.
@@ -290,9 +292,9 @@ class DictionaryLearningTokenized(nn.Module):
         sparsity_level: int = 4,
         n_bins: int = 16,
         coef_max: float = 3.0,
-        quantize_sparse_coeffs: bool = True,
-        coef_quantization: str = "mu_law",
-        coef_mu: float = 50.0,
+        quantize_sparse_coeffs: bool = False,
+        coef_quantization: str = "uniform",
+        coef_mu: float = 0.0,
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
     ):
@@ -330,10 +332,16 @@ class DictionaryLearningTokenized(nn.Module):
 
         # Special tokens (for the transformer)
         if self.quantize_sparse_coeffs:
-            self.pad_token_id = self.num_embeddings * self.n_bins
+            self.coeff_token_offset = self.num_embeddings
+            self.token_depth = 2 * self.sparsity_level
+            self.content_vocab_size = self.num_embeddings + self.n_bins
+            self.pad_token_id = self.content_vocab_size
             self.bos_token_id = self.pad_token_id + 1
-            self.vocab_size = self.num_embeddings * self.n_bins + 2
+            self.vocab_size = self.content_vocab_size + 2
         else:
+            self.coeff_token_offset = self.num_embeddings
+            self.token_depth = self.sparsity_level
+            self.content_vocab_size = self.num_embeddings
             self.pad_token_id = self.num_embeddings
             self.bos_token_id = self.num_embeddings + 1
             self.vocab_size = self.num_embeddings + 2
@@ -370,6 +378,44 @@ class DictionaryLearningTokenized(nn.Module):
         z_abs = z.abs()
         decoded_norm = torch.sign(z) * (torch.expm1(z_abs / self.coef_mu_invlog1p) / self.coef_mu)
         return decoded_norm * self.coef_max
+
+    def _pack_quantized_tokens(self, support: torch.Tensor, bin_idx: torch.Tensor) -> torch.Tensor:
+        """Interleave atom tokens and coefficient-bin tokens along the token depth axis."""
+        if support.shape != bin_idx.shape:
+            raise ValueError(f"support and bin_idx shape mismatch: {support.shape} vs {bin_idx.shape}")
+        if support.size(-1) != self.sparsity_level:
+            raise ValueError(f"Expected sparse depth {self.sparsity_level}, got {support.size(-1)}")
+
+        tokens = torch.empty(
+            *support.shape[:-1],
+            self.token_depth,
+            device=support.device,
+            dtype=torch.long,
+        )
+        tokens[..., 0::2] = support.to(torch.long)
+        tokens[..., 1::2] = bin_idx.to(torch.long) + self.coeff_token_offset
+        return tokens
+
+    def _unpack_quantized_tokens(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode alternating [atom, coeff_bin] tokens back to atom ids and coefficients."""
+        if tokens.size(-1) != self.token_depth:
+            raise ValueError(f"Expected token depth {self.token_depth}, got {tokens.size(-1)}")
+
+        atom_tokens = tokens[..., 0::2].to(torch.long)
+        coeff_tokens = tokens[..., 1::2].to(torch.long)
+
+        atom_invalid = (atom_tokens < 0) | (atom_tokens >= self.num_embeddings)
+        coeff_bin = coeff_tokens - self.coeff_token_offset
+        coeff_invalid = (coeff_bin < 0) | (coeff_bin >= self.n_bins)
+        invalid = atom_invalid | coeff_invalid
+
+        atom_ids = atom_tokens.clamp(0, self.num_embeddings - 1)
+        coeff_bin = coeff_bin.clamp(0, self.n_bins - 1)
+        coeffs = self._dequantize_coeff(coeff_bin)
+
+        atom_ids = atom_ids.masked_fill(invalid, 0)
+        coeffs = coeffs.masked_fill(invalid, 0.0)
+        return atom_ids, coeffs
 
     def _encode_sparse_codes(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run OMP and return support atom ids and continuous coefficients."""
@@ -517,7 +563,7 @@ class DictionaryLearningTokenized(nn.Module):
         Returns:
             z_q_ste: [B, C, H, W]
             loss: scalar bottleneck loss
-            tokens: [B, H, W, D] (D=sparsity_level)
+            tokens: [B, H, W, token_depth]
         """
         if z_e.dim() != 4:
             raise ValueError(f"Expected [B,C,H,W], got {tuple(z_e.shape)}")
@@ -530,10 +576,12 @@ class DictionaryLearningTokenized(nn.Module):
         coeffs_flat = coeffs.view(-1, self.sparsity_level)
 
         if self.quantize_sparse_coeffs:
-            # Quantize coefficients (Option A)
+            # Quantize coefficients and interleave atom + coefficient-bin tokens.
             bin_idx, coeff_q = self._quantize_coeff(coeffs_flat)  # both [Nsig, D]
-            # Tokens: [Nsig, D] -> [B,H,W,D]
-            tokens = (support_flat * self.n_bins + bin_idx).view(B, H, W, self.sparsity_level)
+            tokens = self._pack_quantized_tokens(
+                support_flat.view(B, H, W, self.sparsity_level),
+                bin_idx.view(B, H, W, self.sparsity_level),
+            )
             coeffs_for_recon = coeff_q
         else:
             tokens = support.view(B, H, W, self.sparsity_level).long()
@@ -556,7 +604,7 @@ class DictionaryLearningTokenized(nn.Module):
         """
         Decode tokens back to a latent map.
         Args:
-            tokens: [B, H, W, D]
+            tokens: [B, H, W, token_depth]
             coeffs: [B, H, W, D] (only used in non-quantized mode)
         Returns:
             z_q: [B, C, H, W]
@@ -564,22 +612,12 @@ class DictionaryLearningTokenized(nn.Module):
         if tokens.dim() != 4:
             raise ValueError(f"Expected [B,H,W,D], got {tuple(tokens.shape)}")
         B, H, W, D = tokens.shape
-        if D != self.sparsity_level:
-            raise ValueError(f"Expected D={self.sparsity_level}, got {D}")
+        if D != self.token_depth:
+            raise ValueError(f"Expected token depth {self.token_depth}, got {D}")
 
         if self.quantize_sparse_coeffs:
-            dictionary = self._normalize_dict()
-            tok = tokens.to(torch.long)
-            special = tok >= self.pad_token_id  # pad or bos
-            tok_clamped = tok.clamp_max(self.pad_token_id - 1)
-
-            atom = tok_clamped // self.n_bins
-            bin_idx = tok_clamped % self.n_bins
-
-            coeff = self._dequantize_coeff(bin_idx).to(dictionary.dtype)
-            coeff = coeff * (~special).float()
-            atom = atom * (~special).long()
-            return self._reconstruct_sparse(atom, coeff)
+            atom_ids, coeff_q = self._unpack_quantized_tokens(tokens)
+            return self._reconstruct_sparse(atom_ids, coeff_q)
 
         if coeffs is None:
             raise ValueError("coeffs must be provided when quantize_sparse_coeffs=False")
@@ -608,10 +646,10 @@ class LASER(nn.Module):
         commitment_cost: float = 0.25,
         n_bins: int = 16,
         coef_max: float = 3.0,
-        coef_quantization: str = "mu_law",
+        coef_quantization: str = "uniform",
         coef_mu: float = 50.0,
         out_tanh: bool = True,
-        quantize_sparse_coeffs: bool = True,
+        quantize_sparse_coeffs: bool = False,
     ):
         super().__init__()
         self.out_tanh = bool(out_tanh)
@@ -757,6 +795,8 @@ class RQTransformerConfig:
     H: int
     W: int
     D: int
+    atom_vocab_size: Optional[int] = None
+    coeff_vocab_size: Optional[int] = None
     d_model: int = 256
     n_heads: int = 8
     n_layers: int = 6
@@ -767,12 +807,27 @@ class RQTransformerConfig:
 class RQTransformerPrior(nn.Module):
     """
     Autoregressive prior over a flattened H x W x D token grid.
+    In quantized LASER mode, D is the token depth after atom/coeff interleaving.
     """
     def __init__(self, cfg: RQTransformerConfig, bos_token_id: int, pad_token_id: int):
         super().__init__()
         self.cfg = cfg
         self.bos_token_id = int(bos_token_id)
         self.pad_token_id = int(pad_token_id)
+        self.atom_vocab_size = None if cfg.atom_vocab_size is None else int(cfg.atom_vocab_size)
+        self.coeff_vocab_size = None if cfg.coeff_vocab_size is None else int(cfg.coeff_vocab_size)
+        if (self.atom_vocab_size is None) != (self.coeff_vocab_size is None):
+            raise ValueError("atom_vocab_size and coeff_vocab_size must both be set or both be None")
+        if self.atom_vocab_size is not None and self.coeff_vocab_size is not None:
+            if self.atom_vocab_size <= 0 or self.coeff_vocab_size <= 0:
+                raise ValueError("atom_vocab_size and coeff_vocab_size must be positive")
+            self.content_vocab_size = self.atom_vocab_size + self.coeff_vocab_size
+            if self.content_vocab_size > self.pad_token_id:
+                raise ValueError(
+                    f"content vocab ({self.content_vocab_size}) exceeds pad token id ({self.pad_token_id})"
+                )
+        else:
+            self.content_vocab_size = None
 
         self.tokens_per_patch = cfg.H * cfg.W * cfg.D
         self.max_len = 1 + self.tokens_per_patch
@@ -851,6 +906,14 @@ class RQTransformerPrior(nn.Module):
         )
         for _ in steps:
             logits = self(seq)[:, -1, :] / max(temperature, 1e-8)
+            logits[:, self.pad_token_id] = float("-inf")
+            logits[:, self.bos_token_id] = float("-inf")
+            if self.content_vocab_size is not None:
+                logits[:, self.content_vocab_size:] = float("-inf")
+                if (_ % 2) == 0:
+                    logits[:, self.atom_vocab_size:self.content_vocab_size] = float("-inf")
+                else:
+                    logits[:, :self.atom_vocab_size] = float("-inf")
             if top_k is not None and top_k > 0:
                 k = min(int(top_k), int(logits.size(-1)))
                 v, ix = torch.topk(logits, k, dim=-1)
@@ -1302,9 +1365,9 @@ def precompute_tokens(
     """
     Encode dataset to tokens for stage-2 training.
     Returns:
-      tokens_flat: [N, H*W*D] int32
-      coeffs_flat: [N, H*W*D] float32 (None if quantized)
-      H, W, D
+      tokens_flat: [N, H*W*token_depth] int32
+      coeffs_flat: [N, H*W*sparsity_level] float32 (None if quantized)
+      H, W, token_depth
     """
     ae.eval()
     all_tokens = []
@@ -1505,7 +1568,7 @@ def main():
     parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=4e-4)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--stage2_batch_size", type=int, default=8)
+    parser.add_argument("--stage2_batch_size", type=int, default=16)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -1516,8 +1579,9 @@ def main():
     parser.add_argument("--embedding_dim", type=int, default=16)
     parser.add_argument("--num_atoms", type=int, default=128)
     parser.add_argument("--sparsity_level", type=int, default=3)
-    parser.add_argument("--n_bins", type=int, default=32)
-    parser.add_argument("--coef_max", type=float, default=30.0)
+    parser.add_argument("--n_bins", type=int, default=256)
+    parser.add_argument("--coef_max", type=float, default=3.0)
+    parser.add_argument("--quantize_sparse_coeffs", type=bool, default=False)
     parser.add_argument("--coef_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
     parser.add_argument("--coef_mu", type=float, default=0.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
@@ -1540,7 +1604,7 @@ def main():
         help="Number of validation images used for stage-1 reconstruction FID (0 disables it).",
     )
     parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
-    parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
+    parser.add_argument("--stage2_sample_batch_size", type=int, default=16)
     parser.add_argument("--stage2_sample_temperature", type=float, default=0.6)
     parser.add_argument("--stage2_sample_top_k", type=int, default=0)
     parser.add_argument("--stage2_sample_image_size", type=int, default=128)
@@ -1772,6 +1836,8 @@ def main():
             H=H,
             W=W,
             D=D,
+            atom_vocab_size=(laser.bottleneck.num_embeddings if laser.bottleneck.quantize_sparse_coeffs else None),
+            coeff_vocab_size=(laser.bottleneck.n_bins if laser.bottleneck.quantize_sparse_coeffs else None),
             d_model=args.tf_d_model,
             n_heads=args.tf_heads,
             n_layers=args.tf_layers,
