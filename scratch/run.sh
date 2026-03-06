@@ -17,10 +17,12 @@ set -euo pipefail
 export PYTHONUNBUFFERED=1
 export NCCL_DEBUG=INFO
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 STAGE1_DEVICES="${STAGE1_DEVICES:-4}"
 STAGE2_DEVICES="${STAGE2_DEVICES:-4}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-auto}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-10}"
 STAGE1_STRATEGY="${STAGE1_STRATEGY:-ddp}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-32}"
@@ -187,6 +189,23 @@ if [[ ! -d "$DATA_BIND_DIR" ]]; then
 fi
 OUT_BIND_DIR="$OUT_DIR"
 
+if [[ "$STAGE1_EPOCHS" == "auto" ]]; then
+  if [[ -f "$OUT_DIR/stage1/ae_last.pt" ]]; then
+    STAGE1_EPOCHS=0
+  else
+    STAGE1_EPOCHS=5
+  fi
+fi
+
+if ! [[ "$STAGE1_EPOCHS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: STAGE1_EPOCHS must be a non-negative integer or 'auto'. Got: $STAGE1_EPOCHS" >&2
+  exit 1
+fi
+if ! [[ "$STAGE2_EPOCHS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: STAGE2_EPOCHS must be a non-negative integer. Got: $STAGE2_EPOCHS" >&2
+  exit 1
+fi
+
 echo "PROJECT_DIR=$PROJECT_DIR"
 echo "DATA_DIR=$DATA_DIR"
 echo "OUT_DIR=$OUT_DIR"
@@ -195,6 +214,8 @@ echo "BASE_DIR=$BASE_DIR"
 echo "PWD=$PWD"
 echo "STAGE1_DEVICES=$STAGE1_DEVICES"
 echo "STAGE2_DEVICES=$STAGE2_DEVICES"
+echo "STAGE1_EPOCHS=$STAGE1_EPOCHS"
+echo "STAGE2_EPOCHS=$STAGE2_EPOCHS"
 echo "STAGE1_STRATEGY=$STAGE1_STRATEGY"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo "STAGE2_BATCH_SIZE=$STAGE2_BATCH_SIZE"
@@ -214,6 +235,8 @@ srun singularity exec --nv \
   --data_dir "$DATA_DIR" \
   --image_size 128 \
   --out_dir "$OUT_DIR" \
+  --stage1_epochs "$STAGE1_EPOCHS" \
+  --stage2_epochs "$STAGE2_EPOCHS" \
   --batch_size "$BATCH_SIZE" \
   --stage2_batch_size "$STAGE2_BATCH_SIZE" \
   --fid_num_samples "$FID_NUM_SAMPLES" \

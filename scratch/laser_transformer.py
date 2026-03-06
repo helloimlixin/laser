@@ -131,6 +131,7 @@ class SpatialDepthPrior(nn.Module):
 
         # Shared atom embedding
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.coeff_proj = nn.Linear(1, cfg.d_model)
         self.row_emb = nn.Embedding(cfg.H, cfg.d_model)
         self.col_emb = nn.Embedding(cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
@@ -179,8 +180,7 @@ class SpatialDepthPrior(nn.Module):
 
         Args:
             atom_ids: [B, H*W, D] ground-truth atom indices.
-            coeffs:   [B, H*W, D] ground-truth coefficients (used only
-                      implicitly — atom_ids drive teacher forcing).
+            coeffs:   [B, H*W, D] normalized ground-truth coefficients.
 
         Returns:
             atom_logits: [B, H*W, D, vocab_size]
@@ -189,13 +189,16 @@ class SpatialDepthPrior(nn.Module):
         B, T, D = atom_ids.shape
         d_model = self.cfg.d_model
         device = atom_ids.device
+        coeffs = coeffs.to(device=device, dtype=self.start_emb.dtype)
 
         # ---- Spatial stage ----
         spatial_in = torch.zeros(B, T, d_model, device=device)
         spatial_in[:, 0] = self.start_emb.squeeze(1)
         if T > 1:
-            prev_emb = self.token_emb(atom_ids[:, :-1])        # [B, T-1, D, d]
-            prev_flat = prev_emb.reshape(B, T - 1, D * d_model)
+            prev_atom_emb = self.token_emb(atom_ids[:, :-1])   # [B, T-1, D, d]
+            prev_coeff_emb = self.coeff_proj(coeffs[:, :-1].unsqueeze(-1))
+            prev_pair_emb = prev_atom_emb + prev_coeff_emb
+            prev_flat = prev_pair_emb.reshape(B, T - 1, D * d_model)
             spatial_in[:, 1:] = self.spatial_fuse(prev_flat)
 
         spatial_in = spatial_in + self._spatial_pos(T, device).unsqueeze(0)
@@ -213,7 +216,11 @@ class SpatialDepthPrior(nn.Module):
         depth_in[:, 0] = spatial_h_flat
         if D > 1:
             prev_depth_atoms = atom_ids[:, :, :-1].reshape(bt, D - 1)
-            depth_in[:, 1:] = self.token_emb(prev_depth_atoms)
+            prev_depth_coeffs = coeffs[:, :, :-1].reshape(bt, D - 1, 1)
+            depth_in[:, 1:] = (
+                self.token_emb(prev_depth_atoms)
+                + self.coeff_proj(prev_depth_coeffs)
+            )
 
         depth_pos = self.depth_emb(torch.arange(D, device=device))
         depth_in = depth_in + depth_pos.unsqueeze(0)
@@ -264,7 +271,10 @@ class SpatialDepthPrior(nn.Module):
             if t == 0:
                 x_new = self.start_emb.expand(batch_size, -1, -1)
             else:
-                prev_emb = self.token_emb(atom_ids[:, t - 1])   # [B, D, d]
+                prev_emb = (
+                    self.token_emb(atom_ids[:, t - 1])
+                    + self.coeff_proj(coeffs[:, t - 1].unsqueeze(-1))
+                )                                               # [B, D, d]
                 x_new = self.spatial_fuse(
                     prev_emb.reshape(batch_size, -1),
                 ).unsqueeze(1)                                   # [B, 1, d]
@@ -284,7 +294,10 @@ class SpatialDepthPrior(nn.Module):
                 if d == 0:
                     step_in = h_t.unsqueeze(1)
                 else:
-                    step_in = self.token_emb(atom_ids[:, t, d - 1]).unsqueeze(1)
+                    step_in = (
+                        self.token_emb(atom_ids[:, t, d - 1]).unsqueeze(1)
+                        + self.coeff_proj(coeffs[:, t, d - 1].view(batch_size, 1, 1))
+                    )
                 step_in = step_in + self.depth_emb.weight[d]
                 depth_seq.append(step_in)
 
@@ -295,6 +308,9 @@ class SpatialDepthPrior(nn.Module):
                 last_h = depth_h[:, -1]                          # [B, dm]
 
                 logits = self.atom_head(last_h)
+                if d > 0:
+                    prev_atoms = atom_ids[:, t, :d]
+                    logits.scatter_(1, prev_atoms, float("-inf"))
                 probs = F.softmax(logits, dim=-1)
                 sampled = torch.multinomial(probs, 1).squeeze(-1)
                 atom_ids[:, t, d] = sampled
