@@ -699,14 +699,12 @@ class CausalSelfAttention(nn.Module):
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.dropout_p = float(dropout)
+        self.max_seq_len = int(max_seq_len)
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
-
-        mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
-        self.register_buffer("causal_mask", mask.view(1, 1, max_seq_len, max_seq_len))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -716,12 +714,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = attn.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        out = attn @ v
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=(self.dropout_p if self.training else 0.0),
+            is_causal=True,
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.out_proj(out)
         out = self.resid_dropout(out)
@@ -1058,7 +1058,7 @@ def _init_wandb(args) -> Optional[object]:
         print("[W&B] wandb is not installed; continuing without logging.")
         return None
     try:
-        return wandb.init(
+        run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=args.wandb_name,
@@ -1066,23 +1066,46 @@ def _init_wandb(args) -> Optional[object]:
             mode=args.wandb_mode,
             config=dict(vars(args)),
         )
+        run.define_metric("stage1/step")
+        run.define_metric("stage1/*", step_metric="stage1/step")
+        run.define_metric("stage2/step")
+        run.define_metric("stage2/*", step_metric="stage2/step")
+        return run
     except Exception as exc:
         print(f"[W&B] init failed ({exc}); continuing without logging.")
         return None
 
 
-def _log_wandb(run: Optional[object], data: dict, step: Optional[int] = None):
+def _log_wandb(
+    run: Optional[object],
+    data: dict,
+    step_metric: Optional[str] = None,
+    step_value: Optional[int] = None,
+):
     if run is None:
         return
-    run.log(data, step=step)
+    payload = dict(data)
+    if step_metric is not None and step_value is not None:
+        payload[step_metric] = int(step_value)
+    run.log(payload)
 
 
-def _log_wandb_image(run: Optional[object], key: str, x: torch.Tensor, step: int, caption: Optional[str] = None):
+def _log_wandb_image(
+    run: Optional[object],
+    key: str,
+    x: torch.Tensor,
+    step_metric: Optional[str] = None,
+    step_value: Optional[int] = None,
+    caption: Optional[str] = None,
+):
     if run is None or wandb is None:
         return
     grid = _make_image_grid(x)
     image = grid.permute(1, 2, 0).mul(255).clamp(0, 255).byte().numpy()
-    run.log({key: wandb.Image(image, caption=caption)}, step=step)
+    payload = {key: wandb.Image(image, caption=caption)}
+    if step_metric is not None and step_value is not None:
+        payload[step_metric] = int(step_value)
+    run.log(payload)
 
 
 def train_stage1_ae(
@@ -1156,7 +1179,8 @@ def train_stage1_ae(
                         "stage1/bottleneck_loss": float(b_log.item()),
                         "stage1/epoch": epoch,
                     },
-                    step=global_step,
+                    step_metric="stage1/step",
+                    step_value=global_step,
                 )
 
         # Validation
@@ -1201,7 +1225,8 @@ def train_stage1_ae(
                     "stage1/val_ssim": float(val_ssim),
                     "stage1/epoch": epoch,
                 },
-                step=global_step,
+                step_metric="stage1/step",
+                step_value=global_step,
             )
 
         _barrier()
@@ -1228,7 +1253,8 @@ def train_stage1_ae(
                             "stage1/rfid": float(val_rfid),
                             "stage1/epoch": epoch,
                         },
-                        step=global_step,
+                        step_metric="stage1/step",
+                        step_value=global_step,
                     )
 
             x_vis, _ = next(iter(val_loader))
@@ -1241,14 +1267,16 @@ def train_stage1_ae(
                 wandb_run,
                 "stage1/real",
                 x_vis,
-                step=global_step,
+                step_metric="stage1/step",
+                step_value=global_step,
                 caption=f"epoch={epoch} real",
             )
             _log_wandb_image(
                 wandb_run,
                 "stage1/recon",
                 recon_vis,
-                step=global_step,
+                step_metric="stage1/step",
+                step_value=global_step,
                 caption=f"epoch={epoch} recon",
             )
 
@@ -1358,14 +1386,13 @@ def train_stage2_transformer(
             x_in = seq[:, :-1]
             y = seq[:, 1:]
 
+            opt.zero_grad(set_to_none=True)
             logits = transformer(x_in)
             loss = F.cross_entropy(
                 logits.reshape(-1, vocab),
                 y.reshape(-1),
                 ignore_index=pad_token_id,
             )
-
-            opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
             opt.step()
@@ -1382,7 +1409,8 @@ def train_stage2_transformer(
                         "stage2/train_loss": float(loss_log.item()),
                         "stage2/epoch": epoch,
                     },
-                    step=global_step,
+                    step_metric="stage2/step",
+                    step_value=global_step,
                 )
 
             if sample_every_steps > 0 and (global_step % sample_every_steps == 0):
@@ -1414,7 +1442,8 @@ def train_stage2_transformer(
                         wandb_run,
                         "stage2/samples",
                         imgs,
-                        step=global_step,
+                        step_metric="stage2/step",
+                        step_value=global_step,
                         caption=f"step={global_step}",
                     )
                     print(f"[Stage2] sampling done at step {global_step}")
@@ -1430,7 +1459,8 @@ def train_stage2_transformer(
                     "stage2/epoch_loss": float(epoch_loss),
                     "stage2/epoch": epoch,
                 },
-                step=global_step,
+                step_metric="stage2/step",
+                step_value=global_step,
             )
 
         _barrier()
@@ -1452,7 +1482,7 @@ def main():
     parser.add_argument(
         "--image_size",
         type=int,
-        default=None,
+        default=128,
         help="Resize every image to this square size.",
     )
     parser.add_argument("--out_dir", type=str, default=None)
@@ -1461,18 +1491,18 @@ def main():
     parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for token precompute.")
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True, help="Enable Weights & Biases logging.")
     parser.add_argument("--no_wandb", dest="wandb", action="store_false", help="Disable Weights & Biases logging.")
-    parser.add_argument("--wandb_project", type=str, default="laser-scratch")
+    parser.add_argument("--wandb_project", type=str, default="laser")
     parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_name", type=str, default="laser_celeba128")
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
-    parser.add_argument("--stage1_epochs", type=int, default=5)
+    parser.add_argument("--stage1_epochs", type=int, default=100)
     parser.add_argument("--stage1_lr", type=float, default=2e-4)
-    parser.add_argument("--stage2_epochs", type=int, default=10)
-    parser.add_argument("--stage2_lr", type=float, default=3e-4)
+    parser.add_argument("--stage2_epochs", type=int, default=100)
+    parser.add_argument("--stage2_lr", type=float, default=4e-4)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--stage2_batch_size", type=int, default=4)
+    parser.add_argument("--stage2_batch_size", type=int, default=8)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -1480,13 +1510,13 @@ def main():
     parser.add_argument("--ae_num_downsamples", type=int, default=2)
     parser.add_argument("--num_res_layers", type=int, default=2)
     parser.add_argument("--num_res_hiddens", type=int, default=32)
-    parser.add_argument("--embedding_dim", type=int, default=64)
+    parser.add_argument("--embedding_dim", type=int, default=16)
     parser.add_argument("--num_atoms", type=int, default=128)
     parser.add_argument("--sparsity_level", type=int, default=3)
-    parser.add_argument("--n_bins", type=int, default=16)
-    parser.add_argument("--coef_max", type=float, default=3.0)
-    parser.add_argument("--coef_quantization", type=str, default="mu_law", choices=["uniform", "mu_law"])
-    parser.add_argument("--coef_mu", type=float, default=50.0)
+    parser.add_argument("--n_bins", type=int, default=32)
+    parser.add_argument("--coef_max", type=float, default=30.0)
+    parser.add_argument("--coef_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
+    parser.add_argument("--coef_mu", type=float, default=0.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
 
     parser.add_argument("--tf_d_model", type=int, default=256)
@@ -1497,8 +1527,8 @@ def main():
     parser.add_argument(
         "--token_subset",
         type=int,
-        default=2048,
-        help="Number of stage-1 token grids to encode and use for stage-2 training.",
+        default=0,
+        help="Number of stage-1 token grids to encode for stage-2 training (<= 0 uses the full set).",
     )
     parser.add_argument(
         "--rfid_num_samples",
@@ -1506,11 +1536,11 @@ def main():
         default=256,
         help="Number of validation images used for stage-1 reconstruction FID (0 disables it).",
     )
-    parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
+    parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=8)
-    parser.add_argument("--stage2_sample_temperature", type=float, default=0.9)
-    parser.add_argument("--stage2_sample_top_k", type=int, default=128)
-    parser.add_argument("--stage2_sample_image_size", type=int, default=256)
+    parser.add_argument("--stage2_sample_temperature", type=float, default=0.6)
+    parser.add_argument("--stage2_sample_top_k", type=int, default=0)
+    parser.add_argument("--stage2_sample_image_size", type=int, default=128)
 
     args = parser.parse_args()
     wandb_run = None
@@ -1520,6 +1550,8 @@ def main():
         raise ValueError(f"ae_num_downsamples must be positive, got {args.ae_num_downsamples}")
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0.")
+    if args.token_subset < 0:
+        args.token_subset = 0
     if args.image_size is None:
         args.image_size = _default_image_size(args.dataset)
     args.image_size = int(args.image_size)
@@ -1565,7 +1597,6 @@ def main():
                 "setup/device": str(device),
                 "setup/dataset": args.dataset,
             },
-            step=0,
         )
 
     def _build_laser() -> LASER:
@@ -1684,6 +1715,7 @@ def main():
 
     token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
     if is_main_process:
+        token_subset = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
         token_source_loader = DataLoader(
             stage2_source_set,
             batch_size=args.batch_size,
@@ -1696,7 +1728,7 @@ def main():
             laser,
             token_source_loader,
             device,
-            max_items=min(args.token_subset, len(stage2_source_set)),
+            max_items=token_subset,
         )
         if coeffs_flat is not None:
             raise RuntimeError("The simplified script only trains the quantized-token stage-2 prior.")
