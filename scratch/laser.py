@@ -51,7 +51,7 @@ def soft_clamp(x: torch.Tensor, max_val: float) -> torch.Tensor:
 
 
 def safe_atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Numerically safe inverse tanh for latents expected to live in [-1, 1]."""
+    """Numerically safe inverse tanh for values expected to lie in [-1, 1]."""
     return torch.atanh(x.clamp(min=-(1.0 - eps), max=(1.0 - eps)))
 
 
@@ -878,8 +878,12 @@ class DictionaryLearning(nn.Module):
         z_q = self._reconstruct_sparse(support, coeffs_for_recon)
 
         # Bottleneck loss (LASER-style)
-        dl_latent_loss = F.mse_loss(z_q, z_e.detach())
-        e_latent_loss = F.mse_loss(z_q.detach(), z_e)
+        # The stage-1 latent transform divides features by sqrt(patch_dim) so each sparse-coding
+        # signal is norm-bounded. Multiply the latent MSE by patch_dim to keep the bottleneck
+        # objective in the original latent scale instead of shrinking it by that normalization.
+        latent_loss_scale = float(self.patch_dim)
+        dl_latent_loss = F.mse_loss(z_q, z_e.detach()) * latent_loss_scale
+        e_latent_loss = F.mse_loss(z_q.detach(), z_e) * latent_loss_scale
         loss = dl_latent_loss + self.commitment_cost * e_latent_loss
 
         # Straight-through estimator to encoder
@@ -970,11 +974,30 @@ class LASER(nn.Module):
             num_upsamples=num_downsamples,
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _latent_transform_scale(self, z: torch.Tensor) -> torch.Tensor:
+        if z.dim() != 4:
+            raise ValueError(f"Expected latent tensor [B,C,H,W], got {tuple(z.shape)}")
+        num_signal = max(int(self.bottleneck.patch_dim), 1)
+        num_signal_t = torch.tensor(float(num_signal), device=z.device, dtype=z.dtype)
+        return torch.sqrt(num_signal_t)
+
+    def _to_bottleneck_input(self, z: torch.Tensor) -> torch.Tensor:
+        z = self.pre_bottleneck(z)
+        scale = self._latent_transform_scale(z)
+        return torch.tanh(z) / scale
+
+    def _from_bottleneck_output(self, z_q: torch.Tensor) -> torch.Tensor:
+        scale = self._latent_transform_scale(z_q)
+        return safe_atanh(z_q * scale)
+
+    def _encode_bottleneck_input(self, x: torch.Tensor) -> torch.Tensor:
         z = self.encoder(x)
-        z = torch.tanh(self.pre_bottleneck(z))
+        return self._to_bottleneck_input(z)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = self._encode_bottleneck_input(x)
         z_q, b_loss, tokens = self.bottleneck(z)
-        z_q = safe_atanh(z_q)
+        z_q = self._from_bottleneck_output(z_q)
         z_q = self.post_bottleneck(z_q)
         recon = self.decoder(z_q)
         return recon, b_loss, tokens
@@ -984,8 +1007,7 @@ class LASER(nn.Module):
         self,
         x: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
-        z = self.encoder(x)
-        z = torch.tanh(self.pre_bottleneck(z))
+        z = self._encode_bottleneck_input(x)
         atoms, coeffs = self.bottleneck._encode_sparse_codes(z)
         if self.bottleneck.quantize_sparse_coeffs:
             coeff_bin, _ = self.bottleneck._quantize_coeff(coeffs)
@@ -1003,7 +1025,7 @@ class LASER(nn.Module):
             if coeffs is None:
                 raise ValueError("coeffs must be provided when quantize_sparse_coeffs=False")
             z_q = self.bottleneck._reconstruct_sparse(codes, coeffs)
-        z_q = safe_atanh(z_q)
+        z_q = self._from_bottleneck_output(z_q)
         z_q = self.post_bottleneck(z_q)
         return self.decoder(z_q)
 
@@ -1553,6 +1575,7 @@ def train_stage1_ae(
             loss_log = dist_ctx.mean(loss)
             recon_log = dist_ctx.mean(recon_loss)
             b_log = dist_ctx.mean(b_loss)
+            effective_b_log = dist_ctx.mean(bottleneck_weight * b_loss)
             running += float(loss_log.item())
             global_step += 1
             if dist_ctx.is_main_process:
@@ -1560,6 +1583,7 @@ def train_stage1_ae(
                     total_loss=float(loss_log.item()),
                     reconstruction_loss=float(recon_log.item()),
                     bottleneck_loss=float(b_log.item()),
+                    effective_bottleneck=float(effective_b_log.item()),
                 )
                 _log_wandb(
                     wandb_run,
@@ -1567,6 +1591,7 @@ def train_stage1_ae(
                         "stage1/train_loss": float(loss_log.item()),
                         "stage1/recon_loss": float(recon_log.item()),
                         "stage1/bottleneck_loss": float(b_log.item()),
+                        "stage1/effective_bottleneck_loss": float(effective_b_log.item()),
                         "stage1/epoch": epoch,
                     },
                     step_metric="stage1/step",
@@ -1720,8 +1745,7 @@ def precompute_tokens(
             x = batch
 
         x = x.to(device, non_blocking=True)
-        z = ae.encoder(x)
-        z = torch.tanh(ae.pre_bottleneck(z))
+        z = ae._encode_bottleneck_input(x)
         atoms, raw_coeffs = ae.bottleneck._encode_sparse_codes(z)
         batch_min = float(raw_coeffs.min().item())
         batch_max = float(raw_coeffs.max().item())
