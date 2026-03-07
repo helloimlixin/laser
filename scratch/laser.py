@@ -1980,9 +1980,9 @@ def main():
         help="Print rank-aware distributed setup details for multi-GPU debugging.",
     )
 
-    parser.add_argument("--stage1_epochs", type=int, default=0)
+    parser.add_argument("--stage1_epochs", type=int, default=50)
     parser.add_argument("--stage1_lr", type=float, default=2e-3)
-    parser.add_argument("--stage2_epochs", type=int, default=5)
+    parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=2e-3)
     parser.add_argument("--stage1_batch_size", type=int, default=128)
     parser.add_argument("--stage2_batch_size", type=int, default=32)
@@ -1997,8 +1997,8 @@ def main():
     parser.add_argument("--sparsity_level", type=int, default=8)
     parser.add_argument("--latent_patch_size", type=int, default=8)
     parser.add_argument("--latent_patch_stride", type=int, default=4)
-    parser.add_argument("--n_bins", type=int, default=256)
-    parser.add_argument("--coef_max", type=float, default=1.0)
+    parser.add_argument("--n_bins", type=int, default=1024)
+    parser.add_argument("--coef_max", type=float, default=2.0)
     parser.add_argument(
         "--quantize_sparse_coeffs",
         dest="quantize_sparse_coeffs",
@@ -2031,9 +2031,9 @@ def main():
         default=256,
         help="Number of validation images used for stage-1 reconstruction FID (0 disables it).",
     )
-    parser.add_argument("--stage2_sample_every_steps", type=int, default=200)
+    parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=64)
-    parser.add_argument("--stage2_sample_temperature", type=float, default=1.0)
+    parser.add_argument("--stage2_sample_temperature", type=float, default=0.5)
     parser.add_argument("--stage2_sample_top_k", type=int, default=0)
     parser.add_argument("--stage2_sample_image_size", type=int, default=128)
     parser.add_argument("--stage2_coeff_loss_weight", type=float, default=1.0)
