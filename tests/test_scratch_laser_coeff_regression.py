@@ -209,7 +209,7 @@ def test_laser_forward_outputs_are_finite():
     assert torch.isfinite(recon).all()
 
 
-def test_bottleneck_loss_is_rescaled_back_to_pre_normalized_latent_scale():
+def test_bottleneck_loss_matches_plain_latent_mse_formula():
     torch.manual_seed(0)
 
     bottleneck = DictionaryLearning(
@@ -230,14 +230,14 @@ def test_bottleneck_loss_is_rescaled_back_to_pre_normalized_latent_scale():
         z_q = bottleneck._reconstruct_sparse(support, coeffs)
         _, loss, _ = bottleneck(z_e)
 
-    expected = float(bottleneck.patch_dim) * (
+    expected = (
         F.mse_loss(z_q, z_e) + bottleneck.commitment_cost * F.mse_loss(z_q, z_e)
     )
 
     assert torch.allclose(loss, expected, atol=1e-6)
 
 
-def test_latent_transform_scale_matches_sparse_signal_dimension():
+def test_latent_transform_is_identity_through_pre_bottleneck():
     laser = LASER(
         in_channels=3,
         num_hiddens=8,
@@ -252,14 +252,14 @@ def test_latent_transform_scale_matches_sparse_signal_dimension():
         quantize_sparse_coeffs=False,
     ).eval()
 
-    z = torch.randn(3, 2, 4, 4)
+    z = torch.randn(3, 8, 4, 4)
 
-    scale = laser._latent_transform_scale(z)
+    encoded = laser._to_bottleneck_input(z)
 
-    assert torch.allclose(scale, torch.tensor(float(laser.bottleneck.patch_dim) ** 0.5, dtype=z.dtype))
+    assert torch.allclose(encoded, laser.pre_bottleneck(z), atol=1e-6)
 
 
-def test_latent_transform_helpers_are_inverse_pairs():
+def test_latent_transform_helpers_are_identity_pairs():
     laser = LASER(
         in_channels=3,
         num_hiddens=2,
@@ -288,10 +288,10 @@ def test_latent_transform_helpers_are_inverse_pairs():
     encoded = laser._to_bottleneck_input(z)
     decoded = laser._from_bottleneck_output(encoded)
 
-    assert torch.allclose(decoded, z, atol=1e-6)
+    assert torch.allclose(decoded, encoded, atol=1e-6)
 
 
-def test_latent_transform_keeps_each_sparse_signal_norm_within_one():
+def test_latent_transform_matches_direct_pre_bottleneck_output():
     torch.manual_seed(0)
 
     laser = LASER(
@@ -312,11 +312,9 @@ def test_latent_transform_keeps_each_sparse_signal_norm_within_one():
 
     with torch.no_grad():
         encoded = laser._to_bottleneck_input(z)
+        expected = laser.pre_bottleneck(z)
 
-    patches, _, _ = laser.bottleneck._extract_patches(encoded)
-    signal_norm = patches.view(-1, laser.bottleneck.patch_dim).norm(dim=1)
-
-    assert torch.all(signal_norm <= 1.0 + 1e-6)
+    assert torch.allclose(encoded, expected, atol=1e-6)
 
 
 def test_laser_encode_is_batch_invariant():
