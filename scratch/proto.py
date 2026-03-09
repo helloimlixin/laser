@@ -2612,7 +2612,7 @@ def main():
         help="Weight applied to the real-valued coefficient regression term during stage-2 training.",
     )
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--stage2_batch_size", type=int, default=16)
+    parser.add_argument("--stage2_batch_size", type=int, default=2)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
