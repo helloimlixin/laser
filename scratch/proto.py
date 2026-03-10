@@ -62,7 +62,55 @@ def _default_data_dir(dataset: str) -> Path:
 
 
 def _default_out_dir(dataset: str, image_size: int) -> Path:
-    return (SCRIPT_DIR / "runs" / f"laser_{dataset}_{image_size}").resolve()
+    return (SCRIPT_DIR / "runs" / f"laser_{dataset}{image_size}").resolve()
+
+
+def _broadcast_optional_string(value: Optional[str], src: int = 0) -> str:
+    """Broadcast a short string from src to all ranks."""
+    if not _is_distributed():
+        if value is None:
+            raise ValueError("value must be provided when distributed training is disabled")
+        return str(value)
+    obj_list = [value if dist.get_rank() == src else None]
+    dist.broadcast_object_list(obj_list, src=src)
+    if obj_list[0] is None:
+        raise RuntimeError("failed to broadcast launch timestamp")
+    return str(obj_list[0])
+
+
+def _launch_timestamp() -> str:
+    """Return a single launch timestamp shared across all ranks."""
+    value = None
+    if not _is_distributed() or dist.get_rank() == 0:
+        value = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return _broadcast_optional_string(value, src=0)
+
+
+def _resolve_run_out_dir(base_dir: str, launch_timestamp: str) -> Path:
+    """Create a per-launch run directory under the provided experiment root."""
+    return Path(base_dir).expanduser().resolve() / launch_timestamp
+
+
+def _find_latest_stage1_checkpoint(experiment_root: Path, current_run_dir: Path) -> Optional[Path]:
+    """Find the newest prior stage-1 checkpoint under the experiment root."""
+    candidates = []
+    legacy_ckpt = experiment_root / "stage1" / "ae_best.pt"
+    if legacy_ckpt.exists():
+        candidates.append(legacy_ckpt)
+
+    if experiment_root.exists():
+        for child in experiment_root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.resolve() == current_run_dir.resolve():
+                continue
+            ckpt = child / "stage1" / "ae_best.pt"
+            if ckpt.exists():
+                candidates.append(ckpt)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
 def _init_distributed() -> Tuple[bool, int, int, int]:
@@ -657,7 +705,7 @@ class DictionaryLearningTokenized(nn.Module):
                 G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
                 w = torch.linalg.solve_triangular(L, G_stack, upper=False)
                 w = w.view(-1, 1, k - 1)
-                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-12))
+                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-6))
                 k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device, dtype=h.dtype)
                 L = torch.cat(
                     (
@@ -1009,7 +1057,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
                 G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
                 w = torch.linalg.solve_triangular(L, G_stack, upper=False)
                 w = w.view(-1, 1, k - 1)
-                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-12))
+                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-6))
                 k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device, dtype=h.dtype)
                 L = torch.cat(
                     (
@@ -1361,7 +1409,11 @@ class LASER(nn.Module):
     def encode_to_atoms_and_coeffs(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         z = self.encoder(x)
         self._remember_latent_hw(z)
-        atoms, coeffs, _, _ = self.bottleneck._encode_sparse_codes(z)
+        encoded = self.bottleneck._encode_sparse_codes(z)
+        if isinstance(self.bottleneck, PatchDictionaryLearningTokenized):
+            atoms, coeffs, _, _ = encoded
+        else:
+            atoms, coeffs = encoded
         return atoms, coeffs, atoms.shape[1], atoms.shape[2]
 
     @torch.no_grad()
@@ -1475,6 +1527,7 @@ class TransformerConfig:
     atom_vocab_size: Optional[int] = None
     coeff_vocab_size: Optional[int] = None
     real_valued_coeffs: bool = True
+    coeff_norm_max: float = 4.0
     d_model: int = 256
     n_heads: int = 8
     n_layers: int = 6
@@ -1511,11 +1564,24 @@ class Transformer(nn.Module):
         self.max_len = 1 + self.tokens_per_patch
 
         self.real_valued_coeffs = bool(cfg.real_valued_coeffs)
+        self.coeff_norm_max = float(cfg.coeff_norm_max)
+        if self.coeff_norm_max <= 0.0:
+            raise ValueError("coeff_norm_max must be > 0 when real_valued_coeffs=True")
 
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.spatial_emb = nn.Embedding(cfg.H * cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
         self.type_emb = nn.Embedding(2, cfg.d_model)
+        self.register_buffer(
+            "coeff_mean",
+            torch.zeros(cfg.vocab_size, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "coeff_std",
+            torch.ones(cfg.vocab_size, dtype=torch.float32),
+            persistent=False,
+        )
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([
@@ -1547,6 +1613,32 @@ class Transformer(nn.Module):
         self.register_buffer("_spatial_ids", spatial_ids)
         self.register_buffer("_depth_ids", depth_ids)
         self.register_buffer("_type_ids", type_ids)
+
+    def set_coeff_normalization_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Set atom-conditioned normalization stats for real-valued coefficient modeling."""
+        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=self.coeff_mean.device).flatten()
+        std_t = torch.as_tensor(std, dtype=torch.float32, device=self.coeff_std.device).flatten().clamp_min(1e-6)
+        if mean_t.numel() != self.coeff_mean.numel() or std_t.numel() != self.coeff_std.numel():
+            raise ValueError(
+                f"Expected coeff stats with {self.coeff_mean.numel()} entries, "
+                f"got mean={mean_t.numel()} std={std_t.numel()}"
+            )
+        self.coeff_mean.copy_(mean_t)
+        self.coeff_std.copy_(std_t)
+
+    def normalize_coeffs(self, coeffs: torch.Tensor, atom_ids: torch.Tensor) -> torch.Tensor:
+        """Map raw coefficients to a bounded normalized space using atom-conditioned stats."""
+        mean = self.coeff_mean[atom_ids.to(torch.long)]
+        std = self.coeff_std[atom_ids.to(torch.long)]
+        coeffs_norm = (coeffs.float() - mean) / std
+        return coeffs_norm.clamp(-self.coeff_norm_max, self.coeff_norm_max)
+
+    def denormalize_coeffs(self, coeffs_norm: torch.Tensor, atom_ids: torch.Tensor) -> torch.Tensor:
+        """Map normalized coefficients back to raw decoder space using atom-conditioned stats."""
+        coeffs_norm = coeffs_norm.float().clamp(-self.coeff_norm_max, self.coeff_norm_max)
+        mean = self.coeff_mean[atom_ids.to(torch.long)]
+        std = self.coeff_std[atom_ids.to(torch.long)]
+        return coeffs_norm * std + mean
 
     def _forward_hidden(self, x: torch.Tensor, coeffs: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Shared trunk: returns normalized hidden states [B, L, d_model].
@@ -1594,7 +1686,8 @@ class Transformer(nn.Module):
             )
         atom_feat = self.token_emb(atom_ids.to(torch.long))
         coeff_in = torch.cat([hidden, atom_feat], dim=-1)
-        return self.coeff_head(coeff_in).squeeze(-1)
+        coeff_raw = self.coeff_head(coeff_in).squeeze(-1)
+        return torch.tanh(coeff_raw) * self.coeff_norm_max
 
     def forward_with_coeffs(
         self,
@@ -1680,9 +1773,9 @@ class Transformer(nn.Module):
         T = self.cfg.H * self.cfg.W * self.cfg.D
 
         seq = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
-        # coeff_seq holds the coefficients fed *into* the model; position 0 (BOS) is 0.
-        coeff_seq = torch.zeros(batch_size, 1, device=device)
-        all_coeffs = []
+        # coeff_seq_norm holds normalized coefficients fed back into the model.
+        coeff_seq_norm = torch.zeros(batch_size, 1, device=device)
+        all_coeffs_norm = []
         steps = tqdm(
             range(T),
             desc=(progress_desc or "[Stage2] sampling tokens"),
@@ -1691,7 +1784,7 @@ class Transformer(nn.Module):
             disable=(not show_progress),
         )
         for _ in steps:
-            h = self._forward_hidden(seq, coeff_seq)
+            h = self._forward_hidden(seq, coeff_seq_norm)
             logits = self.head(h)[:, -1, :] / max(temperature, 1e-8)
             logits[:, self.pad_token_id] = float("-inf")
             logits[:, self.bos_token_id] = float("-inf")
@@ -1703,11 +1796,13 @@ class Transformer(nn.Module):
                 logits = mask
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
-            coeff_t = self._predict_coeffs(h[:, -1:, :], nxt).squeeze(1)
+            coeff_t_norm = self._predict_coeffs(h[:, -1:, :], nxt).squeeze(1)
             seq = torch.cat([seq, nxt], dim=1)
-            coeff_seq = torch.cat([coeff_seq, coeff_t.unsqueeze(1)], dim=1)
-            all_coeffs.append(coeff_t)
-        return seq[:, 1:], torch.stack(all_coeffs, dim=1)
+            coeff_seq_norm = torch.cat([coeff_seq_norm, coeff_t_norm.unsqueeze(1)], dim=1)
+            all_coeffs_norm.append(coeff_t_norm)
+        coeffs_norm = torch.stack(all_coeffs_norm, dim=1)
+        atom_ids = seq[:, 1:]
+        return atom_ids, self.denormalize_coeffs(coeffs_norm, atom_ids)
 
 
 
@@ -1852,6 +1947,74 @@ def save_image_grid(x: torch.Tensor, path: str, nrow: int = 8):
 def _to_unit_range(x: torch.Tensor) -> torch.Tensor:
     """Map images from [-1, 1] to [0, 1] for reconstruction metrics."""
     return x.detach().clamp(-1, 1).add(1.0).mul(0.5)
+
+
+def _sample_quality_features(x: torch.Tensor) -> torch.Tensor:
+    """Compact image features for filtering off-manifold stage-2 samples."""
+    x_unit = _to_unit_range(x)
+    rgb_mean = x_unit.mean(dim=(2, 3))
+    rgb_std = x_unit.std(dim=(2, 3))
+    saturation = (x_unit.amax(dim=1) - x_unit.amin(dim=1)).mean(dim=(1, 2)).unsqueeze(1)
+    brightness = x_unit.mean(dim=(1, 2, 3)).unsqueeze(1)
+    return torch.cat([rgb_mean, rgb_std, saturation, brightness], dim=1)
+
+
+@torch.no_grad()
+def _compute_stage2_sample_reference_stats(
+    ae: LASER,
+    tokens_flat: torch.Tensor,
+    coeffs_flat: Optional[torch.Tensor],
+    H: int,
+    W: int,
+    D: int,
+    device: torch.device,
+    max_items: int = 256,
+    batch_size: int = 32,
+) -> Optional[dict]:
+    """Compute reference image-statistics from stage-1 codes for sample filtering."""
+    keep = min(int(tokens_flat.size(0)), max(1, int(max_items)))
+    if keep <= 0:
+        return None
+
+    was_training = ae.training
+    ae.eval()
+    feats_all = []
+    for start in range(0, keep, max(1, int(batch_size))):
+        end = min(keep, start + max(1, int(batch_size)))
+        tok = tokens_flat[start:end].view(-1, H, W, D).to(device=device, dtype=torch.long)
+        if coeffs_flat is not None:
+            coeff = coeffs_flat[start:end].view(-1, H, W, D).to(device=device, dtype=torch.float32)
+            imgs = ae.decode_from_atoms_and_coeffs(tok, coeff)
+        else:
+            imgs = ae.decode_from_tokens(tok)
+        feats_all.append(_sample_quality_features(imgs))
+    if was_training:
+        ae.train()
+
+    feats = torch.cat(feats_all, dim=0)
+    return {
+        "mean": feats.mean(dim=0, keepdim=True),
+        "std": feats.std(dim=0, keepdim=True).clamp_min(1e-6),
+    }
+
+
+@torch.no_grad()
+def _select_best_stage2_samples(
+    imgs: torch.Tensor,
+    keep: int,
+    reference_stats: Optional[dict],
+) -> torch.Tensor:
+    """Keep the decoded candidates closest to stage-1 sample statistics."""
+    keep = min(int(keep), int(imgs.size(0)))
+    if keep <= 0 or reference_stats is None or imgs.size(0) <= keep:
+        return imgs[:keep]
+
+    feats = _sample_quality_features(imgs)
+    ref_mean = reference_stats["mean"].to(device=imgs.device, dtype=feats.dtype)
+    ref_std = reference_stats["std"].to(device=imgs.device, dtype=feats.dtype)
+    score = (((feats - ref_mean) / ref_std) ** 2).mean(dim=1)
+    best = torch.topk(-score, k=keep).indices
+    return imgs.index_select(0, best)
 
 
 def _batch_psnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -2085,7 +2248,7 @@ def _log_wandb_image(
 
 
 def _stage1_lr_scale(
-    epoch: int,
+    epoch: float,
     max_epochs: int,
     schedule: str,
     warmup_epochs: int,
@@ -2094,20 +2257,20 @@ def _stage1_lr_scale(
     if str(schedule) != "cosine":
         return 1.0
 
+    epoch = float(epoch)
     max_epochs = max(1, int(max_epochs))
     warmup_epochs = min(max(0, int(warmup_epochs)), max_epochs - 1)
     min_lr_ratio = float(max(0.0, min(float(min_lr_ratio), 1.0)))
+    warmup_start_ratio = 0.1
 
-    if warmup_epochs > 0 and epoch <= warmup_epochs:
-        if warmup_epochs == 1:
-            return 0.1
-        progress = float(epoch - 1) / float(warmup_epochs - 1)
-        return 0.1 + 0.9 * progress
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        progress = max(0.0, min(epoch / float(warmup_epochs), 1.0))
+        return warmup_start_ratio + (1.0 - warmup_start_ratio) * progress
 
     if max_epochs <= warmup_epochs + 1:
         return 1.0
 
-    decay_progress = float(epoch - warmup_epochs - 1) / float(max_epochs - warmup_epochs - 1)
+    decay_progress = float(epoch - warmup_epochs) / float(max_epochs - warmup_epochs)
     decay_progress = max(0.0, min(decay_progress, 1.0))
     cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
@@ -2134,7 +2297,15 @@ def train_stage1_ae(
 ):
     """Train stage 1 with optional DDP and rank-0-only artifacts."""
     ae_module = _unwrap_module(ae)
-    opt = torch.optim.Adam(ae.parameters(), lr=lr)
+    dict_param = ae_module.bottleneck.dictionary
+    non_dict_params = [p for p in ae.parameters() if p is not dict_param]
+    opt = torch.optim.Adam(non_dict_params, lr=lr)
+    # SGD for the dictionary: Adam accumulates moments in unconstrained Euclidean space
+    # then the post-hoc unit-norm projection distorts those moments, pushing atoms together
+    # and increasing dictionary coherence over time.  Plain SGD avoids this — the Riemannian
+    # gradient on the unit sphere is just the Euclidean gradient minus its radial component,
+    # which the post-hoc normalization approximates correctly when the step is small.
+    dict_opt = torch.optim.SGD([dict_param], lr=lr * 10)
     best_val_recon = float("inf")
     global_step = 0
     rfid_warned = False
@@ -2142,30 +2313,38 @@ def train_stage1_ae(
     for epoch in range(1, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        lr_scale = _stage1_lr_scale(
-            epoch=epoch,
-            max_epochs=epochs,
-            schedule=lr_schedule,
-            warmup_epochs=warmup_epochs,
-            min_lr_ratio=min_lr_ratio,
-        )
-        current_lr = float(lr) * float(lr_scale)
-        for param_group in opt.param_groups:
-            param_group["lr"] = current_lr
         ae.train()
         pbar = tqdm(train_loader, desc=f"[Stage1] epoch {epoch}/{epochs}", disable=(not is_main_process))
         running = 0.0
-        for x, _ in pbar:
+        num_train_steps = max(1, len(train_loader))
+        current_lr = float(lr)
+        for step_idx, (x, _) in enumerate(pbar):
+            epoch_progress = float(epoch - 1) + float(step_idx + 1) / float(num_train_steps)
+            lr_scale = _stage1_lr_scale(
+                epoch=epoch_progress,
+                max_epochs=epochs,
+                schedule=lr_schedule,
+                warmup_epochs=warmup_epochs,
+                min_lr_ratio=min_lr_ratio,
+            )
+            current_lr = float(lr) * float(lr_scale)
+            for param_group in opt.param_groups:
+                param_group["lr"] = current_lr
+            for param_group in dict_opt.param_groups:
+                param_group["lr"] = float(lr) * 10 * float(lr_scale)
             x = x.to(device)
             recon, b_loss, _ = ae(x)
             recon_loss = F.mse_loss(recon, x)
             loss = recon_loss + bottleneck_weight * b_loss
 
             opt.zero_grad(set_to_none=True)
+            dict_opt.zero_grad(set_to_none=True)
             loss.backward()
             if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(ae.parameters(), grad_clip)
+                torch.nn.utils.clip_grad_norm_(non_dict_params, grad_clip)
+                torch.nn.utils.clip_grad_norm_([dict_param], grad_clip)
             opt.step()
+            dict_opt.step()
 
             # Keep dictionary atoms normalized after each optimizer step.
             with torch.no_grad():
@@ -2379,6 +2558,104 @@ def precompute_tokens(
     return tokens_flat, coeffs_flat, H, W, D
 
 
+def _load_token_cache(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _compute_atom_conditioned_coeff_stats(
+    tokens_flat: torch.Tensor,
+    coeffs_flat: torch.Tensor,
+    vocab_size: int,
+    min_count: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute atom-conditioned coefficient mean/std with global fallbacks for rare atoms."""
+    atom_ids = tokens_flat.to(torch.long).flatten()
+    coeffs = coeffs_flat.to(torch.float32).flatten()
+    count = torch.bincount(atom_ids, minlength=vocab_size).to(torch.float32)
+    sumv = torch.bincount(atom_ids, weights=coeffs, minlength=vocab_size)
+    sumsq = torch.bincount(atom_ids, weights=coeffs * coeffs, minlength=vocab_size)
+
+    global_mean = coeffs.mean()
+    global_std = coeffs.std().clamp_min(1e-6)
+    mean = torch.full((vocab_size,), float(global_mean), dtype=torch.float32)
+    std = torch.full((vocab_size,), float(global_std), dtype=torch.float32)
+
+    enough = count >= float(max(1, int(min_count)))
+    if enough.any():
+        mean_enough = sumv[enough] / count[enough].clamp_min(1.0)
+        var_enough = (sumsq[enough] / count[enough].clamp_min(1.0) - mean_enough.square()).clamp_min(0.0)
+        mean[enough] = mean_enough
+        std[enough] = var_enough.sqrt().clamp_min(1e-6)
+
+    return mean, std
+
+
+def _expected_token_cache_meta(args, stage2_source_set, token_subset: Optional[int], ae: LASER) -> dict:
+    effective_items = len(stage2_source_set) if token_subset is None else int(token_subset)
+    return {
+        "version": 1,
+        "dataset": str(args.dataset),
+        "image_size": int(args.image_size),
+        "seed": int(args.seed),
+        "source_items": int(len(stage2_source_set)),
+        "effective_items": int(effective_items),
+        "quantize_sparse_coeffs": bool(ae.bottleneck.quantize_sparse_coeffs),
+        "ae_num_downsamples": int(args.ae_num_downsamples),
+        "embedding_dim": int(args.embedding_dim),
+        "num_atoms": int(args.num_atoms),
+        "sparsity_level": int(args.sparsity_level),
+        "patch_based": bool(args.patch_based),
+        "patch_size": int(args.patch_size),
+        "patch_stride": int(args.patch_stride),
+        "patch_reconstruction": str(args.patch_reconstruction),
+    }
+
+
+def _token_cache_is_compatible(cache, expected_meta: dict) -> Tuple[bool, str]:
+    if not isinstance(cache, dict):
+        return False, "cache payload is not a dict"
+
+    tokens_flat = cache.get("tokens_flat")
+    coeffs_flat = cache.get("coeffs_flat", None)
+    shape = cache.get("shape")
+    if not torch.is_tensor(tokens_flat) or tokens_flat.ndim != 2:
+        return False, "tokens_flat must be a rank-2 tensor"
+    if not isinstance(shape, (tuple, list)) or len(shape) != 3:
+        return False, "shape must be a 3-tuple/list"
+
+    H, W, D = (int(shape[0]), int(shape[1]), int(shape[2]))
+    if tokens_flat.size(1) != H * W * D:
+        return False, "tokens_flat width does not match cached shape metadata"
+
+    expect_real_valued = not bool(expected_meta["quantize_sparse_coeffs"])
+    if expect_real_valued != (coeffs_flat is not None):
+        mode = "real-valued coefficients" if expect_real_valued else "quantized coefficients"
+        return False, f"cache coefficient mode does not match current run ({mode})"
+
+    if coeffs_flat is not None:
+        if not torch.is_tensor(coeffs_flat) or coeffs_flat.ndim != 2:
+            return False, "coeffs_flat must be a rank-2 tensor when present"
+        if coeffs_flat.size(0) != tokens_flat.size(0):
+            return False, "coeffs_flat row count does not match tokens_flat"
+        if coeffs_flat.size(1) != H * W * D:
+            return False, "coeffs_flat width does not match cached shape metadata"
+
+    required_items = int(expected_meta["effective_items"])
+    if tokens_flat.size(0) < required_items:
+        return False, f"cache has {tokens_flat.size(0)} items but run needs {required_items}"
+
+    cache_meta = cache.get("meta")
+    if cache_meta is not None:
+        for key, expected_value in expected_meta.items():
+            if cache_meta.get(key) != expected_value:
+                return False, f"meta mismatch for {key}: cache={cache_meta.get(key)!r}, expected={expected_value!r}"
+
+    return True, "ok"
+
+
 def train_stage2_transformer(
     transformer: Transformer,
     token_loader: DataLoader,
@@ -2386,6 +2663,8 @@ def train_stage2_transformer(
     epochs: int,
     lr: float,
     coeff_loss_weight: float,
+    coeff_huber_delta: float,
+    sched_sampling_final_prob: float,
     pad_token_id: int,
     out_dir: str,
     ae_for_decode: LASER,
@@ -2394,9 +2673,11 @@ def train_stage2_transformer(
     D: int,
     sample_every_steps: int = 200,
     sample_batch_size: int = 8,
+    sample_candidate_factor: int = 4,
     sample_temperature: float = 1.0,
     sample_top_k: Optional[int] = 256,
     sample_image_size: Optional[int] = None,
+    sample_reference_stats: Optional[dict] = None,
     token_sampler: Optional[DistributedSampler] = None,
     is_main_process: bool = True,
     wandb_run: Optional[object] = None,
@@ -2409,8 +2690,12 @@ def train_stage2_transformer(
     bos = transformer_module.bos_token_id
     global_step = 0
     sample_top_k = None if sample_top_k is None or int(sample_top_k) <= 0 else int(sample_top_k)
+    sample_candidate_factor = max(1, int(sample_candidate_factor))
     real_valued = transformer_module.real_valued_coeffs
     coeff_loss_weight = float(coeff_loss_weight)
+    coeff_huber_delta = float(coeff_huber_delta)
+    sched_sampling_final_prob = max(0.0, float(sched_sampling_final_prob))
+    num_batches = max(1, len(token_loader))
 
     for epoch in range(1, epochs + 1):
         if token_sampler is not None:
@@ -2420,7 +2705,7 @@ def train_stage2_transformer(
         running = 0.0
         steps = 0
 
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             if real_valued:
                 tok_flat, coeff_flat = batch[0].to(device).long(), batch[1].to(device).float()
             else:
@@ -2434,18 +2719,39 @@ def train_stage2_transformer(
 
             opt.zero_grad(set_to_none=True)
             ce_loss = None
-            mse_loss = None
+            coeff_reg_loss = None
+            sched_prob = 0.0
             if real_valued:
+                coeff_target = transformer_module.normalize_coeffs(coeff_flat, y)
                 # Shift coefficients right: position 0 (BOS) gets 0, position t gets c_{t-1}.
-                coeff_in = torch.cat([torch.zeros(B, 1, device=device), coeff_flat[:, :-1]], dim=1)
-                logits, coeff_pred = transformer_module.forward_with_coeffs(x_in, coeff_in, y)
+                coeff_in = torch.cat([torch.zeros(B, 1, device=device), coeff_target[:, :-1]], dim=1)
+                x_model = x_in
+                coeff_model = coeff_in
+                total_steps = max(1, epochs * num_batches - 1)
+                progress = ((epoch - 1) * num_batches + batch_idx) / total_steps
+                sched_prob = sched_sampling_final_prob * progress
+                if sched_prob > 0.0 and x_in.size(1) > 1:
+                    with torch.no_grad():
+                        h_tf = transformer_module._forward_hidden(x_in, coeff_in)
+                        logits_tf = transformer_module.head(h_tf)
+                        logits_prev = logits_tf[:, :-1, :].clone()
+                        logits_prev[..., pad_token_id] = float("-inf")
+                        logits_prev[..., transformer_module.bos_token_id] = float("-inf")
+                        pred_prev_tokens = logits_prev.argmax(dim=-1)
+                        pred_prev_coeffs = transformer_module._predict_coeffs(h_tf[:, :-1, :], pred_prev_tokens)
+                        replace_mask = torch.rand(B, x_in.size(1) - 1, device=device) < sched_prob
+                    x_tail = torch.where(replace_mask, pred_prev_tokens, x_in[:, 1:])
+                    coeff_tail = torch.where(replace_mask, pred_prev_coeffs, coeff_in[:, 1:])
+                    x_model = torch.cat([x_in[:, :1], x_tail], dim=1)
+                    coeff_model = torch.cat([coeff_in[:, :1], coeff_tail], dim=1)
+                logits, coeff_pred = transformer_module.forward_with_coeffs(x_model, coeff_model, y)
                 ce_loss = F.cross_entropy(
                     logits.reshape(-1, vocab),
                     y.reshape(-1),
                     ignore_index=pad_token_id,
                 )
-                mse_loss = F.mse_loss(coeff_pred, coeff_flat)
-                loss = ce_loss + coeff_loss_weight * mse_loss
+                coeff_reg_loss = F.huber_loss(coeff_pred, coeff_target, delta=coeff_huber_delta)
+                loss = ce_loss + coeff_loss_weight * coeff_reg_loss
             else:
                 logits = transformer(x_in)
                 ce_loss = F.cross_entropy(
@@ -2461,7 +2767,10 @@ def train_stage2_transformer(
 
             loss_log = _distributed_mean(loss)
             ce_log = _distributed_mean(ce_loss.detach())
-            mse_log = _distributed_mean(mse_loss.detach()) if mse_loss is not None else None
+            coeff_reg_log = (
+                _distributed_mean(coeff_reg_loss.detach())
+                if coeff_reg_loss is not None else None
+            )
             running += float(loss_log.item())
             steps += 1
             if is_main_process:
@@ -2469,18 +2778,23 @@ def train_stage2_transformer(
                     "loss": float(loss_log.item()),
                     "ce": float(ce_log.item()),
                 }
-                if mse_log is not None:
-                    postfix["mse"] = float(mse_log.item())
+                if coeff_reg_log is not None:
+                    postfix["huber"] = float(coeff_reg_log.item())
+                if real_valued and sched_sampling_final_prob > 0.0:
+                    postfix["sched_p"] = float(sched_prob)
                 pbar.set_postfix(**postfix)
                 log_payload = {
                     "stage2/train_loss": float(loss_log.item()),
                     "stage2/ce_loss": float(ce_log.item()),
                     "stage2/epoch": epoch,
                 }
-                if mse_log is not None:
-                    log_payload["stage2/coeff_mse_loss"] = float(mse_log.item())
+                if coeff_reg_log is not None:
+                    log_payload["stage2/coeff_huber_loss"] = float(coeff_reg_log.item())
                     log_payload["stage2/coeff_loss_weight"] = coeff_loss_weight
-                    log_payload["stage2/weighted_coeff_loss"] = float(coeff_loss_weight * mse_log.item())
+                    log_payload["stage2/coeff_huber_delta"] = coeff_huber_delta
+                    log_payload["stage2/weighted_coeff_loss"] = float(coeff_loss_weight * coeff_reg_log.item())
+                if real_valued and sched_sampling_final_prob > 0.0:
+                    log_payload["stage2/sched_sampling_prob"] = float(sched_prob)
                 _log_wandb(
                     wandb_run,
                     log_payload,
@@ -2493,11 +2807,15 @@ def train_stage2_transformer(
                 if is_main_process:
                     transformer.eval()
                     ae_decode.eval()
-                    print(f"[Stage2] sampling at step {global_step} (batch_size={sample_batch_size})...")
+                    candidate_batch_size = max(sample_batch_size, sample_batch_size * sample_candidate_factor)
+                    print(
+                        f"[Stage2] sampling at step {global_step} "
+                        f"(keep={sample_batch_size}, candidates={candidate_batch_size})..."
+                    )
                     with torch.no_grad():
                         if real_valued:
                             flat_gen, coeffs_gen = transformer_module.generate_with_coeffs(
-                                batch_size=sample_batch_size,
+                                batch_size=candidate_batch_size,
                                 temperature=sample_temperature,
                                 top_k=sample_top_k,
                                 show_progress=True,
@@ -2508,7 +2826,7 @@ def train_stage2_transformer(
                             imgs = ae_decode.decode_from_atoms_and_coeffs(atoms_gen, coeffs_gen)
                         else:
                             flat_gen = transformer_module.generate(
-                                batch_size=sample_batch_size,
+                                batch_size=candidate_batch_size,
                                 temperature=sample_temperature,
                                 top_k=sample_top_k,
                                 show_progress=True,
@@ -2516,6 +2834,11 @@ def train_stage2_transformer(
                             )
                             tokens_gen = flat_gen.view(-1, H, W, D)
                             imgs = ae_decode.decode_from_tokens(tokens_gen.to(device))
+                        imgs = _select_best_stage2_samples(
+                            imgs,
+                            keep=sample_batch_size,
+                            reference_stats=sample_reference_stats,
+                        )
                         if sample_image_size is not None and int(sample_image_size) > 0:
                             if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
                                 imgs = F.interpolate(
@@ -2599,11 +2922,11 @@ def main():
     )
 
     parser.add_argument("--stage1_epochs", type=int, default=5)
-    parser.add_argument("--stage1_lr", type=float, default=2e-4)
+    parser.add_argument("--stage1_lr", type=float, default=2e-3)
     parser.add_argument("--stage1_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--stage1_warmup_epochs", type=int, default=1)
     parser.add_argument("--stage1_min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--stage2_epochs", type=int, default=5)
+    parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=2e-3)
     parser.add_argument(
         "--stage2_coeff_loss_weight",
@@ -2611,8 +2934,26 @@ def main():
         default=0.1,
         help="Weight applied to the real-valued coefficient regression term during stage-2 training.",
     )
+    parser.add_argument(
+        "--stage2_coeff_norm_max",
+        type=float,
+        default=4.0,
+        help="Maximum absolute value used for normalized real-valued coefficient prediction.",
+    )
+    parser.add_argument(
+        "--stage2_coeff_huber_delta",
+        type=float,
+        default=1.0,
+        help="Delta parameter for Huber loss on normalized real-valued coefficients.",
+    )
+    parser.add_argument(
+        "--stage2_sched_sampling_final_prob",
+        type=float,
+        default=0.25,
+        help="Final probability of replacing previous stage-2 inputs with model predictions during training.",
+    )
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--stage2_batch_size", type=int, default=2)
+    parser.add_argument("--stage2_batch_size", type=int, default=32)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -2622,7 +2963,7 @@ def main():
     parser.add_argument("--num_res_hiddens", type=int, default=32)
     parser.add_argument("--embedding_dim", type=int, default=64,
                         help="Latent channel depth. Must be > sparsity_level to keep OMP well-conditioned.")
-    parser.add_argument("--num_atoms", type=int, default=2048)
+    parser.add_argument("--num_atoms", type=int, default=512)
     parser.add_argument("--sparsity_level", type=int, default=3)
     parser.add_argument("--n_bins", type=int, default=256)
     parser.add_argument("--coef_max", type=float, default=3.0)
@@ -2669,6 +3010,11 @@ def main():
         help="Number of stage-1 token grids to encode for stage-2 training (<= 0 uses the full set).",
     )
     parser.add_argument(
+        "--rebuild_token_cache",
+        action="store_true",
+        help="Ignore any existing stage-2 token cache and rebuild it from the stage-1 model.",
+    )
+    parser.add_argument(
         "--rfid_num_samples",
         type=int,
         default=256,
@@ -2676,6 +3022,12 @@ def main():
     )
     parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=16)
+    parser.add_argument(
+        "--stage2_sample_candidate_factor",
+        type=int,
+        default=4,
+        help="Generate this many times more stage-2 candidates and keep the ones closest to stage-1 image stats.",
+    )
     parser.add_argument("--stage2_sample_temperature", type=float, default=0.6)
     parser.add_argument("--stage2_sample_top_k", type=int, default=0)
     parser.add_argument("--stage2_sample_image_size", type=int, default=128)
@@ -2692,6 +3044,12 @@ def main():
         raise ValueError("stage2_sample_temperature must be > 0.")
     if args.stage2_coeff_loss_weight < 0.0:
         raise ValueError("stage2_coeff_loss_weight must be >= 0.")
+    if args.stage2_coeff_norm_max <= 0.0:
+        raise ValueError("stage2_coeff_norm_max must be > 0.")
+    if args.stage2_coeff_huber_delta <= 0.0:
+        raise ValueError("stage2_coeff_huber_delta must be > 0.")
+    if not (0.0 <= args.stage2_sched_sampling_final_prob <= 1.0):
+        raise ValueError("stage2_sched_sampling_final_prob must be in [0, 1].")
     if args.token_subset < 0:
         args.token_subset = 0
     if args.image_size is None:
@@ -2701,9 +3059,15 @@ def main():
         args.data_dir = str(_default_data_dir(args.dataset))
     if args.out_dir is None:
         args.out_dir = str(_default_out_dir(args.dataset, args.image_size))
+    experiment_root = Path(args.out_dir).expanduser().resolve()
 
     distributed, rank, local_rank, world_size = _init_distributed()
     is_main_process = (rank == 0)
+    launch_timestamp = _launch_timestamp()
+    run_out_dir = _resolve_run_out_dir(str(experiment_root), launch_timestamp)
+    args.out_root = str(experiment_root)
+    args.launch_timestamp = launch_timestamp
+    args.out_dir = str(run_out_dir)
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -2718,6 +3082,7 @@ def main():
     pin_memory = device.type == "cuda"
 
     if is_main_process:
+        os.makedirs(experiment_root, exist_ok=True)
         os.makedirs(args.out_dir, exist_ok=True)
     stage1_dir = os.path.join(args.out_dir, "stage1")
     stage2_dir = os.path.join(args.out_dir, "stage2")
@@ -2731,6 +3096,7 @@ def main():
             f"[Setup] device={device} world_size={world_size} dataset={args.dataset} "
             f"data_dir={args.data_dir} image_size={args.image_size}"
         )
+        print(f"[Setup] experiment_root={experiment_root} run_out_dir={args.out_dir}")
         wandb_run = _init_wandb(args)
     if wandb_run is not None:
         _log_wandb(
@@ -2764,9 +3130,17 @@ def main():
         )
 
     def _load_best_laser_weights(laser_model: LASER):
-        best_path = os.path.join(stage1_dir, "ae_best.pt")
-        if not os.path.exists(best_path):
-            raise FileNotFoundError(f"Stage-1 checkpoint not found at {best_path}")
+        best_path = Path(stage1_dir) / "ae_best.pt"
+        if not best_path.exists():
+            fallback_path = _find_latest_stage1_checkpoint(experiment_root, run_out_dir)
+            if fallback_path is None:
+                raise FileNotFoundError(
+                    f"Stage-1 checkpoint not found in current run at {best_path} "
+                    f"or prior runs under {experiment_root}"
+                )
+            if is_main_process:
+                print(f"[Stage1] reusing prior checkpoint from {fallback_path}")
+            best_path = fallback_path
         try:
             state_dict = torch.load(best_path, map_location="cpu", weights_only=True)
         except TypeError:
@@ -2882,36 +3256,70 @@ def main():
         return
 
     token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
+    token_subset = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
+    expected_token_meta = _expected_token_cache_meta(args, stage2_source_set, token_subset, laser)
     if is_main_process:
-        token_subset = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
-        token_source_loader = DataLoader(
-            stage2_source_set,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.token_num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=(args.token_num_workers > 0),
-        )
-        tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
-            laser,
-            token_source_loader,
-            device,
-            max_items=token_subset,
-        )
-        cache = {"tokens_flat": tokens_flat, "shape": (H, W, D)}
-        if coeffs_flat is not None:
-            cache["coeffs_flat"] = coeffs_flat
-        torch.save(cache, token_cache_path)
-        print(f"[Stage2] token dataset: {tokens_flat.shape} (H={H}, W={W}, D={D})")
+        cache_ready = False
+        if (not args.rebuild_token_cache) and os.path.exists(token_cache_path):
+            token_cache = _load_token_cache(token_cache_path)
+            compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
+            if compatible:
+                tokens_flat = token_cache["tokens_flat"]
+                H, W, D = token_cache["shape"]
+                print(
+                    f"[Stage2] reusing token cache: {tokens_flat.shape} "
+                    f"(H={H}, W={W}, D={D}) from {token_cache_path}"
+                )
+                cache_ready = True
+            else:
+                print(f"[Stage2] rebuilding token cache ({reason})")
+        elif args.rebuild_token_cache:
+            print("[Stage2] rebuilding token cache (--rebuild_token_cache)")
+
+        if not cache_ready:
+            token_source_loader = DataLoader(
+                stage2_source_set,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.token_num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=(args.token_num_workers > 0),
+            )
+            tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
+                laser,
+                token_source_loader,
+                device,
+                max_items=token_subset,
+            )
+            cache = {
+                "tokens_flat": tokens_flat,
+                "shape": (H, W, D),
+                "meta": expected_token_meta,
+            }
+            if coeffs_flat is not None:
+                cache["coeffs_flat"] = coeffs_flat
+            torch.save(cache, token_cache_path)
+            print(f"[Stage2] token dataset: {tokens_flat.shape} (H={H}, W={W}, D={D})")
     _barrier()
-    try:
-        token_cache = torch.load(token_cache_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        token_cache = torch.load(token_cache_path, map_location="cpu")
+    token_cache = _load_token_cache(token_cache_path)
     tokens_flat = token_cache["tokens_flat"]
     coeffs_flat = token_cache.get("coeffs_flat", None)
     H, W, D = token_cache["shape"]
+    expected_items = int(expected_token_meta["effective_items"])
+    if tokens_flat.size(0) > expected_items:
+        tokens_flat = tokens_flat[:expected_items]
+        if coeffs_flat is not None:
+            coeffs_flat = coeffs_flat[:expected_items]
     real_valued = (coeffs_flat is not None)
+    sample_reference_stats = _compute_stage2_sample_reference_stats(
+        laser,
+        tokens_flat,
+        coeffs_flat,
+        H,
+        W,
+        D,
+        device,
+    )
 
     if args.stage2_epochs <= 0:
         _barrier()
@@ -2946,6 +3354,7 @@ def main():
             atom_vocab_size=(laser.bottleneck.num_embeddings if laser.bottleneck.quantize_sparse_coeffs else None),
             coeff_vocab_size=(laser.bottleneck.n_bins if laser.bottleneck.quantize_sparse_coeffs else None),
             real_valued_coeffs=real_valued,
+            coeff_norm_max=args.stage2_coeff_norm_max,
             d_model=args.tf_d_model,
             n_heads=args.tf_heads,
             n_layers=args.tf_layers,
@@ -2955,6 +3364,13 @@ def main():
         bos_token_id=laser.bottleneck.bos_token_id,
         pad_token_id=laser.bottleneck.pad_token_id,
     ).to(device)
+    if real_valued:
+        coeff_mean, coeff_std = _compute_atom_conditioned_coeff_stats(
+            tokens_flat,
+            coeffs_flat,
+            vocab_size=laser.bottleneck.vocab_size,
+        )
+        transformer.set_coeff_normalization_stats(coeff_mean, coeff_std)
     transformer_stage2 = DDP(transformer, device_ids=[local_rank], output_device=local_rank) if distributed else transformer
 
     train_stage2_transformer(
@@ -2964,6 +3380,8 @@ def main():
         epochs=args.stage2_epochs,
         lr=args.stage2_lr,
         coeff_loss_weight=args.stage2_coeff_loss_weight,
+        coeff_huber_delta=args.stage2_coeff_huber_delta,
+        sched_sampling_final_prob=args.stage2_sched_sampling_final_prob,
         pad_token_id=laser.bottleneck.pad_token_id,
         out_dir=stage2_dir,
         ae_for_decode=laser,
@@ -2972,9 +3390,11 @@ def main():
         D=D,
         sample_every_steps=args.stage2_sample_every_steps,
         sample_batch_size=args.stage2_sample_batch_size,
+        sample_candidate_factor=args.stage2_sample_candidate_factor,
         sample_temperature=args.stage2_sample_temperature,
         sample_top_k=(None if args.stage2_sample_top_k <= 0 else args.stage2_sample_top_k),
         sample_image_size=args.stage2_sample_image_size,
+        sample_reference_stats=sample_reference_stats,
         token_sampler=token_sampler,
         is_main_process=is_main_process,
         wandb_run=wandb_run,
