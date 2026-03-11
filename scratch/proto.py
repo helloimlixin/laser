@@ -15,6 +15,7 @@ import argparse
 import datetime
 import math
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -113,6 +114,28 @@ def _find_latest_stage1_checkpoint(experiment_root: Path, current_run_dir: Path)
     return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
+def _find_latest_stage2_token_cache(experiment_root: Path, current_run_dir: Path) -> Optional[Path]:
+    """Find the newest prior stage-2 token cache under the experiment root."""
+    candidates = []
+    legacy_cache = experiment_root / "stage2" / "tokens_cache.pt"
+    if legacy_cache.exists():
+        candidates.append(legacy_cache)
+
+    if experiment_root.exists():
+        for child in experiment_root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.resolve() == current_run_dir.resolve():
+                continue
+            cache_path = child / "stage2" / "tokens_cache.pt"
+            if cache_path.exists():
+                candidates.append(cache_path)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
+
+
 def _init_distributed() -> Tuple[bool, int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
@@ -157,6 +180,118 @@ def _distributed_mean(value: torch.Tensor) -> torch.Tensor:
 
 def _unwrap_module(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
+
+
+def _dictionary_coherence(dictionary: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Return the maximum absolute off-diagonal atom cosine similarity."""
+    atoms = F.normalize(dictionary.detach(), p=2, dim=0, eps=eps)
+    gram = atoms.t() @ atoms
+    if gram.size(0) <= 1:
+        return torch.zeros((), device=gram.device, dtype=gram.dtype)
+    gram.fill_diagonal_(0.0)
+    return gram.abs().max()
+
+
+def _normalize_dictionary_in_place(dictionary: torch.Tensor, eps: float = 1e-12) -> None:
+    with torch.no_grad():
+        dictionary.copy_(F.normalize(dictionary, p=2, dim=0, eps=eps))
+
+
+def _project_dictionary_gradient_in_place(dictionary: torch.Tensor, eps: float = 1e-12) -> None:
+    """Project dictionary gradients onto the unit-sphere tangent space per atom."""
+    if dictionary.grad is None:
+        return
+    with torch.no_grad():
+        atoms = F.normalize(dictionary.detach(), p=2, dim=0, eps=eps)
+        grad = dictionary.grad
+        radial = (atoms * grad).sum(dim=0, keepdim=True)
+        grad.sub_(atoms * radial)
+
+
+def _batched_omp_with_support(
+    X: torch.Tensor,
+    D: torch.Tensor,
+    sparsity_level: int,
+    diag_eps: float = 1e-4,
+    cholesky_eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Numerically damped batched OMP that returns support indices and ordered coefficients."""
+    if X.ndim != 2 or D.ndim != 2:
+        raise ValueError(f"Expected 2D tensors, got X={tuple(X.shape)} D={tuple(D.shape)}")
+    if sparsity_level > int(D.size(1)):
+        raise ValueError(
+            f"sparsity_level ({int(sparsity_level)}) must be <= num_atoms ({int(D.size(1))})"
+        )
+
+    _, batch_size = X.size()
+    device = D.device
+    dtype = D.dtype
+    batch_idx = torch.arange(batch_size, device=device)
+
+    Dt = D.t()
+    G = Dt.mm(D)
+    if diag_eps > 0.0:
+        G = G + float(diag_eps) * torch.eye(G.size(0), device=device, dtype=dtype)
+    h_bar = Dt.mm(X).t()
+    h = h_bar.clone()
+    x = torch.zeros_like(h_bar)
+    L = torch.empty(batch_size, 0, 0, device=device, dtype=dtype)
+    I = torch.empty(batch_size, 0, device=device, dtype=torch.long)
+    I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
+
+    def _update_logical(logical: torch.Tensor, to_add: torch.Tensor) -> None:
+        logical[batch_idx, to_add] = True
+
+    while I.size(1) < int(sparsity_level):
+        scores = h.abs().masked_fill(I_logic, -1.0)
+        index = scores.argmax(dim=1)
+        _update_logical(I_logic, index)
+
+        selected = int(I.size(1))
+        diag_g = G[index, index].view(batch_size, 1, 1)
+        if selected == 0:
+            L = torch.sqrt(torch.clamp(diag_g, min=cholesky_eps))
+        else:
+            expanded_batch_idx = batch_idx.unsqueeze(0).expand(selected, batch_size).t()
+            G_stack = G[I[batch_idx, :], index[expanded_batch_idx]].view(batch_size, selected, 1)
+            w = torch.linalg.solve_triangular(L, G_stack, upper=False)
+            w_t = w.transpose(1, 2)
+            w_corner = torch.sqrt(
+                torch.clamp(diag_g - (w_t ** 2).sum(dim=2, keepdim=True), min=cholesky_eps)
+            )
+            k_zeros = torch.zeros(batch_size, selected, 1, device=device, dtype=dtype)
+            L = torch.cat(
+                (
+                    torch.cat((L, k_zeros), dim=2),
+                    torch.cat((w_t, w_corner), dim=2),
+                ),
+                dim=1,
+            )
+
+        I = torch.cat([I, index.unsqueeze(1)], dim=1)
+        support_size = int(I.size(1))
+        expanded_batch_idx = batch_idx.unsqueeze(0).expand(support_size, batch_size).t()
+        h_stack = h_bar[expanded_batch_idx, I].view(batch_size, support_size, 1)
+        try:
+            x_stack = torch.cholesky_solve(h_stack, L)
+        except RuntimeError:
+            gram_support = torch.bmm(L, L.transpose(1, 2))
+            reg_eye = torch.eye(support_size, device=device, dtype=dtype).expand(batch_size, -1, -1)
+            x_stack = torch.linalg.solve(gram_support + cholesky_eps * reg_eye, h_stack)
+        x_stack = torch.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
+        x[batch_idx.unsqueeze(1), I] = x_stack.squeeze(-1)
+
+        beta = (
+            x[batch_idx.unsqueeze(1), I]
+            .unsqueeze(1)
+            .bmm(G[I[batch_idx], :])
+            .squeeze(1)
+        )
+        h = torch.nan_to_num(h_bar - beta, nan=0.0, posinf=0.0, neginf=0.0)
+
+    coeffs_ordered = x[batch_idx.unsqueeze(1), I]
+    coeffs_ordered = torch.nan_to_num(coeffs_ordered, nan=0.0, posinf=0.0, neginf=0.0)
+    return I, coeffs_ordered
 
 
 _RFID_MODEL = None
@@ -466,9 +601,9 @@ class DictionaryLearningTokenized(nn.Module):
     """
     def __init__(
         self,
-        num_embeddings: int = 256,
-        embedding_dim: int = 64,
-        sparsity_level: int = 4,
+        num_embeddings: int = 1024,
+        embedding_dim: int = 16,
+        sparsity_level: int = 8,
         n_bins: int = 16,
         coef_max: float = 3.0,
         quantize_sparse_coeffs: bool = False,
@@ -671,73 +806,11 @@ class DictionaryLearningTokenized(nn.Module):
             support: [B, K] indices in selection order (K = sparsity_level)
             coeffs:  [B, K] coefficients aligned with support (same order)
         """
-        if self.sparsity_level > int(D.size(1)):
-            raise ValueError(
-                f"sparsity_level ({self.sparsity_level}) must be <= num_atoms ({int(D.size(1))})"
-            )
-        _, batch_size = X.size()
-        Dt = D.t()                   # [N, M]
-        G = Dt.mm(D)                 # [N, N]
-        eps = torch.norm(X, dim=0)   # [B]
-        h_bar = Dt.mm(X).t()         # [B, N]
-        h = h_bar
-        x = torch.zeros_like(h_bar)  # [B, N]
-        L = torch.ones(batch_size, 1, 1, device=h.device, dtype=h.dtype)
-        I = torch.ones(batch_size, 0, device=h.device, dtype=torch.long)
-        I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
-        delta = torch.zeros(batch_size, device=h.device, dtype=h.dtype)
-
-        def _update_logical(logical: torch.Tensor, to_add: torch.Tensor):
-            running_idx = torch.arange(to_add.shape[0], device=to_add.device)
-            logical[running_idx, to_add] = True
-
-        k = 0
-        # Always run exactly K selections; relying on residual-based stopping can return short supports.
-        while k < self.sparsity_level:
-            k += 1
-            index = (h * (~I_logic).float()).abs().argmax(dim=1)  # [B]
-            _update_logical(I_logic, index)
-
-            batch_idx = torch.arange(batch_size, device=G.device)
-            expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()  # [B,k]
-
-            if k > 1:
-                G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
-                w = torch.linalg.solve_triangular(L, G_stack, upper=False)
-                w = w.view(-1, 1, k - 1)
-                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-6))
-                k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device, dtype=h.dtype)
-                L = torch.cat(
-                    (
-                        torch.cat((L, k_zeros), dim=2),
-                        torch.cat((w, w_corner), dim=2),
-                    ),
-                    dim=1,
-                )
-
-            I = torch.cat([I, index.unsqueeze(1)], dim=1)  # [B,k]
-
-            h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)
-            x_stack = torch.cholesky_solve(h_stack, L)
-            x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack[batch_idx].squeeze(-1)
-
-            beta = (
-                x[batch_idx.unsqueeze(1), I[batch_idx]]
-                .unsqueeze(1)
-                .bmm(G[I[batch_idx], :])
-                .squeeze(1)
-            )
-            h = h_bar - beta
-
-            new_delta = (x * beta).sum(dim=1)
-            eps = eps + delta - new_delta
-            delta = new_delta
-
-        # Ordered coefficients: x is dense over atoms; gather along support I
-        batch_idx = torch.arange(batch_size, device=x.device)[:, None]
-        coeffs_ordered = x[batch_idx, I].squeeze(1)  # [B, K]
-
-        return I, coeffs_ordered
+        return _batched_omp_with_support(
+            X=X,
+            D=D,
+            sparsity_level=self.sparsity_level,
+        )
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -768,7 +841,7 @@ class DictionaryLearningTokenized(nn.Module):
             coeffs_for_recon = coeff_q
         else:
             tokens = support.view(B, H, W, self.sparsity_level).long()
-            coeffs_for_recon = coeffs_flat
+            coeffs_for_recon = coeffs_flat.clamp(-self.coef_max, self.coef_max)
 
         coeffs_for_recon = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
         z_q = self._reconstruct_sparse(support, coeffs_for_recon)
@@ -845,11 +918,11 @@ class PatchDictionaryLearningTokenized(nn.Module):
 
     def __init__(
         self,
-        num_embeddings: int = 256,
-        embedding_dim: int = 64,
+        num_embeddings: int = 1024,
+        embedding_dim: int = 16,
         patch_size: int = 8,
         patch_stride: int = 4,
-        sparsity_level: int = 4,
+        sparsity_level: int = 8,
         n_bins: int = 16,
         coef_max: float = 3.0,
         quantize_sparse_coeffs: bool = False,
@@ -1026,64 +1099,11 @@ class PatchDictionaryLearningTokenized(nn.Module):
             support: [B, K]
             coeffs : [B, K]
         """
-        if self.sparsity_level > int(D.size(1)):
-            raise ValueError(
-                f"sparsity_level ({self.sparsity_level}) must be <= num_atoms ({int(D.size(1))})"
-            )
-        _, batch_size = X.size()
-        Dt = D.t()
-        G = Dt.mm(D)
-        eps = torch.norm(X, dim=0)
-        h_bar = Dt.mm(X).t()
-        h = h_bar
-        x = torch.zeros_like(h_bar)
-        L = torch.ones(batch_size, 1, 1, device=h.device, dtype=h.dtype)
-        I = torch.ones(batch_size, 0, device=h.device, dtype=torch.long)
-        I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
-        delta = torch.zeros(batch_size, device=h.device, dtype=h.dtype)
-
-        def _update_logical(logical, to_add):
-            running_idx = torch.arange(to_add.shape[0], device=to_add.device)
-            logical[running_idx, to_add] = True
-
-        k = 0
-        while k < self.sparsity_level:
-            k += 1
-            index = (h * (~I_logic).float()).abs().argmax(dim=1)
-            _update_logical(I_logic, index)
-            batch_idx = torch.arange(batch_size, device=G.device)
-            expanded_batch_idx = batch_idx.unsqueeze(0).expand(k, batch_size).t()
-            if k > 1:
-                G_stack = G[I[batch_idx, :], index[expanded_batch_idx[..., :-1]]].view(batch_size, k - 1, 1)
-                w = torch.linalg.solve_triangular(L, G_stack, upper=False)
-                w = w.view(-1, 1, k - 1)
-                w_corner = torch.sqrt(torch.clamp(1 - (w ** 2).sum(dim=2, keepdim=True), min=1e-6))
-                k_zeros = torch.zeros(batch_size, k - 1, 1, device=h.device, dtype=h.dtype)
-                L = torch.cat(
-                    (
-                        torch.cat((L, k_zeros), dim=2),
-                        torch.cat((w, w_corner), dim=2),
-                    ),
-                    dim=1,
-                )
-            I = torch.cat([I, index.unsqueeze(1)], dim=1)
-            h_stack = h_bar[expanded_batch_idx, I[batch_idx, :]].view(batch_size, k, 1)
-            x_stack = torch.cholesky_solve(h_stack, L)
-            x[batch_idx.unsqueeze(1), I[batch_idx]] = x_stack[batch_idx].squeeze(-1)
-            beta = (
-                x[batch_idx.unsqueeze(1), I[batch_idx]]
-                .unsqueeze(1)
-                .bmm(G[I[batch_idx], :])
-                .squeeze(1)
-            )
-            h = h_bar - beta
-            new_delta = (x * beta).sum(dim=1)
-            eps = eps + delta - new_delta
-            delta = new_delta
-
-        batch_idx = torch.arange(batch_size, device=x.device)[:, None]
-        coeffs_ordered = x[batch_idx, I].squeeze(1)
-        return I, coeffs_ordered
+        return _batched_omp_with_support(
+            X=X,
+            D=D,
+            sparsity_level=self.sparsity_level,
+        )
 
     def _encode_sparse_codes(
         self, z_e: torch.Tensor
@@ -1245,7 +1265,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
             coeffs_for_recon = coeff_q.reshape(B, nph, npw, self.sparsity_level)
         else:
             tokens = support.view(B, nph, npw, self.sparsity_level).long()
-            coeffs_for_recon = coeffs_flat.reshape(B, nph, npw, self.sparsity_level)
+            coeffs_for_recon = coeffs_flat.clamp(-self.coef_max, self.coef_max).reshape(B, nph, npw, self.sparsity_level)
 
         z_q = self._reconstruct_sparse(support, coeffs_for_recon, H, W)
 
@@ -1314,9 +1334,9 @@ class LASER(nn.Module):
         resolution: int = 128,
         attn_resolutions: tuple = (),
         dropout: float = 0.0,
-        embedding_dim: int = 64,
-        num_embeddings: int = 256,
-        sparsity_level: int = 4,
+        embedding_dim: int = 16,
+        num_embeddings: int = 1024,
+        sparsity_level: int = 8,
         commitment_cost: float = 0.25,
         n_bins: int = 16,
         coef_max: float = 3.0,
@@ -1592,6 +1612,9 @@ class Transformer(nn.Module):
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if self.real_valued_coeffs:
             self.coeff_proj = nn.Linear(1, cfg.d_model, bias=False)
+            self.coeff_atom_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+            # Start from the shared embedding values, then let coeff regression adapt independently.
+            self.coeff_atom_emb.weight.data.copy_(self.token_emb.weight.data)
             self.coeff_head = nn.Sequential(
                 nn.Linear(2 * cfg.d_model, cfg.d_model),
                 nn.GELU(),
@@ -1599,6 +1622,7 @@ class Transformer(nn.Module):
             )
         else:
             self.coeff_proj = None
+            self.coeff_atom_emb = None
             self.coeff_head = None
 
         # Position ids for [BOS] + flattened token sequence.
@@ -1672,19 +1696,44 @@ class Transformer(nn.Module):
         """
         return self.head(self._forward_hidden(x))
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        coeff_atom_key = prefix + "coeff_atom_emb.weight"
+        token_key = prefix + "token_emb.weight"
+        if self.real_valued_coeffs and coeff_atom_key not in state_dict and token_key in state_dict:
+            # Allow older checkpoints to load by seeding the decoupled coeff embedding from token_emb.
+            state_dict[coeff_atom_key] = state_dict[token_key].clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def _predict_coeffs(
         self,
         hidden: torch.Tensor,
         atom_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Predict coefficients conditioned on the chosen atom at each step."""
-        if not self.real_valued_coeffs or self.coeff_head is None:
+        if not self.real_valued_coeffs or self.coeff_head is None or self.coeff_atom_emb is None:
             raise RuntimeError("_predict_coeffs is only valid when real_valued_coeffs=True")
         if hidden.shape[:2] != atom_ids.shape:
             raise ValueError(
                 f"hidden shape {tuple(hidden.shape[:2])} must match atom_ids shape {tuple(atom_ids.shape)}"
             )
-        atom_feat = self.token_emb(atom_ids.to(torch.long))
+        atom_feat = self.coeff_atom_emb(atom_ids.to(torch.long))
         coeff_in = torch.cat([hidden, atom_feat], dim=-1)
         coeff_raw = self.coeff_head(coeff_in).squeeze(-1)
         return torch.tanh(coeff_raw) * self.coeff_norm_max
@@ -2291,6 +2340,12 @@ def train_stage1_ae(
     lr_schedule: str = "cosine",
     warmup_epochs: int = 1,
     min_lr_ratio: float = 0.1,
+    dict_optimizer: str = "shared_adam",
+    dict_lr_multiplier: float = 1.0,
+    dict_lr_schedule: str = "cosine",
+    dict_warmup_epochs: int = 1,
+    dict_min_lr_ratio: float = 0.05,
+    dict_grad_clip: float = 0.1,
     train_sampler: Optional[DistributedSampler] = None,
     is_main_process: bool = True,
     wandb_run: Optional[object] = None,
@@ -2298,14 +2353,24 @@ def train_stage1_ae(
     """Train stage 1 with optional DDP and rank-0-only artifacts."""
     ae_module = _unwrap_module(ae)
     dict_param = ae_module.bottleneck.dictionary
-    non_dict_params = [p for p in ae.parameters() if p is not dict_param]
-    opt = torch.optim.Adam(non_dict_params, lr=lr)
-    # SGD for the dictionary: Adam accumulates moments in unconstrained Euclidean space
-    # then the post-hoc unit-norm projection distorts those moments, pushing atoms together
-    # and increasing dictionary coherence over time.  Plain SGD avoids this — the Riemannian
-    # gradient on the unit sphere is just the Euclidean gradient minus its radial component,
-    # which the post-hoc normalization approximates correctly when the step is small.
-    dict_opt = torch.optim.SGD([dict_param], lr=lr * 10)
+    dict_eps = float(ae_module.bottleneck.epsilon)
+    _normalize_dictionary_in_place(dict_param, eps=dict_eps)
+    dict_optimizer = str(dict_optimizer)
+    if dict_optimizer not in {"shared_adam", "separate_sgd"}:
+        raise ValueError(
+            f"Unsupported stage-1 dictionary optimizer mode: {dict_optimizer!r}"
+        )
+    use_separate_dict_opt = dict_optimizer == "separate_sgd"
+    if use_separate_dict_opt:
+        non_dict_params = [p for p in ae.parameters() if p is not dict_param]
+        opt = torch.optim.Adam(non_dict_params, lr=lr)
+        # Separate SGD remains available for experiments, but it is more sensitive because
+        # OMP support selection changes discontinuously as the dictionary moves.
+        dict_opt = torch.optim.SGD([dict_param], lr=lr * float(dict_lr_multiplier))
+    else:
+        non_dict_params = None
+        opt = torch.optim.Adam(ae.parameters(), lr=lr)
+        dict_opt = None
     best_val_recon = float("inf")
     global_step = 0
     rfid_warned = False
@@ -2328,38 +2393,87 @@ def train_stage1_ae(
                 min_lr_ratio=min_lr_ratio,
             )
             current_lr = float(lr) * float(lr_scale)
+            current_dict_lr = current_lr
             for param_group in opt.param_groups:
                 param_group["lr"] = current_lr
-            for param_group in dict_opt.param_groups:
-                param_group["lr"] = float(lr) * 10 * float(lr_scale)
+            if dict_opt is not None:
+                dict_lr_scale = _stage1_lr_scale(
+                    epoch=epoch_progress,
+                    max_epochs=epochs,
+                    schedule=dict_lr_schedule,
+                    warmup_epochs=dict_warmup_epochs,
+                    min_lr_ratio=dict_min_lr_ratio,
+                )
+                current_dict_lr = float(lr) * float(dict_lr_multiplier) * float(dict_lr_scale)
+                for param_group in dict_opt.param_groups:
+                    param_group["lr"] = current_dict_lr
             x = x.to(device)
             recon, b_loss, _ = ae(x)
             recon_loss = F.mse_loss(recon, x)
             loss = recon_loss + bottleneck_weight * b_loss
 
+            if not torch.isfinite(loss):
+                if is_main_process:
+                    print(
+                        f"[Stage1] Warning: non-finite loss ({float(loss.item()):.4f}) "
+                        f"at step {global_step + 1}, skipping update"
+                    )
+                global_step += 1
+                continue
+
             opt.zero_grad(set_to_none=True)
-            dict_opt.zero_grad(set_to_none=True)
+            if dict_opt is not None:
+                dict_opt.zero_grad(set_to_none=True)
             loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(non_dict_params, grad_clip)
-                torch.nn.utils.clip_grad_norm_([dict_param], grad_clip)
+            dict_before_step = F.normalize(dict_param.detach(), p=2, dim=0, eps=dict_eps)
+            if dict_param.grad is None:
+                dict_grad_norm_raw = torch.zeros((), device=device)
+                dict_grad_norm_preclip = torch.zeros((), device=device)
+                dict_grad_norm_postclip = torch.zeros((), device=device)
+            else:
+                dict_grad_norm_raw = torch.linalg.vector_norm(dict_param.grad.detach())
+                if use_separate_dict_opt:
+                    _project_dictionary_gradient_in_place(dict_param, eps=dict_eps)
+                dict_grad_norm_preclip = torch.linalg.vector_norm(dict_param.grad.detach())
+                dict_grad_norm_postclip = dict_grad_norm_preclip
+            if use_separate_dict_opt:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(non_dict_params, grad_clip)
+                if dict_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_([dict_param], dict_grad_clip)
+                    if dict_param.grad is None:
+                        dict_grad_norm_postclip = torch.zeros((), device=device)
+                    else:
+                        dict_grad_norm_postclip = torch.linalg.vector_norm(dict_param.grad.detach())
+            else:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(ae.parameters(), grad_clip)
+                if dict_param.grad is None:
+                    dict_grad_norm_postclip = torch.zeros((), device=device)
+                else:
+                    dict_grad_norm_postclip = torch.linalg.vector_norm(dict_param.grad.detach())
             opt.step()
-            dict_opt.step()
+            if dict_opt is not None:
+                dict_opt.step()
 
             # Keep dictionary atoms normalized after each optimizer step.
-            with torch.no_grad():
-                ae_module.bottleneck.dictionary.copy_(
-                    F.normalize(
-                        ae_module.bottleneck.dictionary,
-                        p=2,
-                        dim=0,
-                        eps=ae_module.bottleneck.epsilon,
-                    )
-                )
+            _normalize_dictionary_in_place(ae_module.bottleneck.dictionary, eps=dict_eps)
+            dict_update_norm = torch.linalg.vector_norm(
+                F.normalize(dict_param.detach(), p=2, dim=0, eps=dict_eps) - dict_before_step
+            )
+            dict_coherence = _dictionary_coherence(
+                ae_module.bottleneck.dictionary,
+                eps=dict_eps,
+            )
 
             loss_log = _distributed_mean(loss)
             recon_log = _distributed_mean(recon_loss)
             b_log = _distributed_mean(b_loss)
+            dict_grad_raw_log = _distributed_mean(dict_grad_norm_raw)
+            dict_grad_preclip_log = _distributed_mean(dict_grad_norm_preclip)
+            dict_grad_postclip_log = _distributed_mean(dict_grad_norm_postclip)
+            dict_update_log = _distributed_mean(dict_update_norm)
+            dict_coherence_log = _distributed_mean(dict_coherence)
             running += float(loss_log.item())
             global_step += 1
             if is_main_process:
@@ -2374,6 +2488,13 @@ def train_stage1_ae(
                         "stage1/train_loss": float(loss_log.item()),
                         "stage1/recon_loss": float(recon_log.item()),
                         "stage1/bottleneck_loss": float(b_log.item()),
+                        "stage1/dict_lr": float(current_dict_lr),
+                        "stage1/dict_grad_norm_raw": float(dict_grad_raw_log.item()),
+                        "stage1/dict_grad_norm_preclip": float(dict_grad_preclip_log.item()),
+                        "stage1/dict_grad_norm_postclip": float(dict_grad_postclip_log.item()),
+                        "stage1/dict_update_norm": float(dict_update_log.item()),
+                        "stage1/dict_coherence": float(dict_coherence_log.item()),
+                        "stage1/batch_in_epoch": int(step_idx + 1),
                         "stage1/epoch": epoch,
                     },
                     step_metric="stage1/step",
@@ -2663,6 +2784,7 @@ def train_stage2_transformer(
     epochs: int,
     lr: float,
     coeff_loss_weight: float,
+    coeff_loss_type: str,
     coeff_huber_delta: float,
     sched_sampling_final_prob: float,
     pad_token_id: int,
@@ -2685,6 +2807,8 @@ def train_stage2_transformer(
     """Train stage 2 with optional DDP and synchronized rank-0 sampling."""
     transformer_module = _unwrap_module(transformer)
     ae_decode = _unwrap_module(ae_for_decode)
+    ae_decode.eval()
+    ae_decode.requires_grad_(False)
     opt = torch.optim.Adam(transformer.parameters(), lr=lr)
     vocab = transformer_module.cfg.vocab_size
     bos = transformer_module.bos_token_id
@@ -2693,9 +2817,16 @@ def train_stage2_transformer(
     sample_candidate_factor = max(1, int(sample_candidate_factor))
     real_valued = transformer_module.real_valued_coeffs
     coeff_loss_weight = float(coeff_loss_weight)
+    coeff_loss_type = str(coeff_loss_type).lower()
+    if coeff_loss_type not in {"huber", "mse", "recon_mse", "gt_atom_recon_mse"}:
+        raise ValueError(f"Unsupported coeff_loss_type: {coeff_loss_type!r}")
     coeff_huber_delta = float(coeff_huber_delta)
     sched_sampling_final_prob = max(0.0, float(sched_sampling_final_prob))
     num_batches = max(1, len(token_loader))
+    if coeff_loss_type in {"recon_mse", "gt_atom_recon_mse"} and isinstance(ae_decode.bottleneck, PatchDictionaryLearningTokenized):
+        raise ValueError(
+            f"stage2 coeff_loss_type={coeff_loss_type!r} currently requires patch_based=False"
+        )
 
     for epoch in range(1, epochs + 1):
         if token_sampler is not None:
@@ -2744,13 +2875,55 @@ def train_stage2_transformer(
                     coeff_tail = torch.where(replace_mask, pred_prev_coeffs, coeff_in[:, 1:])
                     x_model = torch.cat([x_in[:, :1], x_tail], dim=1)
                     coeff_model = torch.cat([coeff_in[:, :1], coeff_tail], dim=1)
-                logits, coeff_pred = transformer_module.forward_with_coeffs(x_model, coeff_model, y)
+                hidden = transformer_module._forward_hidden(x_model, coeff_model)
+                logits = transformer_module.head(hidden)
                 ce_loss = F.cross_entropy(
                     logits.reshape(-1, vocab),
                     y.reshape(-1),
                     ignore_index=pad_token_id,
                 )
-                coeff_reg_loss = F.huber_loss(coeff_pred, coeff_target, delta=coeff_huber_delta)
+                if coeff_loss_type == "mse":
+                    coeff_pred = transformer_module._predict_coeffs(hidden, y)
+                    coeff_reg_loss = F.mse_loss(coeff_pred, coeff_target)
+                elif coeff_loss_type == "huber":
+                    coeff_pred = transformer_module._predict_coeffs(hidden, y)
+                    coeff_reg_loss = F.huber_loss(coeff_pred, coeff_target, delta=coeff_huber_delta)
+                elif coeff_loss_type == "recon_mse":
+                    logits_pred = logits.clone()
+                    logits_pred[..., pad_token_id] = float("-inf")
+                    logits_pred[..., transformer_module.bos_token_id] = float("-inf")
+                    pred_atoms = logits_pred.argmax(dim=-1)
+                    pred_coeff_norm = transformer_module._predict_coeffs(hidden, pred_atoms)
+                    pred_coeff = transformer_module.denormalize_coeffs(pred_coeff_norm, pred_atoms)
+                    coef_max = float(getattr(ae_decode.bottleneck, "coef_max", float("inf")))
+                    pred_coeff = pred_coeff.clamp(-coef_max, coef_max)
+                    target_coeff = coeff_flat.clamp(-coef_max, coef_max)
+                    pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                        pred_atoms.view(B, H, W, D),
+                        pred_coeff.view(B, H, W, D),
+                    )
+                    with torch.no_grad():
+                        target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            y.view(B, H, W, D),
+                            target_coeff.view(B, H, W, D),
+                        )
+                    coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
+                else:
+                    pred_coeff_norm = transformer_module._predict_coeffs(hidden, y)
+                    pred_coeff = transformer_module.denormalize_coeffs(pred_coeff_norm, y)
+                    coef_max = float(getattr(ae_decode.bottleneck, "coef_max", float("inf")))
+                    pred_coeff = pred_coeff.clamp(-coef_max, coef_max)
+                    target_coeff = coeff_flat.clamp(-coef_max, coef_max)
+                    pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                        y.view(B, H, W, D),
+                        pred_coeff.view(B, H, W, D),
+                    )
+                    with torch.no_grad():
+                        target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            y.view(B, H, W, D),
+                            target_coeff.view(B, H, W, D),
+                        )
+                    coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
                 loss = ce_loss + coeff_loss_weight * coeff_reg_loss
             else:
                 logits = transformer(x_in)
@@ -2779,7 +2952,7 @@ def train_stage2_transformer(
                     "ce": float(ce_log.item()),
                 }
                 if coeff_reg_log is not None:
-                    postfix["huber"] = float(coeff_reg_log.item())
+                    postfix[coeff_loss_type] = float(coeff_reg_log.item())
                 if real_valued and sched_sampling_final_prob > 0.0:
                     postfix["sched_p"] = float(sched_prob)
                 pbar.set_postfix(**postfix)
@@ -2789,10 +2962,17 @@ def train_stage2_transformer(
                     "stage2/epoch": epoch,
                 }
                 if coeff_reg_log is not None:
-                    log_payload["stage2/coeff_huber_loss"] = float(coeff_reg_log.item())
+                    log_payload["stage2/coeff_reg_loss"] = float(coeff_reg_log.item())
+                    log_payload["stage2/coeff_loss_type"] = coeff_loss_type
                     log_payload["stage2/coeff_loss_weight"] = coeff_loss_weight
-                    log_payload["stage2/coeff_huber_delta"] = coeff_huber_delta
                     log_payload["stage2/weighted_coeff_loss"] = float(coeff_loss_weight * coeff_reg_log.item())
+                    if coeff_loss_type == "mse":
+                        log_payload["stage2/coeff_mse_loss"] = float(coeff_reg_log.item())
+                    elif coeff_loss_type in {"recon_mse", "gt_atom_recon_mse"}:
+                        log_payload["stage2/recon_mse_loss"] = float(coeff_reg_log.item())
+                    else:
+                        log_payload["stage2/coeff_huber_loss"] = float(coeff_reg_log.item())
+                        log_payload["stage2/coeff_huber_delta"] = coeff_huber_delta
                 if real_valued and sched_sampling_final_prob > 0.0:
                     log_payload["stage2/sched_sampling_prob"] = float(sched_prob)
                 _log_wandb(
@@ -2922,10 +3102,48 @@ def main():
     )
 
     parser.add_argument("--stage1_epochs", type=int, default=5)
-    parser.add_argument("--stage1_lr", type=float, default=2e-3)
+    parser.add_argument("--stage1_lr", type=float, default=5e-4)
+    parser.add_argument(
+        "--stage1_dict_optimizer",
+        type=str,
+        default="shared_adam",
+        choices=["shared_adam", "separate_sgd"],
+        help="Stage-1 dictionary optimizer mode. 'shared_adam' is the stable default; 'separate_sgd' keeps the experimental split optimizer path.",
+    )
+    parser.add_argument(
+        "--stage1_dict_lr_multiplier",
+        type=float,
+        default=1.0,
+        help="Learning-rate multiplier used by the stage-1 dictionary SGD optimizer.",
+    )
     parser.add_argument("--stage1_lr_schedule", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--stage1_warmup_epochs", type=int, default=1)
     parser.add_argument("--stage1_min_lr_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--stage1_dict_lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["constant", "cosine"],
+        help="Learning-rate schedule used by the stage-1 dictionary optimizer.",
+    )
+    parser.add_argument(
+        "--stage1_dict_warmup_epochs",
+        type=int,
+        default=1,
+        help="Warmup epochs for the stage-1 dictionary LR schedule.",
+    )
+    parser.add_argument(
+        "--stage1_dict_min_lr_ratio",
+        type=float,
+        default=0.05,
+        help="Minimum LR ratio for the stage-1 dictionary cosine schedule.",
+    )
+    parser.add_argument(
+        "--stage1_dict_grad_clip",
+        type=float,
+        default=0.1,
+        help="Clip norm applied only to the stage-1 dictionary gradient after tangent projection (<=0 disables).",
+    )
     parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=2e-3)
     parser.add_argument(
@@ -2933,6 +3151,19 @@ def main():
         type=float,
         default=0.1,
         help="Weight applied to the real-valued coefficient regression term during stage-2 training.",
+    )
+    parser.add_argument(
+        "--stage2_coeff_loss_type",
+        type=str,
+        default="huber",
+        choices=["huber", "mse", "recon_mse", "gt_atom_recon_mse"],
+        help=(
+            "Auxiliary loss used with real-valued sparse coefficients during stage-2 training: "
+            "'huber'/'mse' regress normalized coefficients directly, while 'recon_mse' matches "
+            "the latent reconstruction induced by predicted atoms+coeffs to the ground-truth sparse-code reconstruction, "
+            "and 'gt_atom_recon_mse' matches the latent reconstruction induced by ground-truth atoms + predicted coeffs "
+            "to the ground-truth sparse-code reconstruction."
+        ),
     )
     parser.add_argument(
         "--stage2_coeff_norm_max",
@@ -2961,10 +3192,10 @@ def main():
     parser.add_argument("--ae_num_downsamples", type=int, default=4)
     parser.add_argument("--num_res_layers", type=int, default=2)
     parser.add_argument("--num_res_hiddens", type=int, default=32)
-    parser.add_argument("--embedding_dim", type=int, default=64,
+    parser.add_argument("--embedding_dim", type=int, default=16,
                         help="Latent channel depth. Must be > sparsity_level to keep OMP well-conditioned.")
-    parser.add_argument("--num_atoms", type=int, default=512)
-    parser.add_argument("--sparsity_level", type=int, default=3)
+    parser.add_argument("--num_atoms", type=int, default=1024)
+    parser.add_argument("--sparsity_level", type=int, default=8)
     parser.add_argument("--n_bins", type=int, default=256)
     parser.add_argument("--coef_max", type=float, default=3.0)
     parser.add_argument("--quantize_sparse_coeffs", type=bool, default=False)
@@ -3042,6 +3273,14 @@ def main():
         raise ValueError(f"coef_mu must be > 0 when coef_quantization='mu_law', got {args.coef_mu}")
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0.")
+    if args.stage1_dict_lr_multiplier <= 0.0:
+        raise ValueError("stage1_dict_lr_multiplier must be > 0.")
+    if args.stage1_dict_warmup_epochs < 0:
+        raise ValueError("stage1_dict_warmup_epochs must be >= 0.")
+    if not (0.0 <= args.stage1_dict_min_lr_ratio <= 1.0):
+        raise ValueError("stage1_dict_min_lr_ratio must be in [0, 1].")
+    if args.stage1_dict_grad_clip < 0.0:
+        raise ValueError("stage1_dict_grad_clip must be >= 0.")
     if args.stage2_coeff_loss_weight < 0.0:
         raise ValueError("stage2_coeff_loss_weight must be >= 0.")
     if args.stage2_coeff_norm_max <= 0.0:
@@ -3227,6 +3466,12 @@ def main():
             lr_schedule=args.stage1_lr_schedule,
             warmup_epochs=args.stage1_warmup_epochs,
             min_lr_ratio=args.stage1_min_lr_ratio,
+            dict_optimizer=args.stage1_dict_optimizer,
+            dict_lr_multiplier=args.stage1_dict_lr_multiplier,
+            dict_lr_schedule=args.stage1_dict_lr_schedule,
+            dict_warmup_epochs=args.stage1_dict_warmup_epochs,
+            dict_min_lr_ratio=args.stage1_dict_min_lr_ratio,
+            dict_grad_clip=args.stage1_dict_grad_clip,
             train_sampler=train_sampler,
             is_main_process=is_main_process,
             wandb_run=wandb_run,
@@ -3260,6 +3505,7 @@ def main():
     expected_token_meta = _expected_token_cache_meta(args, stage2_source_set, token_subset, laser)
     if is_main_process:
         cache_ready = False
+        current_cache_reason = None
         if (not args.rebuild_token_cache) and os.path.exists(token_cache_path):
             token_cache = _load_token_cache(token_cache_path)
             compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
@@ -3272,7 +3518,25 @@ def main():
                 )
                 cache_ready = True
             else:
-                print(f"[Stage2] rebuilding token cache ({reason})")
+                current_cache_reason = reason
+        if (not cache_ready) and (not args.rebuild_token_cache):
+            fallback_cache_path = _find_latest_stage2_token_cache(experiment_root, run_out_dir)
+            if fallback_cache_path is not None:
+                token_cache = _load_token_cache(str(fallback_cache_path))
+                compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
+                if compatible:
+                    shutil.copy2(fallback_cache_path, token_cache_path)
+                    tokens_flat = token_cache["tokens_flat"]
+                    H, W, D = token_cache["shape"]
+                    print(
+                        f"[Stage2] reusing prior token cache: {tokens_flat.shape} "
+                        f"(H={H}, W={W}, D={D}) from {fallback_cache_path}"
+                    )
+                    cache_ready = True
+                elif current_cache_reason is None:
+                    current_cache_reason = f"prior token cache incompatible ({reason})"
+        if (not cache_ready) and (not args.rebuild_token_cache) and current_cache_reason is not None:
+            print(f"[Stage2] rebuilding token cache ({current_cache_reason})")
         elif args.rebuild_token_cache:
             print("[Stage2] rebuilding token cache (--rebuild_token_cache)")
 
@@ -3380,6 +3644,7 @@ def main():
         epochs=args.stage2_epochs,
         lr=args.stage2_lr,
         coeff_loss_weight=args.stage2_coeff_loss_weight,
+        coeff_loss_type=args.stage2_coeff_loss_type,
         coeff_huber_delta=args.stage2_coeff_huber_delta,
         sched_sampling_final_prob=args.stage2_sched_sampling_final_prob,
         pad_token_id=laser.bottleneck.pad_token_id,
