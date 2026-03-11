@@ -3102,7 +3102,7 @@ def main():
     )
 
     parser.add_argument("--stage1_epochs", type=int, default=5)
-    parser.add_argument("--stage1_lr", type=float, default=5e-4)
+    parser.add_argument("--stage1_lr", type=float, default=2e-4)
     parser.add_argument(
         "--stage1_dict_optimizer",
         type=str,
@@ -3145,7 +3145,7 @@ def main():
         help="Clip norm applied only to the stage-1 dictionary gradient after tangent projection (<=0 disables).",
     )
     parser.add_argument("--stage2_epochs", type=int, default=100)
-    parser.add_argument("--stage2_lr", type=float, default=2e-3)
+    parser.add_argument("--stage2_lr", type=float, default=1e-3)
     parser.add_argument(
         "--stage2_coeff_loss_weight",
         type=float,
@@ -3155,7 +3155,7 @@ def main():
     parser.add_argument(
         "--stage2_coeff_loss_type",
         type=str,
-        default="huber",
+        default="gt_atom_recon_mse",
         choices=["huber", "mse", "recon_mse", "gt_atom_recon_mse"],
         help=(
             "Auxiliary loss used with real-valued sparse coefficients during stage-2 training: "
@@ -3183,8 +3183,8 @@ def main():
         default=0.25,
         help="Final probability of replacing previous stage-2 inputs with model predictions during training.",
     )
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--stage2_batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--stage2_batch_size", type=int, default=16)
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -3198,7 +3198,7 @@ def main():
     parser.add_argument("--sparsity_level", type=int, default=8)
     parser.add_argument("--n_bins", type=int, default=256)
     parser.add_argument("--coef_max", type=float, default=3.0)
-    parser.add_argument("--quantize_sparse_coeffs", type=bool, default=False)
+    parser.add_argument("--quantize_sparse_coeffs", type=bool, default=True)
     parser.add_argument("--coef_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
     parser.add_argument("--coef_mu", type=float, default=0.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
@@ -3229,9 +3229,9 @@ def main():
         help="Patch reconstruction mode: 'center_crop' (no averaging) or 'hann' (weighted overlap-add).",
     )
 
-    parser.add_argument("--tf_d_model", type=int, default=256)
+    parser.add_argument("--tf_d_model", type=int, default=512)
     parser.add_argument("--tf_heads", type=int, default=8)
-    parser.add_argument("--tf_layers", type=int, default=6)
+    parser.add_argument("--tf_layers", type=int, default=12)
     parser.add_argument("--tf_ff", type=int, default=1024)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument(
@@ -3252,14 +3252,14 @@ def main():
         help="Number of validation images used for stage-1 reconstruction FID (0 disables it).",
     )
     parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
-    parser.add_argument("--stage2_sample_batch_size", type=int, default=16)
+    parser.add_argument("--stage2_sample_batch_size", type=int, default=32)
     parser.add_argument(
         "--stage2_sample_candidate_factor",
         type=int,
         default=4,
         help="Generate this many times more stage-2 candidates and keep the ones closest to stage-1 image stats.",
     )
-    parser.add_argument("--stage2_sample_temperature", type=float, default=0.6)
+    parser.add_argument("--stage2_sample_temperature", type=float, default=0.5)
     parser.add_argument("--stage2_sample_top_k", type=int, default=0)
     parser.add_argument("--stage2_sample_image_size", type=int, default=128)
 
