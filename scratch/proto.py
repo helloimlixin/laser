@@ -16,6 +16,7 @@ import datetime
 import math
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -50,6 +51,14 @@ except Exception:
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CELEBA_DIR = (SCRIPT_DIR / "../../data/celeba").resolve()
+DEFAULT_STAGE1_SOURCE_RUN = "helloimlixin-rutgers/laser/4psikzda"
+DEFAULT_STAGE1_SOURCE_CKPT = (
+    SCRIPT_DIR / "runs" / "laser_celeba128_quantized" / "20260311_000321" / "stage1" / "ae_best.pt"
+).resolve()
+DEFAULT_STAGE2_SOURCE_RUN = "helloimlixin-rutgers/laser/q5l0g3jn"
+DEFAULT_STAGE2_SOURCE_TOKEN_CACHE = (
+    SCRIPT_DIR / "runs" / "laser_celeba128_quantized" / "20260311_112058" / "stage2" / "tokens_cache.pt"
+).resolve()
 
 
 def _default_image_size(dataset: str) -> int:
@@ -62,8 +71,13 @@ def _default_data_dir(dataset: str) -> Path:
     return (SCRIPT_DIR / "data").resolve()
 
 
-def _default_out_dir(dataset: str, image_size: int) -> Path:
-    return (SCRIPT_DIR / "runs" / f"laser_{dataset}{image_size}").resolve()
+def _default_run_name(dataset: str, image_size: int, quantized: bool) -> str:
+    suffix = "_quantized" if quantized else ""
+    return f"laser_{dataset}{image_size}{suffix}"
+
+
+def _default_out_dir(dataset: str, image_size: int, quantized: bool) -> Path:
+    return (SCRIPT_DIR / "runs" / _default_run_name(dataset, image_size, quantized)).resolve()
 
 
 def _broadcast_optional_string(value: Optional[str], src: int = 0) -> str:
@@ -114,6 +128,110 @@ def _find_latest_stage1_checkpoint(experiment_root: Path, current_run_dir: Path)
     return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
+def _resolve_stage1_checkpoint_from_wandb_run(run_path: str, cache_root: Path) -> Path:
+    """Resolve ae_best.pt from a W&B run via its recorded out_dir or uploaded files."""
+    run_ref = str(run_path).strip()
+    if not run_ref:
+        raise ValueError("stage1_source_run must not be empty")
+    if run_ref == DEFAULT_STAGE1_SOURCE_RUN and DEFAULT_STAGE1_SOURCE_CKPT.exists():
+        return DEFAULT_STAGE1_SOURCE_CKPT
+    if wandb is None:
+        raise RuntimeError("wandb is not installed; cannot resolve a stage-1 checkpoint from a W&B run")
+
+    api = wandb.Api()
+    run = api.run(run_ref)
+
+    out_dir = run.config.get("out_dir")
+    out_root = run.config.get("out_root")
+    launch_timestamp = run.config.get("launch_timestamp")
+    if out_dir:
+        out_dir_path = Path(str(out_dir)).expanduser().resolve()
+        local_candidates = (
+            out_dir_path / "stage1" / "ae_best.pt",
+            out_dir_path / "ae_best.pt",
+        )
+        for candidate in local_candidates:
+            if candidate.exists():
+                return candidate
+    if out_root and launch_timestamp:
+        candidate = Path(str(out_root)).expanduser().resolve() / str(launch_timestamp) / "stage1" / "ae_best.pt"
+        if candidate.exists():
+            return candidate
+
+    uploaded_file = None
+    for file_obj in run.files():
+        name = str(file_obj.name).replace("\\", "/")
+        if name == "ae_best.pt" or name.endswith("/ae_best.pt"):
+            uploaded_file = file_obj
+            break
+
+    if uploaded_file is not None:
+        download_root = cache_root / "wandb_stage1_ckpts" / run.entity / run.project / run.id
+        download_root.mkdir(parents=True, exist_ok=True)
+        downloaded = uploaded_file.download(root=str(download_root), replace=True, exist_ok=True)
+        downloaded_path = Path(downloaded.name).resolve()
+        downloaded.close()
+        return downloaded_path
+
+    raise FileNotFoundError(
+        f"Could not resolve stage-1 checkpoint for W&B run {run_ref}. "
+        f"Checked run.config['out_dir']={out_dir!r}, out_root={out_root!r}, "
+        f"launch_timestamp={launch_timestamp!r}, and uploaded run files for ae_best.pt."
+    )
+
+
+def _resolve_stage2_token_cache_from_wandb_run(run_path: str, cache_root: Path) -> Path:
+    """Resolve tokens_cache.pt from a W&B run via its recorded out_dir or uploaded files."""
+    run_ref = str(run_path).strip()
+    if not run_ref:
+        raise ValueError("stage2_source_run must not be empty")
+    if run_ref == DEFAULT_STAGE2_SOURCE_RUN and DEFAULT_STAGE2_SOURCE_TOKEN_CACHE.exists():
+        return DEFAULT_STAGE2_SOURCE_TOKEN_CACHE
+    if wandb is None:
+        raise RuntimeError("wandb is not installed; cannot resolve a stage-2 token cache from a W&B run")
+
+    api = wandb.Api()
+    run = api.run(run_ref)
+
+    out_dir = run.config.get("out_dir")
+    out_root = run.config.get("out_root")
+    launch_timestamp = run.config.get("launch_timestamp")
+    if out_dir:
+        out_dir_path = Path(str(out_dir)).expanduser().resolve()
+        local_candidates = (
+            out_dir_path / "stage2" / "tokens_cache.pt",
+            out_dir_path / "tokens_cache.pt",
+        )
+        for candidate in local_candidates:
+            if candidate.exists():
+                return candidate
+    if out_root and launch_timestamp:
+        candidate = Path(str(out_root)).expanduser().resolve() / str(launch_timestamp) / "stage2" / "tokens_cache.pt"
+        if candidate.exists():
+            return candidate
+
+    uploaded_file = None
+    for file_obj in run.files():
+        name = str(file_obj.name).replace("\\", "/")
+        if name == "tokens_cache.pt" or name.endswith("/tokens_cache.pt"):
+            uploaded_file = file_obj
+            break
+
+    if uploaded_file is not None:
+        download_root = cache_root / "wandb_stage2_token_caches" / run.entity / run.project / run.id
+        download_root.mkdir(parents=True, exist_ok=True)
+        downloaded = uploaded_file.download(root=str(download_root), replace=True, exist_ok=True)
+        downloaded_path = Path(downloaded.name).resolve()
+        downloaded.close()
+        return downloaded_path
+
+    raise FileNotFoundError(
+        f"Could not resolve stage-2 token cache for W&B run {run_ref}. "
+        f"Checked run.config['out_dir']={out_dir!r}, out_root={out_root!r}, "
+        f"launch_timestamp={launch_timestamp!r}, and uploaded run files for tokens_cache.pt."
+    )
+
+
 def _find_latest_stage2_token_cache(experiment_root: Path, current_run_dir: Path) -> Optional[Path]:
     """Find the newest prior stage-2 token cache under the experiment root."""
     candidates = []
@@ -136,7 +254,7 @@ def _find_latest_stage2_token_cache(experiment_root: Path, current_run_dir: Path
     return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
-def _init_distributed() -> Tuple[bool, int, int, int]:
+def _init_distributed(timeout_minutes: int) -> Tuple[bool, int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return False, 0, 0, 1
@@ -147,7 +265,10 @@ def _init_distributed() -> Tuple[bool, int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(minutes=int(timeout_minutes)),
+        )
     return True, rank, local_rank, world_size
 
 
@@ -167,6 +288,55 @@ def _barrier():
             dist.barrier(device_ids=[torch.cuda.current_device()])
         else:
             dist.barrier()
+
+
+def _unlink_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _write_atomic_text(path: Path, text: str) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+
+def _wait_for_file_signal(
+    ready_path: Path,
+    error_path: Optional[Path],
+    timeout_seconds: float,
+    description: str,
+    poll_interval: float = 1.0,
+) -> None:
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    while True:
+        if ready_path.exists():
+            return
+        if error_path is not None and error_path.exists():
+            try:
+                error_message = error_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                error_message = ""
+            if not error_message:
+                error_message = f"{description} failed on rank 0"
+            raise RuntimeError(error_message)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {description}. "
+                f"Expected ready signal at {ready_path} within {int(timeout_seconds)} seconds."
+            )
+        time.sleep(max(0.1, float(poll_interval)))
+
+
+def _load_module_checkpoint(module: nn.Module, checkpoint_path: Path) -> None:
+    try:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+    module.load_state_dict(state_dict)
 
 
 def _distributed_mean(value: torch.Tensor) -> torch.Tensor:
@@ -2066,6 +2236,70 @@ def _select_best_stage2_samples(
     return imgs.index_select(0, best)
 
 
+@torch.no_grad()
+def _decode_stage2_candidates_in_chunks(
+    ae: LASER,
+    tokens: torch.Tensor,
+    coeffs: Optional[torch.Tensor] = None,
+    decode_batch_size: int = 16,
+) -> torch.Tensor:
+    """Decode stage-2 preview candidates in small batches to limit GPU peak memory."""
+    total = int(tokens.size(0))
+    if total <= 0:
+        raise ValueError("Expected at least one stage-2 sample candidate to decode")
+
+    device = next(ae.parameters()).device
+    decode_batch_size = max(1, int(decode_batch_size))
+    while True:
+        imgs_all = []
+        tok = None
+        coeff = None
+        imgs = None
+        try:
+            for start in range(0, total, decode_batch_size):
+                end = min(total, start + decode_batch_size)
+                tok = tokens[start:end].to(device=device, dtype=torch.long)
+                if coeffs is not None:
+                    coeff = coeffs[start:end].to(device=device, dtype=torch.float32)
+                    imgs = ae.decode_from_atoms_and_coeffs(tok, coeff)
+                else:
+                    imgs = ae.decode_from_tokens(tok)
+                imgs_all.append(imgs.cpu())
+                del tok
+                tok = None
+                if coeff is not None:
+                    del coeff
+                    coeff = None
+                del imgs
+                imgs = None
+            return torch.cat(imgs_all, dim=0)
+        except torch.OutOfMemoryError:
+            if imgs is not None:
+                del imgs
+                imgs = None
+            if coeff is not None:
+                del coeff
+                coeff = None
+            if tok is not None:
+                del tok
+                tok = None
+            for cached_imgs in imgs_all:
+                del cached_imgs
+            imgs_all.clear()
+            if device.type != "cuda" or decode_batch_size <= 1:
+                raise
+            next_decode_batch_size = max(1, decode_batch_size // 2)
+            if next_decode_batch_size == decode_batch_size:
+                raise
+            torch.cuda.empty_cache()
+            print(
+                "[Stage2] CUDA OOM while decoding preview candidates "
+                f"with decode_batch_size={decode_batch_size}; retrying with "
+                f"decode_batch_size={next_decode_batch_size}"
+            )
+            decode_batch_size = next_decode_batch_size
+
+
 def _batch_psnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Average PSNR over a batch of images in [0, 1]."""
     mse = F.mse_loss(x, y, reduction="none").mean(dim=(1, 2, 3))
@@ -2983,16 +3217,25 @@ def train_stage2_transformer(
                 )
 
             if sample_every_steps > 0 and (global_step % sample_every_steps == 0):
+                opt.zero_grad(set_to_none=True)
                 _barrier()
                 if is_main_process:
                     transformer.eval()
                     ae_decode.eval()
-                    candidate_batch_size = max(sample_batch_size, sample_batch_size * sample_candidate_factor)
+                    candidate_batch_size = int(sample_batch_size)
+                    if sample_reference_stats is not None:
+                        candidate_batch_size = max(
+                            candidate_batch_size,
+                            int(sample_batch_size) * sample_candidate_factor,
+                        )
+                    decode_batch_size = max(1, min(8, int(sample_batch_size)))
                     print(
                         f"[Stage2] sampling at step {global_step} "
                         f"(keep={sample_batch_size}, candidates={candidate_batch_size})..."
                     )
                     with torch.no_grad():
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                         if real_valued:
                             flat_gen, coeffs_gen = transformer_module.generate_with_coeffs(
                                 batch_size=candidate_batch_size,
@@ -3001,9 +3244,19 @@ def train_stage2_transformer(
                                 show_progress=True,
                                 progress_desc=f"[Stage2] sample step {global_step}",
                             )
-                            atoms_gen = flat_gen.view(-1, H, W, D).to(device)
-                            coeffs_gen = coeffs_gen.view(-1, H, W, D).to(device)
-                            imgs = ae_decode.decode_from_atoms_and_coeffs(atoms_gen, coeffs_gen)
+                            atoms_gen = flat_gen.view(-1, H, W, D)
+                            coeffs_gen = coeffs_gen.view(-1, H, W, D)
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                            imgs = _decode_stage2_candidates_in_chunks(
+                                ae_decode,
+                                atoms_gen,
+                                coeffs=coeffs_gen,
+                                decode_batch_size=decode_batch_size,
+                            )
+                            del flat_gen
+                            del atoms_gen
+                            del coeffs_gen
                         else:
                             flat_gen = transformer_module.generate(
                                 batch_size=candidate_batch_size,
@@ -3013,7 +3266,15 @@ def train_stage2_transformer(
                                 progress_desc=f"[Stage2] sample step {global_step}",
                             )
                             tokens_gen = flat_gen.view(-1, H, W, D)
-                            imgs = ae_decode.decode_from_tokens(tokens_gen.to(device))
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                            imgs = _decode_stage2_candidates_in_chunks(
+                                ae_decode,
+                                tokens_gen,
+                                decode_batch_size=decode_batch_size,
+                            )
+                            del flat_gen
+                            del tokens_gen
                         imgs = _select_best_stage2_samples(
                             imgs,
                             keep=sample_batch_size,
@@ -3077,13 +3338,43 @@ def main():
     )
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--stage1_source_run",
+        type=str,
+        default=None,
+        help=(
+            "W&B run path to source the stage-1 ae_best.pt checkpoint from, "
+            "for example helloimlixin-rutgers/laser/4psikzda."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_source_run",
+        type=str,
+        default=None,
+        help=(
+            "W&B run path to source the stage-2 tokens_cache.pt from, "
+            "for example helloimlixin-rutgers/laser/q5l0g3jn."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_source_token_cache",
+        type=str,
+        default=None,
+        help="Local path to a stage-2 tokens_cache.pt to reuse before rebuilding.",
+    )
+    parser.add_argument(
+        "--dist_timeout_minutes",
+        type=int,
+        default=120,
+        help="Distributed process-group timeout in minutes. Increase this when only rank 0 is busy building a token cache.",
+    )
     parser.add_argument("--num_workers", type=int, default=4, help="Workers for image dataloaders.")
     parser.add_argument("--token_num_workers", type=int, default=0, help="Workers for token precompute.")
     parser.add_argument("--wandb", dest="wandb", action="store_true", default=True, help="Enable Weights & Biases logging.")
     parser.add_argument("--no_wandb", dest="wandb", action="store_false", help="Disable Weights & Biases logging.")
     parser.add_argument("--wandb_project", type=str, default="laser")
     parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_name", type=str, default="laser_celeba128")
+    parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_dir", type=str, default="./wandb")
 
@@ -3291,16 +3582,44 @@ def main():
         raise ValueError("stage2_sched_sampling_final_prob must be in [0, 1].")
     if args.token_subset < 0:
         args.token_subset = 0
+    if args.dist_timeout_minutes <= 0:
+        raise ValueError("dist_timeout_minutes must be > 0.")
+    if args.stage1_source_run is not None:
+        args.stage1_source_run = str(args.stage1_source_run).strip()
+        if not args.stage1_source_run:
+            args.stage1_source_run = None
+    stage1_init_source_run = args.stage1_source_run
+    if stage1_init_source_run is None and args.stage1_epochs > 0:
+        stage1_init_source_run = DEFAULT_STAGE1_SOURCE_RUN
+    if args.stage1_source_run is None and args.stage1_epochs <= 0:
+        args.stage1_source_run = DEFAULT_STAGE1_SOURCE_RUN
+    if args.stage2_source_run is not None:
+        args.stage2_source_run = str(args.stage2_source_run).strip()
+        if not args.stage2_source_run:
+            args.stage2_source_run = None
+    if args.stage2_source_token_cache is not None:
+        args.stage2_source_token_cache = str(args.stage2_source_token_cache).strip()
+        if not args.stage2_source_token_cache:
+            args.stage2_source_token_cache = None
+    if (
+        args.stage2_source_run is None
+        and args.stage2_source_token_cache is None
+        and args.stage1_epochs <= 0
+        and args.stage1_source_run == DEFAULT_STAGE1_SOURCE_RUN
+    ):
+        args.stage2_source_run = DEFAULT_STAGE2_SOURCE_RUN
     if args.image_size is None:
         args.image_size = _default_image_size(args.dataset)
     args.image_size = int(args.image_size)
     if args.data_dir is None:
         args.data_dir = str(_default_data_dir(args.dataset))
+    if args.wandb_name is None:
+        args.wandb_name = _default_run_name(args.dataset, args.image_size, args.quantize_sparse_coeffs)
     if args.out_dir is None:
-        args.out_dir = str(_default_out_dir(args.dataset, args.image_size))
+        args.out_dir = str(_default_out_dir(args.dataset, args.image_size, args.quantize_sparse_coeffs))
     experiment_root = Path(args.out_dir).expanduser().resolve()
 
-    distributed, rank, local_rank, world_size = _init_distributed()
+    distributed, rank, local_rank, world_size = _init_distributed(args.dist_timeout_minutes)
     is_main_process = (rank == 0)
     launch_timestamp = _launch_timestamp()
     run_out_dir = _resolve_run_out_dir(str(experiment_root), launch_timestamp)
@@ -3359,6 +3678,7 @@ def main():
             commitment_cost=args.commitment_cost,
             n_bins=args.n_bins,
             coef_max=args.coef_max,
+            quantize_sparse_coeffs=args.quantize_sparse_coeffs,
             coef_quantization=args.coef_quantization,
             coef_mu=args.coef_mu,
             out_tanh=True,
@@ -3368,9 +3688,53 @@ def main():
             patch_reconstruction=args.patch_reconstruction,
         )
 
+    def _prepare_stage1_source_checkpoint(run_ref: str) -> Path:
+        ready_path = Path(stage1_dir) / "stage1_source.ready"
+        error_path = Path(stage1_dir) / "stage1_source.failed"
+        path_record = Path(stage1_dir) / "stage1_source.path"
+        description = f"stage-1 source checkpoint for W&B run {run_ref}"
+        if is_main_process:
+            _unlink_if_exists(ready_path)
+            _unlink_if_exists(error_path)
+            _unlink_if_exists(path_record)
+            try:
+                source_path = _resolve_stage1_checkpoint_from_wandb_run(run_ref, run_out_dir)
+                _write_atomic_text(path_record, f"{source_path}\n")
+                _write_atomic_text(
+                    ready_path,
+                    f"ready {datetime.datetime.now().isoformat()} {source_path}\n",
+                )
+            except Exception as exc:
+                _write_atomic_text(
+                    error_path,
+                    f"[Stage1] source checkpoint preparation failed: {type(exc).__name__}: {exc}\n",
+                )
+                raise
+        elif distributed:
+            _wait_for_file_signal(
+                ready_path,
+                error_path,
+                timeout_seconds=max(60.0, float(args.dist_timeout_minutes) * 60.0),
+                description=description,
+            )
+        try:
+            source_path = Path(path_record.read_text(encoding="utf-8").strip()).expanduser().resolve()
+        except OSError as exc:
+            raise RuntimeError(f"Could not read prepared source checkpoint path from {path_record}: {exc}") from exc
+        if not source_path.exists():
+            raise FileNotFoundError(f"Prepared stage-1 source checkpoint does not exist: {source_path}")
+        return source_path
+
     def _load_best_laser_weights(laser_model: LASER):
         best_path = Path(stage1_dir) / "ae_best.pt"
-        if not best_path.exists():
+        if best_path.exists():
+            if is_main_process and args.stage1_epochs > 0:
+                print(f"[Stage1] loading trained checkpoint from current run: {best_path}")
+        elif args.stage1_epochs <= 0 and args.stage1_source_run is not None:
+            best_path = _prepare_stage1_source_checkpoint(args.stage1_source_run)
+            if is_main_process:
+                print(f"[Stage1] using checkpoint from W&B run {args.stage1_source_run}: {best_path}")
+        else:
             fallback_path = _find_latest_stage1_checkpoint(experiment_root, run_out_dir)
             if fallback_path is None:
                 raise FileNotFoundError(
@@ -3380,11 +3744,7 @@ def main():
             if is_main_process:
                 print(f"[Stage1] reusing prior checkpoint from {fallback_path}")
             best_path = fallback_path
-        try:
-            state_dict = torch.load(best_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            state_dict = torch.load(best_path, map_location="cpu")
-        laser_model.load_state_dict(state_dict)
+        _load_module_checkpoint(laser_model, best_path)
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     train_tfm = transforms.Compose([
@@ -3449,6 +3809,11 @@ def main():
         )
 
     laser = _build_laser().to(device)
+    if stage1_init_source_run is not None:
+        stage1_init_path = _prepare_stage1_source_checkpoint(stage1_init_source_run)
+        if is_main_process:
+            print(f"[Stage1] warm-starting from W&B run {stage1_init_source_run}: {stage1_init_path}")
+        _load_module_checkpoint(laser, stage1_init_path)
     laser_stage1 = DDP(laser, device_ids=[local_rank], output_device=local_rank) if distributed else laser
     if args.stage1_epochs > 0:
         train_stage1_ae(
@@ -3500,72 +3865,144 @@ def main():
         _cleanup_distributed()
         return
 
-    token_cache_path = os.path.join(stage2_dir, "tokens_cache.pt")
+    token_cache_path = Path(stage2_dir) / "tokens_cache.pt"
+    token_cache_ready_path = Path(stage2_dir) / "tokens_cache.ready"
+    token_cache_error_path = Path(stage2_dir) / "tokens_cache.failed"
     token_subset = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
     expected_token_meta = _expected_token_cache_meta(args, stage2_source_set, token_subset, laser)
-    if is_main_process:
-        cache_ready = False
-        current_cache_reason = None
-        if (not args.rebuild_token_cache) and os.path.exists(token_cache_path):
-            token_cache = _load_token_cache(token_cache_path)
-            compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
-            if compatible:
-                tokens_flat = token_cache["tokens_flat"]
-                H, W, D = token_cache["shape"]
-                print(
-                    f"[Stage2] reusing token cache: {tokens_flat.shape} "
-                    f"(H={H}, W={W}, D={D}) from {token_cache_path}"
-                )
-                cache_ready = True
-            else:
-                current_cache_reason = reason
-        if (not cache_ready) and (not args.rebuild_token_cache):
-            fallback_cache_path = _find_latest_stage2_token_cache(experiment_root, run_out_dir)
-            if fallback_cache_path is not None:
-                token_cache = _load_token_cache(str(fallback_cache_path))
-                compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
-                if compatible:
-                    shutil.copy2(fallback_cache_path, token_cache_path)
-                    tokens_flat = token_cache["tokens_flat"]
-                    H, W, D = token_cache["shape"]
-                    print(
-                        f"[Stage2] reusing prior token cache: {tokens_flat.shape} "
-                        f"(H={H}, W={W}, D={D}) from {fallback_cache_path}"
-                    )
-                    cache_ready = True
-                elif current_cache_reason is None:
-                    current_cache_reason = f"prior token cache incompatible ({reason})"
-        if (not cache_ready) and (not args.rebuild_token_cache) and current_cache_reason is not None:
-            print(f"[Stage2] rebuilding token cache ({current_cache_reason})")
-        elif args.rebuild_token_cache:
-            print("[Stage2] rebuilding token cache (--rebuild_token_cache)")
-
-        if not cache_ready:
-            token_source_loader = DataLoader(
-                stage2_source_set,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.token_num_workers,
-                pin_memory=pin_memory,
-                persistent_workers=(args.token_num_workers > 0),
-            )
-            tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
-                laser,
-                token_source_loader,
-                device,
-                max_items=token_subset,
-            )
-            cache = {
-                "tokens_flat": tokens_flat,
-                "shape": (H, W, D),
-                "meta": expected_token_meta,
-            }
-            if coeffs_flat is not None:
-                cache["coeffs_flat"] = coeffs_flat
-            torch.save(cache, token_cache_path)
-            print(f"[Stage2] token dataset: {tokens_flat.shape} (H={H}, W={W}, D={D})")
     _barrier()
-    token_cache = _load_token_cache(token_cache_path)
+    if is_main_process:
+        _unlink_if_exists(token_cache_ready_path)
+        _unlink_if_exists(token_cache_error_path)
+        try:
+            cache_ready = False
+            current_cache_reason = None
+            requested_token_cache_path = None
+            requested_token_cache_desc = None
+            if not args.rebuild_token_cache:
+                if args.stage2_source_token_cache is not None:
+                    requested_token_cache_path = Path(args.stage2_source_token_cache).expanduser().resolve()
+                    if not requested_token_cache_path.exists():
+                        raise FileNotFoundError(
+                            f"Requested stage-2 token cache does not exist: {requested_token_cache_path}"
+                        )
+                    requested_token_cache_desc = f"local path {requested_token_cache_path}"
+                elif args.stage2_source_run is not None:
+                    requested_token_cache_path = _resolve_stage2_token_cache_from_wandb_run(
+                        args.stage2_source_run,
+                        run_out_dir,
+                    )
+                    requested_token_cache_desc = f"W&B run {args.stage2_source_run}"
+
+            if (not cache_ready) and (not args.rebuild_token_cache) and requested_token_cache_path is not None:
+                try:
+                    token_cache = _load_token_cache(str(requested_token_cache_path))
+                    compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
+                    if compatible:
+                        if requested_token_cache_path.resolve() != token_cache_path.resolve():
+                            shutil.copy2(requested_token_cache_path, token_cache_path)
+                        tokens_flat = token_cache["tokens_flat"]
+                        H, W, D = token_cache["shape"]
+                        print(
+                            f"[Stage2] using token cache from {requested_token_cache_desc}: "
+                            f"{tokens_flat.shape} (H={H}, W={W}, D={D}) at {requested_token_cache_path}"
+                        )
+                        cache_ready = True
+                    else:
+                        current_cache_reason = (
+                            f"requested token cache from {requested_token_cache_desc} incompatible ({reason})"
+                        )
+                except Exception as exc:
+                    current_cache_reason = (
+                        f"could not load requested token cache from {requested_token_cache_desc} "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+            if (not cache_ready) and (not args.rebuild_token_cache) and requested_token_cache_path is None:
+                try:
+                    if token_cache_path.exists():
+                        token_cache = _load_token_cache(str(token_cache_path))
+                        compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
+                        if compatible:
+                            tokens_flat = token_cache["tokens_flat"]
+                            H, W, D = token_cache["shape"]
+                            print(
+                                f"[Stage2] reusing token cache: {tokens_flat.shape} "
+                                f"(H={H}, W={W}, D={D}) from {token_cache_path}"
+                            )
+                            cache_ready = True
+                        else:
+                            current_cache_reason = reason
+                except Exception as exc:
+                    current_cache_reason = f"could not load current token cache ({type(exc).__name__}: {exc})"
+            if (not cache_ready) and (not args.rebuild_token_cache) and requested_token_cache_path is None:
+                fallback_cache_path = _find_latest_stage2_token_cache(experiment_root, run_out_dir)
+                if fallback_cache_path is not None:
+                    try:
+                        token_cache = _load_token_cache(str(fallback_cache_path))
+                        compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
+                        if compatible:
+                            shutil.copy2(fallback_cache_path, token_cache_path)
+                            tokens_flat = token_cache["tokens_flat"]
+                            H, W, D = token_cache["shape"]
+                            print(
+                                f"[Stage2] reusing prior token cache: {tokens_flat.shape} "
+                                f"(H={H}, W={W}, D={D}) from {fallback_cache_path}"
+                            )
+                            cache_ready = True
+                        elif current_cache_reason is None:
+                            current_cache_reason = f"prior token cache incompatible ({reason})"
+                    except Exception as exc:
+                        if current_cache_reason is None:
+                            current_cache_reason = (
+                                f"could not load prior token cache ({type(exc).__name__}: {exc})"
+                            )
+            if (not cache_ready) and (not args.rebuild_token_cache) and current_cache_reason is not None:
+                print(f"[Stage2] rebuilding token cache ({current_cache_reason})")
+            elif args.rebuild_token_cache:
+                print("[Stage2] rebuilding token cache (--rebuild_token_cache)")
+
+            if not cache_ready:
+                token_source_loader = DataLoader(
+                    stage2_source_set,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=args.token_num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=(args.token_num_workers > 0),
+                )
+                tokens_flat, coeffs_flat, H, W, D = precompute_tokens(
+                    laser,
+                    token_source_loader,
+                    device,
+                    max_items=token_subset,
+                )
+                cache = {
+                    "tokens_flat": tokens_flat,
+                    "shape": (H, W, D),
+                    "meta": expected_token_meta,
+                }
+                if coeffs_flat is not None:
+                    cache["coeffs_flat"] = coeffs_flat
+                torch.save(cache, str(token_cache_path))
+                print(f"[Stage2] token dataset: {tokens_flat.shape} (H={H}, W={W}, D={D})")
+            _write_atomic_text(
+                token_cache_ready_path,
+                f"ready {datetime.datetime.now().isoformat()} {token_cache_path}\n",
+            )
+        except Exception as exc:
+            _write_atomic_text(
+                token_cache_error_path,
+                f"[Stage2] token cache preparation failed: {type(exc).__name__}: {exc}\n",
+            )
+            raise
+    else:
+        _wait_for_file_signal(
+            token_cache_ready_path,
+            token_cache_error_path,
+            timeout_seconds=max(60.0, float(args.dist_timeout_minutes) * 60.0),
+            description=f"stage-2 token cache at {token_cache_path}",
+        )
+    token_cache = _load_token_cache(str(token_cache_path))
     tokens_flat = token_cache["tokens_flat"]
     coeffs_flat = token_cache.get("coeffs_flat", None)
     H, W, D = token_cache["shape"]
