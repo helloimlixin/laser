@@ -11,16 +11,16 @@ The file implements a two-stage generative model:
 
 The basic pipeline is
 
-$$
+```math
 x \xrightarrow{E_\theta} z_e \xrightarrow{\text{sparse bottleneck}} z_q \xrightarrow{G_\psi} \hat x
-$$
+```
 
 for stage 1, and then
 
-$$
+```math
 \text{stage-1 sparse codes} \xrightarrow{\text{flatten}} y_{1:T}
 \xrightarrow{\text{Transformer prior}} p(y_{1:T})
-$$
+```
 
 for stage 2.
 
@@ -41,17 +41,17 @@ Let
 
 For the patch-based case, the dictionary lives in a higher-dimensional patch space:
 
-$$
+```math
 D_p \in \mathbb{R}^{(C p^2) \times K},
-$$
+```
 
 where $p$ is the latent patch size.
 
 The latent sequence modeled by the transformer has length
 
-$$
+```math
 T = HWD_t,
-$$
+```
 
 where $D_t$ is the token depth per spatial location:
 
@@ -64,13 +64,13 @@ where $D_t$ is the token depth per spatial location:
 
 The encoder-decoder pair is a multiscale convolutional autoencoder with residual blocks and optional attention. The exact layer topology is not the main conceptual point. Mathematically, it simply defines two maps:
 
-$$
+```math
 E_\theta : \mathbb{R}^{3 \times R \times R} \to \mathbb{R}^{C \times H \times W},
-$$
+```
 
-$$
+```math
 G_\psi : \mathbb{R}^{C \times H \times W} \to \mathbb{R}^{3 \times R \times R}.
-$$
+```
 
 The important constraint is what happens between them: the dense latent $z_e$ is projected onto a sparse dictionary model before decoding.
 
@@ -78,15 +78,15 @@ The important constraint is what happens between them: the dense latent $z_e$ is
 
 In the non-patch formulation, each spatial latent vector
 
-$$
+```math
 z_e(u) \in \mathbb{R}^C, \qquad u \in \{1,\dots,H\} \times \{1,\dots,W\}
-$$
+```
 
 is represented as a sparse linear combination of atoms:
 
-$$
+```math
 z_q(u) = \sum_{j=1}^{s} a_j(u)\, d_{i_j(u)},
-$$
+```
 
 where
 
@@ -96,13 +96,13 @@ where
 
 Equivalently, if $\alpha(u) \in \mathbb{R}^K$ is a sparse coefficient vector, then
 
-$$
+```math
 z_q(u) = D \alpha(u), \qquad \|\alpha(u)\|_0 \le s.
-$$
+```
 
 The sparse coding problem at each site is
 
-$$
+```math
 \alpha^*(u)
 =
 \arg\min_{\alpha \in \mathbb{R}^K}
@@ -111,7 +111,7 @@ $$
 \text{subject to}
 \quad
 \|\alpha\|_0 \le s.
-$$
+```
 
 This is the core representation learned by the model.
 
@@ -121,38 +121,38 @@ The sparse approximation is computed with batched Orthogonal Matching Pursuit (O
 
 Given a signal $z \in \mathbb{R}^C$, initialize
 
-$$
+```math
 r^{(0)} = z, \qquad S^{(0)} = \emptyset.
-$$
+```
 
 At iteration $m = 1,\dots,s$:
 
 1. Select the atom with largest correlation to the current residual:
 
-$$
-k^{(m)} = \arg\max_{k \notin S^{(m-1)}} |d_k^\top r^{(m-1)}|.
-$$
+   ```math
+   k^{(m)} = \arg\max_{k \notin S^{(m-1)}} |d_k^\top r^{(m-1)}|.
+   ```
 
 2. Expand the support:
 
-$$
-S^{(m)} = S^{(m-1)} \cup \{k^{(m)}\}.
-$$
+   ```math
+   S^{(m)} = S^{(m-1)} \cup \{k^{(m)}\}.
+   ```
 
 3. Refit the coefficients on the active support:
 
-$$
-\alpha_{S^{(m)}}^{(m)}
-=
-\arg\min_{\beta}
-\|z - D_{S^{(m)}} \beta\|_2^2.
-$$
+   ```math
+   \alpha_{S^{(m)}}^{(m)}
+   =
+   \arg\min_{\beta}
+   \|z - D_{S^{(m)}} \beta\|_2^2.
+   ```
 
 4. Update the residual:
 
-$$
-r^{(m)} = z - D_{S^{(m)}} \alpha_{S^{(m)}}^{(m)}.
-$$
+   ```math
+   r^{(m)} = z - D_{S^{(m)}} \alpha_{S^{(m)}}^{(m)}.
+   ```
 
 After $s$ steps, OMP returns a support of size exactly $s$ and aligned coefficients.
 
@@ -167,9 +167,9 @@ That second point removes arbitrary solver order and makes the tokenization more
 
 The dictionary atoms are constrained to unit norm:
 
-$$
+```math
 \|d_k\|_2 = 1 \quad \text{for all } k.
-$$
+```
 
 This matters because it separates direction from magnitude:
 
@@ -180,9 +180,9 @@ If atom norms were unconstrained, scale could drift between atoms and coefficien
 
 The implementation monitors dictionary coherence, which is the largest absolute off-diagonal cosine similarity:
 
-$$
+```math
 \mu(D) = \max_{i \ne j} |d_i^\top d_j|.
-$$
+```
 
 Low coherence is generally desirable for sparse coding because highly aligned atoms make support selection less stable.
 
@@ -192,23 +192,23 @@ The sparse coding map itself is non-differentiable in practice because OMP invol
 
 Let $z_q$ be the sparse reconstruction obtained from OMP. The latent passed to the decoder is
 
-$$
+```math
 z_{\text{ste}} = z_e + \operatorname{sg}(z_q - z_e),
-$$
+```
 
 where $\operatorname{sg}$ denotes stop-gradient.
 
 Forward pass:
 
-$$
+```math
 z_{\text{ste}} = z_q.
-$$
+```
 
 Backward pass:
 
-$$
+```math
 \frac{\partial z_{\text{ste}}}{\partial z_e} = I.
-$$
+```
 
 So the decoder sees the sparse-projected latent, while the encoder receives an identity-style backward signal through the bottleneck.
 
@@ -223,49 +223,49 @@ The stage-1 loss has two parts:
 
 The image reconstruction term is
 
-$$
+```math
 \mathcal{L}_{\text{recon}}
 =
 \| \hat x - x \|_2^2,
 \qquad
 \hat x = G_\psi(z_{\text{ste}}).
-$$
+```
 
 The bottleneck term has a dictionary-side part and an encoder-side commitment part:
 
-$$
+```math
 \mathcal{L}_{\text{dict}}
 =
 \| z_q - \operatorname{sg}(z_e) \|_2^2,
-$$
+```
 
-$$
+```math
 \mathcal{L}_{\text{commit}}
 =
 \| \operatorname{sg}(z_q) - z_e \|_2^2.
-$$
+```
 
 The bottleneck loss is
 
-$$
+```math
 \mathcal{L}_{\text{bottleneck}}
 =
 \mathcal{L}_{\text{dict}}
 +
 \beta \mathcal{L}_{\text{commit}},
-$$
+```
 
 where $\beta$ is the commitment weight.
 
 The full stage-1 objective is
 
-$$
+```math
 \mathcal{L}_{\text{stage1}}
 =
 \mathcal{L}_{\text{recon}}
 +
 \lambda_b \mathcal{L}_{\text{bottleneck}},
-$$
+```
 
 where $\lambda_b$ is the external bottleneck weight.
 
@@ -295,9 +295,9 @@ Stage 2 does not see dense latents. It sees a tokenized version of the sparse re
 
 At each latent site $u$, the sparse code consists of
 
-$$
+```math
 \{(i_1(u), a_1(u)), \dots, (i_s(u), a_s(u))\}.
-$$
+```
 
 There are two ways to expose this to the transformer.
 
@@ -305,23 +305,23 @@ There are two ways to expose this to the transformer.
 
 In the real-valued regime, only the atom identities are discretized into tokens:
 
-$$
+```math
 t_j(u) = i_j(u), \qquad j=1,\dots,s.
-$$
+```
 
 The coefficients remain continuous side information:
 
-$$
+```math
 c_j(u) = a_j(u).
-$$
+```
 
 So each spatial location emits $s$ discrete tokens and $s$ real-valued scalars.
 
 The stage-2 sequence length becomes
 
-$$
+```math
 T = HWs.
-$$
+```
 
 The vocabulary contains:
 
@@ -333,21 +333,21 @@ The vocabulary contains:
 
 In the quantized regime, each coefficient is itself discretized into one of $B$ bins:
 
-$$
+```math
 q(a_j(u)) \in \{1,\dots,B\}.
-$$
+```
 
 The token stream alternates atom identity and coefficient bin:
 
-$$
+```math
 (i_1(u), q(a_1(u)), i_2(u), q(a_2(u)), \dots, i_s(u), q(a_s(u))).
-$$
+```
 
 So each location emits $2s$ tokens and the sequence length becomes
 
-$$
+```math
 T = HW(2s).
-$$
+```
 
 The vocabulary contains:
 
@@ -362,9 +362,9 @@ This converts stage 2 into a purely discrete sequence-modeling problem.
 
 When coefficients are used as decoder inputs in the real-valued regime, they are projected into a bounded interval:
 
-$$
+```math
 \Pi_{[-c_{\max}, c_{\max}]}(a) = \min(\max(a,-c_{\max}), c_{\max}).
-$$
+```
 
 This means the decoder is trained and sampled on a bounded sparse-code manifold rather than an unbounded regression target.
 
@@ -378,15 +378,15 @@ When the quantized regime is used, the model supports two coefficient discretiza
 
 Let $a \in [-c_{\max}, c_{\max}]$. The uniform map is
 
-$$
+```math
 u(a) = \frac{a + c_{\max}}{2c_{\max}} \in [0,1],
-$$
+```
 
 followed by discretization into $B$ bins:
 
-$$
+```math
 b(a) = \operatorname{round}\left(u(a)(B-1)\right).
-$$
+```
 
 Decoding maps the bin index back to a fixed bin center.
 
@@ -394,18 +394,18 @@ Decoding maps the bin index back to a fixed bin center.
 
 To allocate more resolution near zero, the model also supports mu-law companding. Define the normalized coefficient
 
-$$
+```math
 \bar a = a / c_{\max} \in [-1,1].
-$$
+```
 
 Then apply
 
-$$
+```math
 f_\mu(\bar a)
 =
 \operatorname{sign}(\bar a)
 \frac{\log(1 + \mu |\bar a|)}{\log(1+\mu)}.
-$$
+```
 
 This companded value is quantized uniformly in $[-1,1]$, then inverted at decode time.
 
@@ -419,15 +419,15 @@ The file also implements a patch-based sparse bottleneck. Here the sparse object
 
 Let
 
-$$
+```math
 P_u(z_e) \in \mathbb{R}^{Cp^2}
-$$
+```
 
 be the flattened latent patch centered around location $u$, with patch size $p$ and stride $r$.
 
 For each patch, the sparse coding problem becomes
 
-$$
+```math
 \alpha^*(u)
 =
 \arg\min_{\alpha}
@@ -436,13 +436,13 @@ $$
 \text{subject to}
 \quad
 \|\alpha\|_0 \le s.
-$$
+```
 
 The reconstructed patch is
 
-$$
+```math
 \hat P_u = D_p \alpha^*(u).
-$$
+```
 
 So the dictionary now lives in patch space rather than per-site latent-vector space.
 
@@ -465,15 +465,15 @@ Two overlap rules are implemented mathematically.
 
 Each reconstructed patch contributes only its central $r \times r$ region. If the patch size is $p$ and stride is $r$, define the crop margin
 
-$$
+```math
 c = \frac{p-r}{2}.
-$$
+```
 
 Then each reconstructed patch $\hat P_u$ is reshaped into a $C \times p \times p$ tensor, cropped to
 
-$$
+```math
 \hat P_u[:, c:c+r, c:c+r],
-$$
+```
 
 and tiled into the output grid without averaging.
 
@@ -483,17 +483,17 @@ This makes every output latent pixel come from exactly one patch center.
 
 Let $w \in \mathbb{R}^{p \times p}$ be a separable Hann window. Each reconstructed patch is weighted by $w$ and overlap-added:
 
-$$
+```math
 \tilde z = \sum_u W_u \odot \hat P_u,
-$$
+```
 
 where $W_u$ is the shifted window at patch location $u$.
 
 The final reconstruction divides by the accumulated weight map:
 
-$$
+```math
 z_q = \frac{\sum_u W_u \odot \hat P_u}{\sum_u W_u + \varepsilon}.
-$$
+```
 
 This is a weighted partition-of-unity style reconstruction. It is smoother than naive averaging and behaves especially well at 50 percent overlap.
 
@@ -505,17 +505,17 @@ Once stage 1 is trained, it defines a sparse-code distribution over the training
 
 The sparse code tensor has shape
 
-$$
+```math
 H \times W \times D_t,
-$$
+```
 
 where $D_t$ is the token depth per spatial position.
 
 Flattening gives a sequence
 
-$$
+```math
 y_{1:T}, \qquad T = H W D_t.
-$$
+```
 
 The ordering is raster order over spatial sites with the sparse-slot depth varying within each site.
 
@@ -525,26 +525,26 @@ This matters because the transformer is not invariant to flattening order. The c
 
 In the purely discrete case, the model is simply
 
-$$
+```math
 p(y_{1:T}) = \prod_{t=1}^{T} p(y_t \mid y_{<t}).
-$$
+```
 
 In the real-valued coefficient case, the stage-2 representation consists of atoms and coefficients:
 
-$$
+```math
 (a_1,c_1), \dots, (a_T,c_T).
-$$
+```
 
 The model factorizes this as
 
-$$
+```math
 p(a_{1:T}, c_{1:T})
 =
 \prod_{t=1}^{T}
 p(a_t \mid a_{<t}, c_{<t})
 \,
 p(c_t \mid a_t, a_{<t}, c_{<t}).
-$$
+```
 
 This is the key probabilistic design choice of the real-valued path.
 
@@ -563,7 +563,7 @@ Each sequence position corresponds to:
 
 If position $t$ corresponds to spatial index $s(t)$ and depth slot $d(t)$, then the input embedding is conceptually
 
-$$
+```math
 e_t
 =
 e_{\text{token}}(y_t)
@@ -573,7 +573,7 @@ e_{\text{space}}(s(t))
 e_{\text{depth}}(d(t))
 +
 e_{\text{type}}(t).
-$$
+```
 
 The type embedding distinguishes the BOS position from regular content positions. The spatial and depth embeddings tell the transformer where a token lies in the latent grid and which sparse slot it represents.
 
@@ -587,23 +587,23 @@ In the quantized regime, stage 2 is a standard categorical autoregressive model.
 
 Let $y_t$ be the next token. The transformer produces logits $\ell_t \in \mathbb{R}^V$ over the vocabulary. The model distribution is
 
-$$
+```math
 p(y_t = v \mid y_{<t})
 =
 \frac{\exp(\ell_{t,v})}{\sum_{v'} \exp(\ell_{t,v'})}.
-$$
+```
 
 ### 8.2 Loss
 
 Training minimizes the negative log-likelihood:
 
-$$
+```math
 \mathcal{L}_{\text{CE}}
 =
 -
 \sum_{t=1}^{T}
 \log p(y_t \mid y_{<t}).
-$$
+```
 
 In practice this is the usual cross-entropy over the shifted sequence.
 
@@ -626,21 +626,21 @@ The real-valued path is more interesting mathematically.
 
 At training time, the transformer receives a shifted atom sequence
 
-$$
+```math
 [\text{BOS}, a_1, a_2, \dots, a_{T-1}]
-$$
+```
 
 and a shifted coefficient sequence
 
-$$
+```math
 [0, c_1, c_2, \dots, c_{T-1}].
-$$
+```
 
 The hidden state at time $t$ therefore summarizes
 
-$$
+```math
 (a_{<t}, c_{<t}).
-$$
+```
 
 From that hidden state the model predicts:
 
@@ -653,7 +653,7 @@ The coefficient regression problem is made easier by normalizing coefficients se
 
 For atom $k$, compute empirical statistics $(\mu_k, \sigma_k)$ from stage-1 sparse codes. Then the normalized coefficient target is
 
-$$
+```math
 \tilde c_t
 =
 \operatorname{clip}
@@ -662,17 +662,17 @@ $$
 -M,
 M
 \right),
-$$
+```
 
 where $M$ is a fixed normalization bound.
 
 The model predicts $\hat{\tilde c}_t$, and decoding maps it back via
 
-$$
+```math
 \hat c_t
 =
 \hat{\tilde c}_t \sigma_{a_t} + \mu_{a_t}.
-$$
+```
 
 This is a strong modeling choice. The coefficient head is not asked to learn one global scalar distribution for all atoms. Instead, it learns residual variation after atom-specific centering and scaling.
 
@@ -685,15 +685,15 @@ Let $h_t$ be the transformer hidden state before the output heads. The coefficie
 
 So the coefficient map is conceptually
 
-$$
+```math
 \hat{\tilde c}_t = f_{\text{coeff}}(h_t, e(a_t)).
-$$
+```
 
 This matches the factorization
 
-$$
+```math
 p(c_t \mid a_t, a_{<t}, c_{<t}).
-$$
+```
 
 Without conditioning on $a_t$, the scalar regression target would mix the statistics of all atoms and become substantially less coherent.
 
@@ -705,12 +705,12 @@ The real-valued path always includes atom cross-entropy and then adds one auxili
 
 The categorical term is
 
-$$
+```math
 \mathcal{L}_{\text{atom}}
 =
 -
 \sum_{t=1}^{T} \log p(a_t \mid a_{<t}, c_{<t}).
-$$
+```
 
 ### 10.2 Direct coefficient regression
 
@@ -718,20 +718,20 @@ Two direct scalar objectives are supported.
 
 Mean squared error:
 
-$$
+```math
 \mathcal{L}_{\text{coeff-MSE}}
 =
 \sum_{t=1}^{T} (\hat{\tilde c}_t - \tilde c_t)^2.
-$$
+```
 
 Huber loss:
 
-$$
+```math
 \mathcal{L}_{\text{coeff-Huber}}
 =
 \sum_{t=1}^{T}
 \operatorname{Huber}_\delta(\hat{\tilde c}_t - \tilde c_t).
-$$
+```
 
 These are natural if coefficient accuracy itself is the desired target.
 
@@ -741,17 +741,17 @@ The more interesting options measure coefficient quality through the induced spa
 
 Let
 
-$$
+```math
 R(a_{1:T}, c_{1:T})
-$$
+```
 
 be the operator that reshapes a sequence into the latent sparse grid and reconstructs the corresponding latent tensor through the stage-1 bottleneck.
 
 Then the target sparse latent is
 
-$$
+```math
 z^* = R(a_{1:T}, c_{1:T}).
-$$
+```
 
 There are two reconstruction-style losses.
 
@@ -759,17 +759,17 @@ There are two reconstruction-style losses.
 
 Sample or argmax the model's atom predictions $\hat a_{1:T}$ and use predicted coefficients $\hat c_{1:T}$:
 
-$$
+```math
 \hat z = R(\hat a_{1:T}, \hat c_{1:T}).
-$$
+```
 
 Then minimize
 
-$$
+```math
 \mathcal{L}_{\text{recon-MSE}}
 =
 \| \hat z - z^* \|_2^2.
-$$
+```
 
 This couples atom and coefficient quality through the geometry of the sparse manifold.
 
@@ -777,17 +777,17 @@ This couples atom and coefficient quality through the geometry of the sparse man
 
 Use the true atoms but predicted coefficients:
 
-$$
+```math
 \hat z = R(a_{1:T}, \hat c_{1:T}),
-$$
+```
 
 and minimize
 
-$$
+```math
 \mathcal{L}_{\text{gt-atom-recon-MSE}}
 =
 \| \hat z - z^* \|_2^2.
-$$
+```
 
 This isolates coefficient quality while evaluating it in the latent geometry actually used by the decoder.
 
@@ -795,13 +795,13 @@ This isolates coefficient quality while evaluating it in the latent geometry act
 
 The full loss is
 
-$$
+```math
 \mathcal{L}_{\text{stage2}}
 =
 \mathcal{L}_{\text{atom}}
 +
 \lambda_c \mathcal{L}_{\text{coeff}},
-$$
+```
 
 where $\mathcal{L}_{\text{coeff}}$ is one of the coefficient objectives above.
 
@@ -811,22 +811,22 @@ The real-valued path includes scheduled sampling to reduce exposure bias.
 
 Teacher forcing trains on the true history
 
-$$
+```math
 (a_{<t}, c_{<t}),
-$$
+```
 
 but generation uses model-sampled history. To shrink that train-test mismatch, previous-step inputs are sometimes replaced with model predictions during training.
 
 If $\rho(\tau)$ is the replacement probability at training progress $\tau$, then for a previous time step $m < t$ the training input is
 
-$$
+```math
 (\tilde a_m, \tilde c_m)
 =
 \begin{cases}
 (\hat a_m, \hat c_m), & \text{with probability } \rho(\tau), \\
 (a_m, c_m), & \text{with probability } 1 - \rho(\tau).
 \end{cases}
-$$
+```
 
 The schedule increases from $0$ toward a chosen final probability.
 
@@ -840,17 +840,17 @@ After training, generation proceeds entirely in sparse-code space before decodin
 
 Sample autoregressively:
 
-$$
+```math
 y_t \sim p(y_t \mid y_{<t}),
-$$
+```
 
 subject to the structural constraint that atom and coefficient-bin positions alternate appropriately.
 
 Reshape the sampled sequence into a sparse token grid, reconstruct the latent tensor $z_q$, and decode:
 
-$$
+```math
 \hat x = G_\psi(z_q).
-$$
+```
 
 ### 12.2 Real-valued regime
 
@@ -858,15 +858,15 @@ At each step:
 
 1. sample an atom
 
-$$
-a_t \sim p(a_t \mid a_{<t}, c_{<t}),
-$$
+   ```math
+   a_t \sim p(a_t \mid a_{<t}, c_{<t}),
+   ```
 
 2. predict or sample a coefficient
 
-$$
-\hat c_t \approx \mathbb{E}[c_t \mid a_t, a_{<t}, c_{<t}]
-$$
+   ```math
+   \hat c_t \approx \mathbb{E}[c_t \mid a_t, a_{<t}, c_{<t}]
+   ```
 
 through the coefficient head.
 
@@ -888,17 +888,17 @@ The bottleneck forces local latent content to lie near a union of low-dimensiona
 
 For fixed support $S$, the latent lives in
 
-$$
+```math
 \operatorname{span}(D_S).
-$$
+```
 
 Across all supports of size at most $s$, the bottleneck defines a union-of-subspaces model:
 
-$$
+```math
 \mathcal{M}
 =
 \bigcup_{|S| \le s} \operatorname{span}(D_S).
-$$
+```
 
 This is a useful way to think about the latent manifold. The autoencoder does not learn an arbitrary nonlinear latent geometry. It learns a decoder whose inputs must lie in or near $\mathcal{M}$.
 
@@ -920,9 +920,9 @@ The two stage-2 modes correspond to two different statistical assumptions.
 
 Everything is turned into symbols. This gives a clean categorical model:
 
-$$
+```math
 p(y_{1:T}) = \prod_t p(y_t \mid y_{<t}).
-$$
+```
 
 Advantages:
 
@@ -957,9 +957,9 @@ The deepest approximation in the whole system is not the transformer. It is the 
 
 The exact sparse-coding map
 
-$$
+```math
 z_e \mapsto \alpha^*(z_e; D)
-$$
+```
 
 is non-smooth because support selection changes discontinuously. The model therefore uses a surrogate training procedure:
 
@@ -977,9 +977,9 @@ That does not make it invalid. It simply clarifies what kind of mathematics is a
 
 Stage 1 learns:
 
-$$
+```math
 x \mapsto z_e \mapsto z_q \mapsto \hat x
-$$
+```
 
 with $z_q$ constrained to be a sparse reconstruction from learned atoms.
 
@@ -990,12 +990,12 @@ Stage 2 learns a prior over the coordinates of that sparse representation:
 
 The most useful compact summary is:
 
-$$
+```math
 \text{autoencoder backbone}
 +
 \text{sparse dictionary manifold}
 +
 \text{autoregressive prior over sparse coordinates}.
-$$
+```
 
 That is the mathematical content of the implementation.
