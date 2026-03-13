@@ -21,8 +21,6 @@
 \setlist[enumerate]{nosep,leftmargin=2em}
 
 \newcommand{\R}{\mathbb{R}}
-\DeclareMathOperator{\sg}{sg}
-\DeclareMathOperator{\Span}{span}
 
 \title{\texttt{proto.py}: Theoretical and Mathematical Overview}
 \date{}
@@ -95,7 +93,154 @@ E_\theta : \R^{3 \times R \times R} \to \R^{C \times H \times W},
 G_\psi : \R^{C \times H \times W} \to \R^{3 \times R \times R}.
 \]
 
-The key constraint is what happens between them: the dense latent $z_e$ is projected onto a sparse dictionary model before decoding.
+In the default $128 \times 128$ configuration used here, the target latent grid is $8 \times 8$, so the encoder must reduce spatial resolution by a factor of $16$ along each axis. If $L$ is the number of spatial downsampling steps, then
+\[
+H = W = \frac{R}{2^L}.
+\]
+The implementation uses $L = 4$, so with $R = 128$,
+\[
+H = W = \frac{128}{2^4} = 8.
+\]
+
+\subsubsection{Downsampling law}
+
+Each encoder downsampling layer pads on the right and bottom by one pixel and then applies a $3 \times 3$ convolution with stride $2$. If the incoming spatial size is $n$ and $n$ is even, then the output size is
+\[
+n'
+=
+\left\lfloor \frac{(n+1)-3}{2} \right\rfloor + 1
+=
+\frac{n}{2}.
+\]
+
+So the spatial path is exactly
+\[
+128 \to 64 \to 32 \to 16 \to 8.
+\]
+
+The decoder mirrors this with nearest-neighbor interpolation by a factor of $2$, followed by a $3 \times 3$ convolution, so its spatial path is
+\[
+8 \to 16 \to 32 \to 64 \to 128.
+\]
+
+\subsubsection{Channel schedule in this implementation}
+
+The code does not use an unrestricted doubling schedule. Instead it defines
+\[
+\mathrm{ch\_mult}_\ell = \min(2^\ell, 2), \qquad \ell = 0,\dots,L,
+\]
+so with base width $\mathrm{num\_hiddens} = 128$ and $L = 4$, the channel counts are
+\[
+128 \cdot (1,2,2,2,2) = (128,256,256,256,256).
+\]
+
+Thus the encoder expands channels once, from $128$ to $256$, and then keeps the pyramid at $256$ channels until the final projection to the bottleneck width $\mathrm{embedding\_dim} = 16$.
+
+\subsubsection{Residual block as the basic nonlinear operator}
+
+At each resolution, the main computation is performed by ResNet blocks. If $h \in \R^{C_{\mathrm{in}} \times r \times r}$, one block has the form
+\[
+\mathrm{ResBlock}(h)
+=
+S(h)
++
+W_2 \,
+\mathrm{Drop}\!\left(
+\phi\!\left(
+N_2\!\left(
+W_1 \phi(N_1(h))
+\right)
+\right)
+\right),
+\]
+where $N_1, N_2$ are group-normalization operators, $\phi$ is the SiLU nonlinearity, $W_1, W_2$ are $3 \times 3$ convolutions, and $S$ is either the identity or a learned $1 \times 1$ / $3 \times 3$ shortcut if the channel dimension changes.
+
+\subsubsection{Attention at the bottleneck scale}
+
+The model also includes self-attention blocks. For a feature map $h \in \R^{C \times r \times r}$, let
+\[
+Q \in \R^{r^2 \times C},
+\qquad
+K \in \R^{C \times r^2},
+\qquad
+V \in \R^{C \times r^2}
+\]
+be $1 \times 1$ convolutions of the normalized feature map after reshaping the spatial grid into a sequence of length $r^2$. Define the attention matrix
+\[
+A = \mathrm{softmax}\!\left(\frac{QK}{\sqrt{C}}\right) \in \R^{r^2 \times r^2}.
+\]
+
+Then the attention block is
+\[
+\mathrm{Attn}(h)
+=
+h
++
+W_o (V A^\top).
+\]
+
+Two details matter: attention can optionally be inserted at user-chosen resolutions via \texttt{attn\_resolutions}, and there is always a middle attention block at the lowest-resolution feature map. So even without high-resolution attention, the model still gets one global mixing step at the $8 \times 8$ bottleneck scale.
+
+\subsubsection{Exact encoder geometry for $128 \times 128 \to 8 \times 8$}
+
+With \texttt{num\_residual\_layers = 2}, \texttt{num\_hiddens = 128}, \texttt{num\_downsamples = 4}, and \texttt{embedding\_dim = 16}, the encoder shape progression is:
+\begin{itemize}
+  \item input image: $x \in \R^{3 \times 128 \times 128}$;
+  \item input $3 \times 3$ convolution: $\R^{3 \times 128 \times 128} \to \R^{128 \times 128 \times 128}$;
+  \item level 0 residual stack: stays at $\R^{128 \times 128 \times 128}$;
+  \item downsample: $\R^{128 \times 128 \times 128} \to \R^{128 \times 64 \times 64}$;
+  \item level 1 residual stack: $\R^{128 \times 64 \times 64} \to \R^{256 \times 64 \times 64}$;
+  \item downsample: $\R^{256 \times 64 \times 64} \to \R^{256 \times 32 \times 32}$;
+  \item level 2 residual stack: stays at $\R^{256 \times 32 \times 32}$;
+  \item downsample: $\R^{256 \times 32 \times 32} \to \R^{256 \times 16 \times 16}$;
+  \item level 3 residual stack: stays at $\R^{256 \times 16 \times 16}$;
+  \item downsample: $\R^{256 \times 16 \times 16} \to \R^{256 \times 8 \times 8}$;
+  \item level 4 residual stack plus middle $\mathrm{Res}$-$\mathrm{Attn}$-$\mathrm{Res}$ block: stays at $\R^{256 \times 8 \times 8}$;
+  \item output normalization, SiLU, and final $3 \times 3$ projection: $\R^{256 \times 8 \times 8} \to \R^{16 \times 8 \times 8}$.
+\end{itemize}
+
+So the encoder output is
+\[
+z_e \in \R^{16 \times 8 \times 8}.
+\]
+
+This is a spatial compression by $16$ along each axis and a dense coordinate compression from
+\[
+3 \cdot 128 \cdot 128 = 49152
+\]
+input scalars to
+\[
+16 \cdot 8 \cdot 8 = 1024
+\]
+latent scalars, i.e. a $48:1$ reduction in raw coordinate count before the sparse dictionary bottleneck is applied.
+
+\subsubsection{Exact decoder geometry for $8 \times 8 \to 128 \times 128$}
+
+The decoder is not a U-Net: it has no encoder-decoder skip connections. All information that reaches image space must pass through the latent tensor $z_q \in \R^{16 \times 8 \times 8}$.
+
+The decoder first lifts the $16$ latent channels back to $256$ channels with a $3 \times 3$ convolution, applies the same middle $\mathrm{Res}$-$\mathrm{Attn}$-$\mathrm{Res}$ computation at $8 \times 8$, and then runs a multiscale upsampling tower. Because the decoder uses $\mathrm{num\_res\_blocks} + 1$ residual blocks per scale, it is slightly heavier than the encoder on the way back up.
+
+Its shape progression is:
+\begin{itemize}
+  \item latent input: $z_q \in \R^{16 \times 8 \times 8}$;
+  \item input projection: $\R^{16 \times 8 \times 8} \to \R^{256 \times 8 \times 8}$;
+  \item middle $\mathrm{Res}$-$\mathrm{Attn}$-$\mathrm{Res}$: stays at $\R^{256 \times 8 \times 8}$;
+  \item up level at $8 \times 8$: stays at $\R^{256 \times 8 \times 8}$, then upsample to $\R^{256 \times 16 \times 16}$;
+  \item up level at $16 \times 16$: stays at $\R^{256 \times 16 \times 16}$, then upsample to $\R^{256 \times 32 \times 32}$;
+  \item up level at $32 \times 32$: stays at $\R^{256 \times 32 \times 32}$, then upsample to $\R^{256 \times 64 \times 64}$;
+  \item up level at $64 \times 64$: stays at $\R^{256 \times 64 \times 64}$, then upsample to $\R^{256 \times 128 \times 128}$;
+  \item final level at $128 \times 128$: maps $\R^{256 \times 128 \times 128} \to \R^{128 \times 128 \times 128}$;
+  \item output normalization, SiLU, and final $3 \times 3$ RGB projection: $\R^{128 \times 128 \times 128} \to \R^{3 \times 128 \times 128}$.
+\end{itemize}
+
+If \texttt{out\_tanh=True}, the final image is
+\[
+\hat x = \tanh(G_\psi(z_q)) \in [-1,1]^{3 \times 128 \times 128}.
+\]
+
+So mathematically the decoder is a learned map from an $8 \times 8$ latent field back to image space, with all high-resolution detail reconstructed from the compressed representation rather than copied through skips.
+
+The key constraint is what happens between encoder and decoder: the dense latent $z_e$ is projected onto a sparse dictionary model before decoding.
 
 \subsection{Per-location sparse bottleneck}
 
@@ -175,9 +320,9 @@ which measures the largest absolute off-diagonal cosine similarity.
 
 The sparse coding map is non-differentiable in practice because OMP involves hard support selection. The model therefore uses a straight-through surrogate. Let $z_q$ be the sparse reconstruction obtained from OMP. The latent passed to the decoder is
 \[
-z_{\text{ste}} = z_e + \sg(z_q - z_e),
+z_{\text{ste}} = z_e + \mathrm{sg}(z_q - z_e),
 \]
-where $\sg$ denotes stop-gradient.
+where $\mathrm{sg}$ denotes stop-gradient.
 
 Forward pass:
 \[
@@ -208,12 +353,12 @@ The bottleneck term has a dictionary-side part and an encoder-side commitment pa
 \[
 \mathcal{L}_{\text{dict}}
 =
-\|z_q - \sg(z_e)\|_2^2,
+\|z_q - \mathrm{sg}(z_e)\|_2^2,
 \]
 \[
 \mathcal{L}_{\text{commit}}
 =
-\|\sg(z_q) - z_e\|_2^2.
+\|\mathrm{sg}(z_q) - z_e\|_2^2.
 \]
 
 The bottleneck loss is
@@ -307,7 +452,7 @@ u(a) = \frac{a + c_{\max}}{2c_{\max}} \in [0,1],
 \]
 followed by discretization into $B$ bins:
 \[
-b(a) = \operatorname{round}\left(u(a)(B-1)\right).
+b(a) = \mathrm{round}\left(u(a)(B-1)\right).
 \]
 
 Decoding maps the bin index back to a fixed bin center.
@@ -323,7 +468,7 @@ Then apply
 \[
 f_\mu(\bar a)
 =
-\operatorname{sign}(\bar a)
+\mathrm{sign}(\bar a)
 \frac{\log(1 + \mu |\bar a|)}{\log(1+\mu)}.
 \]
 
@@ -494,7 +639,7 @@ For atom $k$, compute empirical statistics $(\mu_k, \sigma_k)$ from stage-1 spar
 \[
 \tilde c_t
 =
-\operatorname{clip}
+\mathrm{clip}
 \left(
 \frac{c_t - \mu_{a_t}}{\sigma_{a_t}},
 -M,
@@ -552,7 +697,7 @@ Huber loss:
 \mathcal{L}_{\text{coeff-Huber}}
 =
 \sum_{t=1}^{T}
-\operatorname{Huber}_\delta(\hat{\tilde c}_t - \tilde c_t).
+\mathrm{Huber}_\delta(\hat{\tilde c}_t - \tilde c_t).
 \]
 
 \subsection{Reconstruction-aware coefficient losses}
@@ -654,14 +799,14 @@ The encoder-decoder pair extracts a multiscale latent representation adapted to 
 
 The bottleneck forces local latent content to lie near a union of low-dimensional sparse subspaces generated by the dictionary. For fixed support $S$, the latent lives in
 \[
-\Span(D_S).
+\mathrm{span}(D_S).
 \]
 
 Across all supports of size at most $s$, the bottleneck defines a union-of-subspaces model:
 \[
 \mathcal{M}
 =
-\bigcup_{|S| \le s} \Span(D_S).
+\bigcup_{|S| \le s} \mathrm{span}(D_S).
 \]
 
 \subsection{Autoregressive structure}
