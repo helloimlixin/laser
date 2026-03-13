@@ -12,14 +12,13 @@ The file implements a two-stage generative model:
 The basic pipeline is
 
 ```math
-x \xrightarrow{E_\theta} z_e \xrightarrow{\text{sparse bottleneck}} z_q \xrightarrow{G_\psi} \hat x
+x \to z_e \to z_q \to \hat x
 ```
 
 for stage 1, and then
 
 ```math
-\text{stage-1 sparse codes} \xrightarrow{\text{flatten}} y_{1:T}
-\xrightarrow{\text{Transformer prior}} p(y_{1:T})
+codes \to y_{1:T} \to p(y_{1:T})
 ```
 
 for stage 2.
@@ -91,7 +90,7 @@ Each encoder downsampling layer pads on the right and bottom by one pixel and th
 ```math
 n'
 =
-\left\lfloor \frac{(n+1)-3}{2} \right\rfloor + 1
+\lfloor ((n+1)-3)/2 \rfloor + 1
 =
 \frac{n}{2}.
 ```
@@ -113,7 +112,7 @@ The decoder mirrors this with nearest-neighbor interpolation by a factor of `2`,
 The code does not use an unrestricted doubling schedule such as $(1,2,4,8, \dots)$. Instead it defines
 
 ```math
-\mathrm{ch\_mult}_\ell = \min(2^\ell, 2), \qquad \ell = 0,\dots,L,
+m_\ell = \min(2^\ell, 2), \qquad \ell = 0,\dots,L.
 ```
 
 so with base width `num_hiddens = 128` and $L = 4$, the channel counts are
@@ -126,21 +125,14 @@ Thus the encoder expands channels once, from `128` to `256`, and then keeps the 
 
 #### 3.1.3 Residual block as the basic nonlinear operator
 
-At each resolution, the main computation is performed by ResNet blocks. If $h \in \mathbb{R}^{C_{\mathrm{in}} \times r \times r}$, one block has the form
+At each resolution, the main computation is performed by ResNet blocks. If $h \in \mathbb{R}^{C_{in} \times r \times r}$, one block has the form
 
 ```math
-\mathrm{ResBlock}(h)
+R(h)
 =
 S(h)
 +
-W_2 \,
-\mathrm{Drop}\!\left(
-\phi\!\left(
-N_2\!\left(
-W_1 \phi(N_1(h))
-\right)
-\right)
-\right),
+W_2 \phi(N_2(W_1 \phi(N_1(h)))).
 ```
 
 where
@@ -167,13 +159,13 @@ V \in \mathbb{R}^{C \times r^2}
 be `1 x 1` convolutions of the normalized feature map after reshaping the spatial grid into a sequence of length $r^2$. Define the attention matrix
 
 ```math
-A = \mathrm{softmax}\!\left(\frac{QK}{\sqrt{C}}\right) \in \mathbb{R}^{r^2 \times r^2}.
+A = softmax(QK / \sqrt{C}) \in \mathbb{R}^{r^2 \times r^2}.
 ```
 
 Then the attention block is
 
 ```math
-\mathrm{Attn}(h)
+T(h)
 =
 h
 +
@@ -285,10 +277,7 @@ The sparse coding problem at each site is
 =
 \arg\min_{\alpha \in \mathbb{R}^K}
 \|z_e(u) - D\alpha\|_2^2
-\quad
-\text{subject to}
-\quad
-\|\alpha\|_0 \le s.
+\quad \|\alpha\|_0 \le s.
 ```
 
 This is the core representation learned by the model.
@@ -346,7 +335,7 @@ That second point removes arbitrary solver order and makes the tokenization more
 The dictionary atoms are constrained to unit norm:
 
 ```math
-\|d_k\|_2 = 1 \quad \text{for all } k.
+\|d_k\|_2 = 1.
 ```
 
 This matters because it separates direction from magnitude:
@@ -371,21 +360,21 @@ The sparse coding map itself is non-differentiable in practice because OMP invol
 Let $z_q$ be the sparse reconstruction obtained from OMP. The latent passed to the decoder is
 
 ```math
-z_{\text{ste}} = z_e + \mathrm{sg}(z_q - z_e),
+z_{ste} = z_e + sg(z_q - z_e),
 ```
 
-where $\mathrm{sg}$ denotes stop-gradient.
+where $sg$ denotes stop-gradient.
 
 Forward pass:
 
 ```math
-z_{\text{ste}} = z_q.
+z_{ste} = z_q.
 ```
 
 Backward pass:
 
 ```math
-\frac{\partial z_{\text{ste}}}{\partial z_e} = I.
+\frac{\partial z_{ste}}{\partial z_e} = I.
 ```
 
 So the decoder sees the sparse-projected latent, while the encoder receives an identity-style backward signal through the bottleneck.
@@ -402,35 +391,35 @@ The stage-1 loss has two parts:
 The image reconstruction term is
 
 ```math
-\mathcal{L}_{\text{recon}}
+L_r
 =
 \| \hat x - x \|_2^2,
 \qquad
-\hat x = G_\psi(z_{\text{ste}}).
+\hat x = G_\psi(z_{ste}).
 ```
 
 The bottleneck term has a dictionary-side part and an encoder-side commitment part:
 
 ```math
-\mathcal{L}_{\text{dict}}
+L_d
 =
-\| z_q - \mathrm{sg}(z_e) \|_2^2,
+\| z_q - sg(z_e) \|_2^2,
 ```
 
 ```math
-\mathcal{L}_{\text{commit}}
+L_c
 =
-\| \mathrm{sg}(z_q) - z_e \|_2^2.
+\| sg(z_q) - z_e \|_2^2.
 ```
 
 The bottleneck loss is
 
 ```math
-\mathcal{L}_{\text{bottleneck}}
+L_b
 =
-\mathcal{L}_{\text{dict}}
+L_d
 +
-\beta \mathcal{L}_{\text{commit}},
+\beta L_c.
 ```
 
 where $\beta$ is the commitment weight.
@@ -438,20 +427,20 @@ where $\beta$ is the commitment weight.
 The full stage-1 objective is
 
 ```math
-\mathcal{L}_{\text{stage1}}
+L_1
 =
-\mathcal{L}_{\text{recon}}
+L_r
 +
-\lambda_b \mathcal{L}_{\text{bottleneck}},
+\lambda_b L_b.
 ```
 
 where $\lambda_b$ is the external bottleneck weight.
 
 Conceptually:
 
-- $\mathcal{L}_{\text{recon}}$ trains the end-to-end autoencoder,
-- $\mathcal{L}_{\text{dict}}$ trains the sparse manifold to approximate encoder latents,
-- $\mathcal{L}_{\text{commit}}$ discourages the encoder from wandering away from that manifold.
+- $L_r$ trains the end-to-end autoencoder,
+- $L_d$ trains the sparse manifold to approximate encoder latents,
+- $L_c$ discourages the encoder from wandering away from that manifold.
 
 ### 3.7 What is and is not differentiated
 
@@ -563,7 +552,7 @@ u(a) = \frac{a + c_{\max}}{2c_{\max}} \in [0,1],
 followed by discretization into $B$ bins:
 
 ```math
-b(a) = \mathrm{round}\left(u(a)(B-1)\right).
+b(a) = round(u(a)(B-1)).
 ```
 
 Decoding maps the bin index back to a fixed bin center.
@@ -581,7 +570,7 @@ Then apply
 ```math
 f_\mu(\bar a)
 =
-\mathrm{sign}(\bar a)
+sign(\bar a)
 \frac{\log(1 + \mu |\bar a|)}{\log(1+\mu)}.
 ```
 
@@ -610,10 +599,7 @@ For each patch, the sparse coding problem becomes
 =
 \arg\min_{\alpha}
 \|P_u(z_e) - D_p \alpha\|_2^2
-\quad
-\text{subject to}
-\quad
-\|\alpha\|_0 \le s.
+\quad \|\alpha\|_0 \le s.
 ```
 
 The reconstructed patch is
@@ -744,13 +730,13 @@ If position $t$ corresponds to spatial index $s(t)$ and depth slot $d(t)$, then 
 ```math
 e_t
 =
-e_{\text{token}}(y_t)
+e^{tok}(y_t)
 +
-e_{\text{space}}(s(t))
+e^{sp}(s(t))
 +
-e_{\text{depth}}(d(t))
+e^{dep}(d(t))
 +
-e_{\text{type}}(t).
+e^{type}(t).
 ```
 
 The type embedding distinguishes the BOS position from regular content positions. The spatial and depth embeddings tell the transformer where a token lies in the latent grid and which sparse slot it represents.
@@ -776,7 +762,7 @@ p(y_t = v \mid y_{<t})
 Training minimizes the negative log-likelihood:
 
 ```math
-\mathcal{L}_{\text{CE}}
+L_{CE}
 =
 -
 \sum_{t=1}^{T}
@@ -805,7 +791,7 @@ The real-valued path is more interesting mathematically.
 At training time, the transformer receives a shifted atom sequence
 
 ```math
-[\text{BOS}, a_1, a_2, \dots, a_{T-1}]
+[BOS, a_1, a_2, \dots, a_{T-1}]
 ```
 
 and a shifted coefficient sequence
@@ -834,12 +820,11 @@ For atom $k$, compute empirical statistics $(\mu_k, \sigma_k)$ from stage-1 spar
 ```math
 \tilde c_t
 =
-\mathrm{clip}
-\left(
+clip(
 \frac{c_t - \mu_{a_t}}{\sigma_{a_t}},
 -M,
 M
-\right),
+).
 ```
 
 where $M$ is a fixed normalization bound.
@@ -864,7 +849,7 @@ Let $h_t$ be the transformer hidden state before the output heads. The coefficie
 So the coefficient map is conceptually
 
 ```math
-\hat{\tilde c}_t = f_{\text{coeff}}(h_t, e(a_t)).
+\hat{\tilde c}_t = f_c(h_t, e(a_t)).
 ```
 
 This matches the factorization
@@ -884,7 +869,7 @@ The real-valued path always includes atom cross-entropy and then adds one auxili
 The categorical term is
 
 ```math
-\mathcal{L}_{\text{atom}}
+L_a
 =
 -
 \sum_{t=1}^{T} \log p(a_t \mid a_{<t}, c_{<t}).
@@ -897,7 +882,7 @@ Two direct scalar objectives are supported.
 Mean squared error:
 
 ```math
-\mathcal{L}_{\text{coeff-MSE}}
+L_{cmse}
 =
 \sum_{t=1}^{T} (\hat{\tilde c}_t - \tilde c_t)^2.
 ```
@@ -905,10 +890,10 @@ Mean squared error:
 Huber loss:
 
 ```math
-\mathcal{L}_{\text{coeff-Huber}}
+L_{ch}
 =
 \sum_{t=1}^{T}
-\mathrm{Huber}_\delta(\hat{\tilde c}_t - \tilde c_t).
+Huber_\delta(\hat{\tilde c}_t - \tilde c_t).
 ```
 
 These are natural if coefficient accuracy itself is the desired target.
@@ -944,7 +929,7 @@ Sample or argmax the model's atom predictions $\hat a_{1:T}$ and use predicted c
 Then minimize
 
 ```math
-\mathcal{L}_{\text{recon-MSE}}
+L_{rmse}
 =
 \| \hat z - z^* \|_2^2.
 ```
@@ -962,7 +947,7 @@ Use the true atoms but predicted coefficients:
 and minimize
 
 ```math
-\mathcal{L}_{\text{gt-atom-recon-MSE}}
+L_{grmse}
 =
 \| \hat z - z^* \|_2^2.
 ```
@@ -974,14 +959,14 @@ This isolates coefficient quality while evaluating it in the latent geometry act
 The full loss is
 
 ```math
-\mathcal{L}_{\text{stage2}}
+L_2
 =
-\mathcal{L}_{\text{atom}}
+L_a
 +
-\lambda_c \mathcal{L}_{\text{coeff}},
+\lambda_c L_q.
 ```
 
-where $\mathcal{L}_{\text{coeff}}$ is one of the coefficient objectives above.
+where $L_q$ denotes whichever coefficient objective is chosen above.
 
 ## 11. Scheduled sampling
 
@@ -998,13 +983,16 @@ but generation uses model-sampled history. To shrink that train-test mismatch, p
 If $\rho(\tau)$ is the replacement probability at training progress $\tau$, then for a previous time step $m < t$ the training input is
 
 ```math
-(\tilde a_m, \tilde c_m)
-=
-\begin{cases}
-(\hat a_m, \hat c_m), & \text{with probability } \rho(\tau), \\
-(a_m, c_m), & \text{with probability } 1 - \rho(\tau).
-\end{cases}
+(\tilde a_m, \tilde c_m) = (\hat a_m, \hat c_m)
 ```
+
+with probability $\rho(\tau)$, and
+
+```math
+(\tilde a_m, \tilde c_m) = (a_m, c_m)
+```
+
+with probability $1 - \rho(\tau)$.
 
 The schedule increases from $0$ toward a chosen final probability.
 
@@ -1067,7 +1055,7 @@ The bottleneck forces local latent content to lie near a union of low-dimensiona
 For fixed support $S$, the latent lives in
 
 ```math
-\mathrm{span}(D_S).
+span(D_S).
 ```
 
 Across all supports of size at most $s$, the bottleneck defines a union-of-subspaces model:
@@ -1075,7 +1063,7 @@ Across all supports of size at most $s$, the bottleneck defines a union-of-subsp
 ```math
 \mathcal{M}
 =
-\bigcup_{|S| \le s} \mathrm{span}(D_S).
+\bigcup_{|S| \le s} span(D_S).
 ```
 
 This is a useful way to think about the latent manifold. The autoencoder does not learn an arbitrary nonlinear latent geometry. It learns a decoder whose inputs must lie in or near $\mathcal{M}$.
@@ -1166,14 +1154,6 @@ Stage 2 learns a prior over the coordinates of that sparse representation:
 - fully discrete coordinates in the quantized regime,
 - discrete atom identities plus continuous coefficients in the real-valued regime.
 
-The most useful compact summary is:
-
-```math
-\text{autoencoder backbone}
-+
-\text{sparse dictionary manifold}
-+
-\text{autoregressive prior over sparse coordinates}.
-```
+The most useful compact summary is: autoencoder backbone + sparse dictionary manifold + autoregressive prior over sparse coordinates.
 
 That is the mathematical content of the implementation.
