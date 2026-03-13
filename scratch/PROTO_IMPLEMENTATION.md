@@ -690,7 +690,7 @@ This matters because the transformer is not invariant to flattening order. The c
 In the purely discrete case, the model is simply
 
 ```math
-p(y_{1:T}) = \prod_{t=1}^{T} p(y_t \mid y_{<t}).
+p(y_1,\dots,y_T) = \prod_{t=1}^{T} p(y_t | y_1,\dots,y_{t-1}).
 ```
 
 In the real-valued coefficient case, the stage-2 representation consists of atoms and coefficients:
@@ -702,12 +702,12 @@ In the real-valued coefficient case, the stage-2 representation consists of atom
 The model factorizes this as
 
 ```math
-p(a_{1:T}, c_{1:T})
+p(a_1,\dots,a_T,c_1,\dots,c_T)
 =
 \prod_{t=1}^{T}
-p(a_t \mid a_{<t}, c_{<t})
+p(a_t | a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1})
 \,
-p(c_t \mid a_t, a_{<t}, c_{<t}).
+p(c_t | a_t, a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}).
 ```
 
 This is the key probabilistic design choice of the real-valued path.
@@ -752,7 +752,7 @@ In the quantized regime, stage 2 is a standard categorical autoregressive model.
 Let $y_t$ be the next token. The transformer produces logits $\ell_t \in \mathbb{R}^V$ over the vocabulary. The model distribution is
 
 ```math
-p(y_t = v \mid y_{<t})
+p(y_t = v | y_1,\dots,y_{t-1})
 =
 \frac{\exp(\ell_{t,v})}{\sum_{v'} \exp(\ell_{t,v'})}.
 ```
@@ -766,7 +766,7 @@ L_{CE}
 =
 -
 \sum_{t=1}^{T}
-\log p(y_t \mid y_{<t}).
+\log p(y_t | y_1,\dots,y_{t-1}).
 ```
 
 In practice this is the usual cross-entropy over the shifted sequence.
@@ -780,7 +780,7 @@ So the generative process is not merely "sample any token from the vocabulary." 
 - atom identity slots,
 - coefficient-bin slots.
 
-Mathematically, the support of $p(y_t \mid y_{<t})$ depends on whether $t$ is an atom step or a coefficient step.
+Mathematically, the support of $p(y_t | y_1,\dots,y_{t-1})$ depends on whether $t$ is an atom step or a coefficient step.
 
 ## 9. Stage 2 in the real-valued regime
 
@@ -803,7 +803,7 @@ and a shifted coefficient sequence
 The hidden state at time $t$ therefore summarizes
 
 ```math
-(a_{<t}, c_{<t}).
+(a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}).
 ```
 
 From that hidden state the model predicts:
@@ -818,23 +818,17 @@ The coefficient regression problem is made easier by normalizing coefficients se
 For atom $k$, compute empirical statistics $(\mu_k, \sigma_k)$ from stage-1 sparse codes. Then the normalized coefficient target is
 
 ```math
-\tilde c_t
-=
-clip(
-\frac{c_t - \mu_{a_t}}{\sigma_{a_t}},
--M,
-M
-).
+u_t = clip((c_t - \mu_{a_t}) / \sigma_{a_t}, -M, M).
 ```
 
 where $M$ is a fixed normalization bound.
 
-The model predicts $\hat{\tilde c}_t$, and decoding maps it back via
+The model predicts $\hat u_t$, and decoding maps it back via
 
 ```math
 \hat c_t
 =
-\hat{\tilde c}_t \sigma_{a_t} + \mu_{a_t}.
+\hat u_t \sigma_{a_t} + \mu_{a_t}.
 ```
 
 This is a strong modeling choice. The coefficient head is not asked to learn one global scalar distribution for all atoms. Instead, it learns residual variation after atom-specific centering and scaling.
@@ -849,13 +843,13 @@ Let $h_t$ be the transformer hidden state before the output heads. The coefficie
 So the coefficient map is conceptually
 
 ```math
-\hat{\tilde c}_t = f_c(h_t, e(a_t)).
+\hat u_t = f_c(h_t, e(a_t)).
 ```
 
 This matches the factorization
 
 ```math
-p(c_t \mid a_t, a_{<t}, c_{<t}).
+p(c_t | a_t, a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}).
 ```
 
 Without conditioning on $a_t$, the scalar regression target would mix the statistics of all atoms and become substantially less coherent.
@@ -872,7 +866,7 @@ The categorical term is
 L_a
 =
 -
-\sum_{t=1}^{T} \log p(a_t \mid a_{<t}, c_{<t}).
+\sum_{t=1}^{T} \log p(a_t | a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}).
 ```
 
 ### 10.2 Direct coefficient regression
@@ -884,7 +878,7 @@ Mean squared error:
 ```math
 L_{cmse}
 =
-\sum_{t=1}^{T} (\hat{\tilde c}_t - \tilde c_t)^2.
+\sum_{t=1}^{T} (\hat u_t - u_t)^2.
 ```
 
 Huber loss:
@@ -893,7 +887,7 @@ Huber loss:
 L_{ch}
 =
 \sum_{t=1}^{T}
-Huber_\delta(\hat{\tilde c}_t - \tilde c_t).
+Huber_\delta(\hat u_t - u_t).
 ```
 
 These are natural if coefficient accuracy itself is the desired target.
@@ -905,7 +899,7 @@ The more interesting options measure coefficient quality through the induced spa
 Let
 
 ```math
-R(a_{1:T}, c_{1:T})
+R(a_1,\dots,a_T,c_1,\dots,c_T)
 ```
 
 be the operator that reshapes a sequence into the latent sparse grid and reconstructs the corresponding latent tensor through the stage-1 bottleneck.
@@ -913,17 +907,17 @@ be the operator that reshapes a sequence into the latent sparse grid and reconst
 Then the target sparse latent is
 
 ```math
-z^* = R(a_{1:T}, c_{1:T}).
+z^{gt} = R(a_1,\dots,a_T,c_1,\dots,c_T).
 ```
 
 There are two reconstruction-style losses.
 
 #### Predicted atoms plus predicted coefficients
 
-Sample or argmax the model's atom predictions $\hat a_{1:T}$ and use predicted coefficients $\hat c_{1:T}$:
+Sample or argmax the model's atom predictions $a_1^p,\dots,a_T^p$ and use predicted coefficients $c_1^p,\dots,c_T^p$:
 
 ```math
-\hat z = R(\hat a_{1:T}, \hat c_{1:T}).
+z^{p} = R(a_1^p,\dots,a_T^p,c_1^p,\dots,c_T^p).
 ```
 
 Then minimize
@@ -931,7 +925,7 @@ Then minimize
 ```math
 L_{rmse}
 =
-\| \hat z - z^* \|_2^2.
+\| z^{p} - z^{gt} \|_2^2.
 ```
 
 This couples atom and coefficient quality through the geometry of the sparse manifold.
@@ -941,7 +935,7 @@ This couples atom and coefficient quality through the geometry of the sparse man
 Use the true atoms but predicted coefficients:
 
 ```math
-\hat z = R(a_{1:T}, \hat c_{1:T}),
+z^{coef} = R(a_1,\dots,a_T,c_1^p,\dots,c_T^p).
 ```
 
 and minimize
@@ -949,7 +943,7 @@ and minimize
 ```math
 L_{grmse}
 =
-\| \hat z - z^* \|_2^2.
+\| z^{coef} - z^{gt} \|_2^2.
 ```
 
 This isolates coefficient quality while evaluating it in the latent geometry actually used by the decoder.
@@ -975,7 +969,7 @@ The real-valued path includes scheduled sampling to reduce exposure bias.
 Teacher forcing trains on the true history
 
 ```math
-(a_{<t}, c_{<t}),
+(a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}),
 ```
 
 but generation uses model-sampled history. To shrink that train-test mismatch, previous-step inputs are sometimes replaced with model predictions during training.
@@ -1007,7 +1001,7 @@ After training, generation proceeds entirely in sparse-code space before decodin
 Sample autoregressively:
 
 ```math
-y_t \sim p(y_t \mid y_{<t}),
+y_t \sim p(y_t | y_1,\dots,y_{t-1}),
 ```
 
 subject to the structural constraint that atom and coefficient-bin positions alternate appropriately.
@@ -1025,18 +1019,18 @@ At each step:
 1. sample an atom
 
    ```math
-   a_t \sim p(a_t \mid a_{<t}, c_{<t}),
+   a_t \sim p(a_t | a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}),
    ```
 
 2. predict or sample a coefficient
 
    ```math
-   \hat c_t \approx \mathbb{E}[c_t \mid a_t, a_{<t}, c_{<t}]
+   \hat c_t \approx \mathbb{E}[c_t | a_t, a_1,\dots,a_{t-1}, c_1,\dots,c_{t-1}]
    ```
 
 through the coefficient head.
 
-Then reconstruct the stage-1 sparse latent from $(a_{1:T}, \hat c_{1:T})$ and decode it to image space.
+Then reconstruct the stage-1 sparse latent from $(a_1,\dots,a_T,c_1^p,\dots,c_T^p)$ and decode it to image space.
 
 So even though stage 2 is a transformer, the final image model is still fundamentally mediated by the stage-1 sparse manifold.
 
@@ -1087,7 +1081,7 @@ The two stage-2 modes correspond to two different statistical assumptions.
 Everything is turned into symbols. This gives a clean categorical model:
 
 ```math
-p(y_{1:T}) = \prod_t p(y_t \mid y_{<t}).
+p(y_1,\dots,y_T) = \prod_t p(y_t | y_1,\dots,y_{t-1}).
 ```
 
 Advantages:
