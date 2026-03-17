@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 from torchvision import transforms
 
 from proto import (
+    _nan_to_num_tensor,
     DEFAULT_STAGE1_SOURCE_RUN,
     DEFAULT_STAGE2_SOURCE_RUN,
     LASER,
@@ -103,18 +104,38 @@ class Stage1LaserModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
+        x = _nan_to_num_tensor(x)
         recon, b_loss, _ = self.model(x)
+        recon = _nan_to_num_tensor(recon)
+        b_loss = _nan_to_num_tensor(b_loss)
         recon_loss = F.mse_loss(recon, x)
         loss = recon_loss + self.bottleneck_weight * b_loss
         bs = x.size(0)
+        if not torch.isfinite(loss):
+            self.log('stage1/nonfinite_train_batch', 1.0, on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
+            return None
         self.log('stage1/train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
         self.log('stage1/recon_loss', recon_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
         self.log('stage1/bottleneck_loss', b_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=bs)
         return loss
 
+    def on_after_backward(self):
+        found_nonfinite = False
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            if not torch.isfinite(param.grad).all():
+                found_nonfinite = True
+                param.grad.copy_(_nan_to_num_tensor(param.grad))
+        if found_nonfinite:
+            self.log('stage1/nonfinite_grad', 1.0, on_step=True, on_epoch=True, sync_dist=True)
+
     def validation_step(self, batch, batch_idx):
         x, _ = batch
+        x = _nan_to_num_tensor(x)
         recon, b_loss, _ = self.model(x)
+        recon = _nan_to_num_tensor(recon)
+        b_loss = _nan_to_num_tensor(b_loss)
         recon_loss = F.mse_loss(recon, x)
         loss = recon_loss + self.bottleneck_weight * b_loss
         psnr = 10.0 * torch.log10(4.0 / torch.clamp(recon_loss.detach(), min=1e-8))

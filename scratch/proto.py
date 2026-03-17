@@ -81,6 +81,18 @@ def _import_real_wandb():
 wandb = _import_real_wandb()
 
 
+def _nan_to_num_tensor(
+    x: torch.Tensor,
+    *,
+    nan: float = 0.0,
+    posinf: float = 0.0,
+    neginf: float = 0.0,
+) -> torch.Tensor:
+    if torch.isfinite(x).all():
+        return x
+    return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
+
+
 # -----------------------------
 # VQ-VAE style building blocks
 # -----------------------------
@@ -439,7 +451,8 @@ def _dictionary_coherence(dictionary: torch.Tensor, eps: float = 1e-12) -> torch
 
 def _normalize_dictionary_in_place(dictionary: torch.Tensor, eps: float = 1e-12) -> None:
     with torch.no_grad():
-        dictionary.copy_(F.normalize(dictionary, p=2, dim=0, eps=eps))
+        safe_dictionary = _nan_to_num_tensor(dictionary.detach())
+        dictionary.copy_(F.normalize(safe_dictionary, p=2, dim=0, eps=eps))
 
 
 def _project_dictionary_gradient_in_place(dictionary: torch.Tensor, eps: float = 1e-12) -> None:
@@ -447,10 +460,12 @@ def _project_dictionary_gradient_in_place(dictionary: torch.Tensor, eps: float =
     if dictionary.grad is None:
         return
     with torch.no_grad():
-        atoms = F.normalize(dictionary.detach(), p=2, dim=0, eps=eps)
+        atoms = F.normalize(_nan_to_num_tensor(dictionary.detach()), p=2, dim=0, eps=eps)
         grad = dictionary.grad
+        grad.copy_(_nan_to_num_tensor(grad))
         radial = (atoms * grad).sum(dim=0, keepdim=True)
         grad.sub_(atoms * radial)
+        grad.copy_(_nan_to_num_tensor(grad))
 
 
 def _batched_omp_with_support(
@@ -468,6 +483,9 @@ def _batched_omp_with_support(
         raise ValueError(
             f"sparsity_level ({int(sparsity_level)}) must be <= num_atoms ({int(D.size(1))})"
         )
+
+    X = _nan_to_num_tensor(X)
+    D = _nan_to_num_tensor(D)
 
     _, batch_size = X.size()
     device = D.device
@@ -1091,8 +1109,8 @@ class DictionaryLearningTokenized(nn.Module):
             raise ValueError(f"Expected D={self.sparsity_level}, got {D}")
 
         dictionary = self._normalize_dict().t()  # [num_embeddings, C]
-        support = support.to(torch.long)
-        coeffs = coeffs.to(dictionary.dtype)
+        support = support.to(torch.long).clamp_(0, self.num_embeddings - 1)
+        coeffs = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp_(-self.coef_max, self.coef_max)
         support_flat = support.reshape(-1, D)
         coeffs_flat = coeffs.reshape(-1, D)
         atoms = dictionary[support_flat]  # [B*H*W, D, C]
@@ -1198,9 +1216,10 @@ class DictionaryLearningTokenized(nn.Module):
         if C != self.embedding_dim:
             raise ValueError(f"Expected channel dim {self.embedding_dim}, got {C}")
 
+        z_e = _nan_to_num_tensor(z_e)
         support, coeffs = self._encode_sparse_codes(z_e)
         support_flat = support.view(-1, self.sparsity_level)
-        coeffs_flat = coeffs.view(-1, self.sparsity_level)
+        coeffs_flat = _nan_to_num_tensor(coeffs.view(-1, self.sparsity_level)).clamp_(-self.coef_max, self.coef_max)
 
         if self.quantize_sparse_coeffs:
             # Quantize coefficients and interleave atom + coefficient-bin tokens.
@@ -1215,7 +1234,7 @@ class DictionaryLearningTokenized(nn.Module):
             coeffs_for_recon = self.clamp_sparse_coeffs(coeffs_flat)
 
         coeffs_for_recon = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
-        z_q = self._reconstruct_sparse(support, coeffs_for_recon)
+        z_q = _nan_to_num_tensor(self._reconstruct_sparse(support, coeffs_for_recon))
 
         # Bottleneck loss (LASER-style)
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
@@ -1553,8 +1572,8 @@ class PatchDictionaryLearningTokenized(nn.Module):
         C = self.embedding_dim
 
         dictionary = self._normalize_dict().t()
-        support_flat = support.to(torch.long).reshape(-1, D)
-        coeffs_flat = coeffs.to(dictionary.dtype).reshape(-1, D)
+        support_flat = support.to(torch.long).clamp_(0, self.num_embeddings - 1).reshape(-1, D)
+        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp_(-self.coef_max, self.coef_max).reshape(-1, D)
         atoms = dictionary[support_flat]                          # [N, D, patch_dim]
         recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)   # [N, patch_dim]
 
@@ -1590,8 +1609,8 @@ class PatchDictionaryLearningTokenized(nn.Module):
         W_pad = (npw - 1) * s + self.patch_size
 
         dictionary = self._normalize_dict().t()
-        support_flat = support.to(torch.long).reshape(-1, D)
-        coeffs_flat = coeffs.to(dictionary.dtype).reshape(-1, D)
+        support_flat = support.to(torch.long).clamp_(0, self.num_embeddings - 1).reshape(-1, D)
+        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp_(-self.coef_max, self.coef_max).reshape(-1, D)
         atoms = dictionary[support_flat]                          # [N, D, patch_dim]
         recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)   # [N, patch_dim]
 
@@ -1629,11 +1648,12 @@ class PatchDictionaryLearningTokenized(nn.Module):
         if C != self.embedding_dim:
             raise ValueError(f"Expected channel dim {self.embedding_dim}, got {C}")
 
+        z_e = _nan_to_num_tensor(z_e)
         support, coeffs, H, W = self._encode_sparse_codes(z_e)
         _, nph, npw, _ = support.shape
 
         support_flat = support.view(-1, self.sparsity_level)
-        coeffs_flat = coeffs.view(-1, self.sparsity_level)
+        coeffs_flat = _nan_to_num_tensor(coeffs.view(-1, self.sparsity_level)).clamp_(-self.coef_max, self.coef_max)
 
         if self.quantize_sparse_coeffs:
             bin_idx, coeff_q = self._quantize_coeff(coeffs_flat)
@@ -1646,7 +1666,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
             tokens = support.view(B, nph, npw, self.sparsity_level).long()
             coeffs_for_recon = self.clamp_sparse_coeffs(coeffs_flat).reshape(B, nph, npw, self.sparsity_level)
 
-        z_q = self._reconstruct_sparse(support, coeffs_for_recon, H, W)
+        z_q = _nan_to_num_tensor(self._reconstruct_sparse(support, coeffs_for_recon, H, W))
 
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
@@ -2418,6 +2438,11 @@ def train_stage1_ae(
     dict_warmup_epochs: int = 1,
     dict_min_lr_ratio: float = 0.05,
     dict_grad_clip: float = 0.1,
+    dict_max_update_norm: float = 0.0,
+    loss_spike_skip_ratio: float = 0.0,
+    loss_ema_beta: float = 0.98,
+    bottleneck_weight_start: float = 1.0,
+    bottleneck_warmup_epochs: int = 0,
     train_sampler: Optional[DistributedSampler] = None,
     is_main_process: bool = True,
     wandb_run: Optional[object] = None,
@@ -2432,20 +2457,27 @@ def train_stage1_ae(
         raise ValueError(
             f"Unsupported stage-1 dictionary optimizer mode: {dict_optimizer!r}"
         )
+    non_dict_params = [p for p in ae.parameters() if p is not dict_param]
     use_separate_dict_opt = dict_optimizer == "separate_sgd"
     if use_separate_dict_opt:
-        non_dict_params = [p for p in ae.parameters() if p is not dict_param]
         opt = torch.optim.Adam(non_dict_params, lr=lr)
         # Separate SGD remains available for experiments, but it is more sensitive because
         # OMP support selection changes discontinuously as the dictionary moves.
         dict_opt = torch.optim.SGD([dict_param], lr=lr * float(dict_lr_multiplier))
     else:
-        non_dict_params = None
-        opt = torch.optim.Adam(ae.parameters(), lr=lr)
+        # Keep the default Adam path, but give the dictionary its own param group so the
+        # dictionary-specific LR schedule actually takes effect and can be damped separately.
+        opt = torch.optim.Adam(
+            [
+                {"params": non_dict_params, "lr": lr},
+                {"params": [dict_param], "lr": lr * float(dict_lr_multiplier)},
+            ]
+        )
         dict_opt = None
     best_val_recon = float("inf")
     global_step = 0
     rfid_warned = False
+    loss_ema: Optional[float] = None
 
     for epoch in range(1, epochs + 1):
         if train_sampler is not None:
@@ -2465,33 +2497,78 @@ def train_stage1_ae(
                 min_lr_ratio=min_lr_ratio,
             )
             current_lr = float(lr) * float(lr_scale)
-            current_dict_lr = current_lr
-            for param_group in opt.param_groups:
-                param_group["lr"] = current_lr
+            if bottleneck_warmup_epochs > 0:
+                bw_progress = max(0.0, min(epoch_progress / float(max(1, bottleneck_warmup_epochs)), 1.0))
+                current_bottleneck_weight = float(bottleneck_weight_start) + (float(bottleneck_weight) - float(bottleneck_weight_start)) * bw_progress
+            else:
+                current_bottleneck_weight = float(bottleneck_weight)
+            dict_lr_scale = _stage1_lr_scale(
+                epoch=epoch_progress,
+                max_epochs=epochs,
+                schedule=dict_lr_schedule,
+                warmup_epochs=dict_warmup_epochs,
+                min_lr_ratio=dict_min_lr_ratio,
+            )
+            current_dict_lr = float(lr) * float(dict_lr_multiplier) * float(dict_lr_scale)
             if dict_opt is not None:
-                dict_lr_scale = _stage1_lr_scale(
-                    epoch=epoch_progress,
-                    max_epochs=epochs,
-                    schedule=dict_lr_schedule,
-                    warmup_epochs=dict_warmup_epochs,
-                    min_lr_ratio=dict_min_lr_ratio,
-                )
-                current_dict_lr = float(lr) * float(dict_lr_multiplier) * float(dict_lr_scale)
+                for param_group in opt.param_groups:
+                    param_group["lr"] = current_lr
                 for param_group in dict_opt.param_groups:
                     param_group["lr"] = current_dict_lr
-            x = x.to(device)
+            else:
+                opt.param_groups[0]["lr"] = current_lr
+                opt.param_groups[1]["lr"] = current_dict_lr
+            x = _nan_to_num_tensor(x.to(device))
             recon, b_loss, _ = ae(x)
+            recon = _nan_to_num_tensor(recon)
+            b_loss = _nan_to_num_tensor(b_loss)
             recon_loss = F.mse_loss(recon, x)
-            loss = recon_loss + bottleneck_weight * b_loss
+            loss = recon_loss + current_bottleneck_weight * b_loss
 
-            if not torch.isfinite(loss):
+            loss_finite_local = bool(torch.isfinite(loss).item())
+            if dist.is_available() and dist.is_initialized():
+                finite_flag = torch.tensor(1 if loss_finite_local else 0, device=device, dtype=torch.int32)
+                dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+                loss_is_finite = bool(finite_flag.item())
+            else:
+                loss_is_finite = loss_finite_local
+
+            loss_for_ema = _distributed_mean(loss.detach()) if loss_is_finite else None
+            loss_value = float(loss_for_ema.item()) if loss_for_ema is not None else float('nan')
+
+            should_skip_for_loss = not loss_is_finite
+            spike_threshold = None if loss_ema is None else loss_ema * float(loss_spike_skip_ratio)
+            if (
+                not should_skip_for_loss
+                and loss_ema is not None
+                and loss_spike_skip_ratio > 0.0
+                and global_step >= 10
+                and loss_value > float(spike_threshold)
+            ):
+                should_skip_for_loss = True
+
+            if should_skip_for_loss:
                 if is_main_process:
-                    print(
-                        f"[Stage1] Warning: non-finite loss ({float(loss.item()):.4f}) "
-                        f"at step {global_step + 1}, skipping update"
-                    )
+                    if not loss_is_finite:
+                        print(
+                            f"[Stage1] Warning: non-finite loss detected across ranks at step {global_step + 1}, skipping update"
+                        )
+                    else:
+                        print(
+                            f"[Stage1] Warning: loss spike ({loss_value:.4f} > {float(spike_threshold):.4f}) "
+                            f"at step {global_step + 1}, skipping update"
+                        )
+                if loss_is_finite:
+                    capped_loss = loss_value if spike_threshold is None else min(loss_value, float(spike_threshold))
+                    if loss_ema is None:
+                        loss_ema = capped_loss
+                    else:
+                        loss_ema = float(loss_ema_beta) * loss_ema + (1.0 - float(loss_ema_beta)) * capped_loss
                 global_step += 1
                 continue
+
+            if loss_ema is None:
+                loss_ema = loss_value
 
             opt.zero_grad(set_to_none=True)
             if dict_opt is not None:
@@ -2504,10 +2581,16 @@ def train_stage1_ae(
                 dict_grad_norm_postclip = torch.zeros((), device=device)
             else:
                 dict_grad_norm_raw = torch.linalg.vector_norm(dict_param.grad.detach())
-                if use_separate_dict_opt:
-                    _project_dictionary_gradient_in_place(dict_param, eps=dict_eps)
+                _project_dictionary_gradient_in_place(dict_param, eps=dict_eps)
                 dict_grad_norm_preclip = torch.linalg.vector_norm(dict_param.grad.detach())
                 dict_grad_norm_postclip = dict_grad_norm_preclip
+            found_nonfinite_grad = False
+            for param in ae.parameters():
+                if param.grad is None:
+                    continue
+                if not torch.isfinite(param.grad).all():
+                    found_nonfinite_grad = True
+                    param.grad.copy_(_nan_to_num_tensor(param.grad))
             if use_separate_dict_opt:
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(non_dict_params, grad_clip)
@@ -2519,10 +2602,17 @@ def train_stage1_ae(
                         dict_grad_norm_postclip = torch.linalg.vector_norm(dict_param.grad.detach())
             else:
                 if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(ae.parameters(), grad_clip)
+                    torch.nn.utils.clip_grad_norm_(non_dict_params, grad_clip)
+                if dict_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_([dict_param], dict_grad_clip)
                 if dict_param.grad is None:
                     dict_grad_norm_postclip = torch.zeros((), device=device)
                 else:
+                    dict_grad_norm_postclip = torch.linalg.vector_norm(dict_param.grad.detach())
+            if found_nonfinite_grad:
+                if is_main_process:
+                    print(f"[Stage1] Warning: non-finite gradients at step {global_step + 1}, sanitized before optimizer step")
+                if dict_param.grad is not None:
                     dict_grad_norm_postclip = torch.linalg.vector_norm(dict_param.grad.detach())
             opt.step()
             if dict_opt is not None:
@@ -2533,6 +2623,26 @@ def train_stage1_ae(
             dict_update_norm = torch.linalg.vector_norm(
                 F.normalize(dict_param.detach(), p=2, dim=0, eps=dict_eps) - dict_before_step
             )
+            reject_dict_update = False
+            rejected_update_norm = float(dict_update_norm.item())
+            if dict_max_update_norm > 0.0:
+                reject_dict_update = rejected_update_norm > float(dict_max_update_norm)
+                if dist.is_available() and dist.is_initialized():
+                    reject_flag = torch.tensor(1 if reject_dict_update else 0, device=device, dtype=torch.int32)
+                    dist.all_reduce(reject_flag, op=dist.ReduceOp.MAX)
+                    reject_dict_update = bool(reject_flag.item())
+                    rejected_norm_tensor = torch.tensor(rejected_update_norm, device=device, dtype=torch.float32)
+                    dist.all_reduce(rejected_norm_tensor, op=dist.ReduceOp.MAX)
+                    rejected_update_norm = float(rejected_norm_tensor.item())
+            if reject_dict_update:
+                with torch.no_grad():
+                    dict_param.copy_(dict_before_step)
+                dict_update_norm = torch.zeros((), device=device)
+                if is_main_process:
+                    print(
+                        f"[Stage1] Warning: dictionary update norm {rejected_update_norm:.4f} exceeded "
+                        f"limit {float(dict_max_update_norm):.4f} at step {global_step + 1}, restored previous dictionary"
+                    )
             dict_coherence = _dictionary_coherence(
                 ae_module.bottleneck.dictionary,
                 eps=dict_eps,
@@ -2547,6 +2657,10 @@ def train_stage1_ae(
             dict_update_log = _distributed_mean(dict_update_norm)
             dict_coherence_log = _distributed_mean(dict_coherence)
             running += float(loss_log.item())
+            if loss_ema is None:
+                loss_ema = float(loss_log.item())
+            else:
+                loss_ema = float(loss_ema_beta) * loss_ema + (1.0 - float(loss_ema_beta)) * float(loss_log.item())
             global_step += 1
             if is_main_process:
                 pbar.set_postfix(
@@ -2560,12 +2674,14 @@ def train_stage1_ae(
                         "stage1/train_loss": float(loss_log.item()),
                         "stage1/recon_loss": float(recon_log.item()),
                         "stage1/bottleneck_loss": float(b_log.item()),
+                        "stage1/bottleneck_weight": float(current_bottleneck_weight),
                         "stage1/dict_lr": float(current_dict_lr),
                         "stage1/dict_grad_norm_raw": float(dict_grad_raw_log.item()),
                         "stage1/dict_grad_norm_preclip": float(dict_grad_preclip_log.item()),
                         "stage1/dict_grad_norm_postclip": float(dict_grad_postclip_log.item()),
                         "stage1/dict_update_norm": float(dict_update_log.item()),
                         "stage1/dict_coherence": float(dict_coherence_log.item()),
+                        "stage1/loss_ema": float(loss_ema if loss_ema is not None else loss_log.item()),
                         "stage1/batch_in_epoch": int(step_idx + 1),
                         "stage1/epoch": epoch,
                     },
@@ -2583,10 +2699,12 @@ def train_stage1_ae(
         val_count = torch.zeros(1, device=device)
         with torch.no_grad():
             for x, _ in val_loader:
-                x = x.to(device)
+                x = _nan_to_num_tensor(x.to(device))
                 recon, b_loss, _ = ae(x)
+                recon = _nan_to_num_tensor(recon)
+                b_loss = _nan_to_num_tensor(b_loss)
                 recon_loss = F.mse_loss(recon, x)
-                loss = recon_loss + bottleneck_weight * b_loss
+                loss = recon_loss + current_bottleneck_weight * b_loss
                 x_unit = _to_unit_range(x)
                 recon_unit = _to_unit_range(recon)
                 psnr = _batch_psnr(recon_unit, x_unit)
@@ -3514,6 +3632,36 @@ def main():
         default=0.1,
         help="Clip norm applied only to the stage-1 dictionary gradient after tangent projection (<=0 disables).",
     )
+    parser.add_argument(
+        "--stage1_dict_max_update_norm",
+        type=float,
+        default=0.0,
+        help="Maximum allowed normalized dictionary update per stage-1 step. >0 restores the previous dictionary on oversized updates.",
+    )
+    parser.add_argument(
+        "--stage1_loss_spike_skip_ratio",
+        type=float,
+        default=0.0,
+        help="Skip stage-1 updates when the loss exceeds this multiple of the running EMA. 0 disables the guard.",
+    )
+    parser.add_argument(
+        "--stage1_loss_ema_beta",
+        type=float,
+        default=0.98,
+        help="EMA coefficient used by the stage-1 loss-spike skip guard.",
+    )
+    parser.add_argument(
+        "--stage1_bottleneck_weight_start",
+        type=float,
+        default=1.0,
+        help="Initial stage-1 bottleneck weight at epoch 0 before ramping to --bottleneck_weight.",
+    )
+    parser.add_argument(
+        "--stage1_bottleneck_warmup_epochs",
+        type=int,
+        default=0,
+        help="Ramp stage-1 bottleneck weight from --stage1_bottleneck_weight_start to --bottleneck_weight over this many epochs.",
+    )
     parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=1e-3)
     parser.add_argument(
@@ -3723,6 +3871,14 @@ def main():
         raise ValueError("stage1_dict_min_lr_ratio must be in [0, 1].")
     if args.stage1_dict_grad_clip < 0.0:
         raise ValueError("stage1_dict_grad_clip must be >= 0.")
+    if args.stage1_dict_max_update_norm < 0.0:
+        raise ValueError("stage1_dict_max_update_norm must be >= 0.")
+    if args.stage1_loss_spike_skip_ratio < 0.0:
+        raise ValueError("stage1_loss_spike_skip_ratio must be >= 0.")
+    if not (0.0 <= args.stage1_loss_ema_beta < 1.0):
+        raise ValueError("stage1_loss_ema_beta must be in [0, 1).")
+    if args.stage1_bottleneck_warmup_epochs < 0:
+        raise ValueError("stage1_bottleneck_warmup_epochs must be >= 0.")
     if args.stage2_coeff_loss_weight < 0.0:
         raise ValueError("stage2_coeff_loss_weight must be >= 0.")
     if args.stage2_rq_atom_loss_weight < 0.0:
@@ -4028,6 +4184,11 @@ def main():
             dict_warmup_epochs=args.stage1_dict_warmup_epochs,
             dict_min_lr_ratio=args.stage1_dict_min_lr_ratio,
             dict_grad_clip=args.stage1_dict_grad_clip,
+            dict_max_update_norm=args.stage1_dict_max_update_norm,
+            loss_spike_skip_ratio=args.stage1_loss_spike_skip_ratio,
+            loss_ema_beta=args.stage1_loss_ema_beta,
+            bottleneck_weight_start=args.stage1_bottleneck_weight_start,
+            bottleneck_warmup_epochs=args.stage1_bottleneck_warmup_epochs,
             train_sampler=train_sampler,
             is_main_process=is_main_process,
             wandb_run=wandb_run,
