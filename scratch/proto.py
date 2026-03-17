@@ -13,9 +13,12 @@ For multi-GPU runs, launch with torchrun.
 """
 import argparse
 import datetime
+import hashlib
+import importlib
 import math
 import os
 import shutil
+import sys
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -43,10 +46,39 @@ try:
     from torchmetrics.image.fid import FrechetInceptionDistance
 except Exception:
     FrechetInceptionDistance = None
-try:
-    import wandb
-except Exception:
-    wandb = None
+def _import_real_wandb():
+    """Import the actual wandb package even if the workspace has a local wandb/ directory."""
+    try:
+        module = importlib.import_module("wandb")
+        if hasattr(module, "init") and hasattr(module, "Api"):
+            return module
+    except Exception:
+        module = None
+
+    script_dir = Path(__file__).resolve().parent
+    original_sys_path = list(sys.path)
+    try:
+        sys.modules.pop("wandb", None)
+        filtered = []
+        for entry in original_sys_path:
+            try:
+                if Path(entry).resolve() == script_dir:
+                    continue
+            except Exception:
+                pass
+            filtered.append(entry)
+        sys.path = filtered
+        module = importlib.import_module("wandb")
+        if hasattr(module, "init") and hasattr(module, "Api"):
+            return module
+    except Exception:
+        return None
+    finally:
+        sys.path = original_sys_path
+    return None
+
+
+wandb = _import_real_wandb()
 
 
 # -----------------------------
@@ -293,13 +325,26 @@ def _init_distributed(timeout_minutes: int) -> Tuple[bool, int, int, int]:
 
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
+    visible_device_count = torch.cuda.device_count()
+    if visible_device_count <= 0:
+        raise RuntimeError("CUDA is available but no devices are visible to this process.")
+    device_index = local_rank
+    if device_index >= visible_device_count:
+        if visible_device_count == 1:
+            # Some SLURM launches expose one GPU per task but still assign LOCAL_RANK
+            # in the node-local task range. In that case the only valid visible device is 0.
+            device_index = 0
+        else:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} but only {visible_device_count} CUDA devices are visible"
+            )
+    torch.cuda.set_device(device_index)
     if not dist.is_initialized():
         dist.init_process_group(
             backend="nccl",
             timeout=datetime.timedelta(minutes=int(timeout_minutes)),
         )
-    return True, rank, local_rank, world_size
+    return True, rank, device_index, world_size
 
 
 def _cleanup_distributed():
@@ -520,6 +565,27 @@ _RFID_METRIC_DEVICE = None
 _WANDB_LOG_STEP = 0
 
 
+_FLAT_IMAGE_DATASET_INDEX_CACHE = {}
+
+
+def _flat_image_index_cache_file(root: Path) -> Path:
+    cache_base = Path(os.environ.get("LASER_DATASET_CACHE_DIR", f"/scratch/{os.environ.get('USER', 'unknown')}/.cache/laser_dataset_index")).expanduser()
+    root_key = hashlib.sha1(str(root).encode("utf-8")).hexdigest()
+    return cache_base / f"{root_key}.txt"
+
+
+def _scan_image_paths(root: Path):
+    image_paths = []
+    for dirpath, _, filenames in os.walk(root):
+        base = Path(dirpath)
+        for name in filenames:
+            path = base / name
+            if path.suffix.lower() in IMG_EXTENSIONS:
+                image_paths.append(path)
+    image_paths.sort()
+    return image_paths
+
+
 class FlatImageDataset(Dataset):
     """
     Recursively loads images from a directory tree.
@@ -532,14 +598,27 @@ class FlatImageDataset(Dataset):
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset directory not found: {self.root}")
 
-        image_paths = [
-            p for p in self.root.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
-        ]
-        image_paths.sort()
-        if not image_paths:
+        cached = _FLAT_IMAGE_DATASET_INDEX_CACHE.get(self.root)
+        if cached is None:
+            cache_file = _flat_image_index_cache_file(self.root)
+            image_paths = None
+            if cache_file.exists():
+                try:
+                    image_paths = [Path(line.strip()) for line in cache_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+                except Exception:
+                    image_paths = None
+            if image_paths is None:
+                image_paths = _scan_image_paths(self.root)
+                try:
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_text("\n".join(str(p) for p in image_paths) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+            _FLAT_IMAGE_DATASET_INDEX_CACHE[self.root] = image_paths
+            cached = image_paths
+        if not cached:
             raise RuntimeError(f"No images found under: {self.root}")
-        self.image_paths = image_paths
+        self.image_paths = cached
 
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -3670,12 +3749,10 @@ def main():
         if not args.stage1_source_ckpt:
             args.stage1_source_ckpt = None
     default_stage1_ckpt = _default_stage1_source_ckpt(bool(args.quantize_sparse_coeffs))
-    if args.stage1_source_ckpt is None and default_stage1_ckpt is not None:
-        args.stage1_source_ckpt = str(default_stage1_ckpt)
+    # Fresh stage-1 training should start from random init unless the caller
+    # explicitly provides a checkpoint or run to warm-start from.
     stage1_init_source_ckpt = args.stage1_source_ckpt
     stage1_init_source_run = args.stage1_source_run
-    if stage1_init_source_ckpt is None and stage1_init_source_run is None and args.stage1_epochs > 0:
-        stage1_init_source_run = DEFAULT_STAGE1_SOURCE_RUN
     if args.stage1_source_ckpt is None and args.stage1_source_run is None and args.stage1_epochs <= 0:
         args.stage1_source_run = DEFAULT_STAGE1_SOURCE_RUN
     if args.stage2_source_run is not None:
@@ -3858,6 +3935,8 @@ def main():
         normalize,
     ])
 
+    if is_main_process:
+        print(f"[Startup] building datasets for {args.dataset} (num_workers={args.num_workers}, token_num_workers={args.token_num_workers})")
     if args.dataset == "cifar10":
         train_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_tfm)
         val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
@@ -3878,6 +3957,8 @@ def main():
         stage2_source_set = Subset(token_full, train_indices)
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
+    if is_main_process:
+        print(f"[Startup] dataset split ready: train={len(train_set)} val={len(val_set)} stage2_source={len(stage2_source_set)}")
 
     train_sampler = DistributedSampler(train_set, shuffle=True) if distributed else None
     val_sampler = DistributedSampler(val_set, shuffle=False) if distributed else None
@@ -3906,6 +3987,8 @@ def main():
             num_workers=max(0, args.num_workers // 2),
             pin_memory=pin_memory,
         )
+    if is_main_process:
+        print("[Startup] dataloaders ready")
 
     laser = _build_laser().to(device)
     if stage1_init_source_ckpt is not None:
@@ -3921,6 +4004,8 @@ def main():
             print(f"[Stage1] warm-starting from W&B run {stage1_init_source_run}: {stage1_init_path}")
         _load_module_checkpoint(laser, stage1_init_path)
     laser_stage1 = DDP(laser, device_ids=[local_rank], output_device=local_rank) if distributed else laser
+    if is_main_process:
+        print(f"[Startup] entering stage1 train loop (epochs={args.stage1_epochs}, batch_size={args.batch_size}, lr={args.stage1_lr})")
     if args.stage1_epochs > 0:
         train_stage1_ae(
             ae=laser_stage1,
