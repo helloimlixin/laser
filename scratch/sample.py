@@ -75,12 +75,25 @@ def _infer_stage1_config(state_dict: Dict[str, torch.Tensor], token_cache: dict)
             coef_quantization = "mu_law"
             coef_mu = float(math.expm1(1.0 / mu_invlog1p))
 
+    num_hiddens = int(state_dict["encoder.conv_in.weight"].shape[0])
+    num_residual_layers = max(1, _indexed_block_count(state_dict.keys(), "encoder.down.0.block"))
+    encoder_norm_channels = int(state_dict["encoder.norm_out.weight"].shape[0])
+    decoder_blocks_per_level = max(1, _indexed_block_count(state_dict.keys(), "decoder.up.0.block"))
+    inferred_use_mid_attention = (
+        "encoder.mid.attn_1.q.weight" in state_dict or "decoder.mid.attn_1.q.weight" in state_dict
+    )
+
     return {
         "in_channels": int(state_dict["encoder.conv_in.weight"].shape[1]),
-        "num_hiddens": int(state_dict["encoder.conv_in.weight"].shape[0]),
+        "num_hiddens": num_hiddens,
         "num_downsamples": max(0, _indexed_block_count(state_dict.keys(), "encoder.down") - 1),
-        "num_residual_layers": max(1, _indexed_block_count(state_dict.keys(), "encoder.down.0.block")),
+        "num_residual_layers": num_residual_layers,
         "resolution": int(metadata.get("image_size", 128)),
+        "max_ch_mult": int(metadata.get("max_ch_mult", max(1, encoder_norm_channels // max(1, num_hiddens)))),
+        "decoder_extra_residual_layers": int(
+            metadata.get("decoder_extra_residual_layers", max(0, decoder_blocks_per_level - num_residual_layers))
+        ),
+        "use_mid_attention": bool(metadata.get("use_mid_attention", inferred_use_mid_attention)),
         "embedding_dim": int(state_dict["encoder.conv_out.weight"].shape[0]),
         "num_embeddings": int(dictionary_shape[1]),
         "sparsity_level": int(metadata.get("sparsity_level", token_cache["shape"][2])),

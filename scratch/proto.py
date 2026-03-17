@@ -15,6 +15,7 @@ import argparse
 import datetime
 import hashlib
 import importlib
+import importlib.util
 import math
 import os
 import shutil
@@ -47,30 +48,74 @@ try:
 except Exception:
     FrechetInceptionDistance = None
 def _import_real_wandb():
-    """Import the actual wandb package even if the workspace has a local wandb/ directory."""
+    """Import the real wandb package even if the workspace has a local wandb/ directory."""
+
+    def _is_real_wandb(module) -> bool:
+        return bool(module) and hasattr(module, "init") and hasattr(module, "Api")
+
     try:
         module = importlib.import_module("wandb")
-        if hasattr(module, "init") and hasattr(module, "Api"):
+        if _is_real_wandb(module):
             return module
     except Exception:
         module = None
 
     script_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+    blocked_paths = {script_dir, cwd}
     original_sys_path = list(sys.path)
+
+    def _iter_site_packages_paths():
+        seen = set()
+        pyuserbase = os.environ.get("PYTHONUSERBASE")
+        if pyuserbase:
+            for candidate in Path(pyuserbase).expanduser().glob("lib/python*/site-packages"):
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    yield resolved
+        for entry in original_sys_path:
+            try:
+                resolved = Path(entry).resolve()
+            except Exception:
+                continue
+            if "site-packages" in resolved.parts and resolved not in seen:
+                seen.add(resolved)
+                yield resolved
+
     try:
         sys.modules.pop("wandb", None)
         filtered = []
         for entry in original_sys_path:
             try:
-                if Path(entry).resolve() == script_dir:
-                    continue
+                resolved = cwd if entry in ("", ".") else Path(entry).resolve()
             except Exception:
-                pass
+                resolved = None
+            if resolved in blocked_paths:
+                continue
             filtered.append(entry)
         sys.path = filtered
         module = importlib.import_module("wandb")
-        if hasattr(module, "init") and hasattr(module, "Api"):
+        if _is_real_wandb(module):
             return module
+
+        for site_packages in _iter_site_packages_paths():
+            init_py = site_packages / "wandb" / "__init__.py"
+            if not init_py.exists():
+                continue
+            spec = importlib.util.spec_from_file_location(
+                "wandb",
+                init_py,
+                submodule_search_locations=[str(init_py.parent)],
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["wandb"] = module
+            spec.loader.exec_module(module)
+            if _is_real_wandb(module):
+                return module
+            sys.modules.pop("wandb", None)
     except Exception:
         return None
     finally:
@@ -176,6 +221,29 @@ def _launch_timestamp() -> str:
 def _resolve_run_out_dir(base_dir: str, launch_timestamp: str) -> Path:
     """Create a per-launch run directory under the provided experiment root."""
     return Path(base_dir).expanduser().resolve() / launch_timestamp
+
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Return the SHA256 hex digest for a file."""
+    resolved = Path(path).expanduser().resolve()
+    hasher = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _stage1_checkpoint_cache_key(path: Optional[Path]) -> Optional[str]:
+    """Build a stable cache key for the stage-1 checkpoint used by stage 2."""
+    if path is None:
+        return None
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Stage-1 checkpoint does not exist: {resolved}")
+    return f"sha256:{_sha256_file(resolved)}"
 
 
 def _find_latest_stage1_checkpoint(experiment_root: Path, current_run_dir: Path) -> Optional[Path]:
@@ -581,6 +649,7 @@ _RFID_MODEL_DEVICE = None
 _RFID_METRIC = None
 _RFID_METRIC_DEVICE = None
 _WANDB_LOG_STEP = 0
+_WANDB_DISABLE_REASON = None
 
 
 _FLAT_IMAGE_DATASET_INDEX_CACHE = {}
@@ -761,7 +830,7 @@ class Encoder(nn.Module):
     """RQ-VAE encoder with ResNet blocks, optional attention, and progressive downsampling."""
     def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, double_z=False, **ignore_kwargs):
+                 resolution, z_channels, double_z=False, use_mid_attention=True, **ignore_kwargs):
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -769,6 +838,7 @@ class Encoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
+        self.use_mid_attention = bool(use_mid_attention)
 
         self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
 
@@ -797,7 +867,7 @@ class Encoder(nn.Module):
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in,
                                        temb_channels=self.temb_ch, dropout=dropout)
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.attn_1 = AttnBlock(block_in) if self.use_mid_attention else nn.Identity()
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in,
                                        temb_channels=self.temb_ch, dropout=dropout)
 
@@ -828,7 +898,7 @@ class Decoder(nn.Module):
     """RQ-VAE decoder with ResNet blocks, optional attention, and progressive upsampling."""
     def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, give_pre_end=False, **ignorekwargs):
+                 resolution, z_channels, give_pre_end=False, use_mid_attention=True, extra_res_blocks=1, **ignorekwargs):
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -837,6 +907,8 @@ class Decoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
         self.give_pre_end = give_pre_end
+        self.use_mid_attention = bool(use_mid_attention)
+        self.extra_res_blocks = max(0, int(extra_res_blocks))
 
         block_in = ch * ch_mult[self.num_resolutions - 1]
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
@@ -847,16 +919,17 @@ class Decoder(nn.Module):
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in,
                                        temb_channels=self.temb_ch, dropout=dropout)
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.attn_1 = AttnBlock(block_in) if self.use_mid_attention else nn.Identity()
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in,
                                        temb_channels=self.temb_ch, dropout=dropout)
+        self.blocks_per_level = max(1, self.num_res_blocks + self.extra_res_blocks)
 
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks + 1):
+            for i_block in range(self.blocks_per_level):
                 block.append(ResnetBlock(in_channels=block_in, out_channels=block_out,
                                          temb_channels=self.temb_ch, dropout=dropout))
                 block_in = block_out
@@ -881,7 +954,7 @@ class Decoder(nn.Module):
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
         for i_level in reversed(range(self.num_resolutions)):
-            for i_block in range(self.num_res_blocks + 1):
+            for i_block in range(self.blocks_per_level):
                 h = self.up[i_level].block[i_block](h, temb)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
@@ -1109,8 +1182,8 @@ class DictionaryLearningTokenized(nn.Module):
             raise ValueError(f"Expected D={self.sparsity_level}, got {D}")
 
         dictionary = self._normalize_dict().t()  # [num_embeddings, C]
-        support = support.to(torch.long).clamp_(0, self.num_embeddings - 1)
-        coeffs = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp_(-self.coef_max, self.coef_max)
+        support = support.to(torch.long).clamp(0, self.num_embeddings - 1)
+        coeffs = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp(-self.coef_max, self.coef_max)
         support_flat = support.reshape(-1, D)
         coeffs_flat = coeffs.reshape(-1, D)
         atoms = dictionary[support_flat]  # [B*H*W, D, C]
@@ -1572,8 +1645,8 @@ class PatchDictionaryLearningTokenized(nn.Module):
         C = self.embedding_dim
 
         dictionary = self._normalize_dict().t()
-        support_flat = support.to(torch.long).clamp_(0, self.num_embeddings - 1).reshape(-1, D)
-        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp_(-self.coef_max, self.coef_max).reshape(-1, D)
+        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
+        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp(-self.coef_max, self.coef_max).reshape(-1, D)
         atoms = dictionary[support_flat]                          # [N, D, patch_dim]
         recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)   # [N, patch_dim]
 
@@ -1609,8 +1682,8 @@ class PatchDictionaryLearningTokenized(nn.Module):
         W_pad = (npw - 1) * s + self.patch_size
 
         dictionary = self._normalize_dict().t()
-        support_flat = support.to(torch.long).clamp_(0, self.num_embeddings - 1).reshape(-1, D)
-        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp_(-self.coef_max, self.coef_max).reshape(-1, D)
+        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
+        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp(-self.coef_max, self.coef_max).reshape(-1, D)
         atoms = dictionary[support_flat]                          # [N, D, patch_dim]
         recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)   # [N, patch_dim]
 
@@ -1734,6 +1807,9 @@ class LASER(nn.Module):
         resolution: int = 128,
         attn_resolutions: tuple = (),
         dropout: float = 0.0,
+        max_ch_mult: int = 2,
+        decoder_extra_residual_layers: int = 1,
+        use_mid_attention: bool = True,
         embedding_dim: int = 16,
         num_embeddings: int = 1024,
         sparsity_level: int = 8,
@@ -1751,12 +1827,22 @@ class LASER(nn.Module):
     ):
         super().__init__()
         self.out_tanh = bool(out_tanh)
+        self.max_ch_mult = int(max_ch_mult)
+        self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
+        self.use_mid_attention = bool(use_mid_attention)
+
+        if self.max_ch_mult <= 0:
+            raise ValueError(f"max_ch_mult must be positive, got {self.max_ch_mult}")
+        if self.decoder_extra_residual_layers < 0:
+            raise ValueError(
+                f"decoder_extra_residual_layers must be non-negative, got {self.decoder_extra_residual_layers}"
+            )
 
         # ch_mult controls the channel multiplier at each resolution level;
         # len(ch_mult) - 1 equals the number of spatial downsampling steps.
-        # Cap multipliers at 2 to keep max channels = num_hiddens*2.
-        # e.g. num_downsamples=2 → (1,2,2), num_hiddens=128 → max 256 channels.
-        ch_mult = tuple(min(2 ** i, 2) for i in range(num_downsamples + 1))
+        # Cap multipliers to keep the max width bounded without changing the
+        # number of encoder or decoder stages.
+        ch_mult = tuple(min(2 ** i, self.max_ch_mult) for i in range(num_downsamples + 1))
 
         enc_dec_kwargs = dict(
             ch=num_hiddens,
@@ -1765,11 +1851,13 @@ class LASER(nn.Module):
             num_res_blocks=num_residual_layers,
             attn_resolutions=attn_resolutions,
             dropout=dropout,
+            use_mid_attention=self.use_mid_attention,
             resamp_with_conv=True,
             in_channels=in_channels,
             resolution=resolution,
             z_channels=embedding_dim,
         )
+        dec_kwargs = dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
         self.encoder = Encoder(**enc_dec_kwargs)
         bottleneck_kwargs = dict(
             num_embeddings=num_embeddings,
@@ -1791,7 +1879,7 @@ class LASER(nn.Module):
             )
         else:
             self.bottleneck = DictionaryLearningTokenized(**bottleneck_kwargs)
-        self.decoder = Decoder(**enc_dec_kwargs)
+        self.decoder = Decoder(**dec_kwargs)
         self._last_latent_hw: Optional[Tuple[int, int]] = None
 
     def _remember_latent_hw(self, z: torch.Tensor) -> None:
@@ -2029,11 +2117,38 @@ def _to_unit_range(x: torch.Tensor) -> torch.Tensor:
 def _sample_quality_features(x: torch.Tensor) -> torch.Tensor:
     """Compact image features for filtering off-manifold stage-2 samples."""
     x_unit = _to_unit_range(x)
+    B, C, H, W = x_unit.shape
     rgb_mean = x_unit.mean(dim=(2, 3))
     rgb_std = x_unit.std(dim=(2, 3))
     saturation = (x_unit.amax(dim=1) - x_unit.amin(dim=1)).mean(dim=(1, 2)).unsqueeze(1)
     brightness = x_unit.mean(dim=(1, 2, 3)).unsqueeze(1)
-    return torch.cat([rgb_mean, rgb_std, saturation, brightness], dim=1)
+
+    border_width = max(1, min(H, W) // 16)
+    border_pixels = torch.cat([
+        x_unit[:, :, :border_width, :].reshape(B, C, -1),
+        x_unit[:, :, -border_width:, :].reshape(B, C, -1),
+        x_unit[:, :, border_width:-border_width, :border_width].reshape(B, C, -1),
+        x_unit[:, :, border_width:-border_width, -border_width:].reshape(B, C, -1),
+    ], dim=2)
+    if H > 2 * border_width and W > 2 * border_width:
+        center_region = x_unit[:, :, border_width:-border_width, border_width:-border_width]
+    else:
+        center_region = x_unit
+    center_pixels = center_region.reshape(B, C, -1)
+    border_mean = border_pixels.mean(dim=2)
+    border_std = border_pixels.std(dim=2)
+    center_mean = center_pixels.mean(dim=2)
+    border_center_gap = border_mean - center_mean
+
+    return torch.cat([
+        rgb_mean,
+        rgb_std,
+        saturation,
+        brightness,
+        border_mean,
+        border_std,
+        border_center_gap,
+    ], dim=1)
 
 
 @torch.no_grad()
@@ -2081,17 +2196,58 @@ def _select_best_stage2_samples(
     keep: int,
     reference_stats: Optional[dict],
 ) -> torch.Tensor:
-    """Keep the decoded candidates closest to stage-1 sample statistics."""
+    """Select a high-quality but diverse subset of decoded stage-2 candidates."""
     keep = min(int(keep), int(imgs.size(0)))
-    if keep <= 0 or reference_stats is None or imgs.size(0) <= keep:
+    if keep <= 0 or imgs.size(0) <= keep:
         return imgs[:keep]
 
     feats = _sample_quality_features(imgs)
-    ref_mean = reference_stats["mean"].to(device=imgs.device, dtype=feats.dtype)
-    ref_std = reference_stats["std"].to(device=imgs.device, dtype=feats.dtype)
-    score = (((feats - ref_mean) / ref_std) ** 2).mean(dim=1)
-    best = torch.topk(-score, k=keep).indices
-    return imgs.index_select(0, best)
+    if reference_stats is None:
+        quality = torch.zeros(imgs.size(0), device=imgs.device, dtype=feats.dtype)
+    else:
+        ref_mean = reference_stats["mean"].to(device=imgs.device, dtype=feats.dtype)
+        ref_std = reference_stats["std"].to(device=imgs.device, dtype=feats.dtype)
+        quality = (((feats - ref_mean) / ref_std) ** 2).mean(dim=1)
+
+    pool_size = min(int(imgs.size(0)), max(keep, 4 * keep))
+    if pool_size < imgs.size(0):
+        pool = torch.topk(-quality, k=pool_size).indices
+        pool_feats = feats.index_select(0, pool)
+        pool_quality = quality.index_select(0, pool)
+    else:
+        pool = torch.arange(imgs.size(0), device=imgs.device)
+        pool_feats = feats
+        pool_quality = quality
+
+    if pool.numel() <= keep:
+        return imgs.index_select(0, pool[:keep])
+
+    quality_norm = pool_quality - pool_quality.min()
+    quality_norm = quality_norm / quality_norm.max().clamp_min(1e-6)
+
+    selected = [int(torch.argmin(pool_quality).item())]
+    selected_mask = torch.zeros(pool_feats.size(0), device=pool_feats.device, dtype=torch.bool)
+    selected_mask[selected[0]] = True
+    min_feat_dist = torch.full(
+        (pool_feats.size(0),),
+        float("inf"),
+        device=pool_feats.device,
+        dtype=pool_feats.dtype,
+    )
+
+    while len(selected) < keep:
+        last = selected[-1]
+        feat_dist = ((pool_feats - pool_feats[last:last + 1]) ** 2).mean(dim=1)
+        min_feat_dist = torch.minimum(min_feat_dist, feat_dist)
+        diversity_norm = min_feat_dist / min_feat_dist.max().clamp_min(1e-6)
+        score = diversity_norm - 0.15 * quality_norm
+        score = score.masked_fill(selected_mask, float('-inf'))
+        next_idx = int(torch.argmax(score).item())
+        selected.append(next_idx)
+        selected_mask[next_idx] = True
+
+    selected_idx = pool.index_select(0, torch.tensor(selected, device=pool.device, dtype=torch.long))
+    return imgs.index_select(0, selected_idx)
 
 
 @torch.no_grad()
@@ -2322,13 +2478,52 @@ def _compute_reconstruction_fid(
     return _frechet_distance_from_features(torch.cat(real_feats, dim=0), torch.cat(fake_feats, dim=0))
 
 
+def _maybe_load_wandb_api_key() -> Optional[str]:
+    api_key = os.environ.get("WANDB_API_KEY")
+    if api_key:
+        return api_key
+
+    candidates = []
+    key_file_env = os.environ.get("WANDB_API_KEY_FILE")
+    if key_file_env:
+        candidates.append(Path(key_file_env).expanduser())
+
+    user_name = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if user_name:
+        candidates.append(Path("/scratch") / user_name / ".secrets" / "wandb_api_key")
+    try:
+        home_user = Path.home().name
+    except Exception:
+        home_user = None
+    if home_user and home_user != user_name:
+        candidates.append(Path("/scratch") / home_user / ".secrets" / "wandb_api_key")
+
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            api_key = candidate.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if api_key:
+            os.environ["WANDB_API_KEY"] = api_key
+            return api_key
+    return None
+
+
 def _init_wandb(args) -> Optional[object]:
-    global _WANDB_LOG_STEP
+    global _WANDB_DISABLE_REASON, _WANDB_LOG_STEP
     if not getattr(args, "wandb", True):
         return None
     if wandb is None:
         print("[W&B] wandb is not installed; continuing without logging.")
         return None
+    api_key = _maybe_load_wandb_api_key()
+    if api_key:
+        try:
+            wandb.login(key=api_key, relogin=True, verify=True)
+        except Exception as exc:
+            print(f"[W&B] login failed ({type(exc).__name__}: {exc}); continuing to init with existing env.")
     try:
         run = wandb.init(
             project=args.wandb_project,
@@ -2339,6 +2534,7 @@ def _init_wandb(args) -> Optional[object]:
             config=dict(vars(args)),
         )
         _WANDB_LOG_STEP = 0
+        _WANDB_DISABLE_REASON = None
         run.define_metric("stage1/step")
         run.define_metric("stage1/*", step_metric="stage1/step")
         run.define_metric("stage2/step")
@@ -2356,18 +2552,44 @@ def _next_wandb_log_step() -> int:
     return step
 
 
+def _disable_wandb_logging(run: Optional[object], context: str, exc: Exception) -> None:
+    global _WANDB_DISABLE_REASON
+    if _WANDB_DISABLE_REASON is not None:
+        return
+    _WANDB_DISABLE_REASON = f"{context}: {type(exc).__name__}: {exc}"
+    print(f"[W&B] disabling logging after {context} failed ({type(exc).__name__}: {exc})")
+    if run is None:
+        return
+    try:
+        run.summary["wandb_disabled_reason"] = _WANDB_DISABLE_REASON
+    except Exception:
+        pass
+
+
+def _finish_wandb(run: Optional[object]) -> None:
+    if run is None:
+        return
+    try:
+        run.finish()
+    except Exception as exc:
+        print(f"[W&B] finish failed ({type(exc).__name__}: {exc})")
+
+
 def _log_wandb(
     run: Optional[object],
     data: dict,
     step_metric: Optional[str] = None,
     step_value: Optional[int] = None,
 ):
-    if run is None:
+    if run is None or _WANDB_DISABLE_REASON is not None:
         return
     payload = dict(data)
     if step_metric is not None and step_value is not None:
         payload[step_metric] = int(step_value)
-    run.log(payload, step=_next_wandb_log_step())
+    try:
+        run.log(payload, step=_next_wandb_log_step())
+    except Exception as exc:
+        _disable_wandb_logging(run, "scalar log", exc)
 
 
 def _log_wandb_image(
@@ -2378,14 +2600,17 @@ def _log_wandb_image(
     step_value: Optional[int] = None,
     caption: Optional[str] = None,
 ):
-    if run is None or wandb is None:
+    if run is None or wandb is None or _WANDB_DISABLE_REASON is not None:
         return
     grid = _make_image_grid(x)
     image = grid.permute(1, 2, 0).mul(255).clamp(0, 255).byte().numpy()
     payload = {key: wandb.Image(image, caption=caption)}
     if step_metric is not None and step_value is not None:
         payload[step_metric] = int(step_value)
-    run.log(payload, step=_next_wandb_log_step())
+    try:
+        run.log(payload, step=_next_wandb_log_step())
+    except Exception as exc:
+        _disable_wandb_logging(run, f"image log {key}", exc)
 
 
 def _stage1_lr_scale(
@@ -2904,10 +3129,16 @@ def _compute_atom_conditioned_coeff_stats(
     return mean, std
 
 
-def _expected_token_cache_meta(args, stage2_source_set, token_subset: Optional[int], ae: LASER) -> dict:
+def _expected_token_cache_meta(
+    args,
+    stage2_source_set,
+    token_subset: Optional[int],
+    ae: LASER,
+    stage1_checkpoint_path: Optional[Path],
+) -> dict:
     effective_items = len(stage2_source_set) if token_subset is None else int(token_subset)
     return {
-        "version": 1,
+        "version": 2,
         "dataset": str(args.dataset),
         "image_size": int(args.image_size),
         "seed": int(args.seed),
@@ -2918,6 +3149,10 @@ def _expected_token_cache_meta(args, stage2_source_set, token_subset: Optional[i
         "embedding_dim": int(args.embedding_dim),
         "num_atoms": int(args.num_atoms),
         "sparsity_level": int(args.sparsity_level),
+        "stage1_checkpoint_sha256": _stage1_checkpoint_cache_key(stage1_checkpoint_path),
+        "max_ch_mult": int(getattr(ae, "max_ch_mult", 2)),
+        "decoder_extra_residual_layers": int(getattr(ae, "decoder_extra_residual_layers", 1)),
+        "use_mid_attention": bool(getattr(ae, "use_mid_attention", True)),
         "patch_based": bool(args.patch_based),
         "patch_size": int(args.patch_size),
         "patch_stride": int(args.patch_stride),
@@ -3941,13 +4176,41 @@ def main():
         args.out_dir = str(_default_out_dir(args.dataset, args.image_size, args.quantize_sparse_coeffs))
     experiment_root = Path(args.out_dir).expanduser().resolve()
 
-    distributed, rank, local_rank, world_size = _init_distributed(args.dist_timeout_minutes)
-    is_main_process = (rank == 0)
-    launch_timestamp = _launch_timestamp()
+    launch_timestamp_env = os.environ.get("PROTO_LAUNCH_TIMESTAMP")
+    preinit_wandb = False
+    if launch_timestamp_env:
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        distributed = world_size > 1
+        is_main_process = (rank == 0)
+        launch_timestamp = launch_timestamp_env
+        preinit_wandb = distributed
+    else:
+        distributed, rank, local_rank, world_size = _init_distributed(args.dist_timeout_minutes)
+        is_main_process = (rank == 0)
+        launch_timestamp = _launch_timestamp()
     run_out_dir = _resolve_run_out_dir(str(experiment_root), launch_timestamp)
     args.out_root = str(experiment_root)
     args.launch_timestamp = launch_timestamp
     args.out_dir = str(run_out_dir)
+    if args.wandb_dir == "./wandb":
+        args.wandb_dir = str(Path(args.out_dir) / "wandb")
+
+    if is_main_process:
+        os.makedirs(experiment_root, exist_ok=True)
+        os.makedirs(args.out_dir, exist_ok=True)
+    stage1_dir = os.path.join(args.out_dir, "stage1")
+    stage2_dir = os.path.join(args.out_dir, "stage2")
+    if is_main_process:
+        os.makedirs(stage1_dir, exist_ok=True)
+        os.makedirs(stage2_dir, exist_ok=True)
+
+    if preinit_wandb and is_main_process:
+        wandb_run = _init_wandb(args)
+    if preinit_wandb:
+        distributed, rank, local_rank, world_size = _init_distributed(args.dist_timeout_minutes)
+        is_main_process = (rank == 0)
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -3961,14 +4224,6 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin_memory = device.type == "cuda"
 
-    if is_main_process:
-        os.makedirs(experiment_root, exist_ok=True)
-        os.makedirs(args.out_dir, exist_ok=True)
-    stage1_dir = os.path.join(args.out_dir, "stage1")
-    stage2_dir = os.path.join(args.out_dir, "stage2")
-    if is_main_process:
-        os.makedirs(stage1_dir, exist_ok=True)
-        os.makedirs(stage2_dir, exist_ok=True)
     _barrier()
 
     if is_main_process:
@@ -3977,7 +4232,8 @@ def main():
             f"data_dir={args.data_dir} image_size={args.image_size}"
         )
         print(f"[Setup] experiment_root={experiment_root} run_out_dir={args.out_dir}")
-        wandb_run = _init_wandb(args)
+        if wandb_run is None:
+            wandb_run = _init_wandb(args)
     if wandb_run is not None:
         _log_wandb(
             wandb_run,
@@ -4051,7 +4307,7 @@ def main():
             raise FileNotFoundError(f"Prepared stage-1 source checkpoint does not exist: {source_path}")
         return source_path
 
-    def _load_best_laser_weights(laser_model: LASER):
+    def _load_best_laser_weights(laser_model: LASER) -> Path:
         best_path = Path(stage1_dir) / "ae_best.pt"
         if best_path.exists():
             if is_main_process and args.stage1_epochs > 0:
@@ -4077,6 +4333,7 @@ def main():
                 print(f"[Stage1] reusing prior checkpoint from {fallback_path}")
             best_path = fallback_path
         _load_module_checkpoint(laser_model, best_path)
+        return best_path
 
     normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     train_tfm = transforms.Compose([
@@ -4195,7 +4452,7 @@ def main():
         )
     _barrier()
 
-    _load_best_laser_weights(laser)
+    stage1_best_path = _load_best_laser_weights(laser)
     laser = laser.to(device)
 
     if args.analyze_spectrum and is_main_process:
@@ -4213,7 +4470,7 @@ def main():
             n_patches=args.spectrum_n_patches,
         )
         if wandb_run is not None:
-            wandb_run.finish()
+            _finish_wandb(wandb_run)
         _cleanup_distributed()
         return
 
@@ -4221,7 +4478,13 @@ def main():
     token_cache_ready_path = Path(stage2_dir) / "tokens_cache.ready"
     token_cache_error_path = Path(stage2_dir) / "tokens_cache.failed"
     token_subset = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
-    expected_token_meta = _expected_token_cache_meta(args, stage2_source_set, token_subset, laser)
+    expected_token_meta = _expected_token_cache_meta(
+        args,
+        stage2_source_set,
+        token_subset,
+        laser,
+        stage1_best_path,
+    )
     _barrier()
     if is_main_process:
         _unlink_if_exists(token_cache_ready_path)
@@ -4426,7 +4689,7 @@ def main():
     if args.stage2_epochs <= 0:
         if is_main_process:
             if wandb_run is not None:
-                wandb_run.finish()
+                _finish_wandb(wandb_run)
             print(f"Outputs saved to: {args.out_dir}")
         _cleanup_distributed()
         return
@@ -4476,7 +4739,7 @@ def main():
 
     if is_main_process:
         if wandb_run is not None:
-            wandb_run.finish()
+            _finish_wandb(wandb_run)
         print(f"Outputs saved to: {args.out_dir}")
     _barrier()
     _cleanup_distributed()

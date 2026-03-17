@@ -17,6 +17,8 @@ IMAGE="${IMAGE:-docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime}"
 PYTHONUSERBASE_DIR="${PYTHONUSERBASE_DIR:-/scratch/$USER/.pydeps/proto_rqsd_py311}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-10}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-10}"
+STAGE1_SOURCE_CKPT="${STAGE1_SOURCE_CKPT:-}"
+REBUILD_TOKEN_CACHE="${REBUILD_TOKEN_CACHE:-false}"
 STAGE1_LR="${STAGE1_LR:-1.6e-3}"
 STAGE2_LR="${STAGE2_LR:-8e-3}"
 STAGE1_LR_SCHEDULE="${STAGE1_LR_SCHEDULE:-cosine}"
@@ -41,20 +43,26 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-32}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
 TOKEN_NUM_WORKERS="${TOKEN_NUM_WORKERS:-0}"
+TOKEN_SUBSET="${TOKEN_SUBSET:-0}"
+STAGE2_SAMPLE_EVERY_STEPS="${STAGE2_SAMPLE_EVERY_STEPS:-2000}"
+STAGE2_SAMPLE_BATCH_SIZE="${STAGE2_SAMPLE_BATCH_SIZE:-32}"
 QUANTIZE_SPARSE_COEFFS="${QUANTIZE_SPARSE_COEFFS:-true}"
+AE_NUM_DOWNSAMPLES="${AE_NUM_DOWNSAMPLES:-4}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-laser-scratch}"
 WANDB_NAME="${WANDB_NAME:-proto_rqsd_${TOTAL_GPUS}gpu_mn_s${STAGE1_EPOCHS}_s2${STAGE2_EPOCHS}}"
 LOG_PREFIX="${LOG_PREFIX:-proto_rqsd_${TOTAL_GPUS}g_mn}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/scratch/$USER/.secrets/wandb_api_key}"
 DIST_TIMEOUT_MINUTES="${DIST_TIMEOUT_MINUTES:-180}"
+ENTRYPOINT="${ENTRYPOINT:-proto.py}"
+RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 if [[ ! -d "$DATA_DIR" ]]; then
   echo "Missing data directory: $DATA_DIR" >&2
   exit 1
 fi
-if [[ ! -f "$ROOT_DIR/proto.py" ]]; then
-  echo "Missing proto.py under $ROOT_DIR" >&2
+if [[ ! -f "$ROOT_DIR/$ENTRYPOINT" ]]; then
+  echo "Missing $ENTRYPOINT under $ROOT_DIR" >&2
   exit 1
 fi
 
@@ -83,8 +91,11 @@ OUT_DIR='"$OUT_DIR"'
 IMAGE='"$IMAGE"'
 PYTHONUSERBASE_DIR='"$PYTHONUSERBASE_DIR"'
 PYTHON_SITE="$PYTHONUSERBASE_DIR/lib/python3.11/site-packages"
+RUN_TIMESTAMP='"$RUN_TIMESTAMP"'
 STAGE1_EPOCHS='"$STAGE1_EPOCHS"'
 STAGE2_EPOCHS='"$STAGE2_EPOCHS"'
+STAGE1_SOURCE_CKPT='"$STAGE1_SOURCE_CKPT"'
+REBUILD_TOKEN_CACHE='"$REBUILD_TOKEN_CACHE"'
 STAGE1_LR='"$STAGE1_LR"'
 STAGE2_LR='"$STAGE2_LR"'
 STAGE1_LR_SCHEDULE='"$STAGE1_LR_SCHEDULE"'
@@ -109,12 +120,17 @@ BATCH_SIZE='"$BATCH_SIZE"'
 STAGE2_BATCH_SIZE='"$STAGE2_BATCH_SIZE"'
 NUM_WORKERS='"$NUM_WORKERS"'
 TOKEN_NUM_WORKERS='"$TOKEN_NUM_WORKERS"'
+TOKEN_SUBSET='"$TOKEN_SUBSET"'
+STAGE2_SAMPLE_EVERY_STEPS='"$STAGE2_SAMPLE_EVERY_STEPS"'
+STAGE2_SAMPLE_BATCH_SIZE='"$STAGE2_SAMPLE_BATCH_SIZE"'
 QUANTIZE_SPARSE_COEFFS='"$QUANTIZE_SPARSE_COEFFS"'
+AE_NUM_DOWNSAMPLES='"$AE_NUM_DOWNSAMPLES"'
 WANDB_MODE='"$WANDB_MODE"'
 WANDB_PROJECT='"$WANDB_PROJECT"'
 WANDB_NAME='"$WANDB_NAME"'
 WANDB_API_KEY_FILE='"$WANDB_API_KEY_FILE"'
 DIST_TIMEOUT_MINUTES='"$DIST_TIMEOUT_MINUTES"'
+ENTRYPOINT='"$ENTRYPOINT"'
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT=$((29000 + SLURM_JOB_ID % 1000))
 if ! command -v module >/dev/null 2>&1; then
@@ -137,14 +153,23 @@ if ! command -v singularity >/dev/null 2>&1; then
 fi
 command -v singularity >/dev/null 2>&1 || { echo singularity_not_found >&2; exit 1; }
 mkdir -p "$OUT_DIR" "$PYTHONUSERBASE_DIR" "$(dirname "$WANDB_API_KEY_FILE")"
-if [[ -f "$WANDB_API_KEY_FILE" ]]; then
-  export WANDB_API_KEY="$(tr -d "\r\n" < "$WANDB_API_KEY_FILE")"
-fi
+export WANDB_API_KEY_FILE
+export SINGULARITYENV_WANDB_API_KEY_FILE="$WANDB_API_KEY_FILE"
+export APPTAINERENV_WANDB_API_KEY_FILE="$WANDB_API_KEY_FILE"
+unset WANDB_API_KEY || true
+unset SINGULARITYENV_WANDB_API_KEY || true
+unset APPTAINERENV_WANDB_API_KEY || true
 export PYTHONUSERBASE="$PYTHONUSERBASE_DIR"
 export PYTHONNOUSERSITE=0
 export PYTHONPATH="$PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}"
 export MASTER_ADDR MASTER_PORT
-if ! PYTHONUSERBASE="$PYTHONUSERBASE_DIR" PYTHONNOUSERSITE=0 PYTHONPATH="$PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}" singularity exec --bind "$PROJECT_DIR" --bind "/scratch/$USER_NAME" --bind "$DATA_DIR" --bind "$OUT_DIR" "$IMAGE" python3 -c "import scipy, wandb" >/dev/null 2>&1; then
+if ! PYTHONUSERBASE="$PYTHONUSERBASE_DIR" PYTHONNOUSERSITE=0 PYTHONPATH="$PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}" singularity exec --bind "$PROJECT_DIR" --bind "/scratch/$USER_NAME" --bind "$DATA_DIR" --bind "$OUT_DIR" "$IMAGE" python3 - <<'PY_DEP' >/dev/null 2>&1
+import importlib
+import scipy
+module = importlib.import_module("wandb")
+raise SystemExit(0 if hasattr(module, "init") and hasattr(module, "Api") else 1)
+PY_DEP
+then
   PYTHONUSERBASE="$PYTHONUSERBASE_DIR" PYTHONNOUSERSITE=0 PYTHONPATH="$PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}" singularity exec --bind "$PROJECT_DIR" --bind "/scratch/$USER_NAME" --bind "$DATA_DIR" --bind "$OUT_DIR" "$IMAGE" python3 -m pip install --user scipy wandb
 fi
 RUNNER="$OUT_DIR/slurm_proto_multinode_${SLURM_JOB_ID}.sh"
@@ -156,10 +181,23 @@ export WORLD_SIZE="\$SLURM_NTASKS"
 export LOCAL_RANK="\$SLURM_LOCALID"
 export MASTER_ADDR="${MASTER_ADDR}"
 export MASTER_PORT="${MASTER_PORT}"
+export PROTO_LAUNCH_TIMESTAMP="${RUN_TIMESTAMP}"
 export PYTHONUSERBASE="${PYTHONUSERBASE_DIR}"
 export PYTHONNOUSERSITE=0
 export PYTHONPATH="${PYTHON_SITE}\${PYTHONPATH:+:\$PYTHONPATH}"
-exec python3 "${PROJECT_DIR}/proto.py" \
+export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE}"
+if [[ -f "\${WANDB_API_KEY_FILE}" ]]; then
+  IFS= read -r WANDB_API_KEY < "\${WANDB_API_KEY_FILE}" || true
+  export WANDB_API_KEY
+fi
+EXTRA_ARGS=()
+if [[ -n "${STAGE1_SOURCE_CKPT}" ]]; then
+  EXTRA_ARGS+=(--stage1_source_ckpt "${STAGE1_SOURCE_CKPT}")
+fi
+if [[ "${REBUILD_TOKEN_CACHE}" == "1" || "${REBUILD_TOKEN_CACHE}" == "true" || "${REBUILD_TOKEN_CACHE}" == "TRUE" || "${REBUILD_TOKEN_CACHE}" == "yes" || "${REBUILD_TOKEN_CACHE}" == "YES" ]]; then
+  EXTRA_ARGS+=(--rebuild_token_cache)
+fi
+exec python3 "${PROJECT_DIR}/${ENTRYPOINT}" \
   --dataset celeba \
   --data_dir "${DATA_DIR}" \
   --image_size 128 \
@@ -191,11 +229,16 @@ exec python3 "${PROJECT_DIR}/proto.py" \
   --token_num_workers "${TOKEN_NUM_WORKERS}" \
   --batch_size "${BATCH_SIZE}" \
   --stage2_batch_size "${STAGE2_BATCH_SIZE}" \
+  --ae_num_downsamples "${AE_NUM_DOWNSAMPLES}" \
+  --token_subset "${TOKEN_SUBSET}" \
   --rfid_num_samples 0 \
   --wandb_mode "${WANDB_MODE}" \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_name "${WANDB_NAME}" \
-  --quantize_sparse_coeffs "${QUANTIZE_SPARSE_COEFFS}"
+  --stage2_sample_every_steps "${STAGE2_SAMPLE_EVERY_STEPS}" \
+  --stage2_sample_batch_size "${STAGE2_SAMPLE_BATCH_SIZE}" \
+  --quantize_sparse_coeffs "${QUANTIZE_SPARSE_COEFFS}" \\
+  "\${EXTRA_ARGS[@]}"
 EOF_RUNNER
 chmod +x "$RUNNER"
 srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 nvidia-smi

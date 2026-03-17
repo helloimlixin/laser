@@ -1,4 +1,4 @@
-# Stage1 Multinode Runbook
+# Stage1 and VAR Multinode Runbook
 
 ## Current Recommended Launch
 
@@ -12,6 +12,23 @@ Use these saved launchers:
 `launch_stage1_balanced.sh` is the conservative reference-style quantized baseline.
 
 `launch_stage1_nonquantized.sh` launches the matching nonquantized sparse-coefficient comparison run.
+
+
+## VAR Stage2 Launch
+
+Use this launcher for the sparsity-stage VAR path:
+
+```bash
+/cache/home/xl598/Projects/laser/scratch/scripts/launch_var_rqsd_multinode_slurm.sh
+```
+
+It boots a stage1 run through `proto.py`, parses the resulting run directory, then launches `var_stage2.py` from `stage1/ae_best.pt`.
+
+The corresponding Slurm payload script is:
+
+```bash
+/cache/home/xl598/Projects/laser/scratch/scripts/run_var_rqsd_multinode_job.sh
+```
 
 ## Current Recommended Configuration
 
@@ -90,6 +107,61 @@ The shared multinode launcher now supports explicit sparse-coefficient mode sele
 - Shared multinode launcher: `/cache/home/xl598/Projects/laser/scratch/scripts/launch_proto_rqsd_multinode_slurm.sh`
 - Saved quantized launcher: `/cache/home/xl598/Projects/laser/scratch/scripts/launch_stage1_balanced.sh`
 - Saved nonquantized launcher: `/cache/home/xl598/Projects/laser/scratch/scripts/launch_stage1_nonquantized.sh`
+
+- VAR model: `/cache/home/xl598/Projects/laser/scratch/var.py`
+- VAR stage2 trainer: `/cache/home/xl598/Projects/laser/scratch/var_stage2.py`
+- VAR launch wrapper: `/cache/home/xl598/Projects/laser/scratch/scripts/launch_var_rqsd_multinode_slurm.sh`
+- VAR Slurm payload: `/cache/home/xl598/Projects/laser/scratch/scripts/run_var_rqsd_multinode_job.sh`
+
+
+
+## VAR Stage2 Workflow
+
+### Quick debug example
+
+This is the current small-cluster debug shape for the VAR path:
+
+```bash
+cd /cache/home/xl598/Projects/laser/scratch
+JOB_NAME=laser-var-debug5-3g \
+PARTITION=gpu-redhat \
+NODES=1 \
+GPUS_PER_NODE=3 \
+CPUS_PER_TASK=4 \
+MEM_MB=128000 \
+TIME_LIMIT=03:00:00 \
+OUT_DIR=/scratch/$USER/runs/laser_var_debug5_3g_celeba128_quantized \
+STAGE1_EPOCHS=5 \
+STAGE2_EPOCHS=5 \
+BATCH_SIZE=16 \
+STAGE2_BATCH_SIZE=16 \
+NUM_WORKERS=4 \
+TOKEN_NUM_WORKERS=2 \
+TOKEN_SUBSET=128 \
+STAGE2_SAMPLE_EVERY_STEPS=0 \
+WANDB_NAME=laser_var_debug5_3g_bs16 \
+LOG_PREFIX=laser_var_debug5_3g \
+./scripts/launch_var_rqsd_multinode_slurm.sh
+```
+
+### Behavior differences that matter
+
+- The launcher always runs stage1 first with `proto.py`, then runs `var_stage2.py` from the resulting `run_dir`.
+- `var_stage2.py` disables sparse-slot canonicalization so the VAR stages follow greedy OMP slot order.
+- VAR outputs land under `<run_dir>/stage2_var/`.
+- The stage2 token cache is stored at `<run_dir>/stage2_var/tokens_cache_greedy.pt`.
+- `TOKEN_SUBSET` only limits stage2 token-cache precompute and stage2 training items. It does not shrink stage1; stage1 still sees the full training split.
+- W&B creates separate runs named `${WANDB_NAME}_stage1` and `${WANDB_NAME}_var`.
+
+### Monitoring
+
+Replace `<jobid>` with the value returned by `sbatch`.
+
+```bash
+squeue -j <jobid>
+tail -f /cache/home/xl598/Projects/laser/scratch/laser_var_debug5_3g_<jobid>.out
+tail -f /cache/home/xl598/Projects/laser/scratch/laser_var_debug5_3g_<jobid>.err
+```
 
 ## How To Start Next Time
 
@@ -252,6 +324,13 @@ Nonquantized comparison:
 
 ```bash
 ./scripts/launch_stage1_nonquantized.sh
+```
+
+
+VAR stage2 path:
+
+```bash
+./scripts/launch_var_rqsd_multinode_slurm.sh
 ```
 
 ### Cancel

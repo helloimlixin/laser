@@ -1,13 +1,13 @@
 # `proto.py`: Theoretical and Mathematical Overview
 
-This note explains `proto.py` as a model, not as a software artifact. It intentionally avoids a code-path walkthrough and instead describes the mathematical objects, training objectives, and generative factorization implemented by the file.
+This note explains the main `proto.py` path and the alternate `var.py` stage-2 prior as models, not as software artifacts. It intentionally avoids a code-path walkthrough and instead describes the mathematical objects, training objectives, and generative factorizations implemented by those files.
 
 ## 1. High-level picture
 
-The file implements a two-stage generative model:
+The main training path implements a two-stage generative model:
 
 1. A sparse-latent autoencoder learns to map an image into a structured latent representation built from dictionary atoms.
-2. An autoregressive transformer learns a prior over that sparse latent representation.
+2. A prior model learns a distribution over that sparse latent representation.
 
 The basic pipeline is
 
@@ -21,7 +21,9 @@ for stage 1, and then
 codes \to y_{1:T} \to p(y_{1:T})
 ```
 
-for stage 2.
+for the token-autoregressive stage-2 path in `proto.py`.
+
+An alternate stage-2 path in `var.py` keeps the same stage-1 sparse codes but changes the prior factorization from next-token prediction to next-sparsity-stage prediction.
 
 The central idea is that the latent space is not modeled as an unconstrained dense tensor. Instead, each latent site or latent patch must lie on a sparse dictionary manifold.
 
@@ -1151,3 +1153,98 @@ Stage 2 learns a prior over the coordinates of that sparse representation:
 The most useful compact summary is: autoencoder backbone + sparse dictionary manifold + autoregressive prior over sparse coordinates.
 
 That is the mathematical content of the implementation.
+
+
+## 17. VAR-style next-sparsity prediction in `var.py`
+
+The alternate `var.py` path is inspired by visual autoregressive modeling, but it does not use a coarse-to-fine image pyramid. Instead, it treats sparse support depth as the autoregressive axis.
+
+### 17.1 Stage variable
+
+For a latent site $u$, write the sparse stage-1 code as
+
+```math
+z_q(u) = \sum_{k=1}^{s} c_k(u)\, d_{a_k(u)},
+```
+
+where $a_k(u)$ is the atom id chosen at sparse slot $k$ and $c_k(u)$ is its coefficient.
+
+The key change is to interpret the slot index $k$ as a latent "scale". Stage $k$ now means:
+
+- predict the $k$-th atom id at every latent site,
+- then predict the associated $k$-th coefficient at every latent site,
+- conditioned on all earlier sparse stages $1,\dots,k-1$.
+
+So the autoregressive depth is `sparsity_level` rather than sequence position.
+
+### 17.2 Factorization
+
+Let
+
+```math
+A_k = \{ a_k(u) : u \in \Omega \},
+\qquad
+C_k = \{ c_k(u) : u \in \Omega \},
+```
+
+with $\Omega$ the latent grid of size $H \times W$.
+
+The `var.py` model factorizes the sparse-code law as
+
+```math
+p(A_{1:s}, C_{1:s})
+=
+\prod_{k=1}^{s}
+p(A_k \mid A_{<k}, C_{<k})
+\,
+p(C_k \mid A_k, A_{<k}, C_{<k}).
+```
+
+Within a stage, all spatial sites are predicted in parallel. Across stages, prediction remains autoregressive.
+
+This differs from the standard `proto.py` stage-2 factorization:
+
+- `proto.py`: autoregressive over flattened token positions,
+- `var.py`: autoregressive over sparse support depth, parallel over spatial sites inside each depth.
+
+### 17.3 Why greedy OMP order matters
+
+This reinterpretation only makes sense if sparse slot $k$ really means "the $k$-th atom chosen by the sparse solver".
+
+If stage 1 canonicalizes slots after solving OMP, then the slot index no longer reflects the constructive order in which the sparse code was built. The `var.py` workflow therefore disables slot canonicalization through `force_greedy_omp_slot_order(ae)`, so stage $k$ corresponds to the greedy OMP step $k$.
+
+Mathematically, this makes the conditioning chain
+
+```math
+(A_1, C_1) \to (A_2, C_2) \to \cdots \to (A_s, C_s)
+```
+
+align with the actual sparse approximation process.
+
+### 17.4 Conditioning signal
+
+At stage $k$, the model can also condition on the partial latent reconstruction
+
+```math
+\tilde z_{k-1}(u) = \sum_{j=1}^{k-1} c_j(u)\, d_{a_j(u)}.
+```
+
+This gives the predictor a summary of what the earlier sparse stages have already explained and turns the next-stage prediction problem into a residual modeling problem.
+
+### 17.5 Structural constraints
+
+The VAR-style path imposes two important structural constraints:
+
+1. Duplicate atoms are masked within a site, so later sparse stages cannot reuse an atom already selected earlier at that site.
+2. If coefficients are quantized, the coefficient head is categorical; if coefficients are real-valued, the coefficient head is scalar regression.
+
+So the model is still a prior over the sparse dictionary manifold, but with a different causal axis.
+
+### 17.6 Relation to image-scale VAR
+
+The original visual autoregressive idea predicts the next spatial scale in a multiscale image pyramid. The `var.py` adaptation keeps the same spirit while changing the hierarchy:
+
+- original VAR hierarchy: image resolution,
+- LASER VAR hierarchy: sparse support depth.
+
+This is the main conceptual innovation of the alternate path. The "coarse-to-fine" notion is no longer geometric resolution; it is progressive sparse reconstruction quality.
