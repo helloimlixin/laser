@@ -2,14 +2,13 @@
 """
 Sample images from existing LASER stage-1/stage-2 checkpoints without retraining.
 
-This is intended for quick validation of sampling-only changes against an existing
-run directory. By default it uses the current non-quantized CelebA checkpoint and
-the updated sampler behavior from `scratch/laser.py`.
+This loader targets the current `proto.py` + `spatial_prior.py` checkpoint format.
+Legacy flattened-token transformer checkpoints are no longer supported here.
 
 Examples:
   python3 sample.py
-  python3 sample.py --num_samples 16 --compare_legacy_greedy0
-  python3 sample.py --run_dir runs/laser_celeba128_quantized --tf_heads 8
+  python3 sample.py --num_samples 16 --top_k 32
+  python3 sample.py --run_dir runs/laser_celeba128_quantized
 """
 
 from __future__ import annotations
@@ -27,14 +26,14 @@ import torch.nn.functional as F
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_RUN_DIR = SCRIPT_DIR / "runs" / "laser_celeba128_no_quantized"
+DEFAULT_RUN_DIR = SCRIPT_DIR / "runs" / "laser_celeba128"
 
 
-def _load_scratch_laser_module():
-    module_path = SCRIPT_DIR / "laser.py"
-    spec = importlib.util.spec_from_file_location("scratch_laser_checkpoint_sampler", module_path)
+def _load_proto_module():
+    module_path = SCRIPT_DIR / "proto.py"
+    spec = importlib.util.spec_from_file_location("scratch_proto_checkpoint_sampler", module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to import scratch laser module from {module_path}")
+        raise RuntimeError(f"Failed to import proto module from {module_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -46,81 +45,100 @@ def _indexed_block_count(keys: Iterable[str], prefix: str) -> int:
     return len(indices)
 
 
-def _infer_stage1_config(state_dict: Dict[str, torch.Tensor], token_cache: dict) -> dict:
-    metadata = token_cache.get("metadata") or {}
-    dictionary_shape = tuple(state_dict["bottleneck.dictionary"].shape)
-    embedding_dim = int(state_dict["pre_bottleneck.weight"].shape[0])
-    patch_dim = int(dictionary_shape[0])
-    num_embeddings = int(dictionary_shape[1])
-    patch_area = patch_dim // max(embedding_dim, 1)
-    patch_size = int(round(math.sqrt(patch_area)))
-    if patch_size * patch_size * embedding_dim != patch_dim:
-        raise ValueError(
-            f"Could not infer latent patch size from dictionary shape {dictionary_shape} "
-            f"and embedding_dim={embedding_dim}"
-        )
+def _load_torch_payload(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
 
+
+def _first_existing_path(*candidates: Path) -> Optional[Path]:
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate
+    return None
+
+
+def _infer_stage1_config(state_dict: Dict[str, torch.Tensor], token_cache: dict) -> dict:
+    metadata = token_cache.get("meta") or token_cache.get("metadata") or {}
+    dictionary_shape = tuple(state_dict["bottleneck.dictionary"].shape)
     quantize_sparse_coeffs = metadata.get("quantize_sparse_coeffs")
     if quantize_sparse_coeffs is None:
         quantize_sparse_coeffs = token_cache.get("coeffs_flat") is None
 
-    if "latent_patch_stride" not in metadata:
-        raise ValueError(
-            "Token cache metadata is missing latent_patch_stride; pass a cache built by the current training code."
-        )
+    coef_quantization = "uniform"
+    coef_mu = 0.0
+    coef_mu_invlog1p = state_dict.get("bottleneck.coef_mu_invlog1p")
+    if coef_mu_invlog1p is not None:
+        mu_invlog1p = float(coef_mu_invlog1p.item())
+        if abs(mu_invlog1p - 1.0) > 1e-6:
+            coef_quantization = "mu_law"
+            coef_mu = float(math.expm1(1.0 / mu_invlog1p))
 
     return {
-        "in_channels": int(state_dict["encoder.down_convs.0.weight"].shape[1]),
-        "num_hiddens": int(state_dict["encoder.conv3.weight"].shape[0]),
-        "num_downsamples": _indexed_block_count(state_dict.keys(), "encoder.down_convs"),
-        "num_residual_layers": _indexed_block_count(state_dict.keys(), "encoder.res.layers"),
-        "num_residual_hiddens": int(state_dict["encoder.res.layers.0.conv1.weight"].shape[0]),
-        "embedding_dim": embedding_dim,
-        "num_embeddings": num_embeddings,
-        "sparsity_level": int(metadata.get("sparsity_level", token_cache["shape"][2] // (2 if quantize_sparse_coeffs else 1))),
-        "latent_patch_size": int(metadata.get("latent_patch_size", patch_size)),
-        "latent_patch_stride": int(metadata["latent_patch_stride"]),
+        "in_channels": int(state_dict["encoder.conv_in.weight"].shape[1]),
+        "num_hiddens": int(state_dict["encoder.conv_in.weight"].shape[0]),
+        "num_downsamples": max(0, _indexed_block_count(state_dict.keys(), "encoder.down") - 1),
+        "num_residual_layers": max(1, _indexed_block_count(state_dict.keys(), "encoder.down.0.block")),
+        "resolution": int(metadata.get("image_size", 128)),
+        "embedding_dim": int(state_dict["encoder.conv_out.weight"].shape[0]),
+        "num_embeddings": int(dictionary_shape[1]),
+        "sparsity_level": int(metadata.get("sparsity_level", token_cache["shape"][2])),
+        "commitment_cost": 0.25,
         "n_bins": int(state_dict["bottleneck.coef_bin_centers"].shape[0]),
         "coef_max": float(state_dict["bottleneck.coef_bin_centers"].abs().max().item()),
-        "commitment_cost": 0.25,
+        "coef_quantization": coef_quantization,
+        "coef_mu": coef_mu,
+        "out_tanh": True,
         "quantize_sparse_coeffs": bool(quantize_sparse_coeffs),
+        "patch_based": bool(metadata.get("patch_based", False)),
+        "patch_size": int(metadata.get("patch_size", 8)),
+        "patch_stride": int(metadata.get("patch_stride", 4)),
+        "patch_reconstruction": str(metadata.get("patch_reconstruction", "center_crop")),
     }
 
 
-def _infer_transformer_config(
-    laser_mod,
+def _infer_spatial_prior_arch(
     state_dict: Dict[str, torch.Tensor],
-    token_cache: dict,
-    stage1_cfg: dict,
     *,
     tf_heads: int,
     tf_dropout: float,
-):
+) -> dict:
     if tf_heads <= 0:
         raise ValueError(f"tf_heads must be positive, got {tf_heads}")
+    if "token_emb.weight" not in state_dict:
+        raise ValueError("Stage-2 checkpoint is missing token_emb.weight.")
+
+    n_spatial_layers = _indexed_block_count(state_dict.keys(), "spatial_blocks")
+    n_depth_layers = _indexed_block_count(state_dict.keys(), "depth_blocks")
+    if n_spatial_layers <= 0 and n_depth_layers <= 0:
+        raise ValueError(
+            "This sample script only supports the current spatial-depth prior checkpoint format."
+        )
+
     vocab_size, d_model = state_dict["token_emb.weight"].shape
-    d_ff = int(state_dict["blocks.0.ffn.0.weight"].shape[0])
-    n_layers = _indexed_block_count(state_dict.keys(), "blocks")
-    H, W, D = token_cache["shape"]
     if d_model % tf_heads != 0:
         raise ValueError(f"d_model={d_model} is not divisible by tf_heads={tf_heads}")
-    predict_coefficients = any(key.startswith("coeff_head.") for key in state_dict.keys())
-    quantized_tokens = bool(stage1_cfg["quantize_sparse_coeffs"])
-    return laser_mod.TransformerConfig(
-        vocab_size=int(vocab_size),
-        H=int(H),
-        W=int(W),
-        D=int(D),
-        atom_vocab_size=(int(stage1_cfg["num_embeddings"]) if quantized_tokens else None),
-        coeff_vocab_size=(int(stage1_cfg["n_bins"]) if quantized_tokens else None),
-        predict_coefficients=bool(predict_coefficients),
-        d_model=int(d_model),
-        n_heads=int(tf_heads),
-        n_layers=int(n_layers),
-        d_ff=int(d_ff),
-        dropout=float(tf_dropout),
-        coeff_max=float(stage1_cfg["coef_max"]),
-    )
+
+    d_ff = None
+    if n_spatial_layers > 0:
+        d_ff = int(state_dict["spatial_blocks.0.ffn.0.weight"].shape[0])
+    elif n_depth_layers > 0:
+        d_ff = int(state_dict["depth_blocks.0.ffn.0.weight"].shape[0])
+    if d_ff is None:
+        raise ValueError("Could not infer transformer feed-forward width from the checkpoint.")
+
+    return {
+        "vocab_size": int(vocab_size),
+        "d_model": int(d_model),
+        "n_spatial_layers": int(n_spatial_layers),
+        "n_depth_layers": int(n_depth_layers),
+        "d_ff": int(d_ff),
+        "dropout": float(tf_dropout),
+        "n_heads": int(tf_heads),
+        "n_global_spatial_tokens": int(state_dict.get("global_spatial_tokens", torch.empty(1, 0, 1)).shape[1]),
+        "real_valued_coeffs": any(key.startswith("coeff_head.") for key in state_dict.keys()),
+    }
 
 
 def _resolve_device(device_arg: str) -> torch.device:
@@ -148,7 +166,7 @@ def _seed_everything(seed: int) -> None:
 
 @torch.no_grad()
 def _generate_samples(
-    laser_mod,
+    proto_mod,
     *,
     laser,
     transformer,
@@ -158,11 +176,6 @@ def _generate_samples(
     num_samples: int,
     temperature: float,
     top_k: Optional[int],
-    atom_temperature: Optional[float],
-    atom_top_k: Optional[int],
-    coeff_temperature: Optional[float],
-    coeff_top_k: Optional[int],
-    greedy_atom_prefix_steps: Optional[int],
     output_image_size: Optional[int],
     seed: int,
 ):
@@ -171,24 +184,25 @@ def _generate_samples(
         batch_size=num_samples,
         temperature=temperature,
         top_k=top_k,
-        atom_temperature=atom_temperature,
-        atom_top_k=atom_top_k,
-        coeff_temperature=coeff_temperature,
-        coeff_top_k=coeff_top_k,
-        greedy_atom_prefix_steps=greedy_atom_prefix_steps,
         show_progress=True,
-        progress_desc="[Sample] generating tokens",
+        progress_desc="[Sample] generating sparse codes",
     )
-    if transformer.predict_coefficients:
-        tokens_flat, coeffs_flat = gen_out
-        tokens = tokens_flat.view(-1, H, W, D)
-        coeffs = coeffs_flat.view(-1, H, W, D)
-        imgs = laser.decode(tokens.to(next(laser.parameters()).device), coeffs.to(next(laser.parameters()).device))
+    laser_device = next(laser.parameters()).device
+    if transformer.real_valued_coeffs:
+        atom_ids, coeffs = gen_out
+        atom_grid = atom_ids.view(-1, H, W, D)
+        coeff_grid = coeffs.view(-1, H, W, D)
+        imgs = laser.decode_from_atoms_and_coeffs(
+            atom_grid.to(laser_device),
+            coeff_grid.to(laser_device),
+        )
+        tokens_flat = atom_ids.reshape(atom_ids.size(0), -1)
+        coeffs_flat = coeffs.reshape(coeffs.size(0), -1)
     else:
-        tokens_flat = gen_out
+        tokens = gen_out.view(-1, H, W, D)
+        imgs = laser.decode_from_tokens(tokens.to(laser_device))
+        tokens_flat = tokens.reshape(tokens.size(0), -1)
         coeffs_flat = None
-        tokens = tokens_flat.view(-1, H, W, D)
-        imgs = laser.decode(tokens.to(next(laser.parameters()).device))
 
     if output_image_size is not None and int(output_image_size) > 0:
         output_size = int(output_image_size)
@@ -224,20 +238,40 @@ def main() -> None:
     parser.add_argument("--nrow", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top_k", type=int, default=16)
-    parser.add_argument("--atom_temperature", type=float, default=None)
-    parser.add_argument("--atom_top_k", type=int, default=None)
-    parser.add_argument("--coeff_temperature", type=float, default=None)
-    parser.add_argument("--coeff_top_k", type=int, default=None)
+    parser.add_argument(
+        "--atom_temperature",
+        type=float,
+        default=None,
+        help="Legacy option from the removed flattened-token transformer sampler; ignored.",
+    )
+    parser.add_argument(
+        "--atom_top_k",
+        type=int,
+        default=None,
+        help="Legacy option from the removed flattened-token transformer sampler; ignored.",
+    )
+    parser.add_argument(
+        "--coeff_temperature",
+        type=float,
+        default=None,
+        help="Legacy option from the removed flattened-token transformer sampler; ignored.",
+    )
+    parser.add_argument(
+        "--coeff_top_k",
+        type=int,
+        default=None,
+        help="Legacy option from the removed flattened-token transformer sampler; ignored.",
+    )
     parser.add_argument(
         "--greedy_atom_prefix_steps",
         type=int,
         default=None,
-        help="Override the sampler's greedy atom prefix length. Omit to use the current auto default.",
+        help="Legacy option from the removed flattened-token transformer sampler; ignored.",
     )
     parser.add_argument(
         "--compare_legacy_greedy0",
         action="store_true",
-        help="Also render a second grid with greedy_atom_prefix_steps forced to 0.",
+        help="Legacy option from the removed flattened-token transformer sampler; ignored.",
     )
     parser.add_argument(
         "--output_image_size",
@@ -263,26 +297,22 @@ def main() -> None:
         raise ValueError("num_samples must be positive.")
     if args.temperature <= 0.0:
         raise ValueError("temperature must be > 0.")
-    if args.atom_temperature is not None and args.atom_temperature <= 0.0:
-        raise ValueError("atom_temperature must be > 0 when provided.")
-    if args.coeff_temperature is not None and args.coeff_temperature <= 0.0:
-        raise ValueError("coeff_temperature must be > 0 when provided.")
-    if args.greedy_atom_prefix_steps is not None and args.greedy_atom_prefix_steps < 0:
-        raise ValueError("greedy_atom_prefix_steps must be >= 0 when provided.")
+    if args.atom_temperature is not None or args.atom_top_k is not None or args.coeff_temperature is not None or args.coeff_top_k is not None:
+        print("[Sample] ignoring legacy atom/coeff sampling overrides; the spatial-depth prior uses a single temperature/top_k.")
+    if args.greedy_atom_prefix_steps is not None or args.compare_legacy_greedy0:
+        print("[Sample] ignoring legacy greedy atom prefix options; the current spatial-depth prior sampler does not use them.")
 
-    laser_mod = _load_scratch_laser_module()
+    proto_mod = _load_proto_module()
     run_dir = args.run_dir.resolve()
     output_dir = (args.output_dir or (run_dir / "stage2_checkpoint_samples")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stage1_checkpoint = args.stage1_checkpoint or Path(
-        laser_mod._first_existing_path(
-            str(run_dir / "stage1" / "ae_best.pt"),
-            str(run_dir / "stage1" / "ae_last.pt"),
-        )
+    stage1_checkpoint = args.stage1_checkpoint or _first_existing_path(
+        run_dir / "stage1" / "ae_best.pt",
+        run_dir / "stage1" / "ae_last.pt",
     )
-    stage2_checkpoint = args.stage2_checkpoint or Path(
-        laser_mod._first_existing_path(str(run_dir / "stage2" / "transformer_last.pt"))
+    stage2_checkpoint = args.stage2_checkpoint or _first_existing_path(
+        run_dir / "stage2" / "transformer_last.pt",
     )
     token_cache_path = args.token_cache or (run_dir / "stage2" / "tokens_cache.pt")
 
@@ -293,68 +323,90 @@ def main() -> None:
     if not token_cache_path.exists():
         raise FileNotFoundError(f"Token cache not found: {token_cache_path}")
 
-    stage1_state = laser_mod._load_torch_payload(str(stage1_checkpoint))
-    stage2_state = laser_mod._load_torch_payload(str(stage2_checkpoint))
-    token_cache = laser_mod._load_torch_payload(str(token_cache_path))
+    stage1_state = _load_torch_payload(stage1_checkpoint)
+    stage2_state = _load_torch_payload(stage2_checkpoint)
+    token_cache = _load_torch_payload(token_cache_path)
     if "shape" not in token_cache:
         raise ValueError(f"Token cache {token_cache_path} is missing the stored token grid shape.")
 
     stage1_cfg = _infer_stage1_config(stage1_state, token_cache)
-    transformer_cfg = _infer_transformer_config(
-        laser_mod,
+    H, W, D = (int(token_cache["shape"][0]), int(token_cache["shape"][1]), int(token_cache["shape"][2]))
+    transformer_arch = _infer_spatial_prior_arch(
         stage2_state,
-        token_cache,
-        stage1_cfg,
         tf_heads=args.tf_heads,
         tf_dropout=args.tf_dropout,
     )
+
+    if transformer_arch["real_valued_coeffs"] == bool(stage1_cfg["quantize_sparse_coeffs"]):
+        raise ValueError(
+            "Stage-1 sparse-code mode and stage-2 checkpoint disagree: "
+            f"stage1 quantize_sparse_coeffs={stage1_cfg['quantize_sparse_coeffs']}, "
+            f"stage2 real_valued_coeffs={transformer_arch['real_valued_coeffs']}"
+        )
 
     device = _resolve_device(args.device)
     if device.type == "cuda":
         torch.set_float32_matmul_precision("medium")
 
-    laser = laser_mod.LASER(**stage1_cfg).to(device)
-    laser_mod._load_module_checkpoint(laser, str(stage1_checkpoint))
+    laser = proto_mod.LASER(**stage1_cfg).to(device)
+    proto_mod._load_module_checkpoint(laser, stage1_checkpoint)
     laser.eval()
 
-    transformer = laser_mod.TransformerPrior(
-        transformer_cfg,
-        bos_token_id=laser.bottleneck.bos_token_id,
-        pad_token_id=laser.bottleneck.pad_token_id,
-    ).to(device)
-    laser_mod._load_module_checkpoint(transformer, str(stage2_checkpoint))
+    transformer_cfg = proto_mod.build_spatial_depth_prior_config(
+        laser.bottleneck,
+        H=H,
+        W=W,
+        D=D,
+        d_model=int(transformer_arch["d_model"]),
+        n_heads=int(transformer_arch["n_heads"]),
+        n_spatial_layers=int(transformer_arch["n_spatial_layers"]),
+        n_depth_layers=int(transformer_arch["n_depth_layers"]),
+        d_ff=int(transformer_arch["d_ff"]),
+        dropout=float(transformer_arch["dropout"]),
+        n_global_spatial_tokens=int(transformer_arch["n_global_spatial_tokens"]),
+        real_valued_coeffs=bool(transformer_arch["real_valued_coeffs"]),
+        coeff_max_fallback=float(stage1_cfg["coef_max"]),
+    )
+    transformer = proto_mod.SpatialDepthPrior(transformer_cfg).to(device)
+    proto_mod._load_module_checkpoint(transformer, stage2_checkpoint)
     transformer.eval()
 
-    H, W, D = token_cache["shape"]
     resolved_top_k = None if args.top_k is None or int(args.top_k) <= 0 else int(args.top_k)
-    resolved_atom_top_k = None if args.atom_top_k is None or int(args.atom_top_k) <= 0 else int(args.atom_top_k)
-    resolved_coeff_top_k = None if args.coeff_top_k is None or int(args.coeff_top_k) <= 0 else int(args.coeff_top_k)
-    resolved_greedy = laser_mod._resolve_stage2_sample_greedy_atom_prefix_steps(
-        args.greedy_atom_prefix_steps,
-        quantized_tokens=(transformer.content_vocab_size is not None),
-        token_depth=int(D),
-        grid_width=int(W),
+    sample = _generate_samples(
+        proto_mod,
+        laser=laser,
+        transformer=transformer,
+        H=H,
+        W=W,
+        D=D,
+        num_samples=int(args.num_samples),
+        temperature=float(args.temperature),
+        top_k=resolved_top_k,
+        output_image_size=args.output_image_size,
+        seed=int(args.seed),
     )
 
-    runs = [
+    output_path = output_dir / "samples.png"
+    proto_mod.save_image_grid(
+        sample["images"],
+        str(output_path),
+        nrow=_resolve_nrow(int(args.num_samples), args.nrow),
+    )
+    output_payload_path = output_dir / "samples.pt"
+    torch.save(
         {
-            "label": "current",
-            "greedy_atom_prefix_steps": args.greedy_atom_prefix_steps,
-            "resolved_greedy_atom_prefix_steps": resolved_greedy,
-            "filename": "samples.png",
-            "seed": args.seed,
-        }
-    ]
-    if args.compare_legacy_greedy0:
-        runs.append(
-            {
-                "label": "legacy_greedy0",
-                "greedy_atom_prefix_steps": 0,
-                "resolved_greedy_atom_prefix_steps": 0,
-                "filename": "samples_legacy.png",
-                "seed": args.seed,
-            }
-        )
+            "tokens_flat": sample["tokens_flat"],
+            "coeffs_flat": sample["coeffs_flat"],
+            "sampling": {
+                "seed": int(args.seed),
+                "num_samples": int(args.num_samples),
+                "temperature": float(args.temperature),
+                "top_k": (None if resolved_top_k is None else int(resolved_top_k)),
+                "output_image_size": (None if args.output_image_size is None else int(args.output_image_size)),
+            },
+        },
+        output_payload_path,
+    )
 
     manifest = {
         "run_dir": str(run_dir),
@@ -362,23 +414,18 @@ def main() -> None:
         "stage2_checkpoint": str(stage2_checkpoint),
         "token_cache": str(token_cache_path),
         "device": str(device),
-        "token_grid_shape": {"H": int(H), "W": int(W), "D": int(D)},
+        "token_grid_shape": {"H": H, "W": W, "D": D},
         "stage1_config": stage1_cfg,
         "transformer_config": {
             "vocab_size": int(transformer_cfg.vocab_size),
-            "H": int(transformer_cfg.H),
-            "W": int(transformer_cfg.W),
-            "D": int(transformer_cfg.D),
-            "atom_vocab_size": (
-                None if transformer_cfg.atom_vocab_size is None else int(transformer_cfg.atom_vocab_size)
-            ),
-            "coeff_vocab_size": (
-                None if transformer_cfg.coeff_vocab_size is None else int(transformer_cfg.coeff_vocab_size)
-            ),
-            "predict_coefficients": bool(transformer_cfg.predict_coefficients),
+            "atom_vocab_size": (None if transformer_cfg.atom_vocab_size is None else int(transformer_cfg.atom_vocab_size)),
+            "coeff_vocab_size": (None if transformer_cfg.coeff_vocab_size is None else int(transformer_cfg.coeff_vocab_size)),
+            "real_valued_coeffs": bool(transformer_cfg.real_valued_coeffs),
             "d_model": int(transformer_cfg.d_model),
             "n_heads": int(transformer_cfg.n_heads),
-            "n_layers": int(transformer_cfg.n_layers),
+            "n_spatial_layers": int(transformer_cfg.n_spatial_layers),
+            "n_depth_layers": int(transformer_cfg.n_depth_layers),
+            "n_global_spatial_tokens": int(transformer_cfg.n_global_spatial_tokens),
             "d_ff": int(transformer_cfg.d_ff),
             "dropout": float(transformer_cfg.dropout),
             "coeff_max": float(transformer_cfg.coeff_max),
@@ -388,73 +435,28 @@ def main() -> None:
             "nrow": int(_resolve_nrow(args.num_samples, args.nrow)),
             "temperature": float(args.temperature),
             "top_k": (None if resolved_top_k is None else int(resolved_top_k)),
-            "atom_temperature": (None if args.atom_temperature is None else float(args.atom_temperature)),
-            "atom_top_k": (None if resolved_atom_top_k is None else int(resolved_atom_top_k)),
-            "coeff_temperature": (None if args.coeff_temperature is None else float(args.coeff_temperature)),
-            "coeff_top_k": (None if resolved_coeff_top_k is None else int(resolved_coeff_top_k)),
-            "requested_greedy_atom_prefix_steps": (
-                None if args.greedy_atom_prefix_steps is None else int(args.greedy_atom_prefix_steps)
-            ),
-            "resolved_greedy_atom_prefix_steps": int(resolved_greedy),
+            "legacy_atom_temperature": args.atom_temperature,
+            "legacy_atom_top_k": args.atom_top_k,
+            "legacy_coeff_temperature": args.coeff_temperature,
+            "legacy_coeff_top_k": args.coeff_top_k,
+            "legacy_greedy_atom_prefix_steps": args.greedy_atom_prefix_steps,
+            "legacy_compare_greedy0": bool(args.compare_legacy_greedy0),
             "output_image_size": (None if args.output_image_size is None else int(args.output_image_size)),
             "seed": int(args.seed),
         },
-        "outputs": [],
-    }
-
-    for run_info in runs:
-        print(
-            f"[Sample] {run_info['label']}: seed={run_info['seed']} "
-            f"requested_greedy={run_info['greedy_atom_prefix_steps']} "
-            f"resolved_greedy={run_info['resolved_greedy_atom_prefix_steps']}"
-        )
-        sample = _generate_samples(
-            laser_mod,
-            laser=laser,
-            transformer=transformer,
-            H=int(H),
-            W=int(W),
-            D=int(D),
-            num_samples=int(args.num_samples),
-            temperature=float(args.temperature),
-            top_k=resolved_top_k,
-            atom_temperature=args.atom_temperature,
-            atom_top_k=resolved_atom_top_k,
-            coeff_temperature=args.coeff_temperature,
-            coeff_top_k=resolved_coeff_top_k,
-            greedy_atom_prefix_steps=run_info["greedy_atom_prefix_steps"],
-            output_image_size=args.output_image_size,
-            seed=int(run_info["seed"]),
-        )
-        output_path = output_dir / run_info["filename"]
-        laser_mod.save_image_grid(
-            sample["images"],
-            str(output_path),
-            nrow=_resolve_nrow(int(args.num_samples), args.nrow),
-        )
-        output_payload_path = output_dir / f"{output_path.stem}.pt"
-        torch.save(
+        "outputs": [
             {
-                "tokens_flat": sample["tokens_flat"],
-                "coeffs_flat": sample["coeffs_flat"],
-                "sampling": run_info,
-            },
-            output_payload_path,
-        )
-        manifest["outputs"].append(
-            {
-                "label": run_info["label"],
                 "grid": str(output_path),
                 "payload": str(output_payload_path),
-                "requested_greedy_atom_prefix_steps": run_info["greedy_atom_prefix_steps"],
-                "resolved_greedy_atom_prefix_steps": int(run_info["resolved_greedy_atom_prefix_steps"]),
             }
-        )
-        print(f"[Sample] wrote {output_path}")
-
+        ],
+    }
     manifest_path = output_dir / "manifest.json"
     with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
+
+    print(f"[Sample] wrote {output_path}")
+    print(f"[Sample] wrote {output_payload_path}")
     print(f"[Sample] wrote {manifest_path}")
 
 

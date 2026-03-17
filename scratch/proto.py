@@ -17,6 +17,7 @@ import math
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -26,6 +27,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    from spatial_prior import SpatialDepthPrior, build_spatial_depth_prior_config
+except ModuleNotFoundError:
+    from laser_transformer import SpatialDepthPrior, build_spatial_depth_prior_config
 from PIL import Image
 from scipy.linalg import sqrtm
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -52,13 +57,27 @@ IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CELEBA_DIR = (SCRIPT_DIR / "../../data/celeba").resolve()
 DEFAULT_STAGE1_SOURCE_RUN = "helloimlixin-rutgers/laser/4psikzda"
-DEFAULT_STAGE1_SOURCE_CKPT = (
+DEFAULT_STAGE1_SOURCE_CKPT_QUANTIZED = (SCRIPT_DIR / "checkpoints" / "quantized" / "stage1" / "ae_best.pt").resolve()
+DEFAULT_STAGE1_SOURCE_CKPT_NOQUANTIZED = (SCRIPT_DIR / "checkpoints" / "noquantized" / "stage1" / "ae_best.pt").resolve()
+LEGACY_DEFAULT_STAGE1_SOURCE_CKPT = (
     SCRIPT_DIR / "runs" / "laser_celeba128_quantized" / "20260311_000321" / "stage1" / "ae_best.pt"
 ).resolve()
 DEFAULT_STAGE2_SOURCE_RUN = "helloimlixin-rutgers/laser/q5l0g3jn"
 DEFAULT_STAGE2_SOURCE_TOKEN_CACHE = (
     SCRIPT_DIR / "runs" / "laser_celeba128_quantized" / "20260311_112058" / "stage2" / "tokens_cache.pt"
 ).resolve()
+
+
+def _parse_cli_bool(value) -> bool:
+    """Parse a bool flag from common CLI spellings."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
 
 
 def _default_image_size(dataset: str) -> int:
@@ -78,6 +97,15 @@ def _default_run_name(dataset: str, image_size: int, quantized: bool) -> str:
 
 def _default_out_dir(dataset: str, image_size: int, quantized: bool) -> Path:
     return (SCRIPT_DIR / "runs" / _default_run_name(dataset, image_size, quantized)).resolve()
+
+
+def _default_stage1_source_ckpt(quantized: bool) -> Optional[Path]:
+    primary = DEFAULT_STAGE1_SOURCE_CKPT_QUANTIZED if quantized else DEFAULT_STAGE1_SOURCE_CKPT_NOQUANTIZED
+    if primary.exists():
+        return primary
+    if quantized and LEGACY_DEFAULT_STAGE1_SOURCE_CKPT.exists():
+        return LEGACY_DEFAULT_STAGE1_SOURCE_CKPT
+    return None
 
 
 def _broadcast_optional_string(value: Optional[str], src: int = 0) -> str:
@@ -128,13 +156,15 @@ def _find_latest_stage1_checkpoint(experiment_root: Path, current_run_dir: Path)
     return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
-def _resolve_stage1_checkpoint_from_wandb_run(run_path: str, cache_root: Path) -> Path:
+def _resolve_stage1_checkpoint_from_wandb_run(run_path: str, cache_root: Path, quantized: bool) -> Path:
     """Resolve ae_best.pt from a W&B run via its recorded out_dir or uploaded files."""
     run_ref = str(run_path).strip()
     if not run_ref:
         raise ValueError("stage1_source_run must not be empty")
-    if run_ref == DEFAULT_STAGE1_SOURCE_RUN and DEFAULT_STAGE1_SOURCE_CKPT.exists():
-        return DEFAULT_STAGE1_SOURCE_CKPT
+    if run_ref == DEFAULT_STAGE1_SOURCE_RUN:
+        default_ckpt = _default_stage1_source_ckpt(quantized)
+        if default_ckpt is not None:
+            return default_ckpt
     if wandb is None:
         raise RuntimeError("wandb is not installed; cannot resolve a stage-1 checkpoint from a W&B run")
 
@@ -384,7 +414,8 @@ def _batched_omp_with_support(
     sparsity_level: int,
     diag_eps: float = 1e-4,
     cholesky_eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_history: bool = False,
+) -> Tuple[torch.Tensor, ...]:
     """Numerically damped batched OMP that returns support indices and ordered coefficients."""
     if X.ndim != 2 or D.ndim != 2:
         raise ValueError(f"Expected 2D tensors, got X={tuple(X.shape)} D={tuple(D.shape)}")
@@ -408,6 +439,8 @@ def _batched_omp_with_support(
     L = torch.empty(batch_size, 0, 0, device=device, dtype=dtype)
     I = torch.empty(batch_size, 0, device=device, dtype=torch.long)
     I_logic = torch.zeros_like(h_bar, dtype=torch.bool)
+    support_history = [] if return_history else None
+    coeff_history = [] if return_history else None
 
     def _update_logical(logical: torch.Tensor, to_add: torch.Tensor) -> None:
         logical[batch_idx, to_add] = True
@@ -450,9 +483,18 @@ def _batched_omp_with_support(
             x_stack = torch.linalg.solve(gram_support + cholesky_eps * reg_eye, h_stack)
         x_stack = torch.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
         x[batch_idx.unsqueeze(1), I] = x_stack.squeeze(-1)
+        coeffs_ordered = x[batch_idx.unsqueeze(1), I]
+        coeffs_ordered = torch.nan_to_num(coeffs_ordered, nan=0.0, posinf=0.0, neginf=0.0)
+        if return_history:
+            padded_support = torch.zeros(batch_size, int(sparsity_level), device=device, dtype=torch.long)
+            padded_coeffs = torch.zeros(batch_size, int(sparsity_level), device=device, dtype=dtype)
+            padded_support[:, :support_size] = I
+            padded_coeffs[:, :support_size] = coeffs_ordered
+            support_history.append(padded_support)
+            coeff_history.append(padded_coeffs)
 
         beta = (
-            x[batch_idx.unsqueeze(1), I]
+            coeffs_ordered
             .unsqueeze(1)
             .bmm(G[I[batch_idx], :])
             .squeeze(1)
@@ -461,7 +503,14 @@ def _batched_omp_with_support(
 
     coeffs_ordered = x[batch_idx.unsqueeze(1), I]
     coeffs_ordered = torch.nan_to_num(coeffs_ordered, nan=0.0, posinf=0.0, neginf=0.0)
-    return I, coeffs_ordered
+    if not return_history:
+        return I, coeffs_ordered
+    return (
+        I,
+        coeffs_ordered,
+        torch.stack(support_history, dim=1),
+        torch.stack(coeff_history, dim=1),
+    )
 
 
 _RFID_MODEL = None
@@ -781,6 +830,7 @@ class DictionaryLearningTokenized(nn.Module):
         coef_mu: float = 0.0,
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
+        canonicalize_sparse_slots: bool = True,
     ):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
@@ -799,6 +849,7 @@ class DictionaryLearningTokenized(nn.Module):
             raise ValueError(f"coef_mu must be > 0, got {self.coef_mu}")
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
+        self.canonicalize_sparse_slots = bool(canonicalize_sparse_slots)
 
         # Dictionary shape [C, K] (matches LASER)
         self.dictionary = nn.Parameter(torch.randn(self.embedding_dim, self.num_embeddings) * 0.02)
@@ -933,14 +984,19 @@ class DictionaryLearningTokenized(nn.Module):
                 coeffs_pad = torch.zeros((n_signals, pad), device=coeffs.device, dtype=coeffs.dtype)
                 support = torch.cat([support, support_pad], dim=1)
                 coeffs = torch.cat([coeffs, coeffs_pad], dim=1)
-        # Canonicalize sparse slots so stage-2 does not need to model arbitrary OMP selection order.
-        order = coeffs.abs().argsort(dim=1, descending=True)
-        support = support.gather(1, order)
-        coeffs = coeffs.gather(1, order)
+        if self.canonicalize_sparse_slots:
+            # Canonicalize sparse slots so stage-2 does not need to model arbitrary OMP selection order.
+            order = coeffs.abs().argsort(dim=1, descending=True)
+            support = support.gather(1, order)
+            coeffs = coeffs.gather(1, order)
         return (
             support.view(B, H, W, self.sparsity_level),
             coeffs.view(B, H, W, self.sparsity_level),
         )
+
+    def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        """Project coefficients onto the stage-1 decoder manifold."""
+        return coeffs.clamp(-self.coef_max, self.coef_max)
 
     def _reconstruct_sparse(
         self, support: torch.Tensor, coeffs: torch.Tensor
@@ -982,6 +1038,72 @@ class DictionaryLearningTokenized(nn.Module):
             sparsity_level=self.sparsity_level,
         )
 
+    def batch_omp_with_trajectory(
+        self,
+        X: torch.Tensor,
+        D: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Batched OMP with exact per-iteration refit history.
+
+        Returns:
+            support: [B, K] final support indices in greedy selection order.
+            coeffs: [B, K] final coefficients aligned with support.
+            support_history: [B, K, K] padded support prefixes after each OMP step.
+            coeff_history: [B, K, K] padded refit coefficients after each OMP step.
+        """
+        return _batched_omp_with_support(
+            X=X,
+            D=D,
+            sparsity_level=self.sparsity_level,
+            return_history=True,
+        )
+
+    def _encode_sparse_codes_with_trajectory(
+        self,
+        z_e: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run OMP and return the exact greedy refit trajectory.
+
+        The returned history tensors are padded to the full sparsity level so the
+        k-th OMP state can be decoded directly with `_reconstruct_sparse`.
+        """
+        if self.canonicalize_sparse_slots:
+            raise RuntimeError(
+                "Exact OMP trajectories require canonicalize_sparse_slots=False because canonicalization destroys "
+                "the greedy step order."
+            )
+        B, C, H, W = z_e.shape
+        n_signals = B * H * W
+        signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
+        dictionary = self._normalize_dict()
+        with torch.no_grad():
+            support, coeffs, support_hist, coeff_hist = self.batch_omp_with_trajectory(signals, dictionary)
+        if support.ndim != 2 or coeffs.ndim != 2 or support_hist.ndim != 3 or coeff_hist.ndim != 3:
+            raise RuntimeError(
+                "OMP trajectory returned invalid ranks: "
+                f"support={tuple(support.shape)} coeffs={tuple(coeffs.shape)} "
+                f"support_hist={tuple(support_hist.shape)} coeff_hist={tuple(coeff_hist.shape)}"
+            )
+        if support.size(0) != n_signals or coeffs.size(0) != n_signals:
+            raise RuntimeError(
+                f"OMP trajectory returned invalid batch size: expected {n_signals}, "
+                f"got support={support.size(0)} coeffs={coeffs.size(0)}"
+            )
+        expected_shape = (n_signals, self.sparsity_level, self.sparsity_level)
+        if tuple(support_hist.shape) != expected_shape or tuple(coeff_hist.shape) != expected_shape:
+            raise RuntimeError(
+                f"OMP trajectory returned invalid history shapes: expected {expected_shape}, "
+                f"got support_hist={tuple(support_hist.shape)} coeff_hist={tuple(coeff_hist.shape)}"
+            )
+        return (
+            support.view(B, H, W, self.sparsity_level),
+            coeffs.view(B, H, W, self.sparsity_level),
+            support_hist.view(B, H, W, self.sparsity_level, self.sparsity_level),
+            coeff_hist.view(B, H, W, self.sparsity_level, self.sparsity_level),
+        )
+
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -1011,7 +1133,7 @@ class DictionaryLearningTokenized(nn.Module):
             coeffs_for_recon = coeff_q
         else:
             tokens = support.view(B, H, W, self.sparsity_level).long()
-            coeffs_for_recon = coeffs_flat.clamp(-self.coef_max, self.coef_max)
+            coeffs_for_recon = self.clamp_sparse_coeffs(coeffs_flat)
 
         coeffs_for_recon = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
         z_q = self._reconstruct_sparse(support, coeffs_for_recon)
@@ -1048,7 +1170,8 @@ class DictionaryLearningTokenized(nn.Module):
         if coeffs is None:
             raise ValueError("coeffs must be provided when quantize_sparse_coeffs=False")
 
-        return self._reconstruct_sparse(tokens.to(torch.long), coeffs.to(self._normalize_dict().dtype))
+        coeffs_clamped = self.clamp_sparse_coeffs(coeffs.to(self._normalize_dict().dtype))
+        return self._reconstruct_sparse(tokens.to(torch.long), coeffs_clamped)
 
 
 SparseBottleneck = DictionaryLearningTokenized
@@ -1101,6 +1224,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
         patch_reconstruction: str = "center_crop",
+        canonicalize_sparse_slots: bool = True,
     ):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
@@ -1120,6 +1244,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
             raise ValueError(f"coef_mu must be > 0, got {self.coef_mu}")
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
+        self.canonicalize_sparse_slots = bool(canonicalize_sparse_slots)
         if patch_reconstruction not in ("center_crop", "hann"):
             raise ValueError("patch_reconstruction must be 'center_crop' or 'hann'")
         self.patch_reconstruction = patch_reconstruction
@@ -1301,15 +1426,20 @@ class PatchDictionaryLearningTokenized(nn.Module):
         else:
             support = support[:, :self.sparsity_level]
             coeffs = coeffs[:, :self.sparsity_level]
-        # Canonicalize sparse slots so stage-2 sees a stable per-patch ordering.
-        order = coeffs.abs().argsort(dim=1, descending=True)
-        support = support.gather(1, order)
-        coeffs = coeffs.gather(1, order)
+        if self.canonicalize_sparse_slots:
+            # Canonicalize sparse slots so stage-2 sees a stable per-patch ordering.
+            order = coeffs.abs().argsort(dim=1, descending=True)
+            support = support.gather(1, order)
+            coeffs = coeffs.gather(1, order)
         return (
             support.view(B, nph, npw, self.sparsity_level),
             coeffs.view(B, nph, npw, self.sparsity_level),
             H, W,
         )
+
+    def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        """Project coefficients onto the stage-1 decoder manifold."""
+        return coeffs.clamp(-self.coef_max, self.coef_max)
 
     def _reconstruct_sparse(
         self,
@@ -1435,7 +1565,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
             coeffs_for_recon = coeff_q.reshape(B, nph, npw, self.sparsity_level)
         else:
             tokens = support.view(B, nph, npw, self.sparsity_level).long()
-            coeffs_for_recon = coeffs_flat.clamp(-self.coef_max, self.coef_max).reshape(B, nph, npw, self.sparsity_level)
+            coeffs_for_recon = self.clamp_sparse_coeffs(coeffs_flat).reshape(B, nph, npw, self.sparsity_level)
 
         z_q = self._reconstruct_sparse(support, coeffs_for_recon, H, W)
 
@@ -1477,14 +1607,15 @@ class PatchDictionaryLearningTokenized(nn.Module):
 
         if coeffs is None:
             raise ValueError("coeffs must be provided when quantize_sparse_coeffs=False")
+        coeffs_clamped = self.clamp_sparse_coeffs(coeffs.to(self._normalize_dict().dtype))
         if latent_hw is None:
             return self._reconstruct_sparse(
                 tokens.to(torch.long),
-                coeffs.to(self._normalize_dict().dtype),
+                coeffs_clamped,
             )
         return self._reconstruct_sparse(
             tokens.to(torch.long),
-            coeffs.to(self._normalize_dict().dtype),
+            coeffs_clamped,
             int(latent_hw[0]),
             int(latent_hw[1]),
         )
@@ -1604,7 +1735,10 @@ class LASER(nn.Module):
             atoms, coeffs, _, _ = encoded
         else:
             atoms, coeffs = encoded
-        return atoms, coeffs, atoms.shape[1], atoms.shape[2]
+        return atoms, self.clamp_sparse_coeffs(coeffs), atoms.shape[1], atoms.shape[2]
+
+    def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        return self.bottleneck.clamp_sparse_coeffs(coeffs)
 
     @torch.no_grad()
     def decode_from_tokens(
@@ -1629,6 +1763,7 @@ class LASER(nn.Module):
         coeffs: torch.Tensor,
         latent_hw: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
+        coeffs = self.clamp_sparse_coeffs(coeffs)
         patch_latent_hw = self._resolve_patch_latent_hw(latent_hw)
         if isinstance(self.bottleneck, PatchDictionaryLearningTokenized):
             z_q = self.bottleneck._reconstruct_sparse(
@@ -1647,382 +1782,6 @@ class LASER(nn.Module):
 
 # Backward-compatible alias for older scratch experiments.
 SparseDictAE = LASER
-
-
-# -----------------------------
-# Stage-2: Transformer prior (GPT-style causal transformer over stacks)
-# -----------------------------
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, max_seq_len: int):
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.dropout_p = float(dropout)
-        self.max_seq_len = int(max_seq_len)
-
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.resid_dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=(self.dropout_p if self.training else 0.0),
-            is_causal=True,
-        )
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.out_proj(out)
-        out = self.resid_dropout(out)
-        return out
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, max_seq_len: int):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_seq_len)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
-        return x
-
-
-@dataclass
-class TransformerConfig:
-    vocab_size: int
-    H: int
-    W: int
-    D: int
-    atom_vocab_size: Optional[int] = None
-    coeff_vocab_size: Optional[int] = None
-    real_valued_coeffs: bool = True
-    coeff_norm_max: float = 4.0
-    d_model: int = 256
-    n_heads: int = 8
-    n_layers: int = 6
-    d_ff: int = 1024
-    dropout: float = 0.1
-
-
-class Transformer(nn.Module):
-    """
-    Autoregressive prior over a flattened H x W x D token grid.
-    In quantized LASER mode, D is the token depth after atom/coeff interleaving.
-    """
-    def __init__(self, cfg: TransformerConfig, bos_token_id: int, pad_token_id: int):
-        super().__init__()
-        self.cfg = cfg
-        self.bos_token_id = int(bos_token_id)
-        self.pad_token_id = int(pad_token_id)
-        self.atom_vocab_size = None if cfg.atom_vocab_size is None else int(cfg.atom_vocab_size)
-        self.coeff_vocab_size = None if cfg.coeff_vocab_size is None else int(cfg.coeff_vocab_size)
-        if (self.atom_vocab_size is None) != (self.coeff_vocab_size is None):
-            raise ValueError("atom_vocab_size and coeff_vocab_size must both be set or both be None")
-        if self.atom_vocab_size is not None and self.coeff_vocab_size is not None:
-            if self.atom_vocab_size <= 0 or self.coeff_vocab_size <= 0:
-                raise ValueError("atom_vocab_size and coeff_vocab_size must be positive")
-            self.content_vocab_size = self.atom_vocab_size + self.coeff_vocab_size
-            if self.content_vocab_size > self.pad_token_id:
-                raise ValueError(
-                    f"content vocab ({self.content_vocab_size}) exceeds pad token id ({self.pad_token_id})"
-                )
-        else:
-            self.content_vocab_size = None
-
-        self.tokens_per_patch = cfg.H * cfg.W * cfg.D
-        self.max_len = 1 + self.tokens_per_patch
-
-        self.real_valued_coeffs = bool(cfg.real_valued_coeffs)
-        self.coeff_norm_max = float(cfg.coeff_norm_max)
-        if self.coeff_norm_max <= 0.0:
-            raise ValueError("coeff_norm_max must be > 0 when real_valued_coeffs=True")
-
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.spatial_emb = nn.Embedding(cfg.H * cfg.W, cfg.d_model)
-        self.depth_emb = nn.Embedding(cfg.D, cfg.d_model)
-        self.type_emb = nn.Embedding(2, cfg.d_model)
-        self.register_buffer(
-            "coeff_mean",
-            torch.zeros(cfg.vocab_size, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "coeff_std",
-            torch.ones(cfg.vocab_size, dtype=torch.float32),
-            persistent=False,
-        )
-
-        self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, self.max_len)
-            for _ in range(cfg.n_layers)
-        ])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if self.real_valued_coeffs:
-            self.coeff_proj = nn.Linear(1, cfg.d_model, bias=False)
-            self.coeff_atom_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-            # Start from the shared embedding values, then let coeff regression adapt independently.
-            self.coeff_atom_emb.weight.data.copy_(self.token_emb.weight.data)
-            self.coeff_head = nn.Sequential(
-                nn.Linear(2 * cfg.d_model, cfg.d_model),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, 1),
-            )
-        else:
-            self.coeff_proj = None
-            self.coeff_atom_emb = None
-            self.coeff_head = None
-
-        # Position ids for [BOS] + flattened token sequence.
-        spatial_ids = torch.zeros(self.max_len, dtype=torch.long)
-        depth_ids = torch.zeros(self.max_len, dtype=torch.long)
-        type_ids = torch.zeros(self.max_len, dtype=torch.long)
-        if self.max_len > 1:
-            idx = torch.arange(self.max_len - 1)
-            spatial_ids[1:] = idx // cfg.D
-            depth_ids[1:] = idx % cfg.D
-            type_ids[1:] = 1
-        self.register_buffer("_spatial_ids", spatial_ids)
-        self.register_buffer("_depth_ids", depth_ids)
-        self.register_buffer("_type_ids", type_ids)
-
-    def set_coeff_normalization_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        """Set atom-conditioned normalization stats for real-valued coefficient modeling."""
-        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=self.coeff_mean.device).flatten()
-        std_t = torch.as_tensor(std, dtype=torch.float32, device=self.coeff_std.device).flatten().clamp_min(1e-6)
-        if mean_t.numel() != self.coeff_mean.numel() or std_t.numel() != self.coeff_std.numel():
-            raise ValueError(
-                f"Expected coeff stats with {self.coeff_mean.numel()} entries, "
-                f"got mean={mean_t.numel()} std={std_t.numel()}"
-            )
-        self.coeff_mean.copy_(mean_t)
-        self.coeff_std.copy_(std_t)
-
-    def normalize_coeffs(self, coeffs: torch.Tensor, atom_ids: torch.Tensor) -> torch.Tensor:
-        """Map raw coefficients to a bounded normalized space using atom-conditioned stats."""
-        mean = self.coeff_mean[atom_ids.to(torch.long)]
-        std = self.coeff_std[atom_ids.to(torch.long)]
-        coeffs_norm = (coeffs.float() - mean) / std
-        return coeffs_norm.clamp(-self.coeff_norm_max, self.coeff_norm_max)
-
-    def denormalize_coeffs(self, coeffs_norm: torch.Tensor, atom_ids: torch.Tensor) -> torch.Tensor:
-        """Map normalized coefficients back to raw decoder space using atom-conditioned stats."""
-        coeffs_norm = coeffs_norm.float().clamp(-self.coeff_norm_max, self.coeff_norm_max)
-        mean = self.coeff_mean[atom_ids.to(torch.long)]
-        std = self.coeff_std[atom_ids.to(torch.long)]
-        return coeffs_norm * std + mean
-
-    def _forward_hidden(self, x: torch.Tensor, coeffs: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Shared trunk: returns normalized hidden states [B, L, d_model].
-
-        Args:
-            x:      [B, L] atom token ids
-            coeffs: [B, L] float, previous-step coefficients fed back as input.
-                    Position 0 (BOS) should be 0.  Required when real_valued_coeffs=True.
-        """
-        _, L = x.shape
-        if L > self.max_len:
-            raise ValueError(f"Got L={L}, but max_len={self.max_len}")
-        tok = self.token_emb(x)
-        if coeffs is not None:
-            tok = tok + self.coeff_proj(coeffs.unsqueeze(-1).float())
-        sp = self.spatial_emb(self._spatial_ids[:L])
-        dp = self.depth_emb(self._depth_ids[:L])
-        tp = self.type_emb(self._type_ids[:L])
-        h = tok + sp.unsqueeze(0) + dp.unsqueeze(0) + tp.unsqueeze(0)
-        h = self.drop(h)
-        for block in self.blocks:
-            h = block(h)
-        return self.ln_f(h)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, L] tokens, L <= max_len
-        Returns:
-            logits: [B, L, vocab]
-        """
-        return self.head(self._forward_hidden(x))
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        coeff_atom_key = prefix + "coeff_atom_emb.weight"
-        token_key = prefix + "token_emb.weight"
-        if self.real_valued_coeffs and coeff_atom_key not in state_dict and token_key in state_dict:
-            # Allow older checkpoints to load by seeding the decoupled coeff embedding from token_emb.
-            state_dict[coeff_atom_key] = state_dict[token_key].clone()
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-
-    def _predict_coeffs(
-        self,
-        hidden: torch.Tensor,
-        atom_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predict coefficients conditioned on the chosen atom at each step."""
-        if not self.real_valued_coeffs or self.coeff_head is None or self.coeff_atom_emb is None:
-            raise RuntimeError("_predict_coeffs is only valid when real_valued_coeffs=True")
-        if hidden.shape[:2] != atom_ids.shape:
-            raise ValueError(
-                f"hidden shape {tuple(hidden.shape[:2])} must match atom_ids shape {tuple(atom_ids.shape)}"
-            )
-        atom_feat = self.coeff_atom_emb(atom_ids.to(torch.long))
-        coeff_in = torch.cat([hidden, atom_feat], dim=-1)
-        coeff_raw = self.coeff_head(coeff_in).squeeze(-1)
-        return torch.tanh(coeff_raw) * self.coeff_norm_max
-
-    def forward_with_coeffs(
-        self,
-        x: torch.Tensor,
-        coeffs: torch.Tensor,
-        next_atoms: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass with autoregressive coefficient feedback.
-        Only valid when real_valued_coeffs=True.
-
-        Args:
-            x:          [B, L] atom token ids (shifted: [BOS, a_0, ..., a_{T-2}])
-            coeffs:     [B, L] previous-step coefficients (shifted: [0, c_0, ..., c_{T-2}])
-            next_atoms: [B, L] atom ids to condition coefficient prediction on
-                        (typically the teacher-forced target atoms y_t).
-        Returns:
-            logits:     [B, L, vocab]
-            coeff_pred: [B, L] conditioned on next_atoms
-        """
-        h = self._forward_hidden(x, coeffs)
-        return self.head(h), self._predict_coeffs(h, next_atoms)
-
-    @torch.no_grad()
-    def generate(
-        self,
-        batch_size: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        show_progress: bool = False,
-        progress_desc: Optional[str] = None,
-    ) -> torch.Tensor:
-        """Sample a batch of flattened token sequences."""
-        device = next(self.parameters()).device
-        T = self.cfg.H * self.cfg.W * self.cfg.D
-
-        seq = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
-        steps = tqdm(
-            range(T),
-            desc=(progress_desc or "[Stage2] sampling tokens"),
-            leave=False,
-            dynamic_ncols=True,
-            disable=(not show_progress),
-        )
-        for _ in steps:
-            logits = self(seq)[:, -1, :] / max(temperature, 1e-8)
-            logits[:, self.pad_token_id] = float("-inf")
-            logits[:, self.bos_token_id] = float("-inf")
-            if self.content_vocab_size is not None:
-                logits[:, self.content_vocab_size:] = float("-inf")
-                if (_ % 2) == 0:
-                    logits[:, self.atom_vocab_size:self.content_vocab_size] = float("-inf")
-                else:
-                    logits[:, :self.atom_vocab_size] = float("-inf")
-            if top_k is not None and top_k > 0:
-                k = min(int(top_k), int(logits.size(-1)))
-                v, ix = torch.topk(logits, k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1)
-            seq = torch.cat([seq, nxt], dim=1)
-        return seq[:, 1:]
-
-    @torch.no_grad()
-    def generate_with_coeffs(
-        self,
-        batch_size: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        show_progress: bool = False,
-        progress_desc: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample atom indices and predict real-valued coefficients.
-        Only valid when real_valued_coeffs=True.
-        Returns:
-            tokens: [B, T] long  — sampled atom indices
-            coeffs: [B, T] float — predicted coefficients
-        """
-        device = next(self.parameters()).device
-        T = self.cfg.H * self.cfg.W * self.cfg.D
-
-        seq = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
-        # coeff_seq_norm holds normalized coefficients fed back into the model.
-        coeff_seq_norm = torch.zeros(batch_size, 1, device=device)
-        all_coeffs_norm = []
-        steps = tqdm(
-            range(T),
-            desc=(progress_desc or "[Stage2] sampling tokens"),
-            leave=False,
-            dynamic_ncols=True,
-            disable=(not show_progress),
-        )
-        for _ in steps:
-            h = self._forward_hidden(seq, coeff_seq_norm)
-            logits = self.head(h)[:, -1, :] / max(temperature, 1e-8)
-            logits[:, self.pad_token_id] = float("-inf")
-            logits[:, self.bos_token_id] = float("-inf")
-            if top_k is not None and top_k > 0:
-                k = min(int(top_k), int(logits.size(-1)))
-                v, ix = torch.topk(logits, k, dim=-1)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, ix, v)
-                logits = mask
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1)
-            coeff_t_norm = self._predict_coeffs(h[:, -1:, :], nxt).squeeze(1)
-            seq = torch.cat([seq, nxt], dim=1)
-            coeff_seq_norm = torch.cat([coeff_seq_norm, coeff_t_norm.unsqueeze(1)], dim=1)
-            all_coeffs_norm.append(coeff_t_norm)
-        coeffs_norm = torch.stack(all_coeffs_norm, dim=1)
-        atom_ids = seq[:, 1:]
-        return atom_ids, self.denormalize_coeffs(coeffs_norm, atom_ids)
-
 
 
 # -----------------------------
@@ -2212,8 +1971,8 @@ def _compute_stage2_sample_reference_stats(
 
     feats = torch.cat(feats_all, dim=0)
     return {
-        "mean": feats.mean(dim=0, keepdim=True),
-        "std": feats.std(dim=0, keepdim=True).clamp_min(1e-6),
+        "mean": feats.mean(dim=0, keepdim=True).cpu(),
+        "std": feats.std(dim=0, keepdim=True).clamp_min(1e-6).cpu(),
     }
 
 
@@ -3011,16 +2770,89 @@ def _token_cache_is_compatible(cache, expected_meta: dict) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _compute_quantized_rq_losses(
+    per_token_ce: torch.Tensor,
+    atom_loss_weight: float,
+    coeff_loss_weight: float,
+    coeff_depth_weighting: str = "none",
+    coeff_focal_gamma: float = 0.0,
+    coeff_logits: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split interleaved atom/bin CE terms and combine them with explicit weights.
+
+    Args:
+        per_token_ce:         [B, L, D]  per-token CE losses.
+        atom_loss_weight:     weight for atom CE component.
+        coeff_loss_weight:    weight for coeff CE component.
+        coeff_depth_weighting: ``"none"`` (uniform), ``"linear"`` (earlier depths
+                              weighted more), or ``"entropy"`` (weight inversely
+                              proportional to per-depth easiness).
+        coeff_focal_gamma:    gamma for focal modulation on coeff CE.
+                              0 = standard CE; >0 down-weights easy predictions.
+        coeff_logits:         [B, L, s, n_bins]  coeff logits (needed for focal).
+    """
+    if per_token_ce.numel() == 0:
+        raise ValueError("Expected non-empty per-token CE tensor")
+
+    atom_terms = per_token_ce[..., 0::2]                  # [B, L, s]
+    coeff_terms = per_token_ce[..., 1::2]                 # [B, L, s]
+    if atom_terms.numel() == 0 or coeff_terms.numel() == 0:
+        raise ValueError(
+            "Quantized RQ loss expects interleaved atom and coefficient-bin terms"
+        )
+
+    s = coeff_terms.size(-1)  # sparsity level
+
+    # ---- depth-position weighting for coefficients ----
+    if coeff_depth_weighting == "linear":
+        # Linearly decreasing: depth 0 gets weight s, depth s-1 gets weight 1.
+        w = torch.arange(s, 0, -1, device=coeff_terms.device, dtype=coeff_terms.dtype)
+        w = w / w.sum()                                   # normalise to mean 1/s
+        w = w * s                                         # scale so sum = s (same total as uniform)
+        coeff_terms = coeff_terms * w.view(1, 1, s)
+    elif coeff_depth_weighting == "inverse_rank":
+        # 1/rank weighting: depth 0 gets 1/1, depth 1 gets 1/2, ...
+        w = 1.0 / torch.arange(1, s + 1, device=coeff_terms.device, dtype=coeff_terms.dtype)
+        w = w / w.mean()
+        coeff_terms = coeff_terms * w.view(1, 1, s)
+
+    # ---- focal modulation for coefficient CE ----
+    if coeff_focal_gamma > 0.0 and coeff_logits is not None:
+        # Focal loss: multiply CE by (1 - p_correct)^gamma
+        with torch.no_grad():
+            coeff_probs = F.softmax(coeff_logits, dim=-1)  # [B, L, s, n_bins]
+            p_max = coeff_probs.max(dim=-1).values         # [B, L, s]
+            focal_weight = (1.0 - p_max).pow(coeff_focal_gamma)
+        coeff_terms = coeff_terms * focal_weight
+
+    token_ce_loss = per_token_ce.mean()
+    atom_ce_loss = atom_terms.mean()
+    coeff_ce_loss = coeff_terms.mean()
+    weight_sum = float(atom_loss_weight) + float(coeff_loss_weight)
+    if weight_sum <= 0.0:
+        total_loss = token_ce_loss * 0.0
+    else:
+        total_loss = (
+            float(atom_loss_weight) * atom_ce_loss
+            + float(coeff_loss_weight) * coeff_ce_loss
+        ) / weight_sum
+    return token_ce_loss, atom_ce_loss, coeff_ce_loss, total_loss
+
+
 def train_stage2_transformer(
-    transformer: Transformer,
+    transformer: nn.Module,
     token_loader: DataLoader,
     device: torch.device,
     epochs: int,
     lr: float,
+    rq_atom_loss_weight: float,
+    rq_coeff_loss_weight: float,
     coeff_loss_weight: float,
     coeff_loss_type: str,
     coeff_huber_delta: float,
     sched_sampling_final_prob: float,
+    stage2_amp: bool,
+    stage2_amp_dtype: str,
     pad_token_id: int,
     out_dir: str,
     ae_for_decode: LASER,
@@ -3028,6 +2860,19 @@ def train_stage2_transformer(
     W: int,
     D: int,
     sample_every_steps: int = 200,
+    # ---- LR schedule ----
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.01,
+    weight_decay: float = 0.0,
+    # ---- coefficient depth/focal weighting ----
+    coeff_depth_weighting: str = "none",
+    coeff_focal_gamma: float = 0.0,
+    # ---- ordinal coefficient regression ----
+    ordinal_coeff_weight: float = 0.0,
+    ordinal_coeff_huber_delta: float = 0.5,
+    ordinal_magnitude_weighted: bool = False,
+    ordinal_zero_drift_margin: float = 0.0,
+    ordinal_zero_drift_threshold: float = 0.3,
     sample_batch_size: int = 8,
     sample_candidate_factor: int = 4,
     sample_temperature: float = 1.0,
@@ -3040,27 +2885,91 @@ def train_stage2_transformer(
 ):
     """Train stage 2 with optional DDP and synchronized rank-0 sampling."""
     transformer_module = _unwrap_module(transformer)
+    if not isinstance(transformer_module, SpatialDepthPrior):
+        raise TypeError(
+            "train_stage2_transformer now supports SpatialDepthPrior only; "
+            "the legacy stage-2 Transformer path was removed"
+        )
     ae_decode = _unwrap_module(ae_for_decode)
     ae_decode.eval()
     ae_decode.requires_grad_(False)
-    opt = torch.optim.Adam(transformer.parameters(), lr=lr)
+    if weight_decay > 0:
+        opt = torch.optim.AdamW(transformer.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.Adam(transformer.parameters(), lr=lr)
+    total_steps = max(1, epochs * max(1, len(token_loader)))
+    warmup_steps = max(0, int(warmup_steps))
+    min_lr_ratio = float(max(0.0, min(float(min_lr_ratio), 1.0)))
     vocab = transformer_module.cfg.vocab_size
-    bos = transformer_module.bos_token_id
     global_step = 0
     sample_top_k = None if sample_top_k is None or int(sample_top_k) <= 0 else int(sample_top_k)
     sample_candidate_factor = max(1, int(sample_candidate_factor))
     real_valued = transformer_module.real_valued_coeffs
+    rq_atom_loss_weight = float(rq_atom_loss_weight)
+    rq_coeff_loss_weight = float(rq_coeff_loss_weight)
     coeff_loss_weight = float(coeff_loss_weight)
     coeff_loss_type = str(coeff_loss_type).lower()
     if coeff_loss_type not in {"huber", "mse", "recon_mse", "gt_atom_recon_mse"}:
         raise ValueError(f"Unsupported coeff_loss_type: {coeff_loss_type!r}")
     coeff_huber_delta = float(coeff_huber_delta)
+    amp_dtype_name = str(stage2_amp_dtype).strip().lower()
+    if amp_dtype_name not in {"auto", "float16", "bfloat16"}:
+        raise ValueError(f"Unsupported stage2_amp_dtype: {stage2_amp_dtype!r}")
+    amp_enabled = bool(stage2_amp) and device.type == "cuda"
+    if amp_dtype_name == "auto":
+        amp_dtype = torch.bfloat16 if (amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+    elif amp_dtype_name == "bfloat16":
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+    scaler_enabled = amp_enabled and amp_dtype == torch.float16
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler(
+            device="cuda",
+            enabled=scaler_enabled,
+        )
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     sched_sampling_final_prob = max(0.0, float(sched_sampling_final_prob))
+    if sched_sampling_final_prob > 0.0 and is_main_process:
+        print("[Stage2] ignoring scheduled sampling; the legacy transformer path was removed")
+    if not real_valued and is_main_process:
+        print(
+            "[Stage2] quantized RQ training loss: weighted atom/coeff CE "
+            "(raw token CE logged separately)"
+        )
+    if amp_enabled and is_main_process:
+        amp_label = "bfloat16" if amp_dtype == torch.bfloat16 else "float16"
+        print(f"[Stage2] using AMP ({amp_label})")
+    offload_decode_model = (
+        (not real_valued)
+        and device.type == "cuda"
+        and next(ae_decode.parameters()).device.type == "cuda"
+    )
+    if offload_decode_model:
+        ae_decode.to("cpu")
+        torch.cuda.empty_cache()
+        if is_main_process:
+            print("[Stage2] parking stage-1 decoder on CPU between sampling steps")
     num_batches = max(1, len(token_loader))
     if coeff_loss_type in {"recon_mse", "gt_atom_recon_mse"} and isinstance(ae_decode.bottleneck, PatchDictionaryLearningTokenized):
         raise ValueError(
             f"stage2 coeff_loss_type={coeff_loss_type!r} currently requires patch_based=False"
         )
+
+    # ---- ordinal coefficient regression setup ----
+    use_ordinal = not real_valued and ordinal_coeff_weight > 0
+    coeff_bin_values_for_ordinal = None
+    if use_ordinal:
+        from contrastive_sparse import ordinal_coeff_loss
+        coeff_bin_values_for_ordinal = ae_decode.bottleneck._dequantize_coeff(
+            torch.arange(ae_decode.bottleneck.n_bins, dtype=torch.long)
+        ).detach().to(device)
+        if is_main_process:
+            parts = [f"ordinal_coeff(w={ordinal_coeff_weight}, mag_w={ordinal_magnitude_weighted})"]
+            if ordinal_zero_drift_margin > 0:
+                parts.append(f"zero_drift(margin={ordinal_zero_drift_margin}, thresh={ordinal_zero_drift_threshold})")
+            print(f"[Stage2] aux losses: {', '.join(parts)}")
 
     for epoch in range(1, epochs + 1):
         if token_sampler is not None:
@@ -3078,102 +2987,144 @@ def train_stage2_transformer(
                 tok_flat = tok_flat.to(device).long()
             B = tok_flat.size(0)
 
-            seq = torch.cat([torch.full((B, 1), bos, device=device, dtype=torch.long), tok_flat], dim=1)
-            x_in = seq[:, :-1]
-            y = seq[:, 1:]
-
             opt.zero_grad(set_to_none=True)
             ce_loss = None
+            atom_ce_loss = None
+            coeff_ce_loss = None
             coeff_reg_loss = None
-            sched_prob = 0.0
-            if real_valued:
-                coeff_target = transformer_module.normalize_coeffs(coeff_flat, y)
-                # Shift coefficients right: position 0 (BOS) gets 0, position t gets c_{t-1}.
-                coeff_in = torch.cat([torch.zeros(B, 1, device=device), coeff_target[:, :-1]], dim=1)
-                x_model = x_in
-                coeff_model = coeff_in
-                total_steps = max(1, epochs * num_batches - 1)
-                progress = ((epoch - 1) * num_batches + batch_idx) / total_steps
-                sched_prob = sched_sampling_final_prob * progress
-                if sched_prob > 0.0 and x_in.size(1) > 1:
-                    with torch.no_grad():
-                        h_tf = transformer_module._forward_hidden(x_in, coeff_in)
-                        logits_tf = transformer_module.head(h_tf)
-                        logits_prev = logits_tf[:, :-1, :].clone()
-                        logits_prev[..., pad_token_id] = float("-inf")
-                        logits_prev[..., transformer_module.bos_token_id] = float("-inf")
-                        pred_prev_tokens = logits_prev.argmax(dim=-1)
-                        pred_prev_coeffs = transformer_module._predict_coeffs(h_tf[:, :-1, :], pred_prev_tokens)
-                        replace_mask = torch.rand(B, x_in.size(1) - 1, device=device) < sched_prob
-                    x_tail = torch.where(replace_mask, pred_prev_tokens, x_in[:, 1:])
-                    coeff_tail = torch.where(replace_mask, pred_prev_coeffs, coeff_in[:, 1:])
-                    x_model = torch.cat([x_in[:, :1], x_tail], dim=1)
-                    coeff_model = torch.cat([coeff_in[:, :1], coeff_tail], dim=1)
-                hidden = transformer_module._forward_hidden(x_model, coeff_model)
-                logits = transformer_module.head(hidden)
-                ce_loss = F.cross_entropy(
-                    logits.reshape(-1, vocab),
-                    y.reshape(-1),
-                    ignore_index=pad_token_id,
-                )
-                if coeff_loss_type == "mse":
-                    coeff_pred = transformer_module._predict_coeffs(hidden, y)
-                    coeff_reg_loss = F.mse_loss(coeff_pred, coeff_target)
-                elif coeff_loss_type == "huber":
-                    coeff_pred = transformer_module._predict_coeffs(hidden, y)
-                    coeff_reg_loss = F.huber_loss(coeff_pred, coeff_target, delta=coeff_huber_delta)
-                elif coeff_loss_type == "recon_mse":
-                    logits_pred = logits.clone()
-                    logits_pred[..., pad_token_id] = float("-inf")
-                    logits_pred[..., transformer_module.bos_token_id] = float("-inf")
-                    pred_atoms = logits_pred.argmax(dim=-1)
-                    pred_coeff_norm = transformer_module._predict_coeffs(hidden, pred_atoms)
-                    pred_coeff = transformer_module.denormalize_coeffs(pred_coeff_norm, pred_atoms)
-                    coef_max = float(getattr(ae_decode.bottleneck, "coef_max", float("inf")))
-                    pred_coeff = pred_coeff.clamp(-coef_max, coef_max)
-                    target_coeff = coeff_flat.clamp(-coef_max, coef_max)
-                    pred_latent = ae_decode.bottleneck._reconstruct_sparse(
-                        pred_atoms.view(B, H, W, D),
-                        pred_coeff.view(B, H, W, D),
+            ordinal_loss = None
+            autocast_ctx = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_enabled
+                else nullcontext()
+            )
+            with autocast_ctx:
+                if real_valued:
+                    tok_grid = tok_flat.view(B, H * W, D)
+                    coeff_grid = coeff_flat.view(B, H * W, D)
+                    atom_logits, coeff_pred, depth_h = transformer(
+                        tok_grid,
+                        coeff_grid,
+                        return_features=True,
                     )
-                    with torch.no_grad():
-                        target_latent = ae_decode.bottleneck._reconstruct_sparse(
-                            y.view(B, H, W, D),
-                            target_coeff.view(B, H, W, D),
+                    ce_loss = F.cross_entropy(
+                        atom_logits.reshape(-1, vocab),
+                        tok_grid.reshape(-1),
+                    )
+                    pred_coeff = ae_decode.clamp_sparse_coeffs(coeff_pred)
+                    coef_max = float(getattr(ae_decode.bottleneck, "coef_max", float("inf")))
+                    target_coeff = coeff_grid.clamp(-coef_max, coef_max)
+                    if coeff_loss_type == "mse":
+                        coeff_reg_loss = F.mse_loss(pred_coeff, target_coeff)
+                    elif coeff_loss_type == "huber":
+                        coeff_reg_loss = F.huber_loss(
+                            pred_coeff,
+                            target_coeff,
+                            delta=coeff_huber_delta,
                         )
-                    coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
+                    elif coeff_loss_type == "recon_mse":
+                        pred_atoms = atom_logits.argmax(dim=-1)
+                        pred_coeff = ae_decode.clamp_sparse_coeffs(
+                            transformer_module.predict_coeffs_for_atoms(depth_h, pred_atoms)
+                        )
+                        pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            pred_atoms.view(B, H, W, D),
+                            pred_coeff.view(B, H, W, D),
+                        )
+                        with torch.no_grad():
+                            target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                                tok_grid.view(B, H, W, D),
+                                target_coeff.view(B, H, W, D),
+                            )
+                        coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
+                    else:
+                        pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            tok_grid.view(B, H, W, D),
+                            pred_coeff.view(B, H, W, D),
+                        )
+                        with torch.no_grad():
+                            target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                                tok_grid.view(B, H, W, D),
+                                target_coeff.view(B, H, W, D),
+                            )
+                        coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
+                    loss = ce_loss + coeff_loss_weight * coeff_reg_loss
                 else:
-                    pred_coeff_norm = transformer_module._predict_coeffs(hidden, y)
-                    pred_coeff = transformer_module.denormalize_coeffs(pred_coeff_norm, y)
-                    coef_max = float(getattr(ae_decode.bottleneck, "coef_max", float("inf")))
-                    pred_coeff = pred_coeff.clamp(-coef_max, coef_max)
-                    target_coeff = coeff_flat.clamp(-coef_max, coef_max)
-                    pred_latent = ae_decode.bottleneck._reconstruct_sparse(
-                        y.view(B, H, W, D),
-                        pred_coeff.view(B, H, W, D),
+                    tok_grid = tok_flat.view(B, H * W, D)
+                    logits = transformer(tok_grid)
+                    per_token_ce = F.cross_entropy(
+                        logits.reshape(-1, vocab),
+                        tok_grid.reshape(-1),
+                        reduction="none",
+                    ).view(B, H * W, D)
+                    # Extract coeff logits for focal loss if needed.
+                    _coeff_logits_for_focal = None
+                    if coeff_focal_gamma > 0.0:
+                        _coeff_logits_for_focal = logits[
+                            :, :, 1::2,
+                            transformer_module.atom_vocab_size
+                            : transformer_module.atom_vocab_size + transformer_module.coeff_vocab_size,
+                        ]
+                    ce_loss, atom_ce_loss, coeff_ce_loss, loss = _compute_quantized_rq_losses(
+                        per_token_ce,
+                        atom_loss_weight=rq_atom_loss_weight,
+                        coeff_loss_weight=rq_coeff_loss_weight,
+                        coeff_depth_weighting=coeff_depth_weighting,
+                        coeff_focal_gamma=coeff_focal_gamma,
+                        coeff_logits=_coeff_logits_for_focal,
                     )
-                    with torch.no_grad():
-                        target_latent = ae_decode.bottleneck._reconstruct_sparse(
-                            y.view(B, H, W, D),
-                            target_coeff.view(B, H, W, D),
+                    # ---- ordinal coefficient regression ----
+                    if use_ordinal:
+                        coeff_logits_ord = logits[
+                            :, :, 1::2,
+                            transformer_module.atom_vocab_size
+                            : transformer_module.atom_vocab_size + transformer_module.coeff_vocab_size,
+                        ]
+                        coeff_ids_ord = tok_grid[:, :, 1::2] - transformer_module.atom_vocab_size
+                        ordinal_loss = ordinal_coeff_loss(
+                            coeff_logits_ord,
+                            coeff_ids_ord,
+                            coeff_bin_values_for_ordinal,
+                            huber_delta=ordinal_coeff_huber_delta,
+                            magnitude_weighted=ordinal_magnitude_weighted,
+                            zero_drift_margin=ordinal_zero_drift_margin,
+                            zero_drift_threshold=ordinal_zero_drift_threshold,
                         )
-                    coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
-                loss = ce_loss + coeff_loss_weight * coeff_reg_loss
+                        loss = loss + ordinal_coeff_weight * ordinal_loss
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
             else:
-                logits = transformer(x_in)
-                ce_loss = F.cross_entropy(
-                    logits.reshape(-1, vocab),
-                    y.reshape(-1),
-                    ignore_index=pad_token_id,
-                )
-                loss = ce_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
-            opt.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
+                opt.step()
             global_step += 1
+
+            # ---- LR schedule: linear warmup + cosine decay ----
+            if warmup_steps > 0 or min_lr_ratio < 1.0:
+                if global_step <= warmup_steps:
+                    scale = max(0.01, global_step / max(1, warmup_steps))
+                else:
+                    progress = (global_step - warmup_steps) / max(1, total_steps - warmup_steps)
+                    progress = min(progress, 1.0)
+                    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    scale = min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+                for pg in opt.param_groups:
+                    pg["lr"] = lr * scale
 
             loss_log = _distributed_mean(loss)
             ce_log = _distributed_mean(ce_loss.detach())
+            atom_ce_log = (
+                _distributed_mean(atom_ce_loss.detach())
+                if atom_ce_loss is not None else None
+            )
+            coeff_ce_log = (
+                _distributed_mean(coeff_ce_loss.detach())
+                if coeff_ce_loss is not None else None
+            )
             coeff_reg_log = (
                 _distributed_mean(coeff_reg_loss.detach())
                 if coeff_reg_loss is not None else None
@@ -3185,16 +3136,31 @@ def train_stage2_transformer(
                     "loss": float(loss_log.item()),
                     "ce": float(ce_log.item()),
                 }
+                if atom_ce_log is not None:
+                    postfix["atom_ce"] = float(atom_ce_log.item())
+                if coeff_ce_log is not None:
+                    postfix["coeff_ce"] = float(coeff_ce_log.item())
                 if coeff_reg_log is not None:
                     postfix[coeff_loss_type] = float(coeff_reg_log.item())
-                if real_valued and sched_sampling_final_prob > 0.0:
-                    postfix["sched_p"] = float(sched_prob)
                 pbar.set_postfix(**postfix)
                 log_payload = {
                     "stage2/train_loss": float(loss_log.item()),
                     "stage2/ce_loss": float(ce_log.item()),
                     "stage2/epoch": epoch,
+                    "stage2/lr": float(opt.param_groups[0]["lr"]),
                 }
+                if atom_ce_log is not None:
+                    log_payload["stage2/atom_ce_loss"] = float(atom_ce_log.item())
+                    log_payload["stage2/rq_atom_loss_weight"] = rq_atom_loss_weight
+                    log_payload["stage2/weighted_atom_ce_loss"] = float(
+                        rq_atom_loss_weight * atom_ce_log.item()
+                    )
+                if coeff_ce_log is not None:
+                    log_payload["stage2/coeff_ce_loss"] = float(coeff_ce_log.item())
+                    log_payload["stage2/rq_coeff_loss_weight"] = rq_coeff_loss_weight
+                    log_payload["stage2/weighted_coeff_ce_loss"] = float(
+                        rq_coeff_loss_weight * coeff_ce_log.item()
+                    )
                 if coeff_reg_log is not None:
                     log_payload["stage2/coeff_reg_loss"] = float(coeff_reg_log.item())
                     log_payload["stage2/coeff_loss_type"] = coeff_loss_type
@@ -3207,8 +3173,9 @@ def train_stage2_transformer(
                     else:
                         log_payload["stage2/coeff_huber_loss"] = float(coeff_reg_log.item())
                         log_payload["stage2/coeff_huber_delta"] = coeff_huber_delta
-                if real_valued and sched_sampling_final_prob > 0.0:
-                    log_payload["stage2/sched_sampling_prob"] = float(sched_prob)
+                if use_ordinal and ordinal_loss is not None:
+                    log_payload["stage2/ordinal_coeff"] = float(ordinal_loss.item())
+                    log_payload["stage2/ordinal_coeff_weight"] = ordinal_coeff_weight
                 _log_wandb(
                     wandb_run,
                     log_payload,
@@ -3221,6 +3188,10 @@ def train_stage2_transformer(
                 _barrier()
                 if is_main_process:
                     transformer.eval()
+                    if offload_decode_model:
+                        ae_decode.to(device)
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                     ae_decode.eval()
                     candidate_batch_size = int(sample_batch_size)
                     if sample_reference_stats is not None:
@@ -3233,62 +3204,79 @@ def train_stage2_transformer(
                         f"[Stage2] sampling at step {global_step} "
                         f"(keep={sample_batch_size}, candidates={candidate_batch_size})..."
                     )
-                    with torch.no_grad():
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                        if real_valued:
-                            flat_gen, coeffs_gen = transformer_module.generate_with_coeffs(
-                                batch_size=candidate_batch_size,
-                                temperature=sample_temperature,
-                                top_k=sample_top_k,
-                                show_progress=True,
-                                progress_desc=f"[Stage2] sample step {global_step}",
-                            )
-                            atoms_gen = flat_gen.view(-1, H, W, D)
-                            coeffs_gen = coeffs_gen.view(-1, H, W, D)
+                    try:
+                        with torch.no_grad():
                             if device.type == "cuda":
                                 torch.cuda.empty_cache()
-                            imgs = _decode_stage2_candidates_in_chunks(
-                                ae_decode,
-                                atoms_gen,
-                                coeffs=coeffs_gen,
-                                decode_batch_size=decode_batch_size,
-                            )
-                            del flat_gen
-                            del atoms_gen
-                            del coeffs_gen
-                        else:
-                            flat_gen = transformer_module.generate(
-                                batch_size=candidate_batch_size,
-                                temperature=sample_temperature,
-                                top_k=sample_top_k,
-                                show_progress=True,
-                                progress_desc=f"[Stage2] sample step {global_step}",
-                            )
-                            tokens_gen = flat_gen.view(-1, H, W, D)
-                            if device.type == "cuda":
-                                torch.cuda.empty_cache()
-                            imgs = _decode_stage2_candidates_in_chunks(
-                                ae_decode,
-                                tokens_gen,
-                                decode_batch_size=decode_batch_size,
-                            )
-                            del flat_gen
-                            del tokens_gen
-                        imgs = _select_best_stage2_samples(
-                            imgs,
-                            keep=sample_batch_size,
-                            reference_stats=sample_reference_stats,
-                        )
-                        if sample_image_size is not None and int(sample_image_size) > 0:
-                            if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
-                                imgs = F.interpolate(
-                                    imgs,
-                                    size=(int(sample_image_size), int(sample_image_size)),
-                                    mode="bilinear",
-                                    align_corners=False,
+                            if real_valued:
+                                atoms_gen, coeffs_gen = transformer_module.generate(
+                                    batch_size=candidate_batch_size,
+                                    temperature=sample_temperature,
+                                    top_k=sample_top_k,
+                                    show_progress=True,
+                                    progress_desc=f"[Stage2] sample step {global_step}",
                                 )
+                                coeffs_gen = ae_decode.clamp_sparse_coeffs(coeffs_gen)
+                                atoms_gen = atoms_gen.view(-1, H, W, D)
+                                coeffs_gen = coeffs_gen.view(-1, H, W, D)
+                                if device.type == "cuda":
+                                    torch.cuda.empty_cache()
+                                imgs = _decode_stage2_candidates_in_chunks(
+                                    ae_decode,
+                                    atoms_gen,
+                                    coeffs=coeffs_gen,
+                                    decode_batch_size=decode_batch_size,
+                                )
+                                del atoms_gen
+                                del coeffs_gen
+                            else:
+                                tokens_gen = transformer_module.generate(
+                                    batch_size=candidate_batch_size,
+                                    temperature=sample_temperature,
+                                    top_k=sample_top_k,
+                                    show_progress=True,
+                                    progress_desc=f"[Stage2] sample step {global_step}",
+                                ).view(-1, H, W, D)
+                                if device.type == "cuda":
+                                    torch.cuda.empty_cache()
+                                imgs = _decode_stage2_candidates_in_chunks(
+                                    ae_decode,
+                                    tokens_gen,
+                                    decode_batch_size=decode_batch_size,
+                                )
+                                del tokens_gen
+                            imgs_raw = imgs[:min(int(sample_batch_size), int(imgs.size(0)))].clone()
+                            imgs = _select_best_stage2_samples(
+                                imgs,
+                                keep=sample_batch_size,
+                                reference_stats=sample_reference_stats,
+                            )
+                            if sample_image_size is not None and int(sample_image_size) > 0:
+                                if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
+                                    imgs = F.interpolate(
+                                        imgs,
+                                        size=(int(sample_image_size), int(sample_image_size)),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                    finally:
+                        if offload_decode_model:
+                            ae_decode.to("cpu")
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                    save_image_grid(
+                        imgs_raw,
+                        os.path.join(out_dir, f"stage2_step{global_step:06d}_raw_samples.png"),
+                    )
                     save_image_grid(imgs, os.path.join(out_dir, f"stage2_step{global_step:06d}_samples.png"))
+                    _log_wandb_image(
+                        wandb_run,
+                        "stage2/raw_samples",
+                        imgs_raw,
+                        step_metric="stage2/step",
+                        step_value=global_step,
+                        caption=f"step={global_step} raw",
+                    )
                     _log_wandb_image(
                         wandb_run,
                         "stage2/samples",
@@ -3348,6 +3336,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--stage1_source_ckpt",
+        type=str,
+        default=None,
+        help="Local path to a stage-1 ae_best.pt checkpoint to use before any W&B or prior-run fallback.",
+    )
+    parser.add_argument(
         "--stage2_source_run",
         type=str,
         default=None,
@@ -3361,6 +3355,12 @@ def main():
         type=str,
         default=None,
         help="Local path to a stage-2 tokens_cache.pt to reuse before rebuilding.",
+    )
+    parser.add_argument(
+        "--stage2_source_ckpt",
+        type=str,
+        default=None,
+        help="Local path to a stage-2 transformer checkpoint to warm-start before training.",
     )
     parser.add_argument(
         "--dist_timeout_minutes",
@@ -3438,6 +3438,18 @@ def main():
     parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=1e-3)
     parser.add_argument(
+        "--stage2_rq_atom_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to atom-token CE in the quantized RQ stage-2 loss.",
+    )
+    parser.add_argument(
+        "--stage2_rq_coeff_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to coefficient-bin CE in the quantized RQ stage-2 loss.",
+    )
+    parser.add_argument(
         "--stage2_coeff_loss_weight",
         type=float,
         default=0.1,
@@ -3460,7 +3472,7 @@ def main():
         "--stage2_coeff_norm_max",
         type=float,
         default=4.0,
-        help="Maximum absolute value used for normalized real-valued coefficient prediction.",
+        help="Legacy compatibility knob from the removed flattened-token transformer path; ignored by the spatial-depth prior.",
     )
     parser.add_argument(
         "--stage2_coeff_huber_delta",
@@ -3469,13 +3481,60 @@ def main():
         help="Delta parameter for Huber loss on normalized real-valued coefficients.",
     )
     parser.add_argument(
+        "--coeff_depth_weighting",
+        type=str,
+        default="none",
+        choices=["none", "linear", "inverse_rank"],
+        help="Per-depth weighting for coeff CE. 'linear' weights earlier (larger-coeff) depths more; "
+             "'inverse_rank' uses 1/rank weighting.",
+    )
+    parser.add_argument(
+        "--coeff_focal_gamma",
+        type=float,
+        default=0.0,
+        help="Focal loss gamma for coeff CE. 0 = standard CE; >0 down-weights easy (high-confidence) predictions.",
+    )
+    parser.add_argument(
         "--stage2_sched_sampling_final_prob",
         type=float,
         default=0.25,
-        help="Final probability of replacing previous stage-2 inputs with model predictions during training.",
+        help="Legacy compatibility knob from the removed flattened-token transformer path; ignored by the spatial-depth prior.",
     )
+    # ---- ordinal coefficient regression ----
+    parser.add_argument("--ordinal_coeff_weight", type=float, default=0.0,
+                        help="Weight for ordinal coefficient regression loss. 0 = disabled.")
+    parser.add_argument("--ordinal_coeff_huber_delta", type=float, default=0.5,
+                        help="Huber delta for ordinal coefficient regression.")
+    parser.add_argument("--ordinal_magnitude_weighted", type=_parse_cli_bool, nargs="?", const=True, default=False,
+                        help="Weight ordinal coeff loss by |gt_value|. Large coefficients get more gradient.")
+    parser.add_argument("--ordinal_zero_drift_margin", type=float, default=0.0,
+                        help="Penalise |pred| > margin when |gt| < threshold. 0 = disabled.")
+    parser.add_argument("--ordinal_zero_drift_threshold", type=float, default=0.3,
+                        help="GT magnitude below which zero-drift penalty applies.")
+
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--stage2_batch_size", type=int, default=16)
+    parser.add_argument("--stage2_warmup_steps", type=int, default=500,
+                        help="Linear LR warmup steps for stage-2. 0 = no warmup.")
+    parser.add_argument("--stage2_min_lr_ratio", type=float, default=0.01,
+                        help="Minimum LR as fraction of peak LR for cosine decay.")
+    parser.add_argument("--stage2_weight_decay", type=float, default=0.01,
+                        help="AdamW weight decay for stage-2. 0 = plain Adam.")
+    parser.add_argument(
+        "--stage2_amp",
+        type=_parse_cli_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable CUDA AMP for stage-2 training. Ignored on CPU.",
+    )
+    parser.add_argument(
+        "--stage2_amp_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float16", "bfloat16"],
+        help="Autocast dtype for stage-2 AMP. 'auto' prefers bfloat16 when supported.",
+    )
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -3489,7 +3548,14 @@ def main():
     parser.add_argument("--sparsity_level", type=int, default=8)
     parser.add_argument("--n_bins", type=int, default=256)
     parser.add_argument("--coef_max", type=float, default=3.0)
-    parser.add_argument("--quantize_sparse_coeffs", type=bool, default=True)
+    parser.add_argument(
+        "--quantize_sparse_coeffs",
+        type=_parse_cli_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Whether to quantize sparse coefficients. Accepts true/false; `--quantize_sparse_coeffs false` enables the real-valued path.",
+    )
     parser.add_argument("--coef_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
     parser.add_argument("--coef_mu", type=float, default=0.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
@@ -3523,6 +3589,12 @@ def main():
     parser.add_argument("--tf_d_model", type=int, default=512)
     parser.add_argument("--tf_heads", type=int, default=8)
     parser.add_argument("--tf_layers", type=int, default=12)
+    parser.add_argument(
+        "--tf_global_tokens",
+        type=int,
+        default=0,
+        help="Number of learned global prefix tokens prepended to the spatial stage.",
+    )
     parser.add_argument("--tf_ff", type=int, default=1024)
     parser.add_argument("--tf_dropout", type=float, default=0.1)
     parser.add_argument(
@@ -3574,12 +3646,17 @@ def main():
         raise ValueError("stage1_dict_grad_clip must be >= 0.")
     if args.stage2_coeff_loss_weight < 0.0:
         raise ValueError("stage2_coeff_loss_weight must be >= 0.")
-    if args.stage2_coeff_norm_max <= 0.0:
-        raise ValueError("stage2_coeff_norm_max must be > 0.")
+    if args.stage2_rq_atom_loss_weight < 0.0:
+        raise ValueError("stage2_rq_atom_loss_weight must be >= 0.")
+    if args.stage2_rq_coeff_loss_weight < 0.0:
+        raise ValueError("stage2_rq_coeff_loss_weight must be >= 0.")
     if args.stage2_coeff_huber_delta <= 0.0:
         raise ValueError("stage2_coeff_huber_delta must be > 0.")
     if not (0.0 <= args.stage2_sched_sampling_final_prob <= 1.0):
         raise ValueError("stage2_sched_sampling_final_prob must be in [0, 1].")
+    if args.tf_global_tokens < 0:
+        raise ValueError("tf_global_tokens must be >= 0.")
+    args.stage2_amp_dtype = str(args.stage2_amp_dtype).strip().lower()
     if args.token_subset < 0:
         args.token_subset = 0
     if args.dist_timeout_minutes <= 0:
@@ -3588,10 +3665,18 @@ def main():
         args.stage1_source_run = str(args.stage1_source_run).strip()
         if not args.stage1_source_run:
             args.stage1_source_run = None
+    if args.stage1_source_ckpt is not None:
+        args.stage1_source_ckpt = str(args.stage1_source_ckpt).strip()
+        if not args.stage1_source_ckpt:
+            args.stage1_source_ckpt = None
+    default_stage1_ckpt = _default_stage1_source_ckpt(bool(args.quantize_sparse_coeffs))
+    if args.stage1_source_ckpt is None and default_stage1_ckpt is not None:
+        args.stage1_source_ckpt = str(default_stage1_ckpt)
+    stage1_init_source_ckpt = args.stage1_source_ckpt
     stage1_init_source_run = args.stage1_source_run
-    if stage1_init_source_run is None and args.stage1_epochs > 0:
+    if stage1_init_source_ckpt is None and stage1_init_source_run is None and args.stage1_epochs > 0:
         stage1_init_source_run = DEFAULT_STAGE1_SOURCE_RUN
-    if args.stage1_source_run is None and args.stage1_epochs <= 0:
+    if args.stage1_source_ckpt is None and args.stage1_source_run is None and args.stage1_epochs <= 0:
         args.stage1_source_run = DEFAULT_STAGE1_SOURCE_RUN
     if args.stage2_source_run is not None:
         args.stage2_source_run = str(args.stage2_source_run).strip()
@@ -3601,6 +3686,10 @@ def main():
         args.stage2_source_token_cache = str(args.stage2_source_token_cache).strip()
         if not args.stage2_source_token_cache:
             args.stage2_source_token_cache = None
+    if args.stage2_source_ckpt is not None:
+        args.stage2_source_ckpt = str(args.stage2_source_ckpt).strip()
+        if not args.stage2_source_ckpt:
+            args.stage2_source_ckpt = None
     if (
         args.stage2_source_run is None
         and args.stage2_source_token_cache is None
@@ -3698,7 +3787,11 @@ def main():
             _unlink_if_exists(error_path)
             _unlink_if_exists(path_record)
             try:
-                source_path = _resolve_stage1_checkpoint_from_wandb_run(run_ref, run_out_dir)
+                source_path = _resolve_stage1_checkpoint_from_wandb_run(
+                    run_ref,
+                    run_out_dir,
+                    quantized=bool(args.quantize_sparse_coeffs),
+                )
                 _write_atomic_text(path_record, f"{source_path}\n")
                 _write_atomic_text(
                     ready_path,
@@ -3730,6 +3823,12 @@ def main():
         if best_path.exists():
             if is_main_process and args.stage1_epochs > 0:
                 print(f"[Stage1] loading trained checkpoint from current run: {best_path}")
+        elif args.stage1_source_ckpt is not None:
+            best_path = Path(args.stage1_source_ckpt).expanduser().resolve()
+            if not best_path.exists():
+                raise FileNotFoundError(f"Requested stage-1 source checkpoint does not exist: {best_path}")
+            if is_main_process:
+                print(f"[Stage1] using local checkpoint from {best_path}")
         elif args.stage1_epochs <= 0 and args.stage1_source_run is not None:
             best_path = _prepare_stage1_source_checkpoint(args.stage1_source_run)
             if is_main_process:
@@ -3809,7 +3908,14 @@ def main():
         )
 
     laser = _build_laser().to(device)
-    if stage1_init_source_run is not None:
+    if stage1_init_source_ckpt is not None:
+        stage1_init_path = Path(stage1_init_source_ckpt).expanduser().resolve()
+        if not stage1_init_path.exists():
+            raise FileNotFoundError(f"Requested stage-1 init checkpoint does not exist: {stage1_init_path}")
+        if is_main_process:
+            print(f"[Stage1] warm-starting from local checkpoint: {stage1_init_path}")
+        _load_module_checkpoint(laser, stage1_init_path)
+    elif stage1_init_source_run is not None:
         stage1_init_path = _prepare_stage1_source_checkpoint(stage1_init_source_run)
         if is_main_process:
             print(f"[Stage1] warm-starting from W&B run {stage1_init_source_run}: {stage1_init_path}")
@@ -4022,15 +4128,6 @@ def main():
         device,
     )
 
-    if args.stage2_epochs <= 0:
-        _barrier()
-        if is_main_process:
-            if wandb_run is not None:
-                wandb_run.finish()
-            print(f"Outputs saved to: {args.out_dir}")
-        _cleanup_distributed()
-        return
-
     from torch.utils.data import TensorDataset
     if real_valued:
         token_dataset = TensorDataset(tokens_flat, coeffs_flat)
@@ -4046,32 +4143,47 @@ def main():
         pin_memory=pin_memory,
         drop_last=(len(token_dataset) >= args.stage2_batch_size),
     )
-    transformer = Transformer(
-        TransformerConfig(
-            vocab_size=laser.bottleneck.vocab_size,
+    transformer = SpatialDepthPrior(
+        build_spatial_depth_prior_config(
+            laser.bottleneck,
             H=H,
             W=W,
             D=D,
-            atom_vocab_size=(laser.bottleneck.num_embeddings if laser.bottleneck.quantize_sparse_coeffs else None),
-            coeff_vocab_size=(laser.bottleneck.n_bins if laser.bottleneck.quantize_sparse_coeffs else None),
-            real_valued_coeffs=real_valued,
-            coeff_norm_max=args.stage2_coeff_norm_max,
             d_model=args.tf_d_model,
             n_heads=args.tf_heads,
-            n_layers=args.tf_layers,
+            n_spatial_layers=args.tf_layers,
+            n_depth_layers=max(1, args.tf_layers // 2),
             d_ff=args.tf_ff,
             dropout=args.tf_dropout,
-        ),
-        bos_token_id=laser.bottleneck.bos_token_id,
-        pad_token_id=laser.bottleneck.pad_token_id,
-    ).to(device)
-    if real_valued:
-        coeff_mean, coeff_std = _compute_atom_conditioned_coeff_stats(
-            tokens_flat,
-            coeffs_flat,
-            vocab_size=laser.bottleneck.vocab_size,
+            n_global_spatial_tokens=args.tf_global_tokens,
+            real_valued_coeffs=real_valued,
+            coeff_max_fallback=args.coef_max,
         )
-        transformer.set_coeff_normalization_stats(coeff_mean, coeff_std)
+    ).to(device)
+    if args.stage2_source_ckpt is not None:
+        stage2_source_ckpt = Path(args.stage2_source_ckpt).expanduser().resolve()
+        if not stage2_source_ckpt.exists():
+            raise FileNotFoundError(f"Requested stage-2 source checkpoint does not exist: {stage2_source_ckpt}")
+        if is_main_process:
+            print(f"[Stage2] warm-starting transformer from local checkpoint: {stage2_source_ckpt}")
+        _load_module_checkpoint(transformer, stage2_source_ckpt)
+    if is_main_process:
+        coeff_mode = "real-valued coeffs" if real_valued else "quantized sparse coeffs"
+        print(
+            "[Stage2] using RQ spatial-depth prior "
+            f"({coeff_mode}, scalar coeff embeddings, spatial_layers={args.tf_layers}, "
+            f"depth_layers={max(1, args.tf_layers // 2)}, "
+            f"global_tokens={args.tf_global_tokens})"
+        )
+    _barrier()
+
+    if args.stage2_epochs <= 0:
+        if is_main_process:
+            if wandb_run is not None:
+                wandb_run.finish()
+            print(f"Outputs saved to: {args.out_dir}")
+        _cleanup_distributed()
+        return
     transformer_stage2 = DDP(transformer, device_ids=[local_rank], output_device=local_rank) if distributed else transformer
 
     train_stage2_transformer(
@@ -4080,10 +4192,19 @@ def main():
         device=device,
         epochs=args.stage2_epochs,
         lr=args.stage2_lr,
+        rq_atom_loss_weight=args.stage2_rq_atom_loss_weight,
+        rq_coeff_loss_weight=args.stage2_rq_coeff_loss_weight,
         coeff_loss_weight=args.stage2_coeff_loss_weight,
         coeff_loss_type=args.stage2_coeff_loss_type,
         coeff_huber_delta=args.stage2_coeff_huber_delta,
+        coeff_depth_weighting=args.coeff_depth_weighting,
+        coeff_focal_gamma=args.coeff_focal_gamma,
+        warmup_steps=args.stage2_warmup_steps,
+        min_lr_ratio=args.stage2_min_lr_ratio,
+        weight_decay=args.stage2_weight_decay,
         sched_sampling_final_prob=args.stage2_sched_sampling_final_prob,
+        stage2_amp=args.stage2_amp,
+        stage2_amp_dtype=args.stage2_amp_dtype,
         pad_token_id=laser.bottleneck.pad_token_id,
         out_dir=stage2_dir,
         ae_for_decode=laser,
@@ -4100,6 +4221,11 @@ def main():
         token_sampler=token_sampler,
         is_main_process=is_main_process,
         wandb_run=wandb_run,
+        ordinal_coeff_weight=args.ordinal_coeff_weight,
+        ordinal_coeff_huber_delta=args.ordinal_coeff_huber_delta,
+        ordinal_magnitude_weighted=args.ordinal_magnitude_weighted,
+        ordinal_zero_drift_margin=args.ordinal_zero_drift_margin,
+        ordinal_zero_drift_threshold=args.ordinal_zero_drift_threshold,
     )
 
     if is_main_process:

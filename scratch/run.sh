@@ -12,6 +12,49 @@
 #SBATCH --output=laser.out            # STDOUT output file
 #SBATCH --error=laser.err             # STDERR output file (optional)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    local)
+      shift
+      exec "$SCRIPT_DIR/scripts/local.sh" "$@"
+      ;;
+    causal)
+      shift
+      exec "$SCRIPT_DIR/scripts/causal.sh" "$@"
+      ;;
+    launch-causal)
+      shift
+      exec "$SCRIPT_DIR/scripts/launch_causal.sh" "$@"
+      ;;
+    restart-stage2)
+      shift
+      exec "$SCRIPT_DIR/scripts/restart_stage2.sh" "$@"
+      ;;
+    slurm)
+      shift
+      ;;
+    help|-h|--help)
+      cat <<'EOF'
+Usage:
+  ./run.sh                 # slurm job body (also works with sbatch)
+  ./run.sh slurm           # same as default
+  ./run.sh local           # run the baseline locally
+  ./run.sh causal          # run causal multiscale OMP training
+  ./run.sh launch-causal   # start causal training in tmux
+  ./run.sh restart-stage2  # restart the proto stage-2 job
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown mode: $1" >&2
+      echo "Use './run.sh --help' for available modes." >&2
+      exit 2
+      ;;
+  esac
+fi
+
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
@@ -19,15 +62,11 @@ export NCCL_DEBUG=INFO
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-STAGE1_DEVICES="${STAGE1_DEVICES:-4}"
-STAGE2_DEVICES="${STAGE2_DEVICES:-4}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-auto}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-10}"
-STAGE1_STRATEGY="${STAGE1_STRATEGY:-ddp}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-32}"
 FID_NUM_SAMPLES="${FID_NUM_SAMPLES:-0}"
-STAGE2_FID_NUM_SAMPLES="${STAGE2_FID_NUM_SAMPLES:-0}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-laser-scratch}"
 
@@ -94,11 +133,11 @@ if [[ "$IMAGE" != docker://* && "$IMAGE" != library://* && "$IMAGE" != oras://* 
 fi
 
 # Use current working directory (expected: scratch/).
-BASE_DIR="."
+BASE_DIR="$SCRIPT_DIR"
 
 # Accept overrides, but ensure all paths are absolute for singularity binds.
-# PROJECT_DIR should be the folder containing laser.py.
-PROJECT_DIR_INPUT="${PROJECT_DIR:-.}"
+# PROJECT_DIR should be the folder containing proto.py.
+PROJECT_DIR_INPUT="${PROJECT_DIR:-$BASE_DIR}"
 OUT_DIR_INPUT="${OUT_DIR:-/scratch/$USER/runs/laser_celeba_128}"
 
 if [[ -n "${DATA_DIR:-}" ]]; then
@@ -126,8 +165,8 @@ PROJECT_DIR="$(cd "$PROJECT_DIR_INPUT" && pwd)"
 DATA_DIR="$DATA_DIR_INPUT"
 OUT_DIR="$OUT_DIR_INPUT"
 
-if [[ ! -f "$PROJECT_DIR/laser.py" ]]; then
-  echo "ERROR: laser.py not found under PROJECT_DIR: $PROJECT_DIR" >&2
+if [[ ! -f "$PROJECT_DIR/proto.py" ]]; then
+  echo "ERROR: proto.py not found under PROJECT_DIR: $PROJECT_DIR" >&2
   echo "Set PROJECT_DIR to your scratch source folder, e.g.:" >&2
   echo "  PROJECT_DIR=/cache/home/$USER/Projects/laser/scratch sbatch scratch/run.sh" >&2
   exit 1
@@ -212,15 +251,11 @@ echo "OUT_DIR=$OUT_DIR"
 echo "IMAGE=$IMAGE"
 echo "BASE_DIR=$BASE_DIR"
 echo "PWD=$PWD"
-echo "STAGE1_DEVICES=$STAGE1_DEVICES"
-echo "STAGE2_DEVICES=$STAGE2_DEVICES"
 echo "STAGE1_EPOCHS=$STAGE1_EPOCHS"
 echo "STAGE2_EPOCHS=$STAGE2_EPOCHS"
-echo "STAGE1_STRATEGY=$STAGE1_STRATEGY"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo "STAGE2_BATCH_SIZE=$STAGE2_BATCH_SIZE"
 echo "FID_NUM_SAMPLES=$FID_NUM_SAMPLES"
-echo "STAGE2_FID_NUM_SAMPLES=$STAGE2_FID_NUM_SAMPLES"
 echo "WANDB_MODE=$WANDB_MODE"
 echo "WANDB_PROJECT=$WANDB_PROJECT"
 
@@ -230,7 +265,7 @@ srun singularity exec --nv \
   --bind "$DATA_BIND_DIR" \
   --bind "$OUT_BIND_DIR" \
   "$IMAGE" \
-  python3 -u "$PROJECT_DIR/laser.py" \
+  python3 -u "$PROJECT_DIR/proto.py" \
   --dataset celeba \
   --data_dir "$DATA_DIR" \
   --image_size 128 \
@@ -239,12 +274,7 @@ srun singularity exec --nv \
   --stage2_epochs "$STAGE2_EPOCHS" \
   --batch_size "$BATCH_SIZE" \
   --stage2_batch_size "$STAGE2_BATCH_SIZE" \
-  --fid_num_samples "$FID_NUM_SAMPLES" \
-  --stage2_fid_num_samples "$STAGE2_FID_NUM_SAMPLES" \
+  --rfid_num_samples "$FID_NUM_SAMPLES" \
   --wandb_mode "$WANDB_MODE" \
   --wandb_project "$WANDB_PROJECT" \
-  --stage1_devices "$STAGE1_DEVICES" \
-  --stage2_devices "$STAGE2_DEVICES" \
-  --stage1_strategy "$STAGE1_STRATEGY" \
-  --stage2_arch spatial_depth \
-  --no_quantize_sparse_coeffs
+  --quantize_sparse_coeffs false
