@@ -1,6 +1,9 @@
 #!/bin/bash
 
 set -euo pipefail
+unset LC_ALL || true
+export LANG=C
+
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JOB_NAME="${JOB_NAME:-proto-rqsd-8g-mn}"
@@ -33,12 +36,24 @@ STAGE1_DICT_GRAD_CLIP="${STAGE1_DICT_GRAD_CLIP:-0.1}"
 STAGE1_DICT_MAX_UPDATE_NORM="${STAGE1_DICT_MAX_UPDATE_NORM:-0.0}"
 STAGE1_LOSS_SPIKE_SKIP_RATIO="${STAGE1_LOSS_SPIKE_SKIP_RATIO:-0.0}"
 STAGE1_LOSS_EMA_BETA="${STAGE1_LOSS_EMA_BETA:-0.98}"
+BOTTLENECK_WEIGHT="${BOTTLENECK_WEIGHT:-1.0}"
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 STAGE1_BOTTLENECK_WEIGHT_START="${STAGE1_BOTTLENECK_WEIGHT_START:-1.0}"
 STAGE1_BOTTLENECK_WARMUP_EPOCHS="${STAGE1_BOTTLENECK_WARMUP_EPOCHS:-0}"
+STAGE1_DICT_LOSS_WEIGHT="${STAGE1_DICT_LOSS_WEIGHT:-nan}"
+STAGE1_DICT_LOSS_WEIGHT_START="${STAGE1_DICT_LOSS_WEIGHT_START:-nan}"
+STAGE1_DICT_LOSS_WARMUP_EPOCHS="${STAGE1_DICT_LOSS_WARMUP_EPOCHS:-0}"
+STAGE1_COMMITMENT_LOSS_WEIGHT="${STAGE1_COMMITMENT_LOSS_WEIGHT:-nan}"
+STAGE1_COMMITMENT_LOSS_WEIGHT_START="${STAGE1_COMMITMENT_LOSS_WEIGHT_START:-nan}"
+STAGE1_COMMITMENT_LOSS_WARMUP_EPOCHS="${STAGE1_COMMITMENT_LOSS_WARMUP_EPOCHS:-0}"
+STAGE1_COHERENCE_WEIGHT="${STAGE1_COHERENCE_WEIGHT:-0.0}"
+STAGE1_COHERENCE_WEIGHT_START="${STAGE1_COHERENCE_WEIGHT_START:-nan}"
+STAGE1_COHERENCE_WARMUP_EPOCHS="${STAGE1_COHERENCE_WARMUP_EPOCHS:-0}"
+STAGE1_COHERENCE_MARGIN="${STAGE1_COHERENCE_MARGIN:-0.0}"
 STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-500}"
 STAGE2_MIN_LR_RATIO="${STAGE2_MIN_LR_RATIO:-0.01}"
 STAGE2_WEIGHT_DECAY="${STAGE2_WEIGHT_DECAY:-0.01}"
+STAGE2_COEFF_LOSS_TYPE="${STAGE2_COEFF_LOSS_TYPE:-gt_atom_recon_mse}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-32}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
@@ -48,6 +63,17 @@ STAGE2_SAMPLE_EVERY_STEPS="${STAGE2_SAMPLE_EVERY_STEPS:-2000}"
 STAGE2_SAMPLE_BATCH_SIZE="${STAGE2_SAMPLE_BATCH_SIZE:-32}"
 QUANTIZE_SPARSE_COEFFS="${QUANTIZE_SPARSE_COEFFS:-true}"
 AE_NUM_DOWNSAMPLES="${AE_NUM_DOWNSAMPLES:-4}"
+NUM_HIDDENS="${NUM_HIDDENS:-128}"
+NUM_RES_HIDDENS="${NUM_RES_HIDDENS:-32}"
+NUM_RES_LAYERS="${NUM_RES_LAYERS:-2}"
+NUM_ATOMS="${NUM_ATOMS:-1024}"
+SPARSITY_LEVEL="${SPARSITY_LEVEL:-8}"
+COMMITMENT_COST="${COMMITMENT_COST:-0.25}"
+COEF_MAX="${COEF_MAX:-3.0}"
+PATCH_BASED="${PATCH_BASED:-false}"
+PATCH_SIZE="${PATCH_SIZE:-4}"
+PATCH_STRIDE="${PATCH_STRIDE:-2}"
+PATCH_RECONSTRUCTION="${PATCH_RECONSTRUCTION:-center_crop}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-laser-scratch}"
 WANDB_NAME="${WANDB_NAME:-proto_rqsd_${TOTAL_GPUS}gpu_mn_s${STAGE1_EPOCHS}_s2${STAGE2_EPOCHS}}"
@@ -55,18 +81,82 @@ LOG_PREFIX="${LOG_PREFIX:-proto_rqsd_${TOTAL_GPUS}g_mn}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/scratch/$USER/.secrets/wandb_api_key}"
 DIST_TIMEOUT_MINUTES="${DIST_TIMEOUT_MINUTES:-180}"
 ENTRYPOINT="${ENTRYPOINT:-proto.py}"
+SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
+RECIPE_PROFILE="${RECIPE_PROFILE:-}"
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
+apply_recipe_profile() {
+  case "${1:-}" in
+    ""|"none")
+      return 0
+      ;;
+    "415ephb2")
+      STAGE1_EPOCHS="5"
+      STAGE2_EPOCHS="5"
+      STAGE1_SOURCE_CKPT=""
+      REBUILD_TOKEN_CACHE="false"
+      STAGE1_LR="2e-4"
+      STAGE2_LR="1e-3"
+      STAGE1_LR_SCHEDULE="cosine"
+      STAGE1_WARMUP_EPOCHS="2"
+      STAGE1_MIN_LR_RATIO="0.1"
+      STAGE1_DICT_OPTIMIZER="separate_sgd"
+      STAGE1_DICT_LR_MULTIPLIER="0.25"
+      STAGE1_DICT_LR_SCHEDULE="cosine"
+      STAGE1_DICT_WARMUP_EPOCHS="2"
+      STAGE1_DICT_MIN_LR_RATIO="0.05"
+      STAGE1_DICT_GRAD_CLIP="0.05"
+      STAGE1_DICT_MAX_UPDATE_NORM="0.0"
+      STAGE1_LOSS_SPIKE_SKIP_RATIO="0.0"
+      STAGE1_LOSS_EMA_BETA="0.98"
+      BOTTLENECK_WEIGHT="1.0"
+      GRAD_CLIP="1.0"
+      STAGE1_BOTTLENECK_WEIGHT_START="1.0"
+      STAGE1_BOTTLENECK_WARMUP_EPOCHS="0"
+      STAGE2_WARMUP_STEPS="500"
+      STAGE2_MIN_LR_RATIO="0.01"
+      STAGE2_WEIGHT_DECAY="0.01"
+      BATCH_SIZE="32"
+      STAGE2_BATCH_SIZE="32"
+      NUM_WORKERS="12"
+      TOKEN_NUM_WORKERS="4"
+      TOKEN_SUBSET="98304"
+      STAGE2_SAMPLE_EVERY_STEPS="1000"
+      STAGE2_SAMPLE_BATCH_SIZE="32"
+      QUANTIZE_SPARSE_COEFFS="true"
+      AE_NUM_DOWNSAMPLES="4"
+      COEF_MAX="3.0"
+      ;;
+    *)
+      echo "Unsupported RECIPE_PROFILE: ${1}" >&2
+      echo "Supported values: 415ephb2" >&2
+      exit 1
+      ;;
+  esac
+}
+
+apply_recipe_profile "$RECIPE_PROFILE"
 
 if [[ ! -d "$DATA_DIR" ]]; then
   echo "Missing data directory: $DATA_DIR" >&2
   exit 1
 fi
+SBATCH_EXTRA_ARGS=()
+if [[ -n "$SBATCH_DEPENDENCY" ]]; then
+  SBATCH_EXTRA_ARGS+=(--dependency="$SBATCH_DEPENDENCY")
+fi
+
 if [[ ! -f "$ROOT_DIR/$ENTRYPOINT" ]]; then
   echo "Missing $ENTRYPOINT under $ROOT_DIR" >&2
   exit 1
 fi
 
-sbatch \
+SBATCH_CMD=(sbatch)
+if ((${#SBATCH_EXTRA_ARGS[@]} > 0)); then
+  SBATCH_CMD+=("${SBATCH_EXTRA_ARGS[@]}")
+fi
+
+"${SBATCH_CMD[@]}" \
   --partition="$PARTITION" \
   --requeue \
   --job-name="$JOB_NAME" \
@@ -80,6 +170,8 @@ sbatch \
   --output="$ROOT_DIR/${LOG_PREFIX}_%j.out" \
   --error="$ROOT_DIR/${LOG_PREFIX}_%j.err" \
   --wrap='set -euo pipefail
+unset LC_ALL || true
+export LANG=C
 export PYTHONUNBUFFERED=1
 export NCCL_DEBUG=INFO
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
@@ -111,11 +203,23 @@ STAGE1_DICT_MAX_UPDATE_NORM='"$STAGE1_DICT_MAX_UPDATE_NORM"'
 STAGE1_LOSS_SPIKE_SKIP_RATIO='"$STAGE1_LOSS_SPIKE_SKIP_RATIO"'
 STAGE1_LOSS_EMA_BETA='"$STAGE1_LOSS_EMA_BETA"'
 GRAD_CLIP='"$GRAD_CLIP"'
+BOTTLENECK_WEIGHT='"$BOTTLENECK_WEIGHT"'
 STAGE1_BOTTLENECK_WEIGHT_START='"$STAGE1_BOTTLENECK_WEIGHT_START"'
 STAGE1_BOTTLENECK_WARMUP_EPOCHS='"$STAGE1_BOTTLENECK_WARMUP_EPOCHS"'
+STAGE1_DICT_LOSS_WEIGHT='"$STAGE1_DICT_LOSS_WEIGHT"'
+STAGE1_DICT_LOSS_WEIGHT_START='"$STAGE1_DICT_LOSS_WEIGHT_START"'
+STAGE1_DICT_LOSS_WARMUP_EPOCHS='"$STAGE1_DICT_LOSS_WARMUP_EPOCHS"'
+STAGE1_COMMITMENT_LOSS_WEIGHT='"$STAGE1_COMMITMENT_LOSS_WEIGHT"'
+STAGE1_COMMITMENT_LOSS_WEIGHT_START='"$STAGE1_COMMITMENT_LOSS_WEIGHT_START"'
+STAGE1_COMMITMENT_LOSS_WARMUP_EPOCHS='"$STAGE1_COMMITMENT_LOSS_WARMUP_EPOCHS"'
+STAGE1_COHERENCE_WEIGHT='"$STAGE1_COHERENCE_WEIGHT"'
+STAGE1_COHERENCE_WEIGHT_START='"$STAGE1_COHERENCE_WEIGHT_START"'
+STAGE1_COHERENCE_WARMUP_EPOCHS='"$STAGE1_COHERENCE_WARMUP_EPOCHS"'
+STAGE1_COHERENCE_MARGIN='"$STAGE1_COHERENCE_MARGIN"'
 STAGE2_WARMUP_STEPS='"$STAGE2_WARMUP_STEPS"'
 STAGE2_MIN_LR_RATIO='"$STAGE2_MIN_LR_RATIO"'
 STAGE2_WEIGHT_DECAY='"$STAGE2_WEIGHT_DECAY"'
+STAGE2_COEFF_LOSS_TYPE='"$STAGE2_COEFF_LOSS_TYPE"'
 BATCH_SIZE='"$BATCH_SIZE"'
 STAGE2_BATCH_SIZE='"$STAGE2_BATCH_SIZE"'
 NUM_WORKERS='"$NUM_WORKERS"'
@@ -125,6 +229,17 @@ STAGE2_SAMPLE_EVERY_STEPS='"$STAGE2_SAMPLE_EVERY_STEPS"'
 STAGE2_SAMPLE_BATCH_SIZE='"$STAGE2_SAMPLE_BATCH_SIZE"'
 QUANTIZE_SPARSE_COEFFS='"$QUANTIZE_SPARSE_COEFFS"'
 AE_NUM_DOWNSAMPLES='"$AE_NUM_DOWNSAMPLES"'
+NUM_HIDDENS='"$NUM_HIDDENS"'
+NUM_RES_HIDDENS='"$NUM_RES_HIDDENS"'
+NUM_RES_LAYERS='"$NUM_RES_LAYERS"'
+NUM_ATOMS='"$NUM_ATOMS"'
+SPARSITY_LEVEL='"$SPARSITY_LEVEL"'
+COMMITMENT_COST='"$COMMITMENT_COST"'
+COEF_MAX='"$COEF_MAX"'
+PATCH_BASED='"$PATCH_BASED"'
+PATCH_SIZE='"$PATCH_SIZE"'
+PATCH_STRIDE='"$PATCH_STRIDE"'
+PATCH_RECONSTRUCTION='"$PATCH_RECONSTRUCTION"'
 WANDB_MODE='"$WANDB_MODE"'
 WANDB_PROJECT='"$WANDB_PROJECT"'
 WANDB_NAME='"$WANDB_NAME"'
@@ -176,6 +291,8 @@ RUNNER="$OUT_DIR/slurm_proto_multinode_${SLURM_JOB_ID}.sh"
 cat > "$RUNNER" <<EOF_RUNNER
 #!/bin/bash
 set -euo pipefail
+unset LC_ALL || true
+export LANG=C
 export RANK="\$SLURM_PROCID"
 export WORLD_SIZE="\$SLURM_NTASKS"
 export LOCAL_RANK="\$SLURM_LOCALID"
@@ -190,55 +307,81 @@ if [[ -f "\${WANDB_API_KEY_FILE}" ]]; then
   IFS= read -r WANDB_API_KEY < "\${WANDB_API_KEY_FILE}" || true
   export WANDB_API_KEY
 fi
-EXTRA_ARGS=()
+CMD=(
+  python3 "${PROJECT_DIR}/${ENTRYPOINT}"
+  --dataset celeba
+  --data_dir "${DATA_DIR}"
+  --image_size 128
+  --out_dir "${OUT_DIR}"
+  --dist_timeout_minutes "${DIST_TIMEOUT_MINUTES}"
+  --stage1_epochs "${STAGE1_EPOCHS}"
+  --stage2_epochs "${STAGE2_EPOCHS}"
+  --stage1_lr "${STAGE1_LR}"
+  --stage2_lr "${STAGE2_LR}"
+  --stage1_lr_schedule "${STAGE1_LR_SCHEDULE}"
+  --stage1_warmup_epochs "${STAGE1_WARMUP_EPOCHS}"
+  --stage1_min_lr_ratio "${STAGE1_MIN_LR_RATIO}"
+  --stage1_dict_optimizer "${STAGE1_DICT_OPTIMIZER}"
+  --stage1_dict_lr_multiplier "${STAGE1_DICT_LR_MULTIPLIER}"
+  --stage1_dict_lr_schedule "${STAGE1_DICT_LR_SCHEDULE}"
+  --stage1_dict_warmup_epochs "${STAGE1_DICT_WARMUP_EPOCHS}"
+  --stage1_dict_min_lr_ratio "${STAGE1_DICT_MIN_LR_RATIO}"
+  --stage1_dict_grad_clip "${STAGE1_DICT_GRAD_CLIP}"
+  --stage1_dict_max_update_norm "${STAGE1_DICT_MAX_UPDATE_NORM}"
+  --stage1_loss_spike_skip_ratio "${STAGE1_LOSS_SPIKE_SKIP_RATIO}"
+  --stage1_loss_ema_beta "${STAGE1_LOSS_EMA_BETA}"
+  --bottleneck_weight "${BOTTLENECK_WEIGHT}"
+  --grad_clip "${GRAD_CLIP}"
+  --stage1_bottleneck_weight_start "${STAGE1_BOTTLENECK_WEIGHT_START}"
+  --stage1_bottleneck_warmup_epochs "${STAGE1_BOTTLENECK_WARMUP_EPOCHS}"
+  --stage1_dict_loss_weight "${STAGE1_DICT_LOSS_WEIGHT}"
+  --stage1_dict_loss_weight_start "${STAGE1_DICT_LOSS_WEIGHT_START}"
+  --stage1_dict_loss_warmup_epochs "${STAGE1_DICT_LOSS_WARMUP_EPOCHS}"
+  --stage1_commitment_loss_weight "${STAGE1_COMMITMENT_LOSS_WEIGHT}"
+  --stage1_commitment_loss_weight_start "${STAGE1_COMMITMENT_LOSS_WEIGHT_START}"
+  --stage1_commitment_loss_warmup_epochs "${STAGE1_COMMITMENT_LOSS_WARMUP_EPOCHS}"
+  --stage1_coherence_weight "${STAGE1_COHERENCE_WEIGHT}"
+  --stage1_coherence_weight_start "${STAGE1_COHERENCE_WEIGHT_START}"
+  --stage1_coherence_warmup_epochs "${STAGE1_COHERENCE_WARMUP_EPOCHS}"
+  --stage1_coherence_margin "${STAGE1_COHERENCE_MARGIN}"
+  --stage2_warmup_steps "${STAGE2_WARMUP_STEPS}"
+  --stage2_min_lr_ratio "${STAGE2_MIN_LR_RATIO}"
+  --stage2_weight_decay "${STAGE2_WEIGHT_DECAY}"
+  --stage2_coeff_loss_type "${STAGE2_COEFF_LOSS_TYPE}"
+  --num_workers "${NUM_WORKERS}"
+  --token_num_workers "${TOKEN_NUM_WORKERS}"
+  --batch_size "${BATCH_SIZE}"
+  --stage2_batch_size "${STAGE2_BATCH_SIZE}"
+  --ae_num_downsamples "${AE_NUM_DOWNSAMPLES}"
+  --num_hiddens "${NUM_HIDDENS}"
+  --num_res_hiddens "${NUM_RES_HIDDENS}"
+  --num_res_layers "${NUM_RES_LAYERS}"
+  --num_atoms "${NUM_ATOMS}"
+  --sparsity_level "${SPARSITY_LEVEL}"
+  --commitment_cost "${COMMITMENT_COST}"
+  --coef_max "${COEF_MAX}"
+  --patch_size "${PATCH_SIZE}"
+  --patch_stride "${PATCH_STRIDE}"
+  --patch_reconstruction "${PATCH_RECONSTRUCTION}"
+  --token_subset "${TOKEN_SUBSET}"
+  --rfid_num_samples 0
+  --wandb_mode "${WANDB_MODE}"
+  --wandb_project "${WANDB_PROJECT}"
+  --wandb_name "${WANDB_NAME}"
+  --stage2_sample_every_steps "${STAGE2_SAMPLE_EVERY_STEPS}"
+  --stage2_sample_batch_size "${STAGE2_SAMPLE_BATCH_SIZE}"
+  --quantize_sparse_coeffs "${QUANTIZE_SPARSE_COEFFS}"
+)
 if [[ -n "${STAGE1_SOURCE_CKPT}" ]]; then
-  EXTRA_ARGS+=(--stage1_source_ckpt "${STAGE1_SOURCE_CKPT}")
+  CMD+=(--stage1_source_ckpt "${STAGE1_SOURCE_CKPT}")
+fi
+if [[ "${PATCH_BASED}" == "1" || "${PATCH_BASED}" == "true" || "${PATCH_BASED}" == "TRUE" || "${PATCH_BASED}" == "yes" || "${PATCH_BASED}" == "YES" ]]; then
+  CMD+=(--patch_based)
 fi
 if [[ "${REBUILD_TOKEN_CACHE}" == "1" || "${REBUILD_TOKEN_CACHE}" == "true" || "${REBUILD_TOKEN_CACHE}" == "TRUE" || "${REBUILD_TOKEN_CACHE}" == "yes" || "${REBUILD_TOKEN_CACHE}" == "YES" ]]; then
-  EXTRA_ARGS+=(--rebuild_token_cache)
+  CMD+=(--rebuild_token_cache)
 fi
-exec python3 "${PROJECT_DIR}/${ENTRYPOINT}" \
-  --dataset celeba \
-  --data_dir "${DATA_DIR}" \
-  --image_size 128 \
-  --out_dir "${OUT_DIR}" \
-  --dist_timeout_minutes "${DIST_TIMEOUT_MINUTES}" \
-  --stage1_epochs "${STAGE1_EPOCHS}" \
-  --stage2_epochs "${STAGE2_EPOCHS}" \
-  --stage1_lr "${STAGE1_LR}" \
-  --stage2_lr "${STAGE2_LR}" \
-  --stage1_lr_schedule "${STAGE1_LR_SCHEDULE}" \
-  --stage1_warmup_epochs "${STAGE1_WARMUP_EPOCHS}" \
-  --stage1_min_lr_ratio "${STAGE1_MIN_LR_RATIO}" \
-  --stage1_dict_optimizer "${STAGE1_DICT_OPTIMIZER}" \
-  --stage1_dict_lr_multiplier "${STAGE1_DICT_LR_MULTIPLIER}" \
-  --stage1_dict_lr_schedule "${STAGE1_DICT_LR_SCHEDULE}" \
-  --stage1_dict_warmup_epochs "${STAGE1_DICT_WARMUP_EPOCHS}" \
-  --stage1_dict_min_lr_ratio "${STAGE1_DICT_MIN_LR_RATIO}" \
-  --stage1_dict_grad_clip "${STAGE1_DICT_GRAD_CLIP}" \
-  --stage1_dict_max_update_norm "${STAGE1_DICT_MAX_UPDATE_NORM}" \
-  --stage1_loss_spike_skip_ratio "${STAGE1_LOSS_SPIKE_SKIP_RATIO}" \
-  --stage1_loss_ema_beta "${STAGE1_LOSS_EMA_BETA}" \
-  --grad_clip "${GRAD_CLIP}" \
-  --stage1_bottleneck_weight_start "${STAGE1_BOTTLENECK_WEIGHT_START}" \
-  --stage1_bottleneck_warmup_epochs "${STAGE1_BOTTLENECK_WARMUP_EPOCHS}" \
-  --stage2_warmup_steps "${STAGE2_WARMUP_STEPS}" \
-  --stage2_min_lr_ratio "${STAGE2_MIN_LR_RATIO}" \
-  --stage2_weight_decay "${STAGE2_WEIGHT_DECAY}" \
-  --num_workers "${NUM_WORKERS}" \
-  --token_num_workers "${TOKEN_NUM_WORKERS}" \
-  --batch_size "${BATCH_SIZE}" \
-  --stage2_batch_size "${STAGE2_BATCH_SIZE}" \
-  --ae_num_downsamples "${AE_NUM_DOWNSAMPLES}" \
-  --token_subset "${TOKEN_SUBSET}" \
-  --rfid_num_samples 0 \
-  --wandb_mode "${WANDB_MODE}" \
-  --wandb_project "${WANDB_PROJECT}" \
-  --wandb_name "${WANDB_NAME}" \
-  --stage2_sample_every_steps "${STAGE2_SAMPLE_EVERY_STEPS}" \
-  --stage2_sample_batch_size "${STAGE2_SAMPLE_BATCH_SIZE}" \
-  --quantize_sparse_coeffs "${QUANTIZE_SPARSE_COEFFS}" \\
-  "\${EXTRA_ARGS[@]}"
+exec "\${CMD[@]}"
 EOF_RUNNER
 chmod +x "$RUNNER"
 srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 nvidia-smi

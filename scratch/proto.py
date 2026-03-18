@@ -507,14 +507,50 @@ def _unwrap_module(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
 
 
-def _dictionary_coherence(dictionary: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Return the maximum absolute off-diagonal atom cosine similarity."""
-    atoms = F.normalize(dictionary.detach(), p=2, dim=0, eps=eps)
+def _dictionary_abs_offdiag_cosines(
+    dictionary: torch.Tensor,
+    eps: float = 1e-12,
+    *,
+    detach: bool = True,
+) -> Tuple[torch.Tensor, int]:
+    atoms = dictionary.detach() if detach else dictionary
+    atoms = F.normalize(atoms, p=2, dim=0, eps=eps)
     gram = atoms.t() @ atoms
     if gram.size(0) <= 1:
-        return torch.zeros((), device=gram.device, dtype=gram.dtype)
-    gram.fill_diagonal_(0.0)
-    return gram.abs().max()
+        return torch.zeros_like(gram), 0
+    gram = gram - torch.diag_embed(torch.diagonal(gram))
+    return gram.abs(), int(gram.size(0) * (gram.size(0) - 1))
+
+
+def _dictionary_coherence_stats(
+    dictionary: torch.Tensor,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    abs_offdiag, pair_count = _dictionary_abs_offdiag_cosines(dictionary, eps=eps, detach=True)
+    if pair_count <= 0:
+        zero = torch.zeros((), device=dictionary.device, dtype=dictionary.dtype)
+        return zero, zero, zero
+    mean_abs = abs_offdiag.sum() / float(pair_count)
+    rms_abs = torch.sqrt(abs_offdiag.square().sum() / float(pair_count))
+    return abs_offdiag.max(), mean_abs, rms_abs
+
+
+def _dictionary_coherence(dictionary: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Return the maximum absolute off-diagonal atom cosine similarity."""
+    coherence_max, _, _ = _dictionary_coherence_stats(dictionary, eps=eps)
+    return coherence_max
+
+
+def _dictionary_coherence_penalty(
+    dictionary: torch.Tensor,
+    margin: float = 0.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    abs_offdiag, pair_count = _dictionary_abs_offdiag_cosines(dictionary, eps=eps, detach=False)
+    if pair_count <= 0:
+        return torch.zeros((), device=dictionary.device, dtype=dictionary.dtype)
+    excess = F.relu(abs_offdiag - float(max(0.0, margin)))
+    return excess.square().sum() / float(pair_count)
 
 
 def _normalize_dictionary_in_place(dictionary: torch.Tensor, eps: float = 1e-12) -> None:
@@ -661,6 +697,10 @@ def _flat_image_index_cache_file(root: Path) -> Path:
     return cache_base / f"{root_key}.txt"
 
 
+def _packed_celeba_file(root: Path, image_size: int) -> Path:
+    return root / f"celeba_{int(image_size)}x{int(image_size)}_rgb_uint8.npy"
+
+
 def _scan_image_paths(root: Path):
     image_paths = []
     for dirpath, _, filenames in os.walk(root):
@@ -717,6 +757,40 @@ class FlatImageDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, 0
+
+
+class PackedRGBImageDataset(Dataset):
+    """Read resized RGB uint8 images from a single NumPy memmap file."""
+
+    def __init__(self, root: str, image_size: int, random_horizontal_flip: bool = False):
+        self.root = Path(root)
+        self.image_size = int(image_size)
+        self.random_horizontal_flip = bool(random_horizontal_flip)
+        self.packed_path = _packed_celeba_file(self.root, self.image_size)
+        if not self.packed_path.exists():
+            raise FileNotFoundError(f"Packed dataset not found: {self.packed_path}")
+        self.images = np.load(self.packed_path, mmap_mode="r")
+        expected_shape = (self.image_size, self.image_size, 3)
+        if self.images.ndim != 4 or tuple(self.images.shape[1:]) != expected_shape:
+            raise ValueError(
+                f"Packed dataset at {self.packed_path} has shape {tuple(self.images.shape)}; "
+                f"expected [N, {self.image_size}, {self.image_size}, 3]"
+            )
+        if self.images.dtype != np.uint8:
+            raise ValueError(
+                f"Packed dataset at {self.packed_path} has dtype {self.images.dtype}; expected uint8"
+            )
+
+    def __len__(self) -> int:
+        return int(self.images.shape[0])
+
+    def __getitem__(self, idx: int):
+        image = torch.from_numpy(np.array(self.images[idx], copy=True)).permute(2, 0, 1).float().div_(255.0)
+        if self.random_horizontal_flip and torch.rand((), dtype=torch.float32).item() < 0.5:
+            image = torch.flip(image, dims=[2])
+        image = image.mul_(2.0).sub_(1.0)
+        return image, 0
+
 
 # -----------------------------
 # RQ-VAE style building blocks (borrowed from https://github.com/kakaobrain/rq-vae-transformer)
@@ -1313,6 +1387,9 @@ class DictionaryLearningTokenized(nn.Module):
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
         loss = dl_latent_loss + self.commitment_cost * e_latent_loss
+        self._last_dl_latent_loss = dl_latent_loss
+        self._last_e_latent_loss = e_latent_loss
+        self._last_bottleneck_loss = loss
 
         # Straight-through estimator to encoder
         z_q_ste = z_e + (z_q - z_e).detach()
@@ -1744,6 +1821,9 @@ class PatchDictionaryLearningTokenized(nn.Module):
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
         loss = dl_latent_loss + self.commitment_cost * e_latent_loss
+        self._last_dl_latent_loss = dl_latent_loss
+        self._last_e_latent_loss = e_latent_loss
+        self._last_bottleneck_loss = loss
 
         z_q_ste = z_e + (z_q - z_e).detach()
         return z_q_ste, loss, tokens
@@ -2668,6 +2748,16 @@ def train_stage1_ae(
     loss_ema_beta: float = 0.98,
     bottleneck_weight_start: float = 1.0,
     bottleneck_warmup_epochs: int = 0,
+    dict_loss_weight: float = float("nan"),
+    dict_loss_weight_start: float = float("nan"),
+    dict_loss_warmup_epochs: int = 0,
+    commitment_loss_weight: float = float("nan"),
+    commitment_loss_weight_start: float = float("nan"),
+    commitment_loss_warmup_epochs: int = 0,
+    coherence_weight: float = 0.0,
+    coherence_weight_start: float = float("nan"),
+    coherence_warmup_epochs: int = 0,
+    coherence_margin: float = 0.0,
     train_sampler: Optional[DistributedSampler] = None,
     is_main_process: bool = True,
     wandb_run: Optional[object] = None,
@@ -2703,6 +2793,22 @@ def train_stage1_ae(
     global_step = 0
     rfid_warned = False
     loss_ema: Optional[float] = None
+    commitment_beta = float(getattr(ae_module.bottleneck, "commitment_cost", 0.25))
+
+    def _stage1_loss_weight(
+        epoch_progress: float,
+        final_weight: float,
+        start_weight: float,
+        warmup_epochs: int,
+        fallback_weight: float,
+    ) -> float:
+        if not math.isfinite(final_weight):
+            return float(fallback_weight)
+        resolved_start = float(final_weight) if not math.isfinite(start_weight) else float(start_weight)
+        if warmup_epochs > 0:
+            progress = max(0.0, min(epoch_progress / float(max(1, warmup_epochs)), 1.0))
+            return resolved_start + (float(final_weight) - resolved_start) * progress
+        return float(final_weight)
 
     for epoch in range(1, epochs + 1):
         if train_sampler is not None:
@@ -2727,6 +2833,27 @@ def train_stage1_ae(
                 current_bottleneck_weight = float(bottleneck_weight_start) + (float(bottleneck_weight) - float(bottleneck_weight_start)) * bw_progress
             else:
                 current_bottleneck_weight = float(bottleneck_weight)
+            current_dict_loss_weight = _stage1_loss_weight(
+                epoch_progress=epoch_progress,
+                final_weight=dict_loss_weight,
+                start_weight=dict_loss_weight_start,
+                warmup_epochs=dict_loss_warmup_epochs,
+                fallback_weight=current_bottleneck_weight,
+            )
+            current_commitment_loss_weight = _stage1_loss_weight(
+                epoch_progress=epoch_progress,
+                final_weight=commitment_loss_weight,
+                start_weight=commitment_loss_weight_start,
+                warmup_epochs=commitment_loss_warmup_epochs,
+                fallback_weight=current_bottleneck_weight * commitment_beta,
+            )
+            current_coherence_weight = _stage1_loss_weight(
+                epoch_progress=epoch_progress,
+                final_weight=coherence_weight,
+                start_weight=coherence_weight_start,
+                warmup_epochs=coherence_warmup_epochs,
+                fallback_weight=0.0,
+            )
             dict_lr_scale = _stage1_lr_scale(
                 epoch=epoch_progress,
                 max_epochs=epochs,
@@ -2747,8 +2874,24 @@ def train_stage1_ae(
             recon, b_loss, _ = ae(x)
             recon = _nan_to_num_tensor(recon)
             b_loss = _nan_to_num_tensor(b_loss)
+            dict_loss = getattr(ae_module.bottleneck, "_last_dl_latent_loss", None)
+            commitment_loss = getattr(ae_module.bottleneck, "_last_e_latent_loss", None)
+            if dict_loss is None or commitment_loss is None:
+                latent_mse = b_loss / max(1.0 + commitment_beta, 1e-8)
+                dict_loss = latent_mse
+                commitment_loss = latent_mse
+            dict_loss = _nan_to_num_tensor(dict_loss)
+            commitment_loss = _nan_to_num_tensor(commitment_loss)
             recon_loss = F.mse_loss(recon, x)
-            loss = recon_loss + current_bottleneck_weight * b_loss
+            coherence_loss = _dictionary_coherence_penalty(
+                dict_param,
+                margin=coherence_margin,
+                eps=dict_eps,
+            )
+            weighted_dict_loss = float(current_dict_loss_weight) * dict_loss
+            weighted_commitment_loss = float(current_commitment_loss_weight) * commitment_loss
+            weighted_coherence_loss = float(current_coherence_weight) * coherence_loss
+            loss = recon_loss + weighted_dict_loss + weighted_commitment_loss + weighted_coherence_loss
 
             loss_finite_local = bool(torch.isfinite(loss).item())
             if dist.is_available() and dist.is_initialized():
@@ -2868,7 +3011,7 @@ def train_stage1_ae(
                         f"[Stage1] Warning: dictionary update norm {rejected_update_norm:.4f} exceeded "
                         f"limit {float(dict_max_update_norm):.4f} at step {global_step + 1}, restored previous dictionary"
                     )
-            dict_coherence = _dictionary_coherence(
+            dict_coherence, dict_coherence_mean_abs, dict_coherence_rms = _dictionary_coherence_stats(
                 ae_module.bottleneck.dictionary,
                 eps=dict_eps,
             )
@@ -2876,11 +3019,20 @@ def train_stage1_ae(
             loss_log = _distributed_mean(loss)
             recon_log = _distributed_mean(recon_loss)
             b_log = _distributed_mean(b_loss)
+            dict_loss_log = _distributed_mean(dict_loss)
+            commitment_loss_log = _distributed_mean(commitment_loss)
+            coherence_loss_log = _distributed_mean(coherence_loss)
+            weighted_dict_log = _distributed_mean(weighted_dict_loss)
+            weighted_commitment_log = _distributed_mean(weighted_commitment_loss)
+            weighted_coherence_log = _distributed_mean(weighted_coherence_loss)
+            latent_mse_log = _distributed_mean(0.5 * (dict_loss + commitment_loss))
             dict_grad_raw_log = _distributed_mean(dict_grad_norm_raw)
             dict_grad_preclip_log = _distributed_mean(dict_grad_norm_preclip)
             dict_grad_postclip_log = _distributed_mean(dict_grad_norm_postclip)
             dict_update_log = _distributed_mean(dict_update_norm)
             dict_coherence_log = _distributed_mean(dict_coherence)
+            dict_coherence_mean_abs_log = _distributed_mean(dict_coherence_mean_abs)
+            dict_coherence_rms_log = _distributed_mean(dict_coherence_rms)
             running += float(loss_log.item())
             if loss_ema is None:
                 loss_ema = float(loss_log.item())
@@ -2899,13 +3051,26 @@ def train_stage1_ae(
                         "stage1/train_loss": float(loss_log.item()),
                         "stage1/recon_loss": float(recon_log.item()),
                         "stage1/bottleneck_loss": float(b_log.item()),
-                        "stage1/bottleneck_weight": float(current_bottleneck_weight),
+                        "stage1/dict_loss": float(dict_loss_log.item()),
+                        "stage1/commitment_loss": float(commitment_loss_log.item()),
+                        "stage1/coherence_loss": float(coherence_loss_log.item()),
+                        "stage1/latent_mse": float(latent_mse_log.item()),
+                        "stage1/bottleneck_weight": float(current_dict_loss_weight + current_commitment_loss_weight),
+                        "stage1/dict_loss_weight": float(current_dict_loss_weight),
+                        "stage1/commitment_loss_weight": float(current_commitment_loss_weight),
+                        "stage1/coherence_weight": float(current_coherence_weight),
+                        "stage1/weighted_dict_loss": float(weighted_dict_log.item()),
+                        "stage1/weighted_commitment_loss": float(weighted_commitment_log.item()),
+                        "stage1/weighted_coherence_loss": float(weighted_coherence_log.item()),
+                        "stage1/effective_commitment": float(current_commitment_loss_weight),
                         "stage1/dict_lr": float(current_dict_lr),
                         "stage1/dict_grad_norm_raw": float(dict_grad_raw_log.item()),
                         "stage1/dict_grad_norm_preclip": float(dict_grad_preclip_log.item()),
                         "stage1/dict_grad_norm_postclip": float(dict_grad_postclip_log.item()),
                         "stage1/dict_update_norm": float(dict_update_log.item()),
                         "stage1/dict_coherence": float(dict_coherence_log.item()),
+                        "stage1/dict_coherence_mean_abs": float(dict_coherence_mean_abs_log.item()),
+                        "stage1/dict_coherence_rms": float(dict_coherence_rms_log.item()),
                         "stage1/loss_ema": float(loss_ema if loss_ema is not None else loss_log.item()),
                         "stage1/batch_in_epoch": int(step_idx + 1),
                         "stage1/epoch": epoch,
@@ -2928,8 +3093,16 @@ def train_stage1_ae(
                 recon, b_loss, _ = ae(x)
                 recon = _nan_to_num_tensor(recon)
                 b_loss = _nan_to_num_tensor(b_loss)
+                dict_loss = getattr(ae_module.bottleneck, "_last_dl_latent_loss", None)
+                commitment_loss = getattr(ae_module.bottleneck, "_last_e_latent_loss", None)
+                if dict_loss is None or commitment_loss is None:
+                    latent_mse = b_loss / max(1.0 + commitment_beta, 1e-8)
+                    dict_loss = latent_mse
+                    commitment_loss = latent_mse
+                dict_loss = _nan_to_num_tensor(dict_loss)
+                commitment_loss = _nan_to_num_tensor(commitment_loss)
                 recon_loss = F.mse_loss(recon, x)
-                loss = recon_loss + current_bottleneck_weight * b_loss
+                loss = recon_loss + float(current_dict_loss_weight) * dict_loss + float(current_commitment_loss_weight) * commitment_loss
                 x_unit = _to_unit_range(x)
                 recon_unit = _to_unit_range(recon)
                 psnr = _batch_psnr(recon_unit, x_unit)
@@ -3897,6 +4070,42 @@ def main():
         default=0,
         help="Ramp stage-1 bottleneck weight from --stage1_bottleneck_weight_start to --bottleneck_weight over this many epochs.",
     )
+    parser.add_argument(
+        "--stage1_dict_loss_weight",
+        type=float,
+        default=float("nan"),
+        help="Optional explicit stage-1 weight for the dictionary-fit term. NaN keeps the legacy coupled bottleneck objective.",
+    )
+    parser.add_argument(
+        "--stage1_dict_loss_weight_start",
+        type=float,
+        default=float("nan"),
+        help="Optional initial stage-1 dictionary-fit weight before ramping to --stage1_dict_loss_weight.",
+    )
+    parser.add_argument(
+        "--stage1_dict_loss_warmup_epochs",
+        type=int,
+        default=0,
+        help="Ramp stage-1 dictionary-fit weight from --stage1_dict_loss_weight_start to --stage1_dict_loss_weight over this many epochs.",
+    )
+    parser.add_argument(
+        "--stage1_commitment_loss_weight",
+        type=float,
+        default=float("nan"),
+        help="Optional explicit stage-1 weight for the encoder commitment term. NaN keeps the legacy coupled bottleneck objective.",
+    )
+    parser.add_argument(
+        "--stage1_commitment_loss_weight_start",
+        type=float,
+        default=float("nan"),
+        help="Optional initial stage-1 encoder commitment weight before ramping to --stage1_commitment_loss_weight.",
+    )
+    parser.add_argument(
+        "--stage1_commitment_loss_warmup_epochs",
+        type=int,
+        default=0,
+        help="Ramp stage-1 encoder commitment weight from --stage1_commitment_loss_weight_start to --stage1_commitment_loss_weight over this many epochs.",
+    )
     parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=1e-3)
     parser.add_argument(
@@ -4021,6 +4230,14 @@ def main():
     parser.add_argument("--coef_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
     parser.add_argument("--coef_mu", type=float, default=0.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
+    parser.add_argument("--stage1_coherence_weight", type=float, default=0.0,
+                        help="Weight on the dictionary coherence regularizer during stage-1.")
+    parser.add_argument("--stage1_coherence_weight_start", type=float, default=float("nan"),
+                        help="Initial stage-1 coherence weight before warmup. NaN reuses the final weight.")
+    parser.add_argument("--stage1_coherence_warmup_epochs", type=int, default=0,
+                        help="Warmup epochs for stage-1 coherence regularization.")
+    parser.add_argument("--stage1_coherence_margin", type=float, default=0.0,
+                        help="Only penalize absolute atom cosine similarity above this margin.")
     parser.add_argument(
         "--patch_based",
         dest="patch_based",
@@ -4114,6 +4331,18 @@ def main():
         raise ValueError("stage1_loss_ema_beta must be in [0, 1).")
     if args.stage1_bottleneck_warmup_epochs < 0:
         raise ValueError("stage1_bottleneck_warmup_epochs must be >= 0.")
+    if args.stage1_dict_loss_warmup_epochs < 0:
+        raise ValueError("stage1_dict_loss_warmup_epochs must be >= 0.")
+    if args.stage1_commitment_loss_warmup_epochs < 0:
+        raise ValueError("stage1_commitment_loss_warmup_epochs must be >= 0.")
+    if math.isfinite(args.stage1_dict_loss_weight) and args.stage1_dict_loss_weight < 0.0:
+        raise ValueError("stage1_dict_loss_weight must be >= 0 when set.")
+    if math.isfinite(args.stage1_dict_loss_weight_start) and args.stage1_dict_loss_weight_start < 0.0:
+        raise ValueError("stage1_dict_loss_weight_start must be >= 0 when set.")
+    if math.isfinite(args.stage1_commitment_loss_weight) and args.stage1_commitment_loss_weight < 0.0:
+        raise ValueError("stage1_commitment_loss_weight must be >= 0 when set.")
+    if math.isfinite(args.stage1_commitment_loss_weight_start) and args.stage1_commitment_loss_weight_start < 0.0:
+        raise ValueError("stage1_commitment_loss_weight_start must be >= 0 when set.")
     if args.stage2_coeff_loss_weight < 0.0:
         raise ValueError("stage2_coeff_loss_weight must be >= 0.")
     if args.stage2_rq_atom_loss_weight < 0.0:
@@ -4355,9 +4584,19 @@ def main():
         val_set = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=eval_tfm)
         stage2_source_set = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=eval_tfm)
     elif args.dataset == "celeba":
-        train_full = FlatImageDataset(root=args.data_dir, transform=train_tfm)
-        val_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
-        token_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
+        packed_path = _packed_celeba_file(Path(args.data_dir).expanduser().resolve(), args.image_size)
+        if packed_path.exists():
+            if is_main_process:
+                print(f"[Data] using packed CelebA dataset at {packed_path}")
+            train_full = PackedRGBImageDataset(root=args.data_dir, image_size=args.image_size, random_horizontal_flip=True)
+            val_full = PackedRGBImageDataset(root=args.data_dir, image_size=args.image_size, random_horizontal_flip=False)
+            token_full = PackedRGBImageDataset(root=args.data_dir, image_size=args.image_size, random_horizontal_flip=False)
+        else:
+            if is_main_process:
+                print(f"[Data] packed CelebA dataset not found at {packed_path}; falling back to raw image tree")
+            train_full = FlatImageDataset(root=args.data_dir, transform=train_tfm)
+            val_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
+            token_full = FlatImageDataset(root=args.data_dir, transform=eval_tfm)
         if len(train_full) < 2:
             raise RuntimeError("CelebA dataset needs at least 2 images for train/val split.")
         val_size = max(1, int(0.05 * len(train_full)))
@@ -4446,6 +4685,16 @@ def main():
             loss_ema_beta=args.stage1_loss_ema_beta,
             bottleneck_weight_start=args.stage1_bottleneck_weight_start,
             bottleneck_warmup_epochs=args.stage1_bottleneck_warmup_epochs,
+            dict_loss_weight=args.stage1_dict_loss_weight,
+            dict_loss_weight_start=args.stage1_dict_loss_weight_start,
+            dict_loss_warmup_epochs=args.stage1_dict_loss_warmup_epochs,
+            commitment_loss_weight=args.stage1_commitment_loss_weight,
+            commitment_loss_weight_start=args.stage1_commitment_loss_weight_start,
+            commitment_loss_warmup_epochs=args.stage1_commitment_loss_warmup_epochs,
+            coherence_weight=args.stage1_coherence_weight,
+            coherence_weight_start=args.stage1_coherence_weight_start,
+            coherence_warmup_epochs=args.stage1_coherence_warmup_epochs,
+            coherence_margin=args.stage1_coherence_margin,
             train_sampler=train_sampler,
             is_main_process=is_main_process,
             wandb_run=wandb_run,

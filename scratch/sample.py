@@ -250,7 +250,12 @@ def main() -> None:
     parser.add_argument("--num_samples", type=int, default=16)
     parser.add_argument("--nrow", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.5)
-    parser.add_argument("--top_k", type=int, default=16)
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=0,
+        help="Top-k truncation for stage-2 sampling. <= 0 disables top-k, matching proto.py's default sampler.",
+    )
     parser.add_argument(
         "--atom_temperature",
         type=float,
