@@ -9,6 +9,5 @@ export LOG_PREFIX="${LOG_PREFIX:-fast100}"
 export JOB_NAME="${JOB_NAME:-laser-fast100}"
 
 export PATCH_BASED="${PATCH_BASED:-false}"
-export STAGE2_COEFF_LOSS_TYPE="${STAGE2_COEFF_LOSS_TYPE:-gt_atom_recon_mse}"
 
 exec "$ROOT_DIR/scripts/launch_100ep.sh" "$@"

@@ -13,6 +13,7 @@ export MEM_MB="${MEM_MB:-128000}"
 export TIME_LIMIT="${TIME_LIMIT:-24:00:00}"
 
 export DATA_DIR="${DATA_DIR:-/cache/home/xl598/Projects/data/celeba}"
+export IMAGE_SIZE="${IMAGE_SIZE:-128}"
 export OUT_DIR="${OUT_DIR:-/scratch/$USER/runs/laser_100ep}"
 
 export STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
@@ -50,15 +51,15 @@ export STAGE1_COHERENCE_MARGIN="${STAGE1_COHERENCE_MARGIN:-0.0}"
 export STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-500}"
 export STAGE2_MIN_LR_RATIO="${STAGE2_MIN_LR_RATIO:-0.01}"
 export STAGE2_WEIGHT_DECAY="${STAGE2_WEIGHT_DECAY:-0.01}"
-export STAGE2_COEFF_LOSS_TYPE="${STAGE2_COEFF_LOSS_TYPE:-gt_atom_recon_mse}"
 
 export BATCH_SIZE="${BATCH_SIZE:-32}"
 export STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-32}"
-export NUM_WORKERS="${NUM_WORKERS:-12}"
+export NUM_WORKERS="${NUM_WORKERS:-8}"
 export TOKEN_NUM_WORKERS="${TOKEN_NUM_WORKERS:-4}"
 export TOKEN_SUBSET="${TOKEN_SUBSET:-98304}"
 export STAGE2_SAMPLE_EVERY_STEPS="${STAGE2_SAMPLE_EVERY_STEPS:-1000}"
 export STAGE2_SAMPLE_BATCH_SIZE="${STAGE2_SAMPLE_BATCH_SIZE:-32}"
+export STAGE2_SAMPLE_IMAGE_SIZE="${STAGE2_SAMPLE_IMAGE_SIZE:-$IMAGE_SIZE}"
 export QUANTIZE_SPARSE_COEFFS="${QUANTIZE_SPARSE_COEFFS:-true}"
 
 export AE_NUM_DOWNSAMPLES="${AE_NUM_DOWNSAMPLES:-4}"
@@ -67,12 +68,29 @@ export NUM_RES_HIDDENS="${NUM_RES_HIDDENS:-32}"
 export NUM_RES_LAYERS="${NUM_RES_LAYERS:-1}"
 export NUM_ATOMS="${NUM_ATOMS:-1024}"
 export SPARSITY_LEVEL="${SPARSITY_LEVEL:-8}"
+export N_BINS="${N_BINS:-256}"
 export COMMITMENT_COST="${COMMITMENT_COST:-0.25}"
 export COEF_MAX="${COEF_MAX:-3.0}"
+export COEF_QUANTIZATION="${COEF_QUANTIZATION:-uniform}"
+export COEF_MU="${COEF_MU:-0.0}"
 export PATCH_BASED="${PATCH_BASED:-false}"
 export PATCH_SIZE="${PATCH_SIZE:-4}"
 export PATCH_STRIDE="${PATCH_STRIDE:-2}"
 export PATCH_RECONSTRUCTION="${PATCH_RECONSTRUCTION:-center_crop}"
+
+if [[ -z "${STAGE2_COEFF_LOSS_TYPE+x}" ]]; then
+  if [[ "${VARIATIONAL_COEFFS:-false}" == "1" || "${VARIATIONAL_COEFFS:-false}" == "true" || "${VARIATIONAL_COEFFS:-false}" == "TRUE" || "${VARIATIONAL_COEFFS:-false}" == "yes" || "${VARIATIONAL_COEFFS:-false}" == "YES" ]]; then
+    export STAGE2_COEFF_LOSS_TYPE="gaussian_nll"
+  elif [[ "${PATCH_BASED}" == "1" || "${PATCH_BASED}" == "true" || "${PATCH_BASED}" == "TRUE" || "${PATCH_BASED}" == "yes" || "${PATCH_BASED}" == "YES" ]]; then
+    export STAGE2_COEFF_LOSS_TYPE="mse"
+  elif [[ "${QUANTIZE_SPARSE_COEFFS}" == "0" || "${QUANTIZE_SPARSE_COEFFS}" == "false" || "${QUANTIZE_SPARSE_COEFFS}" == "FALSE" || "${QUANTIZE_SPARSE_COEFFS}" == "no" || "${QUANTIZE_SPARSE_COEFFS}" == "NO" ]]; then
+    export STAGE2_COEFF_LOSS_TYPE="mse"
+  else
+    export STAGE2_COEFF_LOSS_TYPE="gt_atom_recon_mse"
+  fi
+else
+  export STAGE2_COEFF_LOSS_TYPE="${STAGE2_COEFF_LOSS_TYPE}"
+fi
 
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-laser-dl}"
@@ -80,7 +98,7 @@ export WANDB_NAME="${WANDB_NAME:-laser100}"
 export LOG_PREFIX="${LOG_PREFIX:-laser100}"
 export JOB_NAME="${JOB_NAME:-laser-100}"
 
-PACKED_NPY="$DATA_DIR/celeba_128x128_rgb_uint8.npy"
+PACKED_NPY="$DATA_DIR/celeba_${IMAGE_SIZE}x${IMAGE_SIZE}_rgb_uint8.npy"
 if [[ -L "$PACKED_NPY" ]]; then
   echo "Warning: $PACKED_NPY is a symlink; some nodes have fallen back to the raw image tree in this setup." >&2
   echo "Prefer a real file under DATA_DIR for the packed fast path." >&2
