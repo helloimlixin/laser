@@ -1,0 +1,178 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+DATA_DIR="${DATA_DIR:-/scratch/$USER/datasets/celebahq_packed_256}"
+OUT_ROOT="${OUT_ROOT:-/scratch/$USER/runs/celebahq256_bottleneck_coeff_sweep}"
+PARTITION="${PARTITION:-gpu-redhat}"
+NODES="${NODES:-1}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
+MEM_MB="${MEM_MB:-128000}"
+TIME_LIMIT="${TIME_LIMIT:-3-00:00:00}"
+
+ENTRYPOINT="${ENTRYPOINT:-proto.py}"
+IMAGE_SIZE="${IMAGE_SIZE:-256}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-10}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-10}"
+BATCH_SIZE="${BATCH_SIZE:-6}"
+STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-6}"
+
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_PROJECT="${WANDB_PROJECT:-laser-dl}"
+RUN_PREFIX="${RUN_PREFIX:-celebahq256_bneck10}"
+JOB_PREFIX="${JOB_PREFIX:-chq256-bn}"
+
+NUM_ATOMS="${NUM_ATOMS:-4096}"
+SPARSITY_LEVEL="${SPARSITY_LEVEL:-24}"
+PATCH_SIZE="${PATCH_SIZE:-4}"
+PATCH_STRIDE="${PATCH_STRIDE:-2}"
+
+PATCH_AE_NUM_DOWNSAMPLES="${PATCH_AE_NUM_DOWNSAMPLES:-4}"
+PATCH_NUM_HIDDENS="${PATCH_NUM_HIDDENS:-128}"
+PATCH_NUM_RES_HIDDENS="${PATCH_NUM_RES_HIDDENS:-64}"
+PATCH_NUM_RES_LAYERS="${PATCH_NUM_RES_LAYERS:-2}"
+
+# Keep a 256x256 encoder/decoder at an 8x8 latent grid for the nonpatched path.
+LATENT8_AE_NUM_DOWNSAMPLES="${LATENT8_AE_NUM_DOWNSAMPLES:-5}"
+LATENT8_NUM_HIDDENS="${LATENT8_NUM_HIDDENS:-128}"
+LATENT8_NUM_RES_HIDDENS="${LATENT8_NUM_RES_HIDDENS:-64}"
+LATENT8_NUM_RES_LAYERS="${LATENT8_NUM_RES_LAYERS:-2}"
+
+STAGE1_AUTO_RESUME_FROM_LATEST="${STAGE1_AUTO_RESUME_FROM_LATEST:-true}"
+STAGE1_CHECKPOINT_EVERY_STEPS="${STAGE1_CHECKPOINT_EVERY_STEPS:-500}"
+RFID_NUM_SAMPLES="${RFID_NUM_SAMPLES:-0}"
+STAGE2_FID_NUM_SAMPLES="${STAGE2_FID_NUM_SAMPLES:-128}"
+STAGE2_FID_EVERY_EPOCHS="${STAGE2_FID_EVERY_EPOCHS:-2}"
+
+FAMILY_FILTER="${FAMILY_FILTER:-}"
+SAMPLER_FILTER="${SAMPLER_FILTER:-}"
+
+if [[ ! -d "$DATA_DIR" ]]; then
+  echo "Missing data directory: $DATA_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "$OUT_ROOT"
+
+families=(
+  "patchq|true|true|${PATCH_AE_NUM_DOWNSAMPLES}|${PATCH_NUM_HIDDENS}|${PATCH_NUM_RES_HIDDENS}|${PATCH_NUM_RES_LAYERS}|${PATCH_SIZE}|${PATCH_STRIDE}|512|4.0|uniform|0.0"
+  "patchr|true|false|${PATCH_AE_NUM_DOWNSAMPLES}|${PATCH_NUM_HIDDENS}|${PATCH_NUM_RES_HIDDENS}|${PATCH_NUM_RES_LAYERS}|${PATCH_SIZE}|${PATCH_STRIDE}|256|3.0|uniform|0.0"
+  "latent8q|false|true|${LATENT8_AE_NUM_DOWNSAMPLES}|${LATENT8_NUM_HIDDENS}|${LATENT8_NUM_RES_HIDDENS}|${LATENT8_NUM_RES_LAYERS}|${PATCH_SIZE}|${PATCH_STRIDE}|512|4.0|uniform|0.0"
+  "latent8r|false|false|${LATENT8_AE_NUM_DOWNSAMPLES}|${LATENT8_NUM_HIDDENS}|${LATENT8_NUM_RES_HIDDENS}|${LATENT8_NUM_RES_LAYERS}|${PATCH_SIZE}|${PATCH_STRIDE}|256|3.0|uniform|0.0"
+)
+
+samplers=(
+  "baseline|cf4|t050|k0|gauss|ctnan|q1|bw10|obw10|rdz15|rbz15|sort1"
+  "mid64|cf8|t022|k64|gauss|ct015|q1|bw10|obw15|rdz08|rbz10|sort1"
+)
+
+FAMILY_FILTER="${FAMILY_FILTER// /}"
+SAMPLER_FILTER="${SAMPLER_FILTER// /}"
+submitted=0
+
+for family_spec in "${families[@]}"; do
+  IFS='|' read -r family_name patch_based quantize_sparse_coeffs ae_num_downsamples num_hiddens num_res_hiddens num_res_layers patch_size patch_stride n_bins coef_max coef_quantization coef_mu <<< "$family_spec"
+
+  if [[ -n "$FAMILY_FILTER" && ",$FAMILY_FILTER," != *",$family_name,"* ]]; then
+    continue
+  fi
+
+  for sampler_spec in "${samplers[@]}"; do
+    IFS='|' read -r sampler_name cf_tag t_tag k_tag coeff_tag ct_tag q_tag bw_tag obw_tag rdz_tag rbz_tag sort_tag <<< "$sampler_spec"
+
+    if [[ -n "$SAMPLER_FILTER" && ",$SAMPLER_FILTER," != *",$sampler_name,"* ]]; then
+      continue
+    fi
+
+    candidate_factor="${cf_tag#cf}"
+    atom_temperature="0.${t_tag#t}"
+    atom_top_k="${k_tag#k}"
+    coeff_mode="${coeff_tag/gauss/gaussian}"
+    coeff_temperature_tag="${ct_tag#ct}"
+    selection_quality_weight="$(awk "BEGIN { print ${q_tag#q} / 1.0 }")"
+    selection_brightness_weight="$(awk "BEGIN { print ${bw_tag#bw} / 10.0 }")"
+    selection_overbright_weight="$(awk "BEGIN { print ${obw_tag#obw} / 10.0 }")"
+    selection_reject_dark_z="$(awk "BEGIN { print ${rdz_tag#rdz} / 10.0 }")"
+    selection_reject_bright_z="$(awk "BEGIN { print ${rbz_tag#rbz} / 10.0 }")"
+
+    if [[ "$coeff_temperature_tag" == "nan" ]]; then
+      coeff_temperature="nan"
+    else
+      coeff_temperature="0.${coeff_temperature_tag}"
+    fi
+
+    if [[ "${sort_tag#sort}" == "1" ]]; then
+      sample_sort_by_quality="true"
+    else
+      sample_sort_by_quality="false"
+    fi
+
+    run_name="${RUN_PREFIX}_${family_name}_${sampler_name}_a${NUM_ATOMS}_k${SPARSITY_LEVEL}"
+    job_name="${JOB_PREFIX}-${family_name}-${sampler_name}"
+    out_dir="$OUT_ROOT/$run_name"
+
+    echo "[Sweep] submitting $run_name"
+    submit_output="$(
+      DATA_DIR="$DATA_DIR" \
+      OUT_DIR="$out_dir" \
+      PARTITION="$PARTITION" \
+      NODES="$NODES" \
+      GPUS_PER_NODE="$GPUS_PER_NODE" \
+      CPUS_PER_TASK="$CPUS_PER_TASK" \
+      MEM_MB="$MEM_MB" \
+      TIME_LIMIT="$TIME_LIMIT" \
+      ENTRYPOINT="$ENTRYPOINT" \
+      IMAGE_SIZE="$IMAGE_SIZE" \
+      STAGE1_EPOCHS="$STAGE1_EPOCHS" \
+      STAGE2_EPOCHS="$STAGE2_EPOCHS" \
+      STAGE2_SAMPLE_IMAGE_SIZE="$IMAGE_SIZE" \
+      BATCH_SIZE="$BATCH_SIZE" \
+      STAGE2_BATCH_SIZE="$STAGE2_BATCH_SIZE" \
+      WANDB_MODE="$WANDB_MODE" \
+      WANDB_PROJECT="$WANDB_PROJECT" \
+      WANDB_NAME="$run_name" \
+      LOG_PREFIX="$run_name" \
+      JOB_NAME="$job_name" \
+      NUM_ATOMS="$NUM_ATOMS" \
+      SPARSITY_LEVEL="$SPARSITY_LEVEL" \
+      PATCH_BASED="$patch_based" \
+      PATCH_SIZE="$patch_size" \
+      PATCH_STRIDE="$patch_stride" \
+      AE_NUM_DOWNSAMPLES="$ae_num_downsamples" \
+      NUM_HIDDENS="$num_hiddens" \
+      NUM_RES_HIDDENS="$num_res_hiddens" \
+      NUM_RES_LAYERS="$num_res_layers" \
+      QUANTIZE_SPARSE_COEFFS="$quantize_sparse_coeffs" \
+      N_BINS="$n_bins" \
+      COEF_MAX="$coef_max" \
+      COEF_QUANTIZATION="$coef_quantization" \
+      COEF_MU="$coef_mu" \
+      STAGE1_AUTO_RESUME_FROM_LATEST="$STAGE1_AUTO_RESUME_FROM_LATEST" \
+      STAGE1_CHECKPOINT_EVERY_STEPS="$STAGE1_CHECKPOINT_EVERY_STEPS" \
+      RFID_NUM_SAMPLES="$RFID_NUM_SAMPLES" \
+      STAGE2_FID_NUM_SAMPLES="$STAGE2_FID_NUM_SAMPLES" \
+      STAGE2_FID_EVERY_EPOCHS="$STAGE2_FID_EVERY_EPOCHS" \
+      STAGE2_SAMPLE_CANDIDATE_FACTOR="$candidate_factor" \
+      STAGE2_SAMPLE_TEMPERATURE="$atom_temperature" \
+      STAGE2_SAMPLE_TOP_K="$atom_top_k" \
+      STAGE2_SAMPLE_COEFF_MODE="$coeff_mode" \
+      STAGE2_SAMPLE_COEFF_TEMPERATURE="$coeff_temperature" \
+      STAGE2_SAMPLE_QUALITY_WEIGHT="$selection_quality_weight" \
+      STAGE2_SAMPLE_BRIGHTNESS_WEIGHT="$selection_brightness_weight" \
+      STAGE2_SAMPLE_OVERBRIGHT_WEIGHT="$selection_overbright_weight" \
+      STAGE2_SAMPLE_REJECT_DARK_Z="$selection_reject_dark_z" \
+      STAGE2_SAMPLE_REJECT_BRIGHT_Z="$selection_reject_bright_z" \
+      STAGE2_SAMPLE_SORT_BY_QUALITY="$sample_sort_by_quality" \
+      "$ROOT_DIR/scripts/patch_celebahq256_best.sh"
+    )"
+    printf '%s\n' "$submit_output"
+    submitted=$((submitted + 1))
+  done
+done
+
+if ((submitted == 0)); then
+  echo "No cases matched FAMILY_FILTER=$FAMILY_FILTER SAMPLER_FILTER=$SAMPLER_FILTER" >&2
+  exit 1
+fi
