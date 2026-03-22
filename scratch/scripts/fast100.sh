@@ -9,5 +9,11 @@ export LOG_PREFIX="${LOG_PREFIX:-fast100}"
 export JOB_NAME="${JOB_NAME:-laser-fast100}"
 
 export PATCH_BASED="${PATCH_BASED:-false}"
+export AE_NUM_DOWNSAMPLES="${AE_NUM_DOWNSAMPLES:-4}"
+
+if [[ "$AE_NUM_DOWNSAMPLES" != "4" ]]; then
+  echo "fast100.sh requires AE_NUM_DOWNSAMPLES=4; got $AE_NUM_DOWNSAMPLES" >&2
+  exit 1
+fi
 
 exec "$ROOT_DIR/scripts/launch_100ep.sh" "$@"

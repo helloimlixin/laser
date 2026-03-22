@@ -7,7 +7,7 @@ export LANG=C
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JOB_NAME="${JOB_NAME:-proto-rqsd-8g-mn}"
-PARTITION="${PARTITION:-gpu}"
+PARTITION="${PARTITION:-auto}"
 NODES="${NODES:-2}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 TOTAL_GPUS="$((NODES * GPUS_PER_NODE))"
@@ -196,6 +196,41 @@ if [[ ! -d "$DATA_DIR" ]]; then
   echo "Missing data directory: $DATA_DIR" >&2
   exit 1
 fi
+
+auto_select_gpu_partition() {
+  if [[ -n "${PARTITION:-}" && "${PARTITION}" != "auto" ]]; then
+    return 0
+  fi
+  local best_partition=""
+  local best_idle=-1
+  while read -r partition avail timelimit nodes _; do
+    [[ -z "${partition:-}" || "$partition" == "PARTITION" ]] && continue
+    partition="${partition%\*}"
+    case "$partition" in
+      gpu|gpu-redhat|cgpu)
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    local alloc idle other total
+    IFS='/' read -r alloc idle other total <<< "$nodes"
+    if [[ "$idle" =~ ^[0-9]+$ ]] && (( idle > best_idle )); then
+      best_idle="$idle"
+      best_partition="$partition"
+    fi
+  done < <(sinfo -s 2>/dev/null)
+  if [[ -z "$best_partition" ]]; then
+    best_partition="gpu-redhat"
+    best_idle=0
+  fi
+  PARTITION="$best_partition"
+  export PARTITION
+  echo "[Launch] auto-selected PARTITION=$PARTITION (idle_nodes=$best_idle)"
+}
+
+auto_select_gpu_partition
+
 SBATCH_EXTRA_ARGS=()
 if [[ -n "$SBATCH_DEPENDENCY" ]]; then
   SBATCH_EXTRA_ARGS+=(--dependency="$SBATCH_DEPENDENCY")
@@ -403,6 +438,9 @@ export LOCAL_RANK="\$SLURM_LOCALID"
 export MASTER_ADDR="${MASTER_ADDR}"
 export MASTER_PORT="${MASTER_PORT}"
 export PROTO_LAUNCH_TIMESTAMP="${RUN_TIMESTAMP}"
+export PROTO_RUN_SLURM_JOB_ID="${SLURM_JOB_ID}"
+export PROTO_RUN_ID="slurm-\${SLURM_JOB_ID}-${RUN_TIMESTAMP}"
+export WANDB_RUN_ID="\${PROTO_RUN_ID}"
 export PYTHONUSERBASE="${PYTHONUSERBASE_DIR}"
 export PYTHONNOUSERSITE=0
 export PYTHONPATH="${PYTHON_SITE}\${PYTHONPATH:+:\$PYTHONPATH}"

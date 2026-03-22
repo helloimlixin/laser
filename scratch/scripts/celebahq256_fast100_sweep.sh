@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DATA_DIR="${DATA_DIR:-/scratch/$USER/datasets/celebahq_packed_256}"
 OUT_ROOT="${OUT_ROOT:-/scratch/$USER/runs/celebahq256_fast100_sweep}"
-PARTITION="${PARTITION:-gpu}"
+PARTITION="${PARTITION:-auto}"
 NODES="${NODES:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-3}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-8}"

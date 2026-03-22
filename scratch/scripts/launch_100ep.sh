@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export ENTRYPOINT="${ENTRYPOINT:-laser.py}"
 
-export PARTITION="${PARTITION:-gpu}"
+export PARTITION="${PARTITION:-auto}"
 export NODES="${NODES:-1}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-3}"
 export CPUS_PER_TASK="${CPUS_PER_TASK:-8}"

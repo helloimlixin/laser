@@ -10,12 +10,14 @@ Run from `/cache/home/xl598/Projects/laser/scratch`.
 ./scripts/pack128.sh
 ./scripts/fast100.sh
 ./scripts/patch100.sh
+./scripts/patch_celebahq256_best.sh
 ./scripts/ref.sh
 ```
 
 - `pack128.sh` submits the CelebA packing job that writes `celeba_128x128_rgb_uint8.npy` and `.json`.
 - `fast100.sh` launches the current fast baseline: `laser.py`, 100 epochs for both stages, 3 GPUs, lightweight AE, no patch bottleneck.
 - `patch100.sh` launches the same 100/100 baseline with overlapping patch dictionary learning enabled.
+- `patch_celebahq256_best.sh` launches the current balanced CelebA-HQ `256 x 256` quantized patch recipe from the 2026-03-19 coeff comparison.
 - `ref.sh` launches the historical `415ephb2`-style small-cluster reference recipe.
 
 ## Baseline Settings
@@ -28,7 +30,7 @@ Run from `/cache/home/xl598/Projects/laser/scratch`.
 - `stage2_lr=1e-3`
 - `batch_size=32`
 - `stage2_batch_size=32`
-- `num_workers=12`
+- `num_workers=8`
 - `token_num_workers=4`
 - `token_subset=98304`
 - `num_hiddens=64`
@@ -41,6 +43,9 @@ Run from `/cache/home/xl598/Projects/laser/scratch`.
 - `ae_num_downsamples=4`
 - `patch_based=false`
 - `stage2_coeff_loss_type=gt_atom_recon_mse`
+
+For real-valued coeff runs (`quantize_sparse_coeffs=false`), the launchers now default to `stage2_coeff_loss_type=mse`.
+If you also enable `variational_coeffs=true` on the current branch, they default to `gaussian_nll` instead.
 
 `patch100.sh` adds:
 
@@ -125,6 +130,29 @@ Historical reference:
 ./scripts/ref.sh
 ```
 
+CelebA-HQ 256 balanced patch recipe:
+
+```bash
+./scripts/patch_celebahq256_best.sh
+```
+
+That launcher defaults to the balanced quantized winner:
+
+- `image_size=256`
+- `num_atoms=4096`
+- `sparsity_level=24`
+- `quantize_sparse_coeffs=true`
+- `n_bins=512`
+- `coef_max=4.0`
+- `patch_size=4`
+- `patch_stride=2`
+
+If you want the strongest stage-1 reconstruction setting from that sweep instead of the balanced default, run:
+
+```bash
+NUM_ATOMS=6144 ./scripts/patch_celebahq256_best.sh
+```
+
 You can still override launcher settings with environment variables. Common examples:
 
 ```bash
@@ -132,6 +160,25 @@ PARTITION=gpu ./scripts/fast100.sh
 PARTITION=cgpu ./scripts/patch100.sh
 WANDB_NAME=fast100-v2 OUT_DIR=/scratch/$USER/runs/laser_fast100_v2 ./scripts/fast100.sh
 ```
+
+## Saved Run Status
+
+Use these saved runs as the current references:
+
+- `/scratch/xl598/runs/laser_fast100/20260318_060507`: strongest completed `128 x 128` baseline.
+- `/scratch/xl598/runs/laser_fast100_nq/20260318_171953`: completed non-quantized comparison run.
+- `/scratch/xl598/runs/laser_patch100/20260318_083442`: completed `128 x 128` patch baseline.
+- `/scratch/xl598/runs/celebahq256_patch_coeff_compare`: completed `256 x 256` patch comparison and current source of truth for coeff settings.
+
+Do not use these as baselines:
+
+- `/scratch/xl598/runs/celebahq256_patch_sweep`: invalid comparison set because validation crashed on the BF16 SSIM path.
+- `/scratch/xl598/runs/celebahq256_patch_sweep_packed`: partial and cancelled.
+- `/scratch/xl598/runs/celebahq256_patch_tuned_sweep`: partial and cancelled.
+- `/scratch/xl598/runs/laser_fast100/20260318_051648`: older run superseded by `20260318_060507`.
+- `/scratch/xl598/runs/laser_patch100/20260318_074154`: older run superseded by `20260318_083442`.
+
+For the full audit, see `docs/run_audit_20260319.md`. For the completed `256 x 256` coeff comparison summary, see `docs/celebahq256_coeff_compare_20260319.md`.
 
 ## Check Resources
 
