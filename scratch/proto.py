@@ -24,7 +24,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ try:
     from spatial_prior import SpatialDepthPrior, build_spatial_depth_prior_config
 except ModuleNotFoundError:
     from laser_transformer import SpatialDepthPrior, build_spatial_depth_prior_config
+from mingpt_prior import MinGPTQuantizedPrior, build_mingpt_quantized_prior_config
 from PIL import Image
 from scipy.linalg import sqrtm
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -138,6 +139,21 @@ def _nan_to_num_tensor(
     return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
 
 
+def _gaussian_kl_to_fixed_mean(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    target_mean: torch.Tensor,
+    target_std: float,
+) -> torch.Tensor:
+    """KL(q || p) for diagonal Gaussians where p uses a fixed std and mean."""
+    target_std = float(max(target_std, 1e-6))
+    target_var = target_std * target_std
+    var = logvar.exp().clamp_min(1e-8)
+    sq_mean = (mu - target_mean).square()
+    kl = 0.5 * ((var + sq_mean) / target_var - 1.0 + math.log(target_var) - logvar)
+    return kl.mean()
+
+
 # -----------------------------
 # VQ-VAE style building blocks
 # -----------------------------
@@ -155,6 +171,7 @@ DEFAULT_STAGE2_SOURCE_RUN = "helloimlixin-rutgers/laser/q5l0g3jn"
 DEFAULT_STAGE2_SOURCE_TOKEN_CACHE = (
     SCRIPT_DIR / "runs" / "laser_celeba128_quantized" / "20260311_112058" / "stage2" / "tokens_cache.pt"
 ).resolve()
+STAGE1_AUTORESUME_CHECKPOINT_NAMES = ("ae_resume_latest.pt", "ae_last.pt", "ae_best.pt")
 
 
 def _parse_cli_bool(value) -> bool:
@@ -266,6 +283,51 @@ def _find_latest_stage1_checkpoint(experiment_root: Path, current_run_dir: Path)
     if not candidates:
         return None
     return max(candidates, key=lambda p: (p.stat().st_mtime, str(p)))
+
+
+def _find_latest_stage1_autoresume_checkpoint(
+    experiment_root: Path,
+    current_run_dir: Path,
+) -> Optional[Path]:
+    """Find the newest stage-1 snapshot suitable for warm-starting a rerun."""
+    run_dirs = []
+    seen_dirs = set()
+
+    def _maybe_add_run_dir(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved in seen_dirs or not path.exists() or not path.is_dir():
+            return
+        seen_dirs.add(resolved)
+        run_dirs.append(path)
+
+    _maybe_add_run_dir(current_run_dir)
+    _maybe_add_run_dir(experiment_root)
+    if experiment_root.exists():
+        for child in experiment_root.iterdir():
+            if child.is_dir():
+                _maybe_add_run_dir(child)
+
+    candidates = []
+    name_priority = {name: idx for idx, name in enumerate(STAGE1_AUTORESUME_CHECKPOINT_NAMES)}
+    for run_dir in run_dirs:
+        stage1_dir = run_dir / "stage1"
+        if not stage1_dir.exists():
+            continue
+        for checkpoint_name in STAGE1_AUTORESUME_CHECKPOINT_NAMES:
+            checkpoint_path = stage1_dir / checkpoint_name
+            if checkpoint_path.exists():
+                candidates.append(checkpoint_path)
+
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda p: (
+            p.stat().st_mtime,
+            -name_priority.get(p.name, len(STAGE1_AUTORESUME_CHECKPOINT_NAMES)),
+            str(p),
+        ),
+    )
 
 
 def _resolve_stage1_checkpoint_from_wandb_run(run_path: str, cache_root: Path, quantized: bool) -> Path:
@@ -494,6 +556,114 @@ def _load_module_checkpoint(module: nn.Module, checkpoint_path: Path) -> None:
     module.load_state_dict(state_dict)
 
 
+def _save_module_checkpoint(module: nn.Module, checkpoint_path: Path) -> None:
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_path.with_suffix(f"{checkpoint_path.suffix}.tmp")
+    torch.save(module.state_dict(), tmp_path)
+    os.replace(tmp_path, checkpoint_path)
+
+
+def _artifact_safe_token(value) -> str:
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return ""
+    cleaned = []
+    last_dash = False
+    for ch in raw:
+        out = ch if (ch.isalnum() or ch in {"-", "_", "."}) else "-"
+        if out == "-" and last_dash:
+            continue
+        cleaned.append(out)
+        last_dash = (out == "-")
+    return "".join(cleaned).strip("-_.")
+
+
+def _resolve_run_id(explicit: Optional[str] = None, fallback_timestamp: Optional[str] = None) -> str:
+    for candidate in (
+        explicit,
+        os.environ.get("PROTO_RUN_ID"),
+        os.environ.get("WANDB_RUN_ID"),
+    ):
+        token = _artifact_safe_token(candidate)
+        if token:
+            return token
+    fallback = _artifact_safe_token(fallback_timestamp)
+    if fallback:
+        return f"run-{fallback}"
+    return ""
+
+
+def _build_run_artifact_tag(args) -> str:
+    payload_fields = (
+        ("dataset", getattr(args, "dataset", None)),
+        ("image_size", getattr(args, "image_size", None)),
+        ("patch_based", getattr(args, "patch_based", None)),
+        ("patch_size", getattr(args, "patch_size", None)),
+        ("patch_stride", getattr(args, "patch_stride", None)),
+        ("patch_reconstruction", getattr(args, "patch_reconstruction", None)),
+        ("quantize_sparse_coeffs", getattr(args, "quantize_sparse_coeffs", None)),
+        ("variational_coeffs", getattr(args, "variational_coeffs", None)),
+        ("embedding_dim", getattr(args, "embedding_dim", None)),
+        ("num_atoms", getattr(args, "num_atoms", None)),
+        ("sparsity_level", getattr(args, "sparsity_level", None)),
+        ("n_bins", getattr(args, "n_bins", None)),
+        ("coef_max", getattr(args, "coef_max", None)),
+        ("stage1_epochs", getattr(args, "stage1_epochs", None)),
+        ("stage2_epochs", getattr(args, "stage2_epochs", None)),
+        ("stage2_arch", getattr(args, "stage2_arch", None)),
+        ("stage2_autoregressive_coeffs", getattr(args, "stage2_autoregressive_coeffs", None)),
+    )
+    payload = "|".join(f"{key}={value}" for key, value in payload_fields)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    run_id = _resolve_run_id(
+        getattr(args, "run_id", None),
+        getattr(args, "launch_timestamp", None) or os.environ.get("PROTO_LAUNCH_TIMESTAMP"),
+    )
+    slurm_job_id = _artifact_safe_token(
+        os.environ.get("PROTO_RUN_SLURM_JOB_ID") or os.environ.get("SLURM_JOB_ID")
+    )
+    launch_timestamp = _artifact_safe_token(
+        getattr(args, "launch_timestamp", None) or os.environ.get("PROTO_LAUNCH_TIMESTAMP")
+    )
+    parts = []
+    if run_id:
+        parts.append(f"r{run_id}")
+    else:
+        if slurm_job_id:
+            parts.append(f"j{slurm_job_id}")
+        if launch_timestamp:
+            parts.append(f"t{launch_timestamp}")
+    parts.append(f"h{digest}")
+    return "__".join(parts)
+
+
+def _tagged_artifact_path(path: Path, artifact_tag: Optional[str]) -> Path:
+    path = Path(path).expanduser().resolve()
+    if not artifact_tag:
+        return path
+    suffix = "".join(path.suffixes)
+    stem = path.name[:-len(suffix)] if suffix else path.name
+    return path.with_name(f"{stem}__{artifact_tag}{suffix}")
+
+
+def _copy_artifact_to_tagged_path(path: Path, artifact_tag: Optional[str]) -> Path:
+    path = Path(path).expanduser().resolve()
+    tagged_path = _tagged_artifact_path(path, artifact_tag)
+    if tagged_path != path:
+        shutil.copy2(path, tagged_path)
+    return tagged_path
+
+
+def _save_module_checkpoint_with_tag(
+    module: nn.Module,
+    checkpoint_path: Path,
+    artifact_tag: Optional[str],
+) -> Path:
+    _save_module_checkpoint(module, checkpoint_path)
+    return _copy_artifact_to_tagged_path(checkpoint_path, artifact_tag)
+
+
 def _distributed_mean(value: torch.Tensor) -> torch.Tensor:
     if not _is_distributed():
         return value.detach()
@@ -505,6 +675,135 @@ def _distributed_mean(value: torch.Tensor) -> torch.Tensor:
 
 def _unwrap_module(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
+
+
+def _clamp_generated_sparse_coeffs_for_decode(ae: nn.Module, coeffs: torch.Tensor) -> torch.Tensor:
+    """
+    Keep sampled real-valued sparse coeffs inside the stage-1 decode range.
+
+    Training can still regress unconstrained real-valued coeffs, but when we
+    unconditionally sample stage-2 and decode those coeffs back through the
+    stage-1 bottleneck we should not let rare outliers explode into painterly
+    artifacts.
+    """
+    ae_module = _unwrap_module(ae)
+    coeffs = _nan_to_num_tensor(ae_module.clamp_sparse_coeffs(coeffs))
+    bottleneck = getattr(ae_module, "bottleneck", None)
+    if bottleneck is None or bool(getattr(bottleneck, "quantize_sparse_coeffs", False)):
+        return coeffs
+    coef_max = getattr(bottleneck, "coef_max", None)
+    if coef_max is None:
+        return coeffs
+    try:
+        coef_max_value = float(coef_max)
+    except (TypeError, ValueError):
+        return coeffs
+    if not math.isfinite(coef_max_value) or coef_max_value <= 0.0:
+        return coeffs
+    return coeffs.clamp(-coef_max_value, coef_max_value)
+
+
+def build_stage2_model(
+    bottleneck,
+    *,
+    stage2_arch: str,
+    H: int,
+    W: int,
+    D: int,
+    d_model: int,
+    n_heads: int,
+    n_layers: int,
+    d_ff: int,
+    dropout: float,
+    n_global_spatial_tokens: int,
+    real_valued_coeffs: bool,
+    coeff_max_fallback: float,
+    autoregressive_coeffs: bool,
+) -> nn.Module:
+    stage2_arch = str(stage2_arch).strip().lower()
+    if (not real_valued_coeffs) and (not autoregressive_coeffs):
+        raise ValueError(
+            "Quantized stage-2 priors require stage2_autoregressive_coeffs=true so the "
+            "shared atom/coeff token stream stays interleaved."
+        )
+    if stage2_arch == "spatial_depth":
+        model = SpatialDepthPrior(
+            build_spatial_depth_prior_config(
+                bottleneck,
+                H=H,
+                W=W,
+                D=D,
+                d_model=d_model,
+                n_heads=n_heads,
+                n_spatial_layers=n_layers,
+                n_depth_layers=max(1, n_layers // 2),
+                d_ff=d_ff,
+                dropout=dropout,
+                n_global_spatial_tokens=n_global_spatial_tokens,
+                real_valued_coeffs=real_valued_coeffs,
+                coeff_max_fallback=coeff_max_fallback,
+                autoregressive_coeffs=autoregressive_coeffs,
+            )
+        )
+    elif stage2_arch == "mingpt":
+        if real_valued_coeffs:
+            raise ValueError("stage2_arch='mingpt' currently supports quantized sparse coefficients only")
+        if not autoregressive_coeffs:
+            raise ValueError("stage2_arch='mingpt' requires stage2_autoregressive_coeffs=true")
+        if int(n_global_spatial_tokens) != 0:
+            raise ValueError("stage2_arch='mingpt' does not support tf_global_tokens; use 0")
+        model = MinGPTQuantizedPrior(
+            build_mingpt_quantized_prior_config(
+                bottleneck,
+                H=H,
+                W=W,
+                D=D,
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                d_ff=d_ff,
+                dropout=dropout,
+            )
+        )
+    else:
+        raise ValueError(f"Unsupported stage2_arch: {stage2_arch!r}")
+    setattr(model, "stage2_arch", stage2_arch)
+    return model
+
+
+def _describe_stage2_model(
+    model: nn.Module,
+    *,
+    stage2_arch: str,
+    tf_layers: int,
+    tf_global_tokens: int,
+) -> str:
+    stage2_arch = str(stage2_arch).strip().lower()
+    if stage2_arch == "spatial_depth":
+        if not getattr(model, "real_valued_coeffs", False):
+            coeff_mode = "quantized shared atom/coeff vocab"
+            rollout_mode = "interleaved token rollout"
+        else:
+            coeff_mode = (
+                "real-valued coeffs, Gaussian head"
+                if getattr(model, "gaussian_coeffs", False)
+                else "real-valued coeffs"
+            )
+            rollout_mode = (
+                "autoregressive coeff rollout"
+                if getattr(model, "autoregressive_coeffs", True)
+                else "support-only coeff conditioning"
+            )
+        return (
+            "[Stage2] using RQ spatial-depth prior "
+            f"({coeff_mode}, {rollout_mode}, spatial_layers={tf_layers}, "
+            f"depth_layers={max(1, tf_layers // 2)}, global_tokens={tf_global_tokens})"
+        )
+    return (
+        "[Stage2] using quantized minGPT prior "
+        f"(shared_vocab={getattr(model, 'content_vocab_size', 'unknown')}, "
+        f"layers={tf_layers}, causal_token_stream=H*W*D)"
+    )
 
 
 def _dictionary_abs_offdiag_cosines(
@@ -1075,6 +1374,10 @@ class DictionaryLearningTokenized(nn.Module):
         commitment_cost: float = 0.25,
         epsilon: float = 1e-10,
         canonicalize_sparse_slots: bool = True,
+        variational_coeffs: bool = False,
+        variational_coeff_kl_weight: float = 0.0,
+        variational_coeff_prior_std: float = 0.25,
+        variational_coeff_min_std: float = 0.01,
     ):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
@@ -1094,9 +1397,48 @@ class DictionaryLearningTokenized(nn.Module):
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
         self.canonicalize_sparse_slots = bool(canonicalize_sparse_slots)
+        self.variational_coeffs = bool(variational_coeffs)
+        self.variational_coeff_kl_weight = float(variational_coeff_kl_weight)
+        self.variational_coeff_prior_std = float(variational_coeff_prior_std)
+        self.variational_coeff_min_std = float(variational_coeff_min_std)
+        if self.variational_coeff_kl_weight < 0.0:
+            raise ValueError(
+                f"variational_coeff_kl_weight must be >= 0, got {self.variational_coeff_kl_weight}"
+            )
+        if self.variational_coeff_prior_std <= 0.0:
+            raise ValueError(
+                f"variational_coeff_prior_std must be > 0, got {self.variational_coeff_prior_std}"
+            )
+        if self.variational_coeff_min_std <= 0.0:
+            raise ValueError(
+                f"variational_coeff_min_std must be > 0, got {self.variational_coeff_min_std}"
+            )
+        if self.variational_coeff_min_std > self.variational_coeff_prior_std:
+            raise ValueError(
+                "variational_coeff_min_std cannot exceed variational_coeff_prior_std: "
+                f"{self.variational_coeff_min_std} > {self.variational_coeff_prior_std}"
+            )
+        if self.variational_coeffs and self.quantize_sparse_coeffs:
+            raise ValueError("variational_coeffs currently requires quantize_sparse_coeffs=False")
 
         # Dictionary shape [C, K] (matches LASER)
         self.dictionary = nn.Parameter(torch.randn(self.embedding_dim, self.num_embeddings) * 0.02)
+        self._last_coeff_kl_loss = torch.zeros(())
+        self._last_weighted_coeff_kl_loss = torch.zeros(())
+        self._last_extra_bottleneck_loss = torch.zeros(())
+        self._last_coeff_posterior_std = torch.zeros(())
+        self._last_coeff_prior_std = torch.tensor(self.variational_coeff_prior_std)
+        if self.variational_coeffs:
+            hidden_dim = max(32, min(128, self.embedding_dim * 4))
+            self.coeff_variational_atom_emb = nn.Embedding(self.num_embeddings, hidden_dim)
+            self.coeff_variational_posterior = nn.Sequential(
+                nn.Linear(hidden_dim + 1, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
+        else:
+            self.coeff_variational_atom_emb = None
+            self.coeff_variational_posterior = None
 
         # Coefficient bin centers (uniform)
         centers = torch.linspace(-self.coef_max, self.coef_max, steps=self.n_bins)
@@ -1124,6 +1466,44 @@ class DictionaryLearningTokenized(nn.Module):
             self.pad_token_id = self.num_embeddings
             self.bos_token_id = self.num_embeddings + 1
             self.vocab_size = self.num_embeddings + 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        variational_prefixes = (
+            prefix + "coeff_variational_atom_emb.",
+            prefix + "coeff_variational_posterior.",
+        )
+        if self.variational_coeffs and self.coeff_variational_atom_emb is not None and self.coeff_variational_posterior is not None:
+            expected_state = {
+                prefix + "coeff_variational_atom_emb.weight": self.coeff_variational_atom_emb.weight.detach().clone(),
+            }
+            for subkey, value in self.coeff_variational_posterior.state_dict().items():
+                expected_state[prefix + "coeff_variational_posterior." + subkey] = value.detach().clone()
+            for key, expected in expected_state.items():
+                loaded = state_dict.get(key, None)
+                if loaded is None or tuple(loaded.shape) != tuple(expected.shape):
+                    state_dict[key] = expected
+        else:
+            for key in list(state_dict.keys()):
+                if key.startswith(variational_prefixes):
+                    state_dict.pop(key, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _normalize_dict(self) -> torch.Tensor:
         return F.normalize(self.dictionary, p=2, dim=0, eps=self.epsilon)
@@ -1200,8 +1580,8 @@ class DictionaryLearningTokenized(nn.Module):
         """Run OMP and return support atom ids and continuous coefficients."""
         B, C, H, W = z_e.shape
         n_signals = B * H * W
-        signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
         dictionary = self._normalize_dict()
+        signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t().to(dictionary.dtype)
         with torch.no_grad():
             support, coeffs = self.batch_omp_with_support(signals, dictionary)
         if support.ndim != 2 or coeffs.ndim != 2:
@@ -1240,7 +1620,43 @@ class DictionaryLearningTokenized(nn.Module):
 
     def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
         """Project coefficients onto the stage-1 decoder manifold."""
-        return coeffs.clamp(-self.coef_max, self.coef_max)
+        coeffs = _nan_to_num_tensor(coeffs)
+        if self.quantize_sparse_coeffs:
+            return coeffs.clamp(-self.coef_max, self.coef_max)
+        return coeffs
+
+    def _coeff_posterior_stats(
+        self,
+        support: torch.Tensor,
+        coeffs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.variational_coeffs:
+            raise RuntimeError("_coeff_posterior_stats requires variational_coeffs=True")
+        if self.coeff_variational_atom_emb is None or self.coeff_variational_posterior is None:
+            raise RuntimeError("variational coefficient modules were not initialized")
+        if support.shape != coeffs.shape:
+            raise ValueError(f"support and coeffs shape mismatch: {support.shape} vs {coeffs.shape}")
+
+        support_clamped = support.to(torch.long).clamp(0, self.num_embeddings - 1)
+        coeffs_base = self.clamp_sparse_coeffs(coeffs.to(torch.float32))
+        atom_emb = self.coeff_variational_atom_emb(support_clamped)
+        posterior_in = torch.cat([atom_emb, coeffs_base.unsqueeze(-1)], dim=-1)
+        posterior_raw = self.coeff_variational_posterior(posterior_in)
+
+        mean_offset = self.variational_coeff_prior_std * torch.tanh(posterior_raw[..., 0])
+        posterior_mu = self.clamp_sparse_coeffs(coeffs_base + mean_offset)
+
+        std_range = max(self.variational_coeff_prior_std - self.variational_coeff_min_std, 0.0)
+        posterior_std = self.variational_coeff_min_std + std_range * torch.sigmoid(posterior_raw[..., 1])
+        posterior_logvar = 2.0 * torch.log(posterior_std.clamp_min(1e-6))
+        return posterior_mu, posterior_logvar
+
+    def project_sparse_coeffs(self, support: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
+        coeffs_clamped = self.clamp_sparse_coeffs(coeffs)
+        if not self.variational_coeffs:
+            return coeffs_clamped
+        coeff_mu, _ = self._coeff_posterior_stats(support, coeffs_clamped)
+        return coeff_mu
 
     def _reconstruct_sparse(
         self, support: torch.Tensor, coeffs: torch.Tensor
@@ -1257,7 +1673,7 @@ class DictionaryLearningTokenized(nn.Module):
 
         dictionary = self._normalize_dict().t()  # [num_embeddings, C]
         support = support.to(torch.long).clamp(0, self.num_embeddings - 1)
-        coeffs = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp(-self.coef_max, self.coef_max)
+        coeffs = self.clamp_sparse_coeffs(coeffs.to(dictionary.dtype))
         support_flat = support.reshape(-1, D)
         coeffs_flat = coeffs.reshape(-1, D)
         atoms = dictionary[support_flat]  # [B*H*W, D, C]
@@ -1366,7 +1782,7 @@ class DictionaryLearningTokenized(nn.Module):
         z_e = _nan_to_num_tensor(z_e)
         support, coeffs = self._encode_sparse_codes(z_e)
         support_flat = support.view(-1, self.sparsity_level)
-        coeffs_flat = _nan_to_num_tensor(coeffs.view(-1, self.sparsity_level)).clamp_(-self.coef_max, self.coef_max)
+        coeffs_flat = self.clamp_sparse_coeffs(coeffs.view(-1, self.sparsity_level))
 
         if self.quantize_sparse_coeffs:
             # Quantize coefficients and interleave atom + coefficient-bin tokens.
@@ -1380,15 +1796,50 @@ class DictionaryLearningTokenized(nn.Module):
             tokens = support.view(B, H, W, self.sparsity_level).long()
             coeffs_for_recon = self.clamp_sparse_coeffs(coeffs_flat)
 
-        coeffs_for_recon = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
+        coeff_kl_loss = z_e.new_zeros(())
+        weighted_coeff_kl_loss = z_e.new_zeros(())
+        if (not self.quantize_sparse_coeffs) and self.variational_coeffs:
+            coeffs_base = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
+            coeff_mu, coeff_logvar = self._coeff_posterior_stats(support, coeffs_base)
+            if self.training:
+                coeff_eps = torch.randn_like(coeff_mu)
+                coeff_std = (0.5 * coeff_logvar).exp()
+                coeffs_for_recon = self.clamp_sparse_coeffs(coeff_mu + coeff_std * coeff_eps)
+            else:
+                coeffs_for_recon = coeff_mu
+            coeff_kl_loss = _gaussian_kl_to_fixed_mean(
+                coeff_mu,
+                coeff_logvar,
+                coeffs_base,
+                target_std=self.variational_coeff_prior_std,
+            )
+            weighted_coeff_kl_loss = float(self.variational_coeff_kl_weight) * coeff_kl_loss
+            self._last_coeff_posterior_std = (0.5 * coeff_logvar).exp().mean().detach()
+            self._last_coeff_prior_std = torch.as_tensor(
+                self.variational_coeff_prior_std,
+                device=z_e.device,
+                dtype=z_e.dtype,
+            )
+        else:
+            coeffs_for_recon = coeffs_for_recon.reshape(B, H, W, self.sparsity_level)
+            self._last_coeff_posterior_std = z_e.new_zeros(())
+            self._last_coeff_prior_std = torch.as_tensor(
+                self.variational_coeff_prior_std,
+                device=z_e.device,
+                dtype=z_e.dtype,
+            )
+
         z_q = _nan_to_num_tensor(self._reconstruct_sparse(support, coeffs_for_recon))
 
         # Bottleneck loss (LASER-style)
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
-        loss = dl_latent_loss + self.commitment_cost * e_latent_loss
+        loss = dl_latent_loss + self.commitment_cost * e_latent_loss + weighted_coeff_kl_loss
         self._last_dl_latent_loss = dl_latent_loss
         self._last_e_latent_loss = e_latent_loss
+        self._last_coeff_kl_loss = coeff_kl_loss
+        self._last_weighted_coeff_kl_loss = weighted_coeff_kl_loss
+        self._last_extra_bottleneck_loss = weighted_coeff_kl_loss
         self._last_bottleneck_loss = loss
 
         # Straight-through estimator to encoder
@@ -1473,6 +1924,10 @@ class PatchDictionaryLearningTokenized(nn.Module):
         epsilon: float = 1e-10,
         patch_reconstruction: str = "center_crop",
         canonicalize_sparse_slots: bool = True,
+        variational_coeffs: bool = False,
+        variational_coeff_kl_weight: float = 0.0,
+        variational_coeff_prior_std: float = 0.25,
+        variational_coeff_min_std: float = 0.01,
     ):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
@@ -1493,14 +1948,53 @@ class PatchDictionaryLearningTokenized(nn.Module):
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
         self.canonicalize_sparse_slots = bool(canonicalize_sparse_slots)
+        self.variational_coeffs = bool(variational_coeffs)
+        self.variational_coeff_kl_weight = float(variational_coeff_kl_weight)
+        self.variational_coeff_prior_std = float(variational_coeff_prior_std)
+        self.variational_coeff_min_std = float(variational_coeff_min_std)
+        if self.variational_coeff_kl_weight < 0.0:
+            raise ValueError(
+                f"variational_coeff_kl_weight must be >= 0, got {self.variational_coeff_kl_weight}"
+            )
+        if self.variational_coeff_prior_std <= 0.0:
+            raise ValueError(
+                f"variational_coeff_prior_std must be > 0, got {self.variational_coeff_prior_std}"
+            )
+        if self.variational_coeff_min_std <= 0.0:
+            raise ValueError(
+                f"variational_coeff_min_std must be > 0, got {self.variational_coeff_min_std}"
+            )
+        if self.variational_coeff_min_std > self.variational_coeff_prior_std:
+            raise ValueError(
+                "variational_coeff_min_std cannot exceed variational_coeff_prior_std: "
+                f"{self.variational_coeff_min_std} > {self.variational_coeff_prior_std}"
+            )
         if patch_reconstruction not in ("center_crop", "hann"):
             raise ValueError("patch_reconstruction must be 'center_crop' or 'hann'")
         self.patch_reconstruction = patch_reconstruction
+        if self.variational_coeffs and self.quantize_sparse_coeffs:
+            raise ValueError("variational_coeffs currently requires quantize_sparse_coeffs=False")
 
         # Dictionary shape: [patch_dim, num_embeddings]
         self.dictionary = nn.Parameter(
             torch.randn(self.patch_dim, self.num_embeddings) * 0.02
         )
+        self._last_coeff_kl_loss = torch.zeros(())
+        self._last_weighted_coeff_kl_loss = torch.zeros(())
+        self._last_extra_bottleneck_loss = torch.zeros(())
+        self._last_coeff_posterior_std = torch.zeros(())
+        self._last_coeff_prior_std = torch.tensor(self.variational_coeff_prior_std)
+        if self.variational_coeffs:
+            hidden_dim = max(64, min(256, self.embedding_dim * self.patch_size))
+            self.coeff_variational_atom_emb = nn.Embedding(self.num_embeddings, hidden_dim)
+            self.coeff_variational_posterior = nn.Sequential(
+                nn.Linear(hidden_dim + 1, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
+        else:
+            self.coeff_variational_atom_emb = None
+            self.coeff_variational_posterior = None
 
         centers = torch.linspace(-self.coef_max, self.coef_max, steps=self.n_bins)
         self.register_buffer("coef_bin_centers", centers)
@@ -1532,6 +2026,44 @@ class PatchDictionaryLearningTokenized(nn.Module):
             self.pad_token_id = self.num_embeddings
             self.bos_token_id = self.num_embeddings + 1
             self.vocab_size = self.num_embeddings + 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        variational_prefixes = (
+            prefix + "coeff_variational_atom_emb.",
+            prefix + "coeff_variational_posterior.",
+        )
+        if self.variational_coeffs and self.coeff_variational_atom_emb is not None and self.coeff_variational_posterior is not None:
+            expected_state = {
+                prefix + "coeff_variational_atom_emb.weight": self.coeff_variational_atom_emb.weight.detach().clone(),
+            }
+            for subkey, value in self.coeff_variational_posterior.state_dict().items():
+                expected_state[prefix + "coeff_variational_posterior." + subkey] = value.detach().clone()
+            for key, expected in expected_state.items():
+                loaded = state_dict.get(key, None)
+                if loaded is None or tuple(loaded.shape) != tuple(expected.shape):
+                    state_dict[key] = expected
+        else:
+            for key in list(state_dict.keys()):
+                if key.startswith(variational_prefixes):
+                    state_dict.pop(key, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _normalize_dict(self) -> torch.Tensor:
         """Return column-normalised dictionary [patch_dim, num_embeddings]."""
@@ -1661,8 +2193,8 @@ class PatchDictionaryLearningTokenized(nn.Module):
         patches, nph, npw, H, W = self._extract_patches(z_e)
         B = z_e.shape[0]
         L = patches.shape[2]  # nph * npw
-        signals = patches.permute(0, 2, 1).contiguous().view(-1, self.patch_dim).t()
         dictionary = self._normalize_dict()
+        signals = patches.permute(0, 2, 1).contiguous().view(-1, self.patch_dim).t().to(dictionary.dtype)
         n_signals = B * L
         with torch.no_grad():
             support, coeffs = self.batch_omp_with_support(signals, dictionary)
@@ -1687,7 +2219,43 @@ class PatchDictionaryLearningTokenized(nn.Module):
 
     def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
         """Project coefficients onto the stage-1 decoder manifold."""
-        return coeffs.clamp(-self.coef_max, self.coef_max)
+        coeffs = _nan_to_num_tensor(coeffs)
+        if self.quantize_sparse_coeffs:
+            return coeffs.clamp(-self.coef_max, self.coef_max)
+        return coeffs
+
+    def _coeff_posterior_stats(
+        self,
+        support: torch.Tensor,
+        coeffs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.variational_coeffs:
+            raise RuntimeError("_coeff_posterior_stats requires variational_coeffs=True")
+        if self.coeff_variational_atom_emb is None or self.coeff_variational_posterior is None:
+            raise RuntimeError("variational coefficient modules were not initialized")
+        if support.shape != coeffs.shape:
+            raise ValueError(f"support and coeffs shape mismatch: {support.shape} vs {coeffs.shape}")
+
+        support_clamped = support.to(torch.long).clamp(0, self.num_embeddings - 1)
+        coeffs_base = self.clamp_sparse_coeffs(coeffs.to(torch.float32))
+        atom_emb = self.coeff_variational_atom_emb(support_clamped)
+        posterior_in = torch.cat([atom_emb, coeffs_base.unsqueeze(-1)], dim=-1)
+        posterior_raw = self.coeff_variational_posterior(posterior_in)
+
+        mean_offset = self.variational_coeff_prior_std * torch.tanh(posterior_raw[..., 0])
+        posterior_mu = self.clamp_sparse_coeffs(coeffs_base + mean_offset)
+
+        std_range = max(self.variational_coeff_prior_std - self.variational_coeff_min_std, 0.0)
+        posterior_std = self.variational_coeff_min_std + std_range * torch.sigmoid(posterior_raw[..., 1])
+        posterior_logvar = 2.0 * torch.log(posterior_std.clamp_min(1e-6))
+        return posterior_mu, posterior_logvar
+
+    def project_sparse_coeffs(self, support: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
+        coeffs_clamped = self.clamp_sparse_coeffs(coeffs)
+        if not self.variational_coeffs:
+            return coeffs_clamped
+        coeff_mu, _ = self._coeff_posterior_stats(support, coeffs_clamped)
+        return coeff_mu
 
     def _reconstruct_sparse(
         self,
@@ -1723,7 +2291,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
 
         dictionary = self._normalize_dict().t()
         support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
-        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp(-self.coef_max, self.coef_max).reshape(-1, D)
+        coeffs_flat = self.clamp_sparse_coeffs(coeffs.to(dictionary.dtype)).reshape(-1, D)
         atoms = dictionary[support_flat]                          # [N, D, patch_dim]
         recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)   # [N, patch_dim]
 
@@ -1760,7 +2328,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
 
         dictionary = self._normalize_dict().t()
         support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
-        coeffs_flat = _nan_to_num_tensor(coeffs.to(dictionary.dtype)).clamp(-self.coef_max, self.coef_max).reshape(-1, D)
+        coeffs_flat = self.clamp_sparse_coeffs(coeffs.to(dictionary.dtype)).reshape(-1, D)
         atoms = dictionary[support_flat]                          # [N, D, patch_dim]
         recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)   # [N, patch_dim]
 
@@ -1803,7 +2371,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
         _, nph, npw, _ = support.shape
 
         support_flat = support.view(-1, self.sparsity_level)
-        coeffs_flat = _nan_to_num_tensor(coeffs.view(-1, self.sparsity_level)).clamp_(-self.coef_max, self.coef_max)
+        coeffs_flat = self.clamp_sparse_coeffs(coeffs.view(-1, self.sparsity_level))
 
         if self.quantize_sparse_coeffs:
             bin_idx, coeff_q = self._quantize_coeff(coeffs_flat)
@@ -1816,13 +2384,48 @@ class PatchDictionaryLearningTokenized(nn.Module):
             tokens = support.view(B, nph, npw, self.sparsity_level).long()
             coeffs_for_recon = self.clamp_sparse_coeffs(coeffs_flat).reshape(B, nph, npw, self.sparsity_level)
 
+        coeff_kl_loss = z_e.new_zeros(())
+        weighted_coeff_kl_loss = z_e.new_zeros(())
+        if (not self.quantize_sparse_coeffs) and self.variational_coeffs:
+            coeffs_base = coeffs_for_recon
+            coeff_mu, coeff_logvar = self._coeff_posterior_stats(support, coeffs_base)
+            if self.training:
+                coeff_eps = torch.randn_like(coeff_mu)
+                coeff_std = (0.5 * coeff_logvar).exp()
+                coeffs_for_recon = self.clamp_sparse_coeffs(coeff_mu + coeff_std * coeff_eps)
+            else:
+                coeffs_for_recon = coeff_mu
+            coeff_kl_loss = _gaussian_kl_to_fixed_mean(
+                coeff_mu,
+                coeff_logvar,
+                coeffs_base,
+                target_std=self.variational_coeff_prior_std,
+            )
+            weighted_coeff_kl_loss = float(self.variational_coeff_kl_weight) * coeff_kl_loss
+            self._last_coeff_posterior_std = (0.5 * coeff_logvar).exp().mean().detach()
+            self._last_coeff_prior_std = torch.as_tensor(
+                self.variational_coeff_prior_std,
+                device=z_e.device,
+                dtype=z_e.dtype,
+            )
+        else:
+            self._last_coeff_posterior_std = z_e.new_zeros(())
+            self._last_coeff_prior_std = torch.as_tensor(
+                self.variational_coeff_prior_std,
+                device=z_e.device,
+                dtype=z_e.dtype,
+            )
+
         z_q = _nan_to_num_tensor(self._reconstruct_sparse(support, coeffs_for_recon, H, W))
 
         dl_latent_loss = F.mse_loss(z_q, z_e.detach())
         e_latent_loss = F.mse_loss(z_q.detach(), z_e)
-        loss = dl_latent_loss + self.commitment_cost * e_latent_loss
+        loss = dl_latent_loss + self.commitment_cost * e_latent_loss + weighted_coeff_kl_loss
         self._last_dl_latent_loss = dl_latent_loss
         self._last_e_latent_loss = e_latent_loss
+        self._last_coeff_kl_loss = coeff_kl_loss
+        self._last_weighted_coeff_kl_loss = weighted_coeff_kl_loss
+        self._last_extra_bottleneck_loss = weighted_coeff_kl_loss
         self._last_bottleneck_loss = loss
 
         z_q_ste = z_e + (z_q - z_e).detach()
@@ -1904,6 +2507,10 @@ class LASER(nn.Module):
         patch_size: int = 8,
         patch_stride: int = 4,
         patch_reconstruction: str = "center_crop",
+        variational_coeffs: bool = False,
+        variational_coeff_kl_weight: float = 0.0,
+        variational_coeff_prior_std: float = 0.25,
+        variational_coeff_min_std: float = 0.01,
     ):
         super().__init__()
         self.out_tanh = bool(out_tanh)
@@ -1949,6 +2556,10 @@ class LASER(nn.Module):
             coef_quantization=coef_quantization,
             coef_mu=coef_mu,
             commitment_cost=commitment_cost,
+            variational_coeffs=variational_coeffs,
+            variational_coeff_kl_weight=variational_coeff_kl_weight,
+            variational_coeff_prior_std=variational_coeff_prior_std,
+            variational_coeff_min_std=variational_coeff_min_std,
         )
         if patch_based:
             self.bottleneck = PatchDictionaryLearningTokenized(
@@ -1970,6 +2581,9 @@ class LASER(nn.Module):
             return None
         if latent_hw is not None:
             return (int(latent_hw[0]), int(latent_hw[1]))
+        decoder_z_shape = getattr(self.decoder, "z_shape", None)
+        if isinstance(decoder_z_shape, tuple) and len(decoder_z_shape) >= 4:
+            return (int(decoder_z_shape[-2]), int(decoder_z_shape[-1]))
         if self._last_latent_hw is None:
             raise RuntimeError(
                 "Patch-based decoding requires the original latent spatial size. "
@@ -1980,7 +2594,13 @@ class LASER(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         z = self.encoder(x)
         self._remember_latent_hw(z)
-        z_q, b_loss, tokens = self.bottleneck(z)
+        bottleneck_ctx = (
+            torch.autocast(device_type=z.device.type, enabled=False)
+            if z.is_cuda and torch.is_autocast_enabled()
+            else nullcontext()
+        )
+        with bottleneck_ctx:
+            z_q, b_loss, tokens = self.bottleneck(z.float())
         recon = self.decoder(z_q)
         if self.out_tanh:
             recon = torch.tanh(recon)
@@ -2002,7 +2622,8 @@ class LASER(nn.Module):
             atoms, coeffs, _, _ = encoded
         else:
             atoms, coeffs = encoded
-        return atoms, self.clamp_sparse_coeffs(coeffs), atoms.shape[1], atoms.shape[2]
+        coeffs = self.bottleneck.project_sparse_coeffs(atoms, coeffs)
+        return atoms, coeffs, atoms.shape[1], atoms.shape[2]
 
     def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
         return self.bottleneck.clamp_sparse_coeffs(coeffs)
@@ -2202,6 +2823,11 @@ def _sample_quality_features(x: torch.Tensor) -> torch.Tensor:
     rgb_std = x_unit.std(dim=(2, 3))
     saturation = (x_unit.amax(dim=1) - x_unit.amin(dim=1)).mean(dim=(1, 2)).unsqueeze(1)
     brightness = x_unit.mean(dim=(1, 2, 3)).unsqueeze(1)
+    luma = (0.2126 * x_unit[:, 0] + 0.7152 * x_unit[:, 1] + 0.0722 * x_unit[:, 2]).reshape(B, -1)
+    luma_p10 = torch.quantile(luma, 0.10, dim=1, keepdim=True)
+    luma_p25 = torch.quantile(luma, 0.25, dim=1, keepdim=True)
+    dark_frac20 = (luma < 0.20).float().mean(dim=1, keepdim=True)
+    dark_frac30 = (luma < 0.30).float().mean(dim=1, keepdim=True)
 
     border_width = max(1, min(H, W) // 16)
     border_pixels = torch.cat([
@@ -2215,6 +2841,14 @@ def _sample_quality_features(x: torch.Tensor) -> torch.Tensor:
     else:
         center_region = x_unit
     center_pixels = center_region.reshape(B, C, -1)
+    center_luma = (
+        0.2126 * center_region[:, 0]
+        + 0.7152 * center_region[:, 1]
+        + 0.0722 * center_region[:, 2]
+    ).reshape(B, -1)
+    center_luma_p10 = torch.quantile(center_luma, 0.10, dim=1, keepdim=True)
+    center_dark_frac20 = (center_luma < 0.20).float().mean(dim=1, keepdim=True)
+    center_dark_frac30 = (center_luma < 0.30).float().mean(dim=1, keepdim=True)
     border_mean = border_pixels.mean(dim=2)
     border_std = border_pixels.std(dim=2)
     center_mean = center_pixels.mean(dim=2)
@@ -2228,7 +2862,245 @@ def _sample_quality_features(x: torch.Tensor) -> torch.Tensor:
         border_mean,
         border_std,
         border_center_gap,
+        luma_p10,
+        luma_p25,
+        dark_frac20,
+        dark_frac30,
+        center_luma_p10,
+        center_dark_frac20,
+        center_dark_frac30,
     ], dim=1)
+
+
+_SAMPLE_FEAT_BRIGHTNESS_SLICE = slice(7, 8)
+_SAMPLE_FEAT_BORDER_MEAN_SLICE = slice(8, 11)
+_SAMPLE_FEAT_BORDER_CENTER_GAP_SLICE = slice(14, 17)
+_SAMPLE_FEAT_LUMA_P10_SLICE = slice(17, 18)
+_SAMPLE_FEAT_LUMA_P25_SLICE = slice(18, 19)
+_SAMPLE_FEAT_DARK_FRAC20_SLICE = slice(19, 20)
+_SAMPLE_FEAT_DARK_FRAC30_SLICE = slice(20, 21)
+_SAMPLE_FEAT_CENTER_LUMA_P10_SLICE = slice(21, 22)
+_SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE = slice(22, 23)
+_SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE = slice(23, 24)
+
+
+def _sample_feature_center_brightness(feats: torch.Tensor) -> torch.Tensor:
+    border_mean = feats[:, _SAMPLE_FEAT_BORDER_MEAN_SLICE]
+    border_center_gap = feats[:, _SAMPLE_FEAT_BORDER_CENTER_GAP_SLICE]
+    center_mean = border_mean - border_center_gap
+    return center_mean.mean(dim=1, keepdim=True)
+
+
+def _sample_feature_low_brightness_penalty(
+    feats: torch.Tensor,
+    ref_mean: torch.Tensor,
+    ref_std: torch.Tensor,
+) -> torch.Tensor:
+    brightness = feats[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness = ref_mean[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness_std = ref_std[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE].clamp_min(1e-6)
+    global_darkness = torch.relu((ref_brightness - brightness) / ref_brightness_std)
+
+    center_brightness = _sample_feature_center_brightness(feats)
+    ref_center_brightness = _sample_feature_center_brightness(ref_mean)
+    ref_center_std = torch.sqrt(
+        ref_std[:, _SAMPLE_FEAT_BORDER_MEAN_SLICE].pow(2)
+        + ref_std[:, _SAMPLE_FEAT_BORDER_CENTER_GAP_SLICE].pow(2)
+    ).mean(dim=1, keepdim=True).clamp_min(1e-6)
+    center_darkness = torch.relu((ref_center_brightness - center_brightness) / ref_center_std)
+    luma_p10 = feats[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10 = ref_mean[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10_std = ref_std[:, _SAMPLE_FEAT_LUMA_P10_SLICE].clamp_min(1e-6)
+    luma_p10_darkness = torch.relu((ref_luma_p10 - luma_p10) / ref_luma_p10_std)
+
+    luma_p25 = feats[:, _SAMPLE_FEAT_LUMA_P25_SLICE]
+    ref_luma_p25 = ref_mean[:, _SAMPLE_FEAT_LUMA_P25_SLICE]
+    ref_luma_p25_std = ref_std[:, _SAMPLE_FEAT_LUMA_P25_SLICE].clamp_min(1e-6)
+    luma_p25_darkness = torch.relu((ref_luma_p25 - luma_p25) / ref_luma_p25_std)
+
+    dark_frac20 = feats[:, _SAMPLE_FEAT_DARK_FRAC20_SLICE]
+    ref_dark_frac20 = ref_mean[:, _SAMPLE_FEAT_DARK_FRAC20_SLICE]
+    ref_dark_frac20_std = ref_std[:, _SAMPLE_FEAT_DARK_FRAC20_SLICE].clamp_min(1e-6)
+    dark_frac20_excess = torch.relu((dark_frac20 - ref_dark_frac20) / ref_dark_frac20_std)
+
+    dark_frac30 = feats[:, _SAMPLE_FEAT_DARK_FRAC30_SLICE]
+    ref_dark_frac30 = ref_mean[:, _SAMPLE_FEAT_DARK_FRAC30_SLICE]
+    ref_dark_frac30_std = ref_std[:, _SAMPLE_FEAT_DARK_FRAC30_SLICE].clamp_min(1e-6)
+    dark_frac30_excess = torch.relu((dark_frac30 - ref_dark_frac30) / ref_dark_frac30_std)
+
+    center_luma_p10 = feats[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10 = ref_mean[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10_std = ref_std[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE].clamp_min(1e-6)
+    center_luma_p10_darkness = torch.relu((ref_center_luma_p10 - center_luma_p10) / ref_center_luma_p10_std)
+
+    center_dark_frac20 = feats[:, _SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE]
+    ref_center_dark_frac20 = ref_mean[:, _SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE]
+    ref_center_dark_frac20_std = ref_std[:, _SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE].clamp_min(1e-6)
+    center_dark_frac20_excess = torch.relu((center_dark_frac20 - ref_center_dark_frac20) / ref_center_dark_frac20_std)
+
+    center_dark_frac30 = feats[:, _SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE]
+    ref_center_dark_frac30 = ref_mean[:, _SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE]
+    ref_center_dark_frac30_std = ref_std[:, _SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE].clamp_min(1e-6)
+    center_dark_frac30_excess = torch.relu((center_dark_frac30 - ref_center_dark_frac30) / ref_center_dark_frac30_std)
+
+    penalty_terms = torch.cat([
+        global_darkness,
+        center_darkness,
+        luma_p10_darkness,
+        luma_p25_darkness,
+        dark_frac20_excess,
+        dark_frac30_excess,
+        center_luma_p10_darkness,
+        center_dark_frac20_excess,
+        center_dark_frac30_excess,
+    ], dim=1)
+    return penalty_terms.mean(dim=1)
+
+
+def _sample_feature_high_brightness_penalty(
+    feats: torch.Tensor,
+    ref_mean: torch.Tensor,
+    ref_std: torch.Tensor,
+) -> torch.Tensor:
+    brightness = feats[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness = ref_mean[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness_std = ref_std[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE].clamp_min(1e-6)
+    global_brightness = torch.relu((brightness - ref_brightness) / ref_brightness_std)
+
+    center_brightness = _sample_feature_center_brightness(feats)
+    ref_center_brightness = _sample_feature_center_brightness(ref_mean)
+    ref_center_std = torch.sqrt(
+        ref_std[:, _SAMPLE_FEAT_BORDER_MEAN_SLICE].pow(2)
+        + ref_std[:, _SAMPLE_FEAT_BORDER_CENTER_GAP_SLICE].pow(2)
+    ).mean(dim=1, keepdim=True).clamp_min(1e-6)
+    center_brightness_excess = torch.relu((center_brightness - ref_center_brightness) / ref_center_std)
+
+    luma_p10 = feats[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10 = ref_mean[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10_std = ref_std[:, _SAMPLE_FEAT_LUMA_P10_SLICE].clamp_min(1e-6)
+    luma_p10_brightness = torch.relu((luma_p10 - ref_luma_p10) / ref_luma_p10_std)
+
+    luma_p25 = feats[:, _SAMPLE_FEAT_LUMA_P25_SLICE]
+    ref_luma_p25 = ref_mean[:, _SAMPLE_FEAT_LUMA_P25_SLICE]
+    ref_luma_p25_std = ref_std[:, _SAMPLE_FEAT_LUMA_P25_SLICE].clamp_min(1e-6)
+    luma_p25_brightness = torch.relu((luma_p25 - ref_luma_p25) / ref_luma_p25_std)
+
+    center_luma_p10 = feats[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10 = ref_mean[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10_std = ref_std[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE].clamp_min(1e-6)
+    center_luma_p10_brightness = torch.relu(
+        (center_luma_p10 - ref_center_luma_p10) / ref_center_luma_p10_std
+    )
+
+    penalty_terms = torch.cat([
+        global_brightness,
+        center_brightness_excess,
+        luma_p10_brightness,
+        luma_p25_brightness,
+        center_luma_p10_brightness,
+    ], dim=1)
+    return penalty_terms.mean(dim=1)
+
+
+def _sample_feature_dark_rejection_mask(
+    feats: torch.Tensor,
+    ref_mean: torch.Tensor,
+    ref_std: torch.Tensor,
+    reject_dark_z: float,
+) -> torch.Tensor:
+    if float(reject_dark_z) <= 0.0:
+        return torch.ones(feats.size(0), device=feats.device, dtype=torch.bool)
+
+    z = float(reject_dark_z)
+    brightness = feats[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness = ref_mean[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness_std = ref_std[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE].clamp_min(1e-6)
+
+    center_brightness = _sample_feature_center_brightness(feats)
+    ref_center_brightness = _sample_feature_center_brightness(ref_mean)
+    ref_center_std = torch.sqrt(
+        ref_std[:, _SAMPLE_FEAT_BORDER_MEAN_SLICE].pow(2)
+        + ref_std[:, _SAMPLE_FEAT_BORDER_CENTER_GAP_SLICE].pow(2)
+    ).mean(dim=1, keepdim=True).clamp_min(1e-6)
+
+    luma_p10 = feats[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10 = ref_mean[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10_std = ref_std[:, _SAMPLE_FEAT_LUMA_P10_SLICE].clamp_min(1e-6)
+
+    center_luma_p10 = feats[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10 = ref_mean[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10_std = ref_std[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE].clamp_min(1e-6)
+
+    dark_frac20 = feats[:, _SAMPLE_FEAT_DARK_FRAC20_SLICE]
+    ref_dark_frac20 = ref_mean[:, _SAMPLE_FEAT_DARK_FRAC20_SLICE]
+    ref_dark_frac20_std = ref_std[:, _SAMPLE_FEAT_DARK_FRAC20_SLICE].clamp_min(1e-6)
+
+    dark_frac30 = feats[:, _SAMPLE_FEAT_DARK_FRAC30_SLICE]
+    ref_dark_frac30 = ref_mean[:, _SAMPLE_FEAT_DARK_FRAC30_SLICE]
+    ref_dark_frac30_std = ref_std[:, _SAMPLE_FEAT_DARK_FRAC30_SLICE].clamp_min(1e-6)
+
+    center_dark_frac20 = feats[:, _SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE]
+    ref_center_dark_frac20 = ref_mean[:, _SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE]
+    ref_center_dark_frac20_std = ref_std[:, _SAMPLE_FEAT_CENTER_DARK_FRAC20_SLICE].clamp_min(1e-6)
+
+    center_dark_frac30 = feats[:, _SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE]
+    ref_center_dark_frac30 = ref_mean[:, _SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE]
+    ref_center_dark_frac30_std = ref_std[:, _SAMPLE_FEAT_CENTER_DARK_FRAC30_SLICE].clamp_min(1e-6)
+
+    checks = torch.cat([
+        brightness >= (ref_brightness - z * ref_brightness_std),
+        center_brightness >= (ref_center_brightness - z * ref_center_std),
+        luma_p10 >= (ref_luma_p10 - z * ref_luma_p10_std),
+        center_luma_p10 >= (ref_center_luma_p10 - z * ref_center_luma_p10_std),
+        dark_frac20 <= (ref_dark_frac20 + z * ref_dark_frac20_std),
+        dark_frac30 <= (ref_dark_frac30 + z * ref_dark_frac30_std),
+        center_dark_frac20 <= (ref_center_dark_frac20 + z * ref_center_dark_frac20_std),
+        center_dark_frac30 <= (ref_center_dark_frac30 + z * ref_center_dark_frac30_std),
+    ], dim=1)
+    return checks.all(dim=1)
+
+
+def _sample_feature_bright_rejection_mask(
+    feats: torch.Tensor,
+    ref_mean: torch.Tensor,
+    ref_std: torch.Tensor,
+    reject_bright_z: float,
+) -> torch.Tensor:
+    if float(reject_bright_z) <= 0.0:
+        return torch.ones(feats.size(0), device=feats.device, dtype=torch.bool)
+
+    z = float(reject_bright_z)
+    brightness = feats[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness = ref_mean[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE]
+    ref_brightness_std = ref_std[:, _SAMPLE_FEAT_BRIGHTNESS_SLICE].clamp_min(1e-6)
+
+    center_brightness = _sample_feature_center_brightness(feats)
+    ref_center_brightness = _sample_feature_center_brightness(ref_mean)
+    ref_center_std = torch.sqrt(
+        ref_std[:, _SAMPLE_FEAT_BORDER_MEAN_SLICE].pow(2)
+        + ref_std[:, _SAMPLE_FEAT_BORDER_CENTER_GAP_SLICE].pow(2)
+    ).mean(dim=1, keepdim=True).clamp_min(1e-6)
+
+    luma_p10 = feats[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10 = ref_mean[:, _SAMPLE_FEAT_LUMA_P10_SLICE]
+    ref_luma_p10_std = ref_std[:, _SAMPLE_FEAT_LUMA_P10_SLICE].clamp_min(1e-6)
+
+    luma_p25 = feats[:, _SAMPLE_FEAT_LUMA_P25_SLICE]
+    ref_luma_p25 = ref_mean[:, _SAMPLE_FEAT_LUMA_P25_SLICE]
+    ref_luma_p25_std = ref_std[:, _SAMPLE_FEAT_LUMA_P25_SLICE].clamp_min(1e-6)
+
+    center_luma_p10 = feats[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10 = ref_mean[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE]
+    ref_center_luma_p10_std = ref_std[:, _SAMPLE_FEAT_CENTER_LUMA_P10_SLICE].clamp_min(1e-6)
+
+    checks = torch.cat([
+        brightness <= (ref_brightness + z * ref_brightness_std),
+        center_brightness <= (ref_center_brightness + z * ref_center_std),
+        luma_p10 <= (ref_luma_p10 + z * ref_luma_p10_std),
+        luma_p25 <= (ref_luma_p25 + z * ref_luma_p25_std),
+        center_luma_p10 <= (ref_center_luma_p10 + z * ref_center_luma_p10_std),
+    ], dim=1)
+    return checks.all(dim=1)
 
 
 @torch.no_grad()
@@ -2271,36 +3143,97 @@ def _compute_stage2_sample_reference_stats(
 
 
 @torch.no_grad()
-def _select_best_stage2_samples(
+def _select_best_stage2_sample_indices(
     imgs: torch.Tensor,
     keep: int,
     reference_stats: Optional[dict],
+    quality_weight: float = 0.15,
+    brightness_weight: float = 0.0,
+    overbright_weight: float = 0.0,
+    reject_dark_z: float = 0.0,
+    reject_bright_z: float = 0.0,
+    selection_mode: str = "diverse",
+    sort_by_quality: bool = False,
 ) -> torch.Tensor:
-    """Select a high-quality but diverse subset of decoded stage-2 candidates."""
+    """Select indices for a reranked subset of decoded stage-2 candidates."""
     keep = min(int(keep), int(imgs.size(0)))
     if keep <= 0 or imgs.size(0) <= keep:
-        return imgs[:keep]
+        return torch.arange(keep, device=imgs.device, dtype=torch.long)
+    selection_mode = str(selection_mode).strip().lower()
+    if selection_mode not in {"diverse", "quality_only"}:
+        raise ValueError(f"Unsupported selection_mode={selection_mode!r}")
 
     feats = _sample_quality_features(imgs)
+    candidate_mask = None
     if reference_stats is None:
         quality = torch.zeros(imgs.size(0), device=imgs.device, dtype=feats.dtype)
     else:
         ref_mean = reference_stats["mean"].to(device=imgs.device, dtype=feats.dtype)
         ref_std = reference_stats["std"].to(device=imgs.device, dtype=feats.dtype)
         quality = (((feats - ref_mean) / ref_std) ** 2).mean(dim=1)
+        if float(brightness_weight) > 0.0:
+            quality = quality + float(brightness_weight) * _sample_feature_low_brightness_penalty(
+                feats,
+                ref_mean=ref_mean,
+                ref_std=ref_std,
+            )
+        if float(overbright_weight) > 0.0:
+            quality = quality + float(overbright_weight) * _sample_feature_high_brightness_penalty(
+                feats,
+                ref_mean=ref_mean,
+                ref_std=ref_std,
+            )
+        if float(reject_dark_z) > 0.0 or float(reject_bright_z) > 0.0:
+            candidate_mask = torch.ones(imgs.size(0), device=imgs.device, dtype=torch.bool)
+            if float(reject_dark_z) > 0.0:
+                candidate_mask = candidate_mask & _sample_feature_dark_rejection_mask(
+                    feats,
+                    ref_mean=ref_mean,
+                    ref_std=ref_std,
+                    reject_dark_z=float(reject_dark_z),
+                )
+            if float(reject_bright_z) > 0.0:
+                candidate_mask = candidate_mask & _sample_feature_bright_rejection_mask(
+                    feats,
+                    ref_mean=ref_mean,
+                    ref_std=ref_std,
+                    reject_bright_z=float(reject_bright_z),
+                )
+            if int(candidate_mask.sum().item()) < keep:
+                candidate_mask = None
 
-    pool_size = min(int(imgs.size(0)), max(keep, 4 * keep))
-    if pool_size < imgs.size(0):
-        pool = torch.topk(-quality, k=pool_size).indices
-        pool_feats = feats.index_select(0, pool)
-        pool_quality = quality.index_select(0, pool)
+    if candidate_mask is not None:
+        candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
     else:
-        pool = torch.arange(imgs.size(0), device=imgs.device)
-        pool_feats = feats
-        pool_quality = quality
+        candidate_indices = torch.arange(imgs.size(0), device=imgs.device)
+    candidate_quality = quality.index_select(0, candidate_indices)
+    candidate_feats = feats.index_select(0, candidate_indices)
+
+    if selection_mode == "quality_only":
+        order = torch.argsort(candidate_quality, dim=0)
+        selected_idx = candidate_indices.index_select(0, order[:keep])
+        if sort_by_quality:
+            return selected_idx
+        return selected_idx
+
+    pool_size = min(int(candidate_indices.numel()), max(keep, 4 * keep))
+    if pool_size < int(candidate_indices.numel()):
+        rel_pool = torch.topk(-candidate_quality, k=pool_size).indices
+        pool = candidate_indices.index_select(0, rel_pool)
+        pool_feats = candidate_feats.index_select(0, rel_pool)
+        pool_quality = candidate_quality.index_select(0, rel_pool)
+    else:
+        pool = candidate_indices
+        pool_feats = candidate_feats
+        pool_quality = candidate_quality
 
     if pool.numel() <= keep:
-        return imgs.index_select(0, pool[:keep])
+        selected_idx = pool[:keep]
+        if sort_by_quality:
+            selected_quality = quality.index_select(0, selected_idx)
+            order = torch.argsort(selected_quality, dim=0)
+            selected_idx = selected_idx.index_select(0, order)
+        return selected_idx
 
     quality_norm = pool_quality - pool_quality.min()
     quality_norm = quality_norm / quality_norm.max().clamp_min(1e-6)
@@ -2320,13 +3253,46 @@ def _select_best_stage2_samples(
         feat_dist = ((pool_feats - pool_feats[last:last + 1]) ** 2).mean(dim=1)
         min_feat_dist = torch.minimum(min_feat_dist, feat_dist)
         diversity_norm = min_feat_dist / min_feat_dist.max().clamp_min(1e-6)
-        score = diversity_norm - 0.15 * quality_norm
+        score = diversity_norm - float(quality_weight) * quality_norm
         score = score.masked_fill(selected_mask, float('-inf'))
         next_idx = int(torch.argmax(score).item())
         selected.append(next_idx)
         selected_mask[next_idx] = True
 
     selected_idx = pool.index_select(0, torch.tensor(selected, device=pool.device, dtype=torch.long))
+    if sort_by_quality:
+        selected_quality = quality.index_select(0, selected_idx)
+        order = torch.argsort(selected_quality, dim=0)
+        selected_idx = selected_idx.index_select(0, order)
+    return selected_idx
+
+
+@torch.no_grad()
+def _select_best_stage2_samples(
+    imgs: torch.Tensor,
+    keep: int,
+    reference_stats: Optional[dict],
+    quality_weight: float = 0.15,
+    brightness_weight: float = 0.0,
+    overbright_weight: float = 0.0,
+    reject_dark_z: float = 0.0,
+    reject_bright_z: float = 0.0,
+    selection_mode: str = "diverse",
+    sort_by_quality: bool = False,
+) -> torch.Tensor:
+    """Select a reranked subset of decoded stage-2 candidates."""
+    selected_idx = _select_best_stage2_sample_indices(
+        imgs,
+        keep=keep,
+        reference_stats=reference_stats,
+        quality_weight=quality_weight,
+        brightness_weight=brightness_weight,
+        overbright_weight=overbright_weight,
+        reject_dark_z=reject_dark_z,
+        reject_bright_z=reject_bright_z,
+        selection_mode=selection_mode,
+        sort_by_quality=sort_by_quality,
+    )
     return imgs.index_select(0, selected_idx)
 
 
@@ -2394,6 +3360,29 @@ def _decode_stage2_candidates_in_chunks(
             decode_batch_size = next_decode_batch_size
 
 
+def _reconstruct_stage2_sparse_latent(
+    ae: LASER,
+    atoms: torch.Tensor,
+    coeffs: torch.Tensor,
+) -> torch.Tensor:
+    """Reconstruct stage-2 sparse latents, including patch-based bottlenecks.
+
+    This helper must stay differentiable for recon-based stage-2 losses, so the
+    caller is responsible for wrapping target-only paths in ``torch.no_grad()``.
+    """
+    ae_module = _unwrap_module(ae)
+    coeffs = ae_module.clamp_sparse_coeffs(coeffs)
+    if isinstance(ae_module.bottleneck, PatchDictionaryLearningTokenized):
+        latent_hw = ae_module._resolve_patch_latent_hw()
+        return ae_module.bottleneck._reconstruct_sparse(
+            atoms,
+            coeffs,
+            int(latent_hw[0]),
+            int(latent_hw[1]),
+        )
+    return ae_module.bottleneck._reconstruct_sparse(atoms, coeffs)
+
+
 def _batch_psnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Average PSNR over a batch of images in [0, 1]."""
     mse = F.mse_loss(x, y, reduction="none").mean(dim=(1, 2, 3))
@@ -2402,6 +3391,10 @@ def _batch_psnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 def _batch_ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Average SSIM over a batch of images in [0, 1] using a Gaussian window."""
+    # SSIM is a logging/eval metric; run it in fp32 so AMP bf16/fp16 activations
+    # do not trip conv2d dtype mismatches against the Gaussian kernel.
+    x = x.to(dtype=torch.float32)
+    y = y.to(dtype=torch.float32)
     _, channels, height, width = x.shape
     window_size = min(11, height, width)
     if window_size % 2 == 0:
@@ -2558,6 +3551,212 @@ def _compute_reconstruction_fid(
     return _frechet_distance_from_features(torch.cat(real_feats, dim=0), torch.cat(fake_feats, dim=0))
 
 
+@torch.no_grad()
+def _compute_image_fid_from_batches(
+    real_batches: Iterable[torch.Tensor],
+    fake_batches: Iterable[torch.Tensor],
+    device: torch.device,
+    max_items: int,
+) -> Optional[float]:
+    """Compute FID between two image streams in [-1, 1]."""
+    if max_items <= 1:
+        return None
+
+    fid_metric = _get_rfid_metric(device, feature=64)
+    if fid_metric is not None:
+        seen_real = 0
+        for real_batch in real_batches:
+            real_batch = real_batch.to(device)
+            keep = min(int(real_batch.size(0)), max_items - seen_real)
+            if keep <= 0:
+                break
+            fid_metric.update(_to_uint8_images(real_batch[:keep]).to(device), real=True)
+            seen_real += keep
+            if seen_real >= max_items:
+                break
+
+        seen_fake = 0
+        for fake_batch in fake_batches:
+            fake_batch = fake_batch.to(device)
+            keep = min(int(fake_batch.size(0)), max_items - seen_fake)
+            if keep <= 0:
+                break
+            fid_metric.update(_to_uint8_images(fake_batch[:keep]).to(device), real=False)
+            seen_fake += keep
+            if seen_fake >= max_items:
+                break
+
+        if min(seen_real, seen_fake) <= 1:
+            return None
+        return float(fid_metric.compute().detach().cpu().item())
+
+    model = _get_rfid_model(device)
+    real_feats = []
+    fake_feats = []
+    seen_real = 0
+    seen_fake = 0
+
+    for real_batch in real_batches:
+        real_batch = real_batch.to(device)
+        keep = min(int(real_batch.size(0)), max_items - seen_real)
+        if keep <= 0:
+            break
+        real_feats.append(_extract_rfid_features(model, real_batch[:keep]).cpu())
+        seen_real += keep
+        if seen_real >= max_items:
+            break
+
+    for fake_batch in fake_batches:
+        fake_batch = fake_batch.to(device)
+        keep = min(int(fake_batch.size(0)), max_items - seen_fake)
+        if keep <= 0:
+            break
+        fake_feats.append(_extract_rfid_features(model, fake_batch[:keep]).cpu())
+        seen_fake += keep
+        if seen_fake >= max_items:
+            break
+
+    if min(seen_real, seen_fake) <= 1:
+        return None
+    return _frechet_distance_from_features(torch.cat(real_feats, dim=0), torch.cat(fake_feats, dim=0))
+
+
+@torch.no_grad()
+def _compute_stage2_sample_fid(
+    transformer: nn.Module,
+    ae: LASER,
+    loader: Optional[DataLoader],
+    device: torch.device,
+    max_items: int,
+    H: int,
+    W: int,
+    D: int,
+    sample_batch_size: int = 32,
+    sample_candidate_factor: int = 4,
+    sample_temperature: float = 1.0,
+    sample_top_k: Optional[int] = None,
+    sample_coeff_temperature: Optional[float] = None,
+    sample_coeff_mode: str = "gaussian",
+    sample_reference_stats: Optional[dict] = None,
+    sample_selection_quality_weight: float = 1.0,
+    sample_brightness_weight: float = 1.0,
+    sample_overbright_weight: float = 1.0,
+    sample_reject_dark_z: float = 1.5,
+    sample_reject_bright_z: float = 1.5,
+    sample_sort_by_quality: bool = True,
+    sample_image_size: Optional[int] = None,
+) -> Optional[float]:
+    """Compute FID between validation images and unconditional stage-2 samples."""
+    if loader is None or max_items <= 1:
+        return None
+
+    real_valued = bool(transformer.real_valued_coeffs)
+    sample_batch_size = max(1, int(sample_batch_size))
+    sample_candidate_factor = max(1, int(sample_candidate_factor))
+    base_candidate_batch_size = sample_batch_size
+    if sample_reference_stats is not None:
+        base_candidate_batch_size = max(sample_batch_size, sample_batch_size * sample_candidate_factor)
+    decode_batch_size = max(1, min(8, sample_batch_size))
+
+    transformer_was_training = transformer.training
+    ae_was_training = ae.training
+    ae_device = next(ae.parameters()).device
+    moved_ae = ae_device != device
+
+    transformer.eval()
+    ae.eval()
+    ae.requires_grad_(False)
+    if moved_ae:
+        ae.to(device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _iter_real_batches():
+        seen = 0
+        for x, _ in tqdm(loader, desc="[Stage2] compute FID real", leave=False, dynamic_ncols=True):
+            keep = min(int(x.size(0)), max_items - seen)
+            if keep <= 0:
+                break
+            yield x[:keep]
+            seen += keep
+            if seen >= max_items:
+                break
+
+    def _iter_fake_batches():
+        produced = 0
+        while produced < max_items:
+            keep = min(sample_batch_size, max_items - produced)
+            candidate_batch_size = max(keep, base_candidate_batch_size)
+            if real_valued:
+                atoms_gen, coeffs_gen = transformer.generate(
+                    batch_size=candidate_batch_size,
+                    temperature=sample_temperature,
+                    top_k=sample_top_k,
+                    coeff_temperature=sample_coeff_temperature,
+                    coeff_sample_mode=sample_coeff_mode,
+                    show_progress=False,
+                )
+                coeffs_gen = _clamp_generated_sparse_coeffs_for_decode(ae, coeffs_gen)
+                atoms_gen = atoms_gen.view(-1, H, W, D)
+                coeffs_gen = coeffs_gen.view(-1, H, W, D)
+                imgs = _decode_stage2_candidates_in_chunks(
+                    ae,
+                    atoms_gen,
+                    coeffs=coeffs_gen,
+                    decode_batch_size=decode_batch_size,
+                )
+            else:
+                tokens_gen = transformer.generate(
+                    batch_size=candidate_batch_size,
+                    temperature=sample_temperature,
+                    top_k=sample_top_k,
+                    show_progress=False,
+                ).view(-1, H, W, D)
+                imgs = _decode_stage2_candidates_in_chunks(
+                    ae,
+                    tokens_gen,
+                    decode_batch_size=decode_batch_size,
+                )
+            imgs = _select_best_stage2_samples(
+                imgs,
+                keep=keep,
+                reference_stats=sample_reference_stats,
+                quality_weight=sample_selection_quality_weight,
+                brightness_weight=sample_brightness_weight,
+                overbright_weight=sample_overbright_weight,
+                reject_dark_z=sample_reject_dark_z,
+                reject_bright_z=sample_reject_bright_z,
+                sort_by_quality=sample_sort_by_quality,
+            )
+            if sample_image_size is not None and int(sample_image_size) > 0:
+                if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
+                    imgs = F.interpolate(
+                        imgs,
+                        size=(int(sample_image_size), int(sample_image_size)),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+            produced += int(imgs.size(0))
+            yield imgs
+
+    try:
+        return _compute_image_fid_from_batches(
+            real_batches=_iter_real_batches(),
+            fake_batches=_iter_fake_batches(),
+            device=device,
+            max_items=max_items,
+        )
+    finally:
+        if moved_ae:
+            ae.to(ae_device)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        if transformer_was_training:
+            transformer.train()
+        if ae_was_training:
+            ae.train()
+
+
 def _maybe_load_wandb_api_key() -> Optional[str]:
     api_key = os.environ.get("WANDB_API_KEY")
     if api_key:
@@ -2605,13 +3804,20 @@ def _init_wandb(args) -> Optional[object]:
         except Exception as exc:
             print(f"[W&B] login failed ({type(exc).__name__}: {exc}); continuing to init with existing env.")
     try:
-        run = wandb.init(
+        run_id = _resolve_run_id(getattr(args, "run_id", None), getattr(args, "launch_timestamp", None))
+        init_kwargs = dict(
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=args.wandb_name,
             dir=args.wandb_dir,
             mode=args.wandb_mode,
             config=dict(vars(args)),
+        )
+        if run_id:
+            init_kwargs["id"] = run_id
+            init_kwargs["resume"] = "allow"
+        run = wandb.init(
+            **init_kwargs,
         )
         _WANDB_LOG_STEP = 0
         _WANDB_DISABLE_REASON = None
@@ -2732,6 +3938,8 @@ def train_stage1_ae(
     lr: float,
     bottleneck_weight: float,
     grad_clip: float,
+    stage1_amp: bool,
+    stage1_amp_dtype: str,
     out_dir: str,
     rfid_num_samples: int = 0,
     lr_schedule: str = "cosine",
@@ -2758,9 +3966,11 @@ def train_stage1_ae(
     coherence_weight_start: float = float("nan"),
     coherence_warmup_epochs: int = 0,
     coherence_margin: float = 0.0,
+    checkpoint_every_steps: int = 0,
     train_sampler: Optional[DistributedSampler] = None,
     is_main_process: bool = True,
     wandb_run: Optional[object] = None,
+    artifact_tag: Optional[str] = None,
 ):
     """Train stage 1 with optional DDP and rank-0-only artifacts."""
     ae_module = _unwrap_module(ae)
@@ -2794,6 +4004,25 @@ def train_stage1_ae(
     rfid_warned = False
     loss_ema: Optional[float] = None
     commitment_beta = float(getattr(ae_module.bottleneck, "commitment_cost", 0.25))
+    amp_dtype_name = str(stage1_amp_dtype).strip().lower()
+    if amp_dtype_name not in {"auto", "float16", "bfloat16"}:
+        raise ValueError(f"Unsupported stage1_amp_dtype: {stage1_amp_dtype!r}")
+    amp_enabled = bool(stage1_amp) and device.type == "cuda"
+    if amp_dtype_name == "auto":
+        amp_dtype = torch.bfloat16 if (amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+    elif amp_dtype_name == "bfloat16":
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+    scaler_enabled = amp_enabled and amp_dtype == torch.float16
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler(device="cuda", enabled=scaler_enabled)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+    if amp_enabled and is_main_process:
+        amp_label = "bfloat16" if amp_dtype == torch.bfloat16 else "float16"
+        print(f"[Stage1] using AMP ({amp_label})")
+    resume_checkpoint_path = Path(out_dir) / "ae_resume_latest.pt"
 
     def _stage1_loss_weight(
         epoch_progress: float,
@@ -2870,28 +4099,56 @@ def train_stage1_ae(
             else:
                 opt.param_groups[0]["lr"] = current_lr
                 opt.param_groups[1]["lr"] = current_dict_lr
-            x = _nan_to_num_tensor(x.to(device))
-            recon, b_loss, _ = ae(x)
-            recon = _nan_to_num_tensor(recon)
-            b_loss = _nan_to_num_tensor(b_loss)
-            dict_loss = getattr(ae_module.bottleneck, "_last_dl_latent_loss", None)
-            commitment_loss = getattr(ae_module.bottleneck, "_last_e_latent_loss", None)
-            if dict_loss is None or commitment_loss is None:
-                latent_mse = b_loss / max(1.0 + commitment_beta, 1e-8)
-                dict_loss = latent_mse
-                commitment_loss = latent_mse
-            dict_loss = _nan_to_num_tensor(dict_loss)
-            commitment_loss = _nan_to_num_tensor(commitment_loss)
-            recon_loss = F.mse_loss(recon, x)
-            coherence_loss = _dictionary_coherence_penalty(
-                dict_param,
-                margin=coherence_margin,
-                eps=dict_eps,
+            x = _nan_to_num_tensor(x.to(device, non_blocking=True))
+            autocast_ctx = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_enabled
+                else nullcontext()
             )
-            weighted_dict_loss = float(current_dict_loss_weight) * dict_loss
-            weighted_commitment_loss = float(current_commitment_loss_weight) * commitment_loss
-            weighted_coherence_loss = float(current_coherence_weight) * coherence_loss
-            loss = recon_loss + weighted_dict_loss + weighted_commitment_loss + weighted_coherence_loss
+            with autocast_ctx:
+                recon, b_loss, _ = ae(x)
+                recon = _nan_to_num_tensor(recon)
+                b_loss = _nan_to_num_tensor(b_loss)
+                dict_loss = getattr(ae_module.bottleneck, "_last_dl_latent_loss", None)
+                commitment_loss = getattr(ae_module.bottleneck, "_last_e_latent_loss", None)
+                extra_bottleneck_loss = getattr(ae_module.bottleneck, "_last_extra_bottleneck_loss", None)
+                coeff_kl_loss = getattr(ae_module.bottleneck, "_last_coeff_kl_loss", None)
+                coeff_posterior_std = getattr(ae_module.bottleneck, "_last_coeff_posterior_std", None)
+                coeff_prior_std = getattr(ae_module.bottleneck, "_last_coeff_prior_std", None)
+                if dict_loss is None or commitment_loss is None:
+                    latent_mse = b_loss / max(1.0 + commitment_beta, 1e-8)
+                    dict_loss = latent_mse
+                    commitment_loss = latent_mse
+                if extra_bottleneck_loss is None:
+                    extra_bottleneck_loss = x.new_zeros(())
+                if coeff_kl_loss is None:
+                    coeff_kl_loss = x.new_zeros(())
+                if coeff_posterior_std is None:
+                    coeff_posterior_std = x.new_zeros(())
+                if coeff_prior_std is None:
+                    coeff_prior_std = x.new_zeros(())
+                dict_loss = _nan_to_num_tensor(dict_loss)
+                commitment_loss = _nan_to_num_tensor(commitment_loss)
+                extra_bottleneck_loss = _nan_to_num_tensor(extra_bottleneck_loss)
+                coeff_kl_loss = _nan_to_num_tensor(coeff_kl_loss)
+                coeff_posterior_std = _nan_to_num_tensor(coeff_posterior_std)
+                coeff_prior_std = _nan_to_num_tensor(coeff_prior_std)
+                recon_loss = F.mse_loss(recon, x)
+                coherence_loss = _dictionary_coherence_penalty(
+                    dict_param,
+                    margin=coherence_margin,
+                    eps=dict_eps,
+                )
+                weighted_dict_loss = float(current_dict_loss_weight) * dict_loss
+                weighted_commitment_loss = float(current_commitment_loss_weight) * commitment_loss
+                weighted_coherence_loss = float(current_coherence_weight) * coherence_loss
+                loss = (
+                    recon_loss
+                    + weighted_dict_loss
+                    + weighted_commitment_loss
+                    + weighted_coherence_loss
+                    + extra_bottleneck_loss
+                )
 
             loss_finite_local = bool(torch.isfinite(loss).item())
             if dist.is_available() and dist.is_initialized():
@@ -2941,7 +4198,13 @@ def train_stage1_ae(
             opt.zero_grad(set_to_none=True)
             if dict_opt is not None:
                 dict_opt.zero_grad(set_to_none=True)
-            loss.backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                if dict_opt is not None:
+                    scaler.unscale_(dict_opt)
+            else:
+                loss.backward()
             dict_before_step = F.normalize(dict_param.detach(), p=2, dim=0, eps=dict_eps)
             if dict_param.grad is None:
                 dict_grad_norm_raw = torch.zeros((), device=device)
@@ -2982,9 +4245,15 @@ def train_stage1_ae(
                     print(f"[Stage1] Warning: non-finite gradients at step {global_step + 1}, sanitized before optimizer step")
                 if dict_param.grad is not None:
                     dict_grad_norm_postclip = torch.linalg.vector_norm(dict_param.grad.detach())
-            opt.step()
-            if dict_opt is not None:
-                dict_opt.step()
+            if scaler.is_enabled():
+                scaler.step(opt)
+                if dict_opt is not None:
+                    scaler.step(dict_opt)
+                scaler.update()
+            else:
+                opt.step()
+                if dict_opt is not None:
+                    dict_opt.step()
 
             # Keep dictionary atoms normalized after each optimizer step.
             _normalize_dictionary_in_place(ae_module.bottleneck.dictionary, eps=dict_eps)
@@ -3025,6 +4294,10 @@ def train_stage1_ae(
             weighted_dict_log = _distributed_mean(weighted_dict_loss)
             weighted_commitment_log = _distributed_mean(weighted_commitment_loss)
             weighted_coherence_log = _distributed_mean(weighted_coherence_loss)
+            extra_bottleneck_log = _distributed_mean(extra_bottleneck_loss)
+            coeff_kl_log = _distributed_mean(coeff_kl_loss)
+            coeff_posterior_std_log = _distributed_mean(coeff_posterior_std)
+            coeff_prior_std_log = _distributed_mean(coeff_prior_std)
             latent_mse_log = _distributed_mean(0.5 * (dict_loss + commitment_loss))
             dict_grad_raw_log = _distributed_mean(dict_grad_norm_raw)
             dict_grad_preclip_log = _distributed_mean(dict_grad_norm_preclip)
@@ -3062,6 +4335,13 @@ def train_stage1_ae(
                         "stage1/weighted_dict_loss": float(weighted_dict_log.item()),
                         "stage1/weighted_commitment_loss": float(weighted_commitment_log.item()),
                         "stage1/weighted_coherence_loss": float(weighted_coherence_log.item()),
+                        "stage1/extra_bottleneck_loss": float(extra_bottleneck_log.item()),
+                        "stage1/coeff_kl_loss": float(coeff_kl_log.item()),
+                        "stage1/coeff_posterior_std": float(coeff_posterior_std_log.item()),
+                        "stage1/coeff_prior_std": float(coeff_prior_std_log.item()),
+                        "stage1/variational_coeff_kl_weight": float(
+                            getattr(ae_module.bottleneck, "variational_coeff_kl_weight", 0.0)
+                        ),
                         "stage1/effective_commitment": float(current_commitment_loss_weight),
                         "stage1/dict_lr": float(current_dict_lr),
                         "stage1/dict_grad_norm_raw": float(dict_grad_raw_log.item()),
@@ -3078,6 +4358,8 @@ def train_stage1_ae(
                     step_metric="stage1/step",
                     step_value=global_step,
                 )
+                if checkpoint_every_steps > 0 and (step_idx + 1) % checkpoint_every_steps == 0:
+                    _save_module_checkpoint_with_tag(ae_module, resume_checkpoint_path, artifact_tag)
 
         # Validation
         ae.eval()
@@ -3089,20 +4371,35 @@ def train_stage1_ae(
         val_count = torch.zeros(1, device=device)
         with torch.no_grad():
             for x, _ in val_loader:
-                x = _nan_to_num_tensor(x.to(device))
-                recon, b_loss, _ = ae(x)
-                recon = _nan_to_num_tensor(recon)
-                b_loss = _nan_to_num_tensor(b_loss)
-                dict_loss = getattr(ae_module.bottleneck, "_last_dl_latent_loss", None)
-                commitment_loss = getattr(ae_module.bottleneck, "_last_e_latent_loss", None)
-                if dict_loss is None or commitment_loss is None:
-                    latent_mse = b_loss / max(1.0 + commitment_beta, 1e-8)
-                    dict_loss = latent_mse
-                    commitment_loss = latent_mse
-                dict_loss = _nan_to_num_tensor(dict_loss)
-                commitment_loss = _nan_to_num_tensor(commitment_loss)
-                recon_loss = F.mse_loss(recon, x)
-                loss = recon_loss + float(current_dict_loss_weight) * dict_loss + float(current_commitment_loss_weight) * commitment_loss
+                x = _nan_to_num_tensor(x.to(device, non_blocking=True))
+                autocast_ctx = (
+                    torch.autocast(device_type=device.type, dtype=amp_dtype)
+                    if amp_enabled
+                    else nullcontext()
+                )
+                with autocast_ctx:
+                    recon, b_loss, _ = ae(x)
+                    recon = _nan_to_num_tensor(recon)
+                    b_loss = _nan_to_num_tensor(b_loss)
+                    dict_loss = getattr(ae_module.bottleneck, "_last_dl_latent_loss", None)
+                    commitment_loss = getattr(ae_module.bottleneck, "_last_e_latent_loss", None)
+                    extra_bottleneck_loss = getattr(ae_module.bottleneck, "_last_extra_bottleneck_loss", None)
+                    if dict_loss is None or commitment_loss is None:
+                        latent_mse = b_loss / max(1.0 + commitment_beta, 1e-8)
+                        dict_loss = latent_mse
+                        commitment_loss = latent_mse
+                    if extra_bottleneck_loss is None:
+                        extra_bottleneck_loss = x.new_zeros(())
+                    dict_loss = _nan_to_num_tensor(dict_loss)
+                    commitment_loss = _nan_to_num_tensor(commitment_loss)
+                    extra_bottleneck_loss = _nan_to_num_tensor(extra_bottleneck_loss)
+                    recon_loss = F.mse_loss(recon, x)
+                    loss = (
+                        recon_loss
+                        + float(current_dict_loss_weight) * dict_loss
+                        + float(current_commitment_loss_weight) * commitment_loss
+                        + extra_bottleneck_loss
+                    )
                 x_unit = _to_unit_range(x)
                 recon_unit = _to_unit_range(recon)
                 psnr = _batch_psnr(recon_unit, x_unit)
@@ -3175,9 +4472,15 @@ def train_stage1_ae(
                     )
 
             x_vis, _ = next(iter(val_loader))
-            x_vis = x_vis.to(device)[:64]
+            x_vis = x_vis.to(device, non_blocking=True)[:64]
             with torch.no_grad():
-                recon_vis, _, _ = ae_module(x_vis)
+                autocast_ctx = (
+                    torch.autocast(device_type=device.type, dtype=amp_dtype)
+                    if amp_enabled
+                    else nullcontext()
+                )
+                with autocast_ctx:
+                    recon_vis, _, _ = ae_module(x_vis)
             save_image_grid(x_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_real.png"))
             save_image_grid(recon_vis, os.path.join(out_dir, f"stage1_epoch{epoch:03d}_recon.png"))
             _log_wandb_image(
@@ -3198,11 +4501,16 @@ def train_stage1_ae(
             )
 
             os.makedirs(out_dir, exist_ok=True)
-            ckpt_path = os.path.join(out_dir, "ae_last.pt")
-            torch.save(ae_module.state_dict(), ckpt_path)
+            ckpt_path = Path(out_dir) / "ae_last.pt"
+            _save_module_checkpoint_with_tag(ae_module, ckpt_path, artifact_tag)
+            _save_module_checkpoint_with_tag(ae_module, resume_checkpoint_path, artifact_tag)
             if val_recon_loss < best_val_recon:
                 best_val_recon = val_recon_loss
-                torch.save(ae_module.state_dict(), os.path.join(out_dir, "ae_best.pt"))
+                _save_module_checkpoint_with_tag(
+                    ae_module,
+                    Path(out_dir) / "ae_best.pt",
+                    artifact_tag,
+                )
         _barrier()
 
 
@@ -3227,7 +4535,7 @@ def precompute_tokens(
     H = W = D = None
 
     for x, _ in tqdm(loader, desc="[Stage2] precompute tokens"):
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
         if ae.bottleneck.quantize_sparse_coeffs:
             tokens, h, w = ae.encode_to_tokens(x)
             coeffs = None
@@ -3311,7 +4619,7 @@ def _expected_token_cache_meta(
 ) -> dict:
     effective_items = len(stage2_source_set) if token_subset is None else int(token_subset)
     return {
-        "version": 2,
+        "version": 3,
         "dataset": str(args.dataset),
         "image_size": int(args.image_size),
         "seed": int(args.seed),
@@ -3330,6 +4638,10 @@ def _expected_token_cache_meta(
         "patch_size": int(args.patch_size),
         "patch_stride": int(args.patch_stride),
         "patch_reconstruction": str(args.patch_reconstruction),
+        "variational_coeffs": bool(args.variational_coeffs),
+        "variational_coeff_kl_weight": float(args.variational_coeff_kl_weight),
+        "variational_coeff_prior_std": float(args.variational_coeff_prior_std),
+        "variational_coeff_min_std": float(args.variational_coeff_min_std),
     }
 
 
@@ -3382,71 +4694,19 @@ def _compute_quantized_rq_losses(
     coeff_depth_weighting: str = "none",
     coeff_focal_gamma: float = 0.0,
     coeff_logits: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split interleaved atom/bin CE terms and combine them with explicit weights.
-
-    Args:
-        per_token_ce:         [B, L, D]  per-token CE losses.
-        atom_loss_weight:     weight for atom CE component.
-        coeff_loss_weight:    weight for coeff CE component.
-        coeff_depth_weighting: ``"none"`` (uniform), ``"linear"`` (earlier depths
-                              weighted more), or ``"entropy"`` (weight inversely
-                              proportional to per-depth easiness).
-        coeff_focal_gamma:    gamma for focal modulation on coeff CE.
-                              0 = standard CE; >0 down-weights easy predictions.
-        coeff_logits:         [B, L, s, n_bins]  coeff logits (needed for focal).
-    """
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    """Return the plain shared-vocab CE used by the simplified quantized path."""
+    del atom_loss_weight, coeff_loss_weight, coeff_depth_weighting, coeff_focal_gamma, coeff_logits
     if per_token_ce.numel() == 0:
         raise ValueError("Expected non-empty per-token CE tensor")
-
-    atom_terms = per_token_ce[..., 0::2]                  # [B, L, s]
-    coeff_terms = per_token_ce[..., 1::2]                 # [B, L, s]
-    if atom_terms.numel() == 0 or coeff_terms.numel() == 0:
-        raise ValueError(
-            "Quantized RQ loss expects interleaved atom and coefficient-bin terms"
-        )
-
-    s = coeff_terms.size(-1)  # sparsity level
-
-    # ---- depth-position weighting for coefficients ----
-    if coeff_depth_weighting == "linear":
-        # Linearly decreasing: depth 0 gets weight s, depth s-1 gets weight 1.
-        w = torch.arange(s, 0, -1, device=coeff_terms.device, dtype=coeff_terms.dtype)
-        w = w / w.sum()                                   # normalise to mean 1/s
-        w = w * s                                         # scale so sum = s (same total as uniform)
-        coeff_terms = coeff_terms * w.view(1, 1, s)
-    elif coeff_depth_weighting == "inverse_rank":
-        # 1/rank weighting: depth 0 gets 1/1, depth 1 gets 1/2, ...
-        w = 1.0 / torch.arange(1, s + 1, device=coeff_terms.device, dtype=coeff_terms.dtype)
-        w = w / w.mean()
-        coeff_terms = coeff_terms * w.view(1, 1, s)
-
-    # ---- focal modulation for coefficient CE ----
-    if coeff_focal_gamma > 0.0 and coeff_logits is not None:
-        # Focal loss: multiply CE by (1 - p_correct)^gamma
-        with torch.no_grad():
-            coeff_probs = F.softmax(coeff_logits, dim=-1)  # [B, L, s, n_bins]
-            p_max = coeff_probs.max(dim=-1).values         # [B, L, s]
-            focal_weight = (1.0 - p_max).pow(coeff_focal_gamma)
-        coeff_terms = coeff_terms * focal_weight
-
     token_ce_loss = per_token_ce.mean()
-    atom_ce_loss = atom_terms.mean()
-    coeff_ce_loss = coeff_terms.mean()
-    weight_sum = float(atom_loss_weight) + float(coeff_loss_weight)
-    if weight_sum <= 0.0:
-        total_loss = token_ce_loss * 0.0
-    else:
-        total_loss = (
-            float(atom_loss_weight) * atom_ce_loss
-            + float(coeff_loss_weight) * coeff_ce_loss
-        ) / weight_sum
-    return token_ce_loss, atom_ce_loss, coeff_ce_loss, total_loss
+    return token_ce_loss, None, None, token_ce_loss
 
 
 def train_stage2_transformer(
     transformer: nn.Module,
     token_loader: DataLoader,
+    stage2_fid_loader: Optional[DataLoader],
     device: torch.device,
     epochs: int,
     lr: float,
@@ -3482,18 +4742,29 @@ def train_stage2_transformer(
     sample_candidate_factor: int = 4,
     sample_temperature: float = 1.0,
     sample_top_k: Optional[int] = 256,
+    sample_coeff_temperature: Optional[float] = None,
+    sample_coeff_mode: str = "gaussian",
+    sample_selection_quality_weight: float = 1.0,
+    sample_brightness_weight: float = 1.0,
+    sample_overbright_weight: float = 1.0,
+    sample_reject_dark_z: float = 1.5,
+    sample_reject_bright_z: float = 1.5,
+    sample_sort_by_quality: bool = True,
     sample_image_size: Optional[int] = None,
     sample_reference_stats: Optional[dict] = None,
+    stage2_fid_num_samples: int = 0,
+    stage2_fid_every_epochs: int = 0,
     token_sampler: Optional[DistributedSampler] = None,
     is_main_process: bool = True,
     wandb_run: Optional[object] = None,
+    artifact_tag: Optional[str] = None,
 ):
     """Train stage 2 with optional DDP and synchronized rank-0 sampling."""
     transformer_module = _unwrap_module(transformer)
-    if not isinstance(transformer_module, SpatialDepthPrior):
+    if not hasattr(transformer_module, "cfg") or not hasattr(transformer_module, "generate"):
         raise TypeError(
-            "train_stage2_transformer now supports SpatialDepthPrior only; "
-            "the legacy stage-2 Transformer path was removed"
+            "train_stage2_transformer expects a stage-2 prior with cfg/generate support; "
+            f"got {type(transformer_module)!r}"
         )
     ae_decode = _unwrap_module(ae_for_decode)
     ae_decode.eval()
@@ -3508,13 +4779,45 @@ def train_stage2_transformer(
     vocab = transformer_module.cfg.vocab_size
     global_step = 0
     sample_top_k = None if sample_top_k is None or int(sample_top_k) <= 0 else int(sample_top_k)
+    if sample_coeff_temperature is None:
+        resolved_sample_coeff_temperature = None
+    else:
+        resolved_sample_coeff_temperature = float(sample_coeff_temperature)
+        if not math.isfinite(resolved_sample_coeff_temperature):
+            resolved_sample_coeff_temperature = None
+        elif resolved_sample_coeff_temperature <= 0.0:
+            raise ValueError("sample_coeff_temperature must be > 0 when set.")
+    sample_coeff_mode = str(sample_coeff_mode).strip().lower()
+    if sample_coeff_mode not in {"gaussian", "mean"}:
+        raise ValueError(
+            f"sample_coeff_mode must be 'gaussian' or 'mean', got {sample_coeff_mode!r}"
+        )
+    sample_selection_quality_weight = float(sample_selection_quality_weight)
+    if sample_selection_quality_weight < 0.0:
+        raise ValueError("sample_selection_quality_weight must be >= 0.")
+    sample_brightness_weight = float(sample_brightness_weight)
+    if sample_brightness_weight < 0.0:
+        raise ValueError("sample_brightness_weight must be >= 0.")
+    sample_overbright_weight = float(sample_overbright_weight)
+    if sample_overbright_weight < 0.0:
+        raise ValueError("sample_overbright_weight must be >= 0.")
+    sample_reject_dark_z = float(sample_reject_dark_z)
+    if sample_reject_dark_z < 0.0:
+        raise ValueError("sample_reject_dark_z must be >= 0.")
+    sample_reject_bright_z = float(sample_reject_bright_z)
+    if sample_reject_bright_z < 0.0:
+        raise ValueError("sample_reject_bright_z must be >= 0.")
+    sample_sort_by_quality = bool(sample_sort_by_quality)
     sample_candidate_factor = max(1, int(sample_candidate_factor))
+    stage2_fid_num_samples = max(0, int(stage2_fid_num_samples))
+    stage2_fid_every_epochs = max(0, int(stage2_fid_every_epochs))
     real_valued = transformer_module.real_valued_coeffs
+    gaussian_coeffs = bool(getattr(transformer_module, "gaussian_coeffs", False))
     rq_atom_loss_weight = float(rq_atom_loss_weight)
     rq_coeff_loss_weight = float(rq_coeff_loss_weight)
     coeff_loss_weight = float(coeff_loss_weight)
     coeff_loss_type = str(coeff_loss_type).lower()
-    if coeff_loss_type not in {"huber", "mse", "recon_mse", "gt_atom_recon_mse"}:
+    if coeff_loss_type not in {"huber", "mse", "recon_mse", "gt_atom_recon_mse", "gaussian_nll"}:
         raise ValueError(f"Unsupported coeff_loss_type: {coeff_loss_type!r}")
     coeff_huber_delta = float(coeff_huber_delta)
     amp_dtype_name = str(stage2_amp_dtype).strip().lower()
@@ -3537,15 +4840,27 @@ def train_stage2_transformer(
         scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     sched_sampling_final_prob = max(0.0, float(sched_sampling_final_prob))
     if sched_sampling_final_prob > 0.0 and is_main_process:
-        print("[Stage2] ignoring scheduled sampling; the legacy transformer path was removed")
+        print(
+            "[Stage2] ignoring deprecated scheduled sampling setting "
+            f"(requested final_prob={sched_sampling_final_prob:.3f}); using pure teacher forcing"
+        )
     if not real_valued and is_main_process:
         print(
-            "[Stage2] quantized RQ training loss: weighted atom/coeff CE "
-            "(raw token CE logged separately)"
+            "[Stage2] quantized stage-2 loss: shared-vocab CE on the cached interleaved token stream"
         )
     if amp_enabled and is_main_process:
         amp_label = "bfloat16" if amp_dtype == torch.bfloat16 else "float16"
         print(f"[Stage2] using AMP ({amp_label})")
+    if real_valued and is_main_process:
+        decode_coef_max = getattr(getattr(ae_decode, "bottleneck", None), "coef_max", None)
+        try:
+            decode_coef_max = float(decode_coef_max)
+        except (TypeError, ValueError):
+            decode_coef_max = None
+        if decode_coef_max is not None and math.isfinite(decode_coef_max) and decode_coef_max > 0.0:
+            print(
+                f"[Stage2] clamping sampled real-valued coeffs to +/-{decode_coef_max:g} before stage-1 decode"
+            )
     offload_decode_model = (
         (not real_valued)
         and device.type == "cuda"
@@ -3557,14 +4872,16 @@ def train_stage2_transformer(
         if is_main_process:
             print("[Stage2] parking stage-1 decoder on CPU between sampling steps")
     num_batches = max(1, len(token_loader))
-    if coeff_loss_type in {"recon_mse", "gt_atom_recon_mse"} and isinstance(ae_decode.bottleneck, PatchDictionaryLearningTokenized):
-        raise ValueError(
-            f"stage2 coeff_loss_type={coeff_loss_type!r} currently requires patch_based=False"
-        )
-
+    if coeff_loss_type == "gaussian_nll" and not real_valued:
+        raise ValueError("stage2 coeff_loss_type='gaussian_nll' requires real-valued sparse coefficients")
+    if coeff_loss_type == "gaussian_nll" and not gaussian_coeffs:
+        raise ValueError("stage2 coeff_loss_type='gaussian_nll' requires variational_coeffs=True")
+    stage2_fid_warned = False
     # ---- ordinal coefficient regression setup ----
-    use_ordinal = not real_valued and ordinal_coeff_weight > 0
+    use_ordinal = False
     coeff_bin_values_for_ordinal = None
+    if (not real_valued) and ordinal_coeff_weight > 0 and is_main_process:
+        print("[Stage2] ignoring ordinal coefficient aux loss for quantized shared-vocab training")
     if use_ordinal:
         from contrastive_sparse import ordinal_coeff_loss
         coeff_bin_values_for_ordinal = ae_decode.bottleneck._dequantize_coeff(
@@ -3586,10 +4903,11 @@ def train_stage2_transformer(
 
         for batch_idx, batch in enumerate(pbar):
             if real_valued:
-                tok_flat, coeff_flat = batch[0].to(device).long(), batch[1].to(device).float()
+                tok_flat = batch[0].to(device=device, dtype=torch.long, non_blocking=True)
+                coeff_flat = batch[1].to(device=device, dtype=torch.float32, non_blocking=True)
             else:
                 tok_flat = batch[0] if isinstance(batch, (tuple, list)) else batch
-                tok_flat = tok_flat.to(device).long()
+                tok_flat = tok_flat.to(device=device, dtype=torch.long, non_blocking=True)
             B = tok_flat.size(0)
 
             opt.zero_grad(set_to_none=True)
@@ -3598,6 +4916,7 @@ def train_stage2_transformer(
             coeff_ce_loss = None
             coeff_reg_loss = None
             ordinal_loss = None
+            loss = None
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=amp_dtype)
                 if amp_enabled
@@ -3605,20 +4924,32 @@ def train_stage2_transformer(
             )
             with autocast_ctx:
                 if real_valued:
-                    tok_grid = tok_flat.view(B, H * W, D)
-                    coeff_grid = coeff_flat.view(B, H * W, D)
-                    atom_logits, coeff_pred, depth_h = transformer(
-                        tok_grid,
-                        coeff_grid,
-                        return_features=True,
-                    )
+                    # Take private copies before stage-2 forward/recon paths so
+                    # CE targets, masking tokens, and latent-reconstruction
+                    # indices do not share storage with the dataloader batch.
+                    tok_grid = tok_flat.view(B, H * W, D).clone()
+                    coeff_grid = coeff_flat.view(B, H * W, D).clone()
+                    if gaussian_coeffs:
+                        atom_logits, coeff_pred, coeff_logvar_pred, depth_h = transformer(
+                            tok_grid,
+                            coeff_grid,
+                            mask_tokens=tok_grid,
+                            return_features=True,
+                        )
+                    else:
+                        atom_logits, coeff_pred, depth_h = transformer(
+                            tok_grid,
+                            coeff_grid,
+                            mask_tokens=tok_grid,
+                            return_features=True,
+                        )
+                        coeff_logvar_pred = None
                     ce_loss = F.cross_entropy(
                         atom_logits.reshape(-1, vocab),
                         tok_grid.reshape(-1),
                     )
                     pred_coeff = ae_decode.clamp_sparse_coeffs(coeff_pred)
-                    coef_max = float(getattr(ae_decode.bottleneck, "coef_max", float("inf")))
-                    target_coeff = coeff_grid.clamp(-coef_max, coef_max)
+                    target_coeff = ae_decode.clamp_sparse_coeffs(coeff_grid)
                     if coeff_loss_type == "mse":
                         coeff_reg_loss = F.mse_loss(pred_coeff, target_coeff)
                     elif coeff_loss_type == "huber":
@@ -3627,75 +4958,77 @@ def train_stage2_transformer(
                             target_coeff,
                             delta=coeff_huber_delta,
                         )
-                    elif coeff_loss_type == "recon_mse":
-                        pred_atoms = atom_logits.argmax(dim=-1)
-                        pred_coeff = ae_decode.clamp_sparse_coeffs(
-                            transformer_module.predict_coeffs_for_atoms(depth_h, pred_atoms)
+                    elif coeff_loss_type == "gaussian_nll":
+                        if coeff_logvar_pred is None:
+                            raise RuntimeError("gaussian_nll requested but transformer did not return coeff_logvar")
+                        pred_var = coeff_logvar_pred.exp().clamp_min(1e-6)
+                        coeff_reg_loss = 0.5 * (
+                            coeff_logvar_pred + (pred_coeff - target_coeff).square() / pred_var
                         )
-                        pred_latent = ae_decode.bottleneck._reconstruct_sparse(
-                            pred_atoms.view(B, H, W, D),
+                        coeff_reg_loss = coeff_reg_loss.mean()
+                    elif coeff_loss_type == "recon_mse":
+                        # Use a self-consistent support mask for the recon loss.
+                        # The CE branch still scores ground-truth atoms under the
+                        # ground-truth support constraints, but recon_mse is meant
+                        # to approximate free-running support generation rather
+                        # than argmax under target-only masking.
+                        rollout_context_tok_grid = tok_grid.detach().clone()
+                        rollout_context_coeff_grid = coeff_grid.detach().clone()
+                        rollout_mask_tok_grid = rollout_context_tok_grid.detach().clone()
+                        if gaussian_coeffs:
+                            rollout_atom_logits, _, _, rollout_depth_h = transformer(
+                                rollout_context_tok_grid,
+                                rollout_context_coeff_grid,
+                                mask_tokens=rollout_mask_tok_grid,
+                                return_features=True,
+                            )
+                        else:
+                            rollout_atom_logits, _, rollout_depth_h = transformer(
+                                rollout_context_tok_grid,
+                                rollout_context_coeff_grid,
+                                mask_tokens=rollout_mask_tok_grid,
+                                return_features=True,
+                            )
+                        pred_atoms = rollout_atom_logits.argmax(dim=-1)
+                        pred_atoms_for_coeff = pred_atoms.detach().clone()
+                        pred_atoms_for_recon = pred_atoms.detach().clone()
+                        pred_coeff = ae_decode.clamp_sparse_coeffs(
+                            transformer_module.predict_coeffs_for_atoms(rollout_depth_h, pred_atoms_for_coeff)
+                        )
+                        pred_latent = _reconstruct_stage2_sparse_latent(
+                            ae_decode,
+                            pred_atoms_for_recon.view(B, H, W, D),
                             pred_coeff.view(B, H, W, D),
                         )
                         with torch.no_grad():
-                            target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            target_latent = _reconstruct_stage2_sparse_latent(
+                                ae_decode,
                                 tok_grid.view(B, H, W, D),
                                 target_coeff.view(B, H, W, D),
                             )
                         coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
                     else:
-                        pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                        pred_latent = _reconstruct_stage2_sparse_latent(
+                            ae_decode,
                             tok_grid.view(B, H, W, D),
                             pred_coeff.view(B, H, W, D),
                         )
                         with torch.no_grad():
-                            target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            target_latent = _reconstruct_stage2_sparse_latent(
+                                ae_decode,
                                 tok_grid.view(B, H, W, D),
                                 target_coeff.view(B, H, W, D),
                             )
                         coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
                     loss = ce_loss + coeff_loss_weight * coeff_reg_loss
                 else:
-                    tok_grid = tok_flat.view(B, H * W, D)
+                    tok_grid = tok_flat.view(B, H * W, D).clone()
                     logits = transformer(tok_grid)
-                    per_token_ce = F.cross_entropy(
+                    ce_loss = F.cross_entropy(
                         logits.reshape(-1, vocab),
                         tok_grid.reshape(-1),
-                        reduction="none",
-                    ).view(B, H * W, D)
-                    # Extract coeff logits for focal loss if needed.
-                    _coeff_logits_for_focal = None
-                    if coeff_focal_gamma > 0.0:
-                        _coeff_logits_for_focal = logits[
-                            :, :, 1::2,
-                            transformer_module.atom_vocab_size
-                            : transformer_module.atom_vocab_size + transformer_module.coeff_vocab_size,
-                        ]
-                    ce_loss, atom_ce_loss, coeff_ce_loss, loss = _compute_quantized_rq_losses(
-                        per_token_ce,
-                        atom_loss_weight=rq_atom_loss_weight,
-                        coeff_loss_weight=rq_coeff_loss_weight,
-                        coeff_depth_weighting=coeff_depth_weighting,
-                        coeff_focal_gamma=coeff_focal_gamma,
-                        coeff_logits=_coeff_logits_for_focal,
                     )
-                    # ---- ordinal coefficient regression ----
-                    if use_ordinal:
-                        coeff_logits_ord = logits[
-                            :, :, 1::2,
-                            transformer_module.atom_vocab_size
-                            : transformer_module.atom_vocab_size + transformer_module.coeff_vocab_size,
-                        ]
-                        coeff_ids_ord = tok_grid[:, :, 1::2] - transformer_module.atom_vocab_size
-                        ordinal_loss = ordinal_coeff_loss(
-                            coeff_logits_ord,
-                            coeff_ids_ord,
-                            coeff_bin_values_for_ordinal,
-                            huber_delta=ordinal_coeff_huber_delta,
-                            magnitude_weighted=ordinal_magnitude_weighted,
-                            zero_drift_margin=ordinal_zero_drift_margin,
-                            zero_drift_threshold=ordinal_zero_drift_threshold,
-                        )
-                        loss = loss + ordinal_coeff_weight * ordinal_loss
+                    loss = ce_loss
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -3773,6 +5106,8 @@ def train_stage2_transformer(
                     log_payload["stage2/weighted_coeff_loss"] = float(coeff_loss_weight * coeff_reg_log.item())
                     if coeff_loss_type == "mse":
                         log_payload["stage2/coeff_mse_loss"] = float(coeff_reg_log.item())
+                    elif coeff_loss_type == "gaussian_nll":
+                        log_payload["stage2/coeff_gaussian_nll"] = float(coeff_reg_log.item())
                     elif coeff_loss_type in {"recon_mse", "gt_atom_recon_mse"}:
                         log_payload["stage2/recon_mse_loss"] = float(coeff_reg_log.item())
                     else:
@@ -3807,7 +5142,16 @@ def train_stage2_transformer(
                     decode_batch_size = max(1, min(8, int(sample_batch_size)))
                     print(
                         f"[Stage2] sampling at step {global_step} "
-                        f"(keep={sample_batch_size}, candidates={candidate_batch_size})..."
+                        f"(keep={sample_batch_size}, candidates={candidate_batch_size}, "
+                        f"atom_temp={sample_temperature}, atom_top_k={sample_top_k}, "
+                        f"coeff_mode={sample_coeff_mode}, "
+                        f"coeff_temp={sample_temperature if resolved_sample_coeff_temperature is None else resolved_sample_coeff_temperature}, "
+                        f"select_q={sample_selection_quality_weight}, "
+                        f"brightness_q={sample_brightness_weight}, "
+                        f"overbright_q={sample_overbright_weight}, "
+                        f"reject_dark_z={sample_reject_dark_z}, "
+                        f"reject_bright_z={sample_reject_bright_z}, "
+                        f"sort_by_quality={sample_sort_by_quality})..."
                     )
                     try:
                         with torch.no_grad():
@@ -3818,10 +5162,12 @@ def train_stage2_transformer(
                                     batch_size=candidate_batch_size,
                                     temperature=sample_temperature,
                                     top_k=sample_top_k,
+                                    coeff_temperature=resolved_sample_coeff_temperature,
+                                    coeff_sample_mode=sample_coeff_mode,
                                     show_progress=True,
                                     progress_desc=f"[Stage2] sample step {global_step}",
                                 )
-                                coeffs_gen = ae_decode.clamp_sparse_coeffs(coeffs_gen)
+                                coeffs_gen = _clamp_generated_sparse_coeffs_for_decode(ae_decode, coeffs_gen)
                                 atoms_gen = atoms_gen.view(-1, H, W, D)
                                 coeffs_gen = coeffs_gen.view(-1, H, W, D)
                                 if device.type == "cuda":
@@ -3855,6 +5201,12 @@ def train_stage2_transformer(
                                 imgs,
                                 keep=sample_batch_size,
                                 reference_stats=sample_reference_stats,
+                                quality_weight=sample_selection_quality_weight,
+                                brightness_weight=sample_brightness_weight,
+                                overbright_weight=sample_overbright_weight,
+                                reject_dark_z=sample_reject_dark_z,
+                                reject_bright_z=sample_reject_bright_z,
+                                sort_by_quality=sample_sort_by_quality,
                             )
                             if sample_image_size is not None and int(sample_image_size) > 0:
                                 if imgs.size(-2) != int(sample_image_size) or imgs.size(-1) != int(sample_image_size):
@@ -3906,11 +5258,76 @@ def train_stage2_transformer(
                 step_metric="stage2/step",
                 step_value=global_step,
             )
+            stage2_fid = None
+            if (
+                stage2_fid_loader is not None
+                and stage2_fid_num_samples > 0
+                and stage2_fid_every_epochs > 0
+                and (epoch % stage2_fid_every_epochs == 0)
+            ):
+                print(
+                    f"[Stage2] computing sample FID at epoch {epoch} "
+                    f"(num_samples={stage2_fid_num_samples})"
+                )
+                if offload_decode_model:
+                    ae_decode.to(device)
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                try:
+                    stage2_fid = _compute_stage2_sample_fid(
+                        transformer=transformer_module,
+                        ae=ae_decode,
+                        loader=stage2_fid_loader,
+                        device=device,
+                        max_items=stage2_fid_num_samples,
+                        H=H,
+                        W=W,
+                        D=D,
+                        sample_batch_size=sample_batch_size,
+                        sample_candidate_factor=sample_candidate_factor,
+                        sample_temperature=sample_temperature,
+                        sample_top_k=sample_top_k,
+                        sample_coeff_temperature=resolved_sample_coeff_temperature,
+                        sample_coeff_mode=sample_coeff_mode,
+                        sample_reference_stats=sample_reference_stats,
+                        sample_selection_quality_weight=sample_selection_quality_weight,
+                        sample_brightness_weight=sample_brightness_weight,
+                        sample_overbright_weight=sample_overbright_weight,
+                        sample_reject_dark_z=sample_reject_dark_z,
+                        sample_reject_bright_z=sample_reject_bright_z,
+                        sample_sort_by_quality=sample_sort_by_quality,
+                        sample_image_size=sample_image_size,
+                    )
+                except Exception as exc:
+                    if not stage2_fid_warned:
+                        print(f"[Stage2] sample FID disabled after failure: {exc}")
+                        stage2_fid_warned = True
+                    stage2_fid = None
+                finally:
+                    if offload_decode_model:
+                        ae_decode.to("cpu")
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                if stage2_fid is not None:
+                    print(f"[Stage2] epoch {epoch} fid={stage2_fid:.4f}")
+                    _log_wandb(
+                        wandb_run,
+                        {
+                            "stage2/fid": float(stage2_fid),
+                            "stage2/fid_num_samples": stage2_fid_num_samples,
+                            "stage2/fid_eval_epoch_interval": stage2_fid_every_epochs,
+                            "stage2/epoch": epoch,
+                        },
+                        step_metric="stage2/step",
+                        step_value=global_step,
+                    )
 
         _barrier()
         if is_main_process:
             os.makedirs(out_dir, exist_ok=True)
-            torch.save(transformer_module.state_dict(), os.path.join(out_dir, "transformer_last.pt"))
+            transformer_last_path = Path(out_dir) / "transformer_last.pt"
+            _save_module_checkpoint(transformer_module, transformer_last_path)
+            _copy_artifact_to_tagged_path(transformer_last_path, artifact_tag)
         _barrier()
 
 
@@ -3945,6 +5362,22 @@ def main():
         type=str,
         default=None,
         help="Local path to a stage-1 ae_best.pt checkpoint to use before any W&B or prior-run fallback.",
+    )
+    parser.add_argument(
+        "--stage1_auto_resume_from_latest",
+        dest="stage1_auto_resume_from_latest",
+        action="store_true",
+        default=False,
+        help=(
+            "When stage 1 is training from scratch, warm-start from the newest stage-1 checkpoint "
+            "already present under the same experiment root."
+        ),
+    )
+    parser.add_argument(
+        "--no_stage1_auto_resume_from_latest",
+        dest="stage1_auto_resume_from_latest",
+        action="store_false",
+        help="Disable automatic stage-1 warm-start from prior checkpoints in the same experiment root.",
     )
     parser.add_argument(
         "--stage2_source_run",
@@ -3998,6 +5431,12 @@ def main():
     )
 
     parser.add_argument("--stage1_epochs", type=int, default=5)
+    parser.add_argument(
+        "--stage1_checkpoint_every_steps",
+        type=int,
+        default=0,
+        help="Save ae_resume_latest.pt every N stage-1 optimizer steps. Set to 0 to disable intra-epoch snapshots.",
+    )
     parser.add_argument("--stage1_lr", type=float, default=2e-4)
     parser.add_argument(
         "--stage1_dict_optimizer",
@@ -4106,6 +5545,21 @@ def main():
         default=0,
         help="Ramp stage-1 encoder commitment weight from --stage1_commitment_loss_weight_start to --stage1_commitment_loss_weight over this many epochs.",
     )
+    parser.add_argument(
+        "--stage1_amp",
+        type=_parse_cli_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable CUDA AMP for stage-1 training. Ignored on CPU.",
+    )
+    parser.add_argument(
+        "--stage1_amp_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float16", "bfloat16"],
+        help="Autocast dtype for stage-1 AMP. 'auto' prefers bfloat16 when supported.",
+    )
     parser.add_argument("--stage2_epochs", type=int, default=100)
     parser.add_argument("--stage2_lr", type=float, default=1e-3)
     parser.add_argument(
@@ -4129,14 +5583,16 @@ def main():
     parser.add_argument(
         "--stage2_coeff_loss_type",
         type=str,
-        default="gt_atom_recon_mse",
-        choices=["huber", "mse", "recon_mse", "gt_atom_recon_mse"],
+        default=None,
+        choices=["huber", "mse", "recon_mse", "gt_atom_recon_mse", "gaussian_nll"],
         help=(
             "Auxiliary loss used with real-valued sparse coefficients during stage-2 training: "
             "'huber'/'mse' regress normalized coefficients directly, while 'recon_mse' matches "
             "the latent reconstruction induced by predicted atoms+coeffs to the ground-truth sparse-code reconstruction, "
-            "and 'gt_atom_recon_mse' matches the latent reconstruction induced by ground-truth atoms + predicted coeffs "
-            "to the ground-truth sparse-code reconstruction."
+            "'gt_atom_recon_mse' matches the latent reconstruction induced by ground-truth atoms + predicted coeffs "
+            "to the ground-truth sparse-code reconstruction, and 'gaussian_nll' trains a diagonal-Gaussian coefficient head. "
+            "Defaults to 'gaussian_nll' for variational coeffs, 'mse' for deterministic real-valued coeffs, "
+            "and 'gt_atom_recon_mse' for quantized coeffs."
         ),
     )
     parser.add_argument(
@@ -4168,8 +5624,8 @@ def main():
     parser.add_argument(
         "--stage2_sched_sampling_final_prob",
         type=float,
-        default=0.25,
-        help="Legacy compatibility knob from the removed flattened-token transformer path; ignored by the spatial-depth prior.",
+        default=0.0,
+        help="Deprecated compatibility flag. Stage-2 now always trains with pure teacher forcing.",
     )
     # ---- ordinal coefficient regression ----
     parser.add_argument("--ordinal_coeff_weight", type=float, default=0.0,
@@ -4206,6 +5662,19 @@ def main():
         choices=["auto", "float16", "bfloat16"],
         help="Autocast dtype for stage-2 AMP. 'auto' prefers bfloat16 when supported.",
     )
+    parser.add_argument(
+        "--stage2_autoregressive_coeffs",
+        dest="stage2_autoregressive_coeffs",
+        action="store_true",
+        default=True,
+        help="Autoregress the interleaved stage-2 token stream. Required for quantized shared-vocab training.",
+    )
+    parser.add_argument(
+        "--no_stage2_autoregressive_coeffs",
+        dest="stage2_autoregressive_coeffs",
+        action="store_false",
+        help="Use support-only conditioning for the real-valued coefficient path.",
+    )
     parser.add_argument("--bottleneck_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -4217,8 +5686,8 @@ def main():
                         help="Latent channel depth. Must be > sparsity_level to keep OMP well-conditioned.")
     parser.add_argument("--num_atoms", type=int, default=1024)
     parser.add_argument("--sparsity_level", type=int, default=8)
-    parser.add_argument("--n_bins", type=int, default=256)
-    parser.add_argument("--coef_max", type=float, default=3.0)
+    parser.add_argument("--n_bins", type=int, default=2048)
+    parser.add_argument("--coef_max", type=float, default=20.0)
     parser.add_argument(
         "--quantize_sparse_coeffs",
         type=_parse_cli_bool,
@@ -4230,6 +5699,32 @@ def main():
     parser.add_argument("--coef_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
     parser.add_argument("--coef_mu", type=float, default=0.0)
     parser.add_argument("--commitment_cost", type=float, default=0.25)
+    parser.add_argument(
+        "--variational_coeffs",
+        type=_parse_cli_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable a local Gaussian posterior around the deterministic sparse coefficients. Currently supported only when quantize_sparse_coeffs=false.",
+    )
+    parser.add_argument(
+        "--variational_coeff_kl_weight",
+        type=float,
+        default=1e-3,
+        help="Weight on the coefficient-posterior KL term during stage-1. Ignored when --variational_coeffs false.",
+    )
+    parser.add_argument(
+        "--variational_coeff_prior_std",
+        type=float,
+        default=0.25,
+        help="Reference std for the local Gaussian coefficient prior centered on the OMP coefficients.",
+    )
+    parser.add_argument(
+        "--variational_coeff_min_std",
+        type=float,
+        default=0.01,
+        help="Minimum std allowed for the variational coefficient posterior.",
+    )
     parser.add_argument("--stage1_coherence_weight", type=float, default=0.0,
                         help="Weight on the dictionary coherence regularizer during stage-1.")
     parser.add_argument("--stage1_coherence_weight_start", type=float, default=float("nan"),
@@ -4269,6 +5764,13 @@ def main():
     parser.add_argument("--tf_heads", type=int, default=8)
     parser.add_argument("--tf_layers", type=int, default=12)
     parser.add_argument(
+        "--stage2_arch",
+        type=str,
+        default="spatial_depth",
+        choices=["spatial_depth", "mingpt"],
+        help="Stage-2 prior architecture. 'mingpt' is currently supported for quantized sparse coefficients only.",
+    )
+    parser.add_argument(
         "--tf_global_tokens",
         type=int,
         default=0,
@@ -4293,6 +5795,18 @@ def main():
         default=256,
         help="Number of validation images used for stage-1 reconstruction FID (0 disables it).",
     )
+    parser.add_argument(
+        "--stage2_fid_num_samples",
+        type=int,
+        default=0,
+        help="Number of validation/generated images used for stage-2 sample FID (0 disables it).",
+    )
+    parser.add_argument(
+        "--stage2_fid_every_epochs",
+        type=int,
+        default=0,
+        help="Compute stage-2 sample FID every N stage-2 epochs (0 disables it).",
+    )
     parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
     parser.add_argument("--stage2_sample_batch_size", type=int, default=32)
     parser.add_argument(
@@ -4303,6 +5817,61 @@ def main():
     )
     parser.add_argument("--stage2_sample_temperature", type=float, default=0.5)
     parser.add_argument("--stage2_sample_top_k", type=int, default=0)
+    parser.add_argument(
+        "--stage2_sample_coeff_temperature",
+        type=float,
+        default=float("nan"),
+        help="Optional separate coefficient temperature for real-valued stage-2 sampling. NaN falls back to --stage2_sample_temperature.",
+    )
+    parser.add_argument(
+        "--stage2_sample_coeff_mode",
+        choices=["gaussian", "mean"],
+        default="gaussian",
+        help="How to sample real-valued coefficients for stage-2 sample grids.",
+    )
+    parser.add_argument(
+        "--stage2_sample_quality_weight",
+        type=float,
+        default=1.0,
+        help="Quality penalty used when reranking oversampled stage-2 preview candidates against stage-1 reference stats.",
+    )
+    parser.add_argument(
+        "--stage2_sample_brightness_weight",
+        type=float,
+        default=1.0,
+        help="Extra penalty for preview candidates that are darker than the stage-1 reference distribution.",
+    )
+    parser.add_argument(
+        "--stage2_sample_overbright_weight",
+        type=float,
+        default=1.0,
+        help="Extra penalty for preview candidates that are brighter than the stage-1 reference distribution.",
+    )
+    parser.add_argument(
+        "--stage2_sample_reject_dark_z",
+        type=float,
+        default=1.5,
+        help="Hard rejection threshold in reference-standard-deviation units for abnormally dark preview candidates. <= 0 disables rejection.",
+    )
+    parser.add_argument(
+        "--stage2_sample_reject_bright_z",
+        type=float,
+        default=1.5,
+        help="Hard rejection threshold in reference-standard-deviation units for abnormally bright preview candidates. <= 0 disables rejection.",
+    )
+    parser.add_argument(
+        "--stage2_sample_sort_by_quality",
+        dest="stage2_sample_sort_by_quality",
+        action="store_true",
+        default=True,
+        help="Sort final stage-2 preview grids by quality so earlier tile indices correspond to safer samples.",
+    )
+    parser.add_argument(
+        "--no_stage2_sample_sort_by_quality",
+        dest="stage2_sample_sort_by_quality",
+        action="store_false",
+        help="Keep the diversity-selection order in stage-2 preview grids.",
+    )
     parser.add_argument("--stage2_sample_image_size", type=int, default=128)
 
     args = parser.parse_args()
@@ -4315,6 +5884,24 @@ def main():
         raise ValueError(f"coef_mu must be > 0 when coef_quantization='mu_law', got {args.coef_mu}")
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0.")
+    if math.isfinite(args.stage2_sample_coeff_temperature) and args.stage2_sample_coeff_temperature <= 0.0:
+        raise ValueError("stage2_sample_coeff_temperature must be > 0 when set.")
+    if args.stage2_sample_quality_weight < 0.0:
+        raise ValueError("stage2_sample_quality_weight must be >= 0.")
+    if args.stage2_sample_brightness_weight < 0.0:
+        raise ValueError("stage2_sample_brightness_weight must be >= 0.")
+    if args.stage2_sample_overbright_weight < 0.0:
+        raise ValueError("stage2_sample_overbright_weight must be >= 0.")
+    if args.stage2_sample_reject_dark_z < 0.0:
+        raise ValueError("stage2_sample_reject_dark_z must be >= 0.")
+    if args.stage2_sample_reject_bright_z < 0.0:
+        raise ValueError("stage2_sample_reject_bright_z must be >= 0.")
+    if args.rfid_num_samples < 0:
+        raise ValueError("rfid_num_samples must be >= 0.")
+    if args.stage2_fid_num_samples < 0:
+        raise ValueError("stage2_fid_num_samples must be >= 0.")
+    if args.stage2_fid_every_epochs < 0:
+        raise ValueError("stage2_fid_every_epochs must be >= 0.")
     if args.stage1_dict_lr_multiplier <= 0.0:
         raise ValueError("stage1_dict_lr_multiplier must be > 0.")
     if args.stage1_dict_warmup_epochs < 0:
@@ -4345,6 +5932,14 @@ def main():
         raise ValueError("stage1_commitment_loss_weight_start must be >= 0 when set.")
     if args.stage2_coeff_loss_weight < 0.0:
         raise ValueError("stage2_coeff_loss_weight must be >= 0.")
+    if args.variational_coeff_kl_weight < 0.0:
+        raise ValueError("variational_coeff_kl_weight must be >= 0.")
+    if args.variational_coeff_prior_std <= 0.0:
+        raise ValueError("variational_coeff_prior_std must be > 0.")
+    if args.variational_coeff_min_std <= 0.0:
+        raise ValueError("variational_coeff_min_std must be > 0.")
+    if args.variational_coeff_min_std > args.variational_coeff_prior_std:
+        raise ValueError("variational_coeff_min_std cannot exceed variational_coeff_prior_std.")
     if args.stage2_rq_atom_loss_weight < 0.0:
         raise ValueError("stage2_rq_atom_loss_weight must be >= 0.")
     if args.stage2_rq_coeff_loss_weight < 0.0:
@@ -4353,8 +5948,50 @@ def main():
         raise ValueError("stage2_coeff_huber_delta must be > 0.")
     if not (0.0 <= args.stage2_sched_sampling_final_prob <= 1.0):
         raise ValueError("stage2_sched_sampling_final_prob must be in [0, 1].")
+    if args.quantize_sparse_coeffs and (not args.stage2_autoregressive_coeffs):
+        raise ValueError(
+            "quantized stage-2 training requires stage2_autoregressive_coeffs=true "
+            "so the shared atom/coeff token stream stays interleaved."
+        )
     if args.tf_global_tokens < 0:
         raise ValueError("tf_global_tokens must be >= 0.")
+    if args.stage2_coeff_loss_type is None:
+        if args.variational_coeffs:
+            args.stage2_coeff_loss_type = "gaussian_nll"
+        elif not args.quantize_sparse_coeffs:
+            args.stage2_coeff_loss_type = "mse"
+        else:
+            args.stage2_coeff_loss_type = "gt_atom_recon_mse"
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "[Config] stage2_coeff_loss_type not set; using "
+                f"{args.stage2_coeff_loss_type!r} for "
+                f"{'variational' if args.variational_coeffs else ('deterministic real-valued' if not args.quantize_sparse_coeffs else 'quantized')} "
+                "stage-2 coefficients."
+            )
+    resolved_stage2_coeff_loss_type = str(args.stage2_coeff_loss_type).strip().lower()
+    args.stage2_coeff_loss_type = resolved_stage2_coeff_loss_type
+    if args.variational_coeffs:
+        if args.quantize_sparse_coeffs:
+            raise ValueError("variational_coeffs requires quantize_sparse_coeffs=false")
+        if args.stage2_epochs > 0 and resolved_stage2_coeff_loss_type != "gaussian_nll":
+            raise ValueError(
+                "variational_coeffs currently requires --stage2_coeff_loss_type gaussian_nll for stage-2 training"
+            )
+    if (
+        args.stage2_epochs > 0
+        and (not args.quantize_sparse_coeffs)
+        and (not args.variational_coeffs)
+        and resolved_stage2_coeff_loss_type == "gt_atom_recon_mse"
+        and int(os.environ.get("RANK", "0")) == 0
+    ):
+        print(
+            "[Warn] stage2_coeff_loss_type='gt_atom_recon_mse' on deterministic real-valued coefficients "
+            "has been empirically unstable and can collapse into blank or near-white samples; "
+            "prefer 'mse' or enable variational_coeffs with 'gaussian_nll'.",
+            file=sys.stderr,
+        )
+    args.stage1_amp_dtype = str(args.stage1_amp_dtype).strip().lower()
     args.stage2_amp_dtype = str(args.stage2_amp_dtype).strip().lower()
     if args.token_subset < 0:
         args.token_subset = 0
@@ -4368,12 +6005,64 @@ def main():
         args.stage1_source_ckpt = str(args.stage1_source_ckpt).strip()
         if not args.stage1_source_ckpt:
             args.stage1_source_ckpt = None
+    rank0 = int(os.environ.get("RANK", "0")) == 0
+    uses_explicit_stage1_dict_weight = math.isfinite(args.stage1_dict_loss_weight)
+    uses_explicit_stage1_commitment_weight = math.isfinite(args.stage1_commitment_loss_weight)
+    if rank0 and (uses_explicit_stage1_dict_weight or uses_explicit_stage1_commitment_weight):
+        print(
+            "[Config] explicit stage-1 dict/commitment weights are enabled, so "
+            "--bottleneck_weight is only a fallback for any term whose explicit weight is left unset.",
+            file=sys.stderr,
+        )
+    if (
+        rank0
+        and args.stage1_bottleneck_warmup_epochs > 0
+        and float(args.stage1_bottleneck_weight_start) > float(args.bottleneck_weight)
+    ):
+        print(
+            "[Warn] stage1_bottleneck_weight_start > bottleneck_weight, so stage-1 bottleneck pressure "
+            "will anneal down over the warmup window instead of ramping up.",
+            file=sys.stderr,
+        )
+    if (
+        rank0
+        and uses_explicit_stage1_dict_weight
+        and math.isfinite(args.stage1_dict_loss_weight_start)
+        and args.stage1_dict_loss_warmup_epochs > 0
+        and float(args.stage1_dict_loss_weight_start) > float(args.stage1_dict_loss_weight)
+    ):
+        print(
+            "[Warn] stage1_dict_loss_weight_start > stage1_dict_loss_weight, so dictionary-fit pressure "
+            "will anneal down over the warmup window instead of ramping up.",
+            file=sys.stderr,
+        )
+    if (
+        rank0
+        and uses_explicit_stage1_commitment_weight
+        and math.isfinite(args.stage1_commitment_loss_weight_start)
+        and args.stage1_commitment_loss_warmup_epochs > 0
+        and float(args.stage1_commitment_loss_weight_start) > float(args.stage1_commitment_loss_weight)
+    ):
+        print(
+            "[Warn] stage1_commitment_loss_weight_start > stage1_commitment_loss_weight, so encoder commitment "
+            "pressure will anneal down over the warmup window instead of ramping up.",
+            file=sys.stderr,
+        )
+    if args.variational_coeffs and args.stage1_epochs <= 0 and args.stage1_source_ckpt is None and args.stage1_source_run is None:
+        raise ValueError(
+            "variational_coeffs requires either stage1_epochs > 0 or an explicit variational stage-1 source checkpoint/run"
+        )
     default_stage1_ckpt = _default_stage1_source_ckpt(bool(args.quantize_sparse_coeffs))
     # Fresh stage-1 training should start from random init unless the caller
     # explicitly provides a checkpoint or run to warm-start from.
     stage1_init_source_ckpt = args.stage1_source_ckpt
     stage1_init_source_run = args.stage1_source_run
-    if args.stage1_source_ckpt is None and args.stage1_source_run is None and args.stage1_epochs <= 0:
+    if (
+        args.stage1_source_ckpt is None
+        and args.stage1_source_run is None
+        and args.stage1_epochs <= 0
+        and (not args.variational_coeffs)
+    ):
         args.stage1_source_run = DEFAULT_STAGE1_SOURCE_RUN
     if args.stage2_source_run is not None:
         args.stage2_source_run = str(args.stage2_source_run).strip()
@@ -4392,6 +6081,7 @@ def main():
         and args.stage2_source_token_cache is None
         and args.stage1_epochs <= 0
         and args.stage1_source_run == DEFAULT_STAGE1_SOURCE_RUN
+        and (not args.variational_coeffs)
     ):
         args.stage2_source_run = DEFAULT_STAGE2_SOURCE_RUN
     if args.image_size is None:
@@ -4423,6 +6113,7 @@ def main():
     args.out_root = str(experiment_root)
     args.launch_timestamp = launch_timestamp
     args.out_dir = str(run_out_dir)
+    args.run_id = _resolve_run_id(getattr(args, "run_id", None), launch_timestamp)
     if args.wandb_dir == "./wandb":
         args.wandb_dir = str(Path(args.out_dir) / "wandb")
 
@@ -4431,9 +6122,24 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
     stage1_dir = os.path.join(args.out_dir, "stage1")
     stage2_dir = os.path.join(args.out_dir, "stage2")
+    args.artifact_tag = _build_run_artifact_tag(args)
     if is_main_process:
         os.makedirs(stage1_dir, exist_ok=True)
         os.makedirs(stage2_dir, exist_ok=True)
+        if args.run_id:
+            print(f"[Setup] run_id={args.run_id}")
+        print(f"[Setup] artifact_tag={args.artifact_tag}")
+    if (
+        args.stage1_auto_resume_from_latest
+        and stage1_init_source_ckpt is None
+        and stage1_init_source_run is None
+        and args.stage1_epochs > 0
+    ):
+        auto_resume_path = _find_latest_stage1_autoresume_checkpoint(experiment_root, run_out_dir)
+        if auto_resume_path is not None:
+            stage1_init_source_ckpt = str(auto_resume_path)
+            if is_main_process:
+                print(f"[Stage1] auto-resuming from latest checkpoint under {experiment_root}: {auto_resume_path}")
 
     if preinit_wandb and is_main_process:
         wandb_run = _init_wandb(args)
@@ -4493,6 +6199,10 @@ def main():
             patch_size=args.patch_size,
             patch_stride=args.patch_stride,
             patch_reconstruction=args.patch_reconstruction,
+            variational_coeffs=args.variational_coeffs,
+            variational_coeff_kl_weight=args.variational_coeff_kl_weight,
+            variational_coeff_prior_std=args.variational_coeff_prior_std,
+            variational_coeff_min_std=args.variational_coeff_min_std,
         )
 
     def _prepare_stage1_source_checkpoint(run_ref: str) -> Path:
@@ -4614,6 +6324,7 @@ def main():
 
     train_sampler = DistributedSampler(train_set, shuffle=True) if distributed else None
     val_sampler = DistributedSampler(val_set, shuffle=False) if distributed else None
+    val_num_workers = max(0, args.num_workers // 2)
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -4621,14 +6332,16 @@ def main():
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
+        persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
         val_set,
         batch_size=min(64, args.batch_size),
         shuffle=False,
         sampler=val_sampler,
-        num_workers=max(0, args.num_workers // 2),
+        num_workers=val_num_workers,
         pin_memory=pin_memory,
+        persistent_workers=(val_num_workers > 0),
     )
     rfid_loader = None
     if is_main_process and args.rfid_num_samples > 0:
@@ -4636,8 +6349,19 @@ def main():
             val_set,
             batch_size=min(32, min(64, args.batch_size)),
             shuffle=False,
-            num_workers=max(0, args.num_workers // 2),
+            num_workers=val_num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(val_num_workers > 0),
+        )
+    stage2_fid_loader = None
+    if is_main_process and args.stage2_fid_num_samples > 0:
+        stage2_fid_loader = DataLoader(
+            val_set,
+            batch_size=min(32, min(64, args.batch_size)),
+            shuffle=False,
+            num_workers=val_num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(val_num_workers > 0),
         )
     if is_main_process:
         print("[Startup] dataloaders ready")
@@ -4669,6 +6393,8 @@ def main():
             lr=args.stage1_lr,
             bottleneck_weight=args.bottleneck_weight,
             grad_clip=args.grad_clip,
+            stage1_amp=args.stage1_amp,
+            stage1_amp_dtype=args.stage1_amp_dtype,
             out_dir=stage1_dir,
             rfid_num_samples=args.rfid_num_samples,
             lr_schedule=args.stage1_lr_schedule,
@@ -4695,9 +6421,11 @@ def main():
             coherence_weight_start=args.stage1_coherence_weight_start,
             coherence_warmup_epochs=args.stage1_coherence_warmup_epochs,
             coherence_margin=args.stage1_coherence_margin,
+            checkpoint_every_steps=args.stage1_checkpoint_every_steps,
             train_sampler=train_sampler,
             is_main_process=is_main_process,
             wandb_run=wandb_run,
+            artifact_tag=args.artifact_tag,
         )
     _barrier()
 
@@ -4709,8 +6437,9 @@ def main():
             val_set,
             batch_size=min(64, args.batch_size),
             shuffle=False,
-            num_workers=max(0, args.num_workers // 2),
+            num_workers=val_num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(val_num_workers > 0),
         )
         analyze_patch_spectrum(
             laser,
@@ -4724,6 +6453,7 @@ def main():
         return
 
     token_cache_path = Path(stage2_dir) / "tokens_cache.pt"
+    token_cache_tagged_path = _tagged_artifact_path(token_cache_path, args.artifact_tag)
     token_cache_ready_path = Path(stage2_dir) / "tokens_cache.ready"
     token_cache_error_path = Path(stage2_dir) / "tokens_cache.failed"
     token_subset = None if args.token_subset <= 0 else min(args.token_subset, len(stage2_source_set))
@@ -4765,6 +6495,7 @@ def main():
                     if compatible:
                         if requested_token_cache_path.resolve() != token_cache_path.resolve():
                             shutil.copy2(requested_token_cache_path, token_cache_path)
+                        _copy_artifact_to_tagged_path(token_cache_path, args.artifact_tag)
                         tokens_flat = token_cache["tokens_flat"]
                         H, W, D = token_cache["shape"]
                         print(
@@ -4789,6 +6520,7 @@ def main():
                         if compatible:
                             tokens_flat = token_cache["tokens_flat"]
                             H, W, D = token_cache["shape"]
+                            _copy_artifact_to_tagged_path(token_cache_path, args.artifact_tag)
                             print(
                                 f"[Stage2] reusing token cache: {tokens_flat.shape} "
                                 f"(H={H}, W={W}, D={D}) from {token_cache_path}"
@@ -4806,6 +6538,7 @@ def main():
                         compatible, reason = _token_cache_is_compatible(token_cache, expected_token_meta)
                         if compatible:
                             shutil.copy2(fallback_cache_path, token_cache_path)
+                            _copy_artifact_to_tagged_path(token_cache_path, args.artifact_tag)
                             tokens_flat = token_cache["tokens_flat"]
                             H, W, D = token_cache["shape"]
                             print(
@@ -4848,10 +6581,11 @@ def main():
                 if coeffs_flat is not None:
                     cache["coeffs_flat"] = coeffs_flat
                 torch.save(cache, str(token_cache_path))
+                _copy_artifact_to_tagged_path(token_cache_path, args.artifact_tag)
                 print(f"[Stage2] token dataset: {tokens_flat.shape} (H={H}, W={W}, D={D})")
             _write_atomic_text(
                 token_cache_ready_path,
-                f"ready {datetime.datetime.now().isoformat()} {token_cache_path}\n",
+                f"ready {datetime.datetime.now().isoformat()} {token_cache_path} tagged={token_cache_tagged_path}\n",
             )
         except Exception as exc:
             _write_atomic_text(
@@ -4901,22 +6635,21 @@ def main():
         pin_memory=pin_memory,
         drop_last=(len(token_dataset) >= args.stage2_batch_size),
     )
-    transformer = SpatialDepthPrior(
-        build_spatial_depth_prior_config(
-            laser.bottleneck,
-            H=H,
-            W=W,
-            D=D,
-            d_model=args.tf_d_model,
-            n_heads=args.tf_heads,
-            n_spatial_layers=args.tf_layers,
-            n_depth_layers=max(1, args.tf_layers // 2),
-            d_ff=args.tf_ff,
-            dropout=args.tf_dropout,
-            n_global_spatial_tokens=args.tf_global_tokens,
-            real_valued_coeffs=real_valued,
-            coeff_max_fallback=args.coef_max,
-        )
+    transformer = build_stage2_model(
+        laser.bottleneck,
+        stage2_arch=args.stage2_arch,
+        H=H,
+        W=W,
+        D=D,
+        d_model=args.tf_d_model,
+        n_heads=args.tf_heads,
+        n_layers=args.tf_layers,
+        d_ff=args.tf_ff,
+        dropout=args.tf_dropout,
+        n_global_spatial_tokens=args.tf_global_tokens,
+        real_valued_coeffs=real_valued,
+        coeff_max_fallback=args.coef_max,
+        autoregressive_coeffs=args.stage2_autoregressive_coeffs,
     ).to(device)
     if args.stage2_source_ckpt is not None:
         stage2_source_ckpt = Path(args.stage2_source_ckpt).expanduser().resolve()
@@ -4926,12 +6659,13 @@ def main():
             print(f"[Stage2] warm-starting transformer from local checkpoint: {stage2_source_ckpt}")
         _load_module_checkpoint(transformer, stage2_source_ckpt)
     if is_main_process:
-        coeff_mode = "real-valued coeffs" if real_valued else "quantized sparse coeffs"
         print(
-            "[Stage2] using RQ spatial-depth prior "
-            f"({coeff_mode}, scalar coeff embeddings, spatial_layers={args.tf_layers}, "
-            f"depth_layers={max(1, args.tf_layers // 2)}, "
-            f"global_tokens={args.tf_global_tokens})"
+            _describe_stage2_model(
+                transformer,
+                stage2_arch=args.stage2_arch,
+                tf_layers=args.tf_layers,
+                tf_global_tokens=args.tf_global_tokens,
+            )
         )
     _barrier()
 
@@ -4942,11 +6676,27 @@ def main():
             print(f"Outputs saved to: {args.out_dir}")
         _cleanup_distributed()
         return
-    transformer_stage2 = DDP(transformer, device_ids=[local_rank], output_device=local_rank) if distributed else transformer
+    stage2_find_unused_parameters = bool(
+        args.stage2_arch == "spatial_depth"
+        and (not getattr(transformer, "autoregressive_coeffs", True))
+    )
+    if distributed and is_main_process and stage2_find_unused_parameters:
+        print("[Stage2] enabling DDP unused-parameter detection for this training configuration")
+    transformer_stage2 = (
+        DDP(
+            transformer,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=stage2_find_unused_parameters,
+        )
+        if distributed
+        else transformer
+    )
 
     train_stage2_transformer(
         transformer=transformer_stage2,
         token_loader=token_loader,
+        stage2_fid_loader=stage2_fid_loader,
         device=device,
         epochs=args.stage2_epochs,
         lr=args.stage2_lr,
@@ -4974,11 +6724,25 @@ def main():
         sample_candidate_factor=args.stage2_sample_candidate_factor,
         sample_temperature=args.stage2_sample_temperature,
         sample_top_k=(None if args.stage2_sample_top_k <= 0 else args.stage2_sample_top_k),
+        sample_coeff_temperature=(
+            None if not math.isfinite(args.stage2_sample_coeff_temperature)
+            else args.stage2_sample_coeff_temperature
+        ),
+        sample_coeff_mode=args.stage2_sample_coeff_mode,
+        sample_selection_quality_weight=args.stage2_sample_quality_weight,
+        sample_brightness_weight=args.stage2_sample_brightness_weight,
+        sample_overbright_weight=args.stage2_sample_overbright_weight,
+        sample_reject_dark_z=args.stage2_sample_reject_dark_z,
+        sample_reject_bright_z=args.stage2_sample_reject_bright_z,
+        sample_sort_by_quality=args.stage2_sample_sort_by_quality,
         sample_image_size=args.stage2_sample_image_size,
         sample_reference_stats=sample_reference_stats,
+        stage2_fid_num_samples=args.stage2_fid_num_samples,
+        stage2_fid_every_epochs=args.stage2_fid_every_epochs,
         token_sampler=token_sampler,
         is_main_process=is_main_process,
         wandb_run=wandb_run,
+        artifact_tag=args.artifact_tag,
         ordinal_coeff_weight=args.ordinal_coeff_weight,
         ordinal_coeff_huber_delta=args.ordinal_coeff_huber_delta,
         ordinal_magnitude_weighted=args.ordinal_magnitude_weighted,

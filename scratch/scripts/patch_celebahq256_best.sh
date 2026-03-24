@@ -27,15 +27,15 @@ export NUM_RES_HIDDENS="${NUM_RES_HIDDENS:-64}"
 export NUM_RES_LAYERS="${NUM_RES_LAYERS:-2}"
 
 export BATCH_SIZE="${BATCH_SIZE:-6}"
-export STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-6}"
+export STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-2}"
 
 # Balanced winner from the 2026-03-19 coeff comparison:
 # a4096/k24 had the lowest stage-2 loss; a6144/k24 was best on stage-1 recon.
 export NUM_ATOMS="${NUM_ATOMS:-4096}"
 export SPARSITY_LEVEL="${SPARSITY_LEVEL:-24}"
 export QUANTIZE_SPARSE_COEFFS="${QUANTIZE_SPARSE_COEFFS:-true}"
-export N_BINS="${N_BINS:-512}"
-export COEF_MAX="${COEF_MAX:-4.0}"
+export N_BINS="${N_BINS:-2048}"
+export COEF_MAX="${COEF_MAX:-20.0}"
 export COEF_QUANTIZATION="${COEF_QUANTIZATION:-uniform}"
 export COEF_MU="${COEF_MU:-0.0}"
 

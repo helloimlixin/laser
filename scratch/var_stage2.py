@@ -31,6 +31,7 @@ from proto import (
     _log_wandb,
     _log_wandb_image,
     _parse_cli_bool,
+    _reconstruct_stage2_sparse_latent,
     _select_best_stage2_samples,
     _unlink_if_exists,
     _unwrap_module,
@@ -288,23 +289,27 @@ def train_stage2_var(
                         coeff_reg_loss = F.huber_loss(pred_coeff, target_coeff, delta=coeff_huber_delta)
                     elif coeff_loss_type == "recon_mse":
                         pred_atoms = atom_logits.argmax(dim=-1)
-                        pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                        pred_latent = _reconstruct_stage2_sparse_latent(
+                            ae_decode,
                             pred_atoms.view(B, H, W, D),
                             pred_coeff.view(B, H, W, D),
                         )
                         with torch.no_grad():
-                            target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            target_latent = _reconstruct_stage2_sparse_latent(
+                                ae_decode,
                                 tok_grid.view(B, H, W, D),
                                 target_coeff.view(B, H, W, D),
                             )
                         coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
                     else:
-                        pred_latent = ae_decode.bottleneck._reconstruct_sparse(
+                        pred_latent = _reconstruct_stage2_sparse_latent(
+                            ae_decode,
                             tok_grid.view(B, H, W, D),
                             pred_coeff.view(B, H, W, D),
                         )
                         with torch.no_grad():
-                            target_latent = ae_decode.bottleneck._reconstruct_sparse(
+                            target_latent = _reconstruct_stage2_sparse_latent(
+                                ae_decode,
                                 tok_grid.view(B, H, W, D),
                                 target_coeff.view(B, H, W, D),
                             )
@@ -532,7 +537,16 @@ def main():
     parser.add_argument("--stage2_rq_atom_loss_weight", type=float, default=1.0)
     parser.add_argument("--stage2_rq_coeff_loss_weight", type=float, default=1.0)
     parser.add_argument("--stage2_coeff_loss_weight", type=float, default=0.1)
-    parser.add_argument("--stage2_coeff_loss_type", type=str, default="gt_atom_recon_mse", choices=["huber", "mse", "recon_mse", "gt_atom_recon_mse"])
+    parser.add_argument(
+        "--stage2_coeff_loss_type",
+        type=str,
+        default=None,
+        choices=["huber", "mse", "recon_mse", "gt_atom_recon_mse"],
+        help=(
+            "Defaults to 'mse' for deterministic real-valued coefficients and "
+            "'gt_atom_recon_mse' for quantized coefficients."
+        ),
+    )
     parser.add_argument("--stage2_coeff_huber_delta", type=float, default=1.0)
     parser.add_argument("--coeff_depth_weighting", type=str, default="none", choices=["none", "linear", "inverse_rank"])
     parser.add_argument("--coeff_focal_gamma", type=float, default=0.0)
@@ -585,6 +599,26 @@ def main():
     parser.add_argument("--var_global_tokens", type=int, default=0)
 
     args = parser.parse_args()
+    if args.stage2_coeff_loss_type is None:
+        args.stage2_coeff_loss_type = "mse" if not args.quantize_sparse_coeffs else "gt_atom_recon_mse"
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "[Config] stage2_coeff_loss_type not set; using "
+                f"{args.stage2_coeff_loss_type!r} for "
+                f"{'deterministic real-valued' if not args.quantize_sparse_coeffs else 'quantized'} "
+                "stage-2 coefficients."
+            )
+    else:
+        args.stage2_coeff_loss_type = str(args.stage2_coeff_loss_type).strip().lower()
+    if (
+        (not args.quantize_sparse_coeffs)
+        and args.stage2_coeff_loss_type == "gt_atom_recon_mse"
+        and int(os.environ.get("RANK", "0")) == 0
+    ):
+        print(
+            "[Warn] stage2_coeff_loss_type='gt_atom_recon_mse' on deterministic real-valued coefficients "
+            "has been empirically unstable and can collapse into blank or near-white samples; prefer 'mse'."
+        )
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0")
     if args.stage2_sample_temperature_end <= 0.0:
