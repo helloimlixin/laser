@@ -1,6 +1,7 @@
 # requirements.txt
 torchvision
 lightning
+rich>=10.2.2
 hydra-core
 wandb
 omegaconf

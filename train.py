@@ -1,13 +1,25 @@
 import os
 import warnings
 
+# Windows: PyTorch (LLVM OpenMP) and MKL/NumPy (Intel OpenMP) can both load and trigger OMP #15.
+if os.name == "nt":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 # Suppress TF32 deprecation warnings (PyTorch 2.9 with Lightning compatibility)
 warnings.filterwarnings('ignore', message='.*TF32.*')
 os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
 
 import torch
+
+from src.hydra_argparse_compat import patch_argparse_for_hydra_on_py314
+
+patch_argparse_for_hydra_on_py314()
 import hydra
 from omegaconf import DictConfig
+
+from src.lightning_warning_filters import register as register_lightning_warning_filters
+
+register_lightning_warning_filters()
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
@@ -25,6 +37,7 @@ from src.data.cifar10 import CIFAR10DataModule
 from src.data.config import DataConfig
 from src.data.imagenette2 import Imagenette2DataModule
 from src.data.celeba import CelebADataModule
+from src.pl_trainer_util import resolve_val_check_interval
 
 # Configure progress bar theme
 progress_bar = RichProgressBar(
@@ -78,11 +91,11 @@ def train(cfg: DictConfig):
     print(f"Embedding Dimensions: {cfg.model.embedding_dim}")
     print(f"Number of Residual Blocks: {cfg.model.num_residual_blocks}")
     print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
-        if cfg.model.type == "laser":
-            print(f"Dictionary Size: {cfg.model.num_embeddings}")
-            print(f"Sparsity: {cfg.model.sparsity_level}")
-            if hasattr(cfg.model, "patch_size"):
-                print(f"Latent Patch Size: {cfg.model.patch_size}")
+    if cfg.model.type == "laser":
+        print(f"Dictionary Size: {cfg.model.num_embeddings}")
+        print(f"Sparsity: {cfg.model.sparsity_level}")
+        if hasattr(cfg.model, "patch_size"):
+            print(f"Latent Patch Size: {cfg.model.patch_size}")
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -268,9 +281,6 @@ def train(cfg: DictConfig):
     else:
         raise ValueError(f"Unsupported model type: {cfg.model.type}")
 
-    if hasattr(cfg.model, 'log_images_every_n_steps'):
-        setattr(model, 'log_images_every_n_steps', cfg.model.log_images_every_n_steps)
-
     # Initialize wandb logger
     run_name = f"{cfg.wandb.name}_{cfg.model.type}_{timestamp}"
     wandb_logger = WandbLogger(
@@ -301,16 +311,27 @@ def train(cfg: DictConfig):
         ))
 
     # Initialize trainer
-    # Choose DDP strategy only when using >1 device (GPU or CPU). Respect explicit config if provided.
+    devices_cfg = cfg.train.devices
+    try:
+        num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
+    except Exception:
+        num_devices = 1
+
+    # Choose DDP only when using >1 device. Single-GPU DDP still inits torch.distributed (NCCL on CUDA),
+    # which is unavailable on many Windows PyTorch builds — use auto instead.
     strategy_cfg = getattr(cfg.train, "strategy", None)
     if strategy_cfg is None:
-        devices_cfg = cfg.train.devices
-        try:
-            num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
-        except Exception:
-            num_devices = 1
         if cfg.model.type == "vqvae" and num_devices and num_devices > 1:
             strategy_cfg = "ddp"
+    # Lightning rejects strategy=None; null / unset in config means default (auto).
+    if strategy_cfg is None:
+        strategy_cfg = "auto"
+    strat_lower = str(strategy_cfg).lower()
+    if num_devices <= 1 and strat_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
+        strategy_cfg = "auto"
+    val_check_interval = resolve_val_check_interval(
+        datamodule, getattr(cfg.train, "val_check_interval", 1.0)
+    )
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,
         accelerator=cfg.train.accelerator,
@@ -321,7 +342,7 @@ def train(cfg: DictConfig):
         precision=cfg.train.precision,
         gradient_clip_val=cfg.train.gradient_clip_val,
         log_every_n_steps=cfg.train.log_every_n_steps,
-        val_check_interval=getattr(cfg.train, "val_check_interval", 1.0),
+        val_check_interval=val_check_interval,
         deterministic=True,
         enable_progress_bar=True,
         enable_model_summary=(str(cfg.train.precision) == "32"),

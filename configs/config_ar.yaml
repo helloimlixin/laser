@@ -2,9 +2,11 @@
 # Usage: python train_ar.py laser_ckpt=/path/to/laser.ckpt
 
 # =============================================================================
-# Required: Path to pretrained LASER checkpoint with pattern quantization
+# Optional inputs. Pattern mode needs `laser_ckpt`; sparse prior modes need
+# `token_cache_path`.
 # =============================================================================
-laser_ckpt: ???  # Must be provided via command line
+laser_ckpt: null
+token_cache_path: null
 
 # =============================================================================
 # General Settings
@@ -16,12 +18,25 @@ output_dir: outputs/ar
 # AR Transformer Model Configuration
 # =============================================================================
 ar:
-  # Vocabulary size (should match num_patterns from LASER)
-  vocab_size: 2048
+  # Training path:
+  # - pattern: legacy pattern-quantizer AR model
+  # - sparse_spatial_depth: quantized sparse-token spatial+depth prior
+  # - sparse_mingpt: quantized sparse-token flat minGPT prior
+  type: pattern
+
+  # Vocabulary size. Leave null to auto-resolve from the LASER checkpoint
+  # (pattern mode) or sparse-token cache metadata (sparse prior modes).
+  vocab_size: null
 
   # Sequence length (number of patches per image)
   # Default assumes 128x128 images, encoder downsample x4, patch_size=8/patch_stride=8 → 4x4=16 tokens
   seq_len: 16
+
+  # Sparse-token-only options. In sparse modes the token grid shape comes from
+  # the cache, while these vocab settings define the atom/bin split.
+  atom_vocab_size: null
+  coeff_vocab_size: null
+  n_global_spatial_tokens: 0
 
   # Model architecture
   d_model: 512
@@ -39,6 +54,13 @@ ar:
   weight_decay: 0.01
   warmup_steps: 1000
   max_steps: 50000
+  min_lr_ratio: 0.01
+
+  # Quantized sparse-token loss shaping. Ignored by pattern mode.
+  atom_loss_weight: 1.0
+  coeff_loss_weight: 1.0
+  coeff_depth_weighting: none
+  coeff_focal_gamma: 0.0
 
 # =============================================================================
 # AR Training Configuration
@@ -52,13 +74,16 @@ train_ar:
   gradient_clip_val: 1.0
   log_every_n_steps: 10
   val_check_interval: 0.25
+  validation_split: 0.05
+  test_split: 0.05
+  max_items: 0
 
 # =============================================================================
 # Dataset Configuration (same as LASER training)
 # =============================================================================
 data:
   dataset: cifar10
-  data_dir: ./data
+  data_dir: ${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}
   batch_size: 64  # For pattern extraction
   num_workers: 4
   image_size: 128

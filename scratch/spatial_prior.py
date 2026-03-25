@@ -20,6 +20,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+try:
+    from transformer_core import (
+        TransformerBlock,
+        private_long_tensor,
+        run_transformer_blocks,
+    )
+except ModuleNotFoundError:
+    from scratch.transformer_core import (
+        TransformerBlock,
+        private_long_tensor,
+        run_transformer_blocks,
+    )
 
 
 def soft_clamp(x: torch.Tensor, max_val: float) -> torch.Tensor:
@@ -28,15 +40,7 @@ def soft_clamp(x: torch.Tensor, max_val: float) -> torch.Tensor:
     return max_val * torch.tanh(x / max_val)
 
 
-def _private_long_tensor(x: torch.Tensor, *, device: Optional[torch.device] = None) -> torch.Tensor:
-    """Return a private int64 copy for embedding/scatter index paths.
-
-    Autograd saves integer index tensors for backward in embedding and gather-
-    style ops. When callers pass views that are later reused elsewhere, taking a
-    dedicated clone here avoids version-counter aliasing failures during
-    backward.
-    """
-    return x.to(device=device, dtype=torch.long).clone()
+_private_long_tensor = private_long_tensor
 
 
 def _autocast_enabled(device_type: str) -> bool:
@@ -142,89 +146,6 @@ def build_spatial_depth_prior_config(
     )
 
 
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_drop_p = dropout
-        self.resid_dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
-        if kv_cache is not None:
-            k_prev, v_prev = kv_cache
-            k = torch.cat([k_prev, k], dim=2)
-            v = torch.cat([v_prev, v], dim=2)
-
-        new_kv = (k, v)
-        drop_p = self.attn_drop_p if self.training else 0.0
-
-        _CUDA_GRID_MAX = 65535
-        if kv_cache is not None:
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop_p)
-        elif B * self.n_heads > _CUDA_GRID_MAX:
-            chunk_b = _CUDA_GRID_MAX // self.n_heads
-            out = torch.cat([
-                F.scaled_dot_product_attention(
-                    q[i:i+chunk_b], k[i:i+chunk_b], v[i:i+chunk_b],
-                    is_causal=True, dropout_p=drop_p,
-                )
-                for i in range(0, B, chunk_b)
-            ], dim=0)
-        else:
-            out = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, dropout_p=drop_p,
-            )
-
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.out_proj(out)
-        out = self.resid_dropout(out)
-        return out, new_kv
-
-
-class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with optional KV cache."""
-
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        h = self.ln1(x)
-        attn_out, new_kv = self.attn(h, kv_cache=kv_cache)
-        x = x + attn_out
-        x = x + self.ffn(self.ln2(x))
-        return x, new_kv
-
-
 class SpatialDepthPrior(nn.Module):
 
     def __init__(self, cfg: SpatialDepthPriorConfig):
@@ -318,7 +239,13 @@ class SpatialDepthPrior(nn.Module):
             self._coeff_bin_values = None
 
         self.spatial_blocks = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+            TransformerBlock(
+                cfg.d_model,
+                cfg.n_heads,
+                cfg.d_ff,
+                cfg.dropout,
+                chunk_causal_batches=True,
+            )
             for _ in range(cfg.n_spatial_layers)
         ])
         self.depth_blocks = nn.ModuleList([
@@ -561,8 +488,12 @@ class SpatialDepthPrior(nn.Module):
         global_h = self.global_spatial_tokens.expand(batch_size, -1, -1).to(
             dtype=self._activation_dtype(self.global_spatial_tokens.device)
         )
-        for i, blk in enumerate(self.spatial_blocks):
-            global_h, spatial_kv[i] = blk(global_h, kv_cache=spatial_kv[i])
+        _, spatial_kv = run_transformer_blocks(
+            global_h,
+            self.spatial_blocks,
+            None,
+            kv_cache=spatial_kv,
+        )
         return spatial_kv
 
     def _prepare_depth_inputs(
@@ -696,9 +627,11 @@ class SpatialDepthPrior(nn.Module):
 
         spatial_in = spatial_in + self._spatial_pos(T, device, dtype=act_dtype).unsqueeze(0)
         spatial_h = self._prepend_global_spatial_tokens(spatial_in)
-        for blk in self.spatial_blocks:
-            spatial_h, _ = blk(spatial_h)
-        spatial_h = self.spatial_ln(spatial_h)
+        spatial_h, _ = run_transformer_blocks(
+            spatial_h,
+            self.spatial_blocks,
+            self.spatial_ln,
+        )
         if self.n_global_spatial_tokens > 0:
             spatial_h = spatial_h[:, self.n_global_spatial_tokens:]
         return spatial_h
@@ -741,10 +674,11 @@ class SpatialDepthPrior(nn.Module):
         depth_pos = self.depth_emb(torch.arange(D, device=device)).to(dtype=act_dtype)
         depth_in = depth_in + depth_pos.unsqueeze(0)
 
-        depth_h = depth_in
-        for blk in self.depth_blocks:
-            depth_h, _ = blk(depth_h)
-        depth_h = self.depth_ln(depth_h)
+        depth_h, _ = run_transformer_blocks(
+            depth_in,
+            self.depth_blocks,
+            self.depth_ln,
+        )
         return depth_h.reshape(B, T, D, d_model)
 
     def _forward_depth_hidden(
@@ -1063,11 +997,13 @@ class SpatialDepthPrior(nn.Module):
             ).to(dtype=x_new.dtype)
 
             spatial_h = x_new
-            for i, blk in enumerate(self.spatial_blocks):
-                spatial_h, spatial_kv[i] = blk(
-                    spatial_h, kv_cache=spatial_kv[i],
-                )
-            h_t = self.spatial_ln(spatial_h).squeeze(1)          # [B, d]
+            spatial_h, spatial_kv = run_transformer_blocks(
+                spatial_h,
+                self.spatial_blocks,
+                self.spatial_ln,
+                kv_cache=spatial_kv,
+            )
+            h_t = spatial_h.squeeze(1)                           # [B, d]
 
             # -- depth stage: autoregressive, no KV cache (D is small) --
             depth_seq: list[torch.Tensor] = []
@@ -1084,9 +1020,11 @@ class SpatialDepthPrior(nn.Module):
                 depth_seq.append(step_in)
 
                 depth_h = torch.cat(depth_seq, dim=1)            # [B, d+1, dm]
-                for blk in self.depth_blocks:
-                    depth_h, _ = blk(depth_h)
-                depth_h = self.depth_ln(depth_h)
+                depth_h, _ = run_transformer_blocks(
+                    depth_h,
+                    self.depth_blocks,
+                    self.depth_ln,
+                )
                 last_h = depth_h[:, -1]                          # [B, dm]
 
                 logits = self.token_head(last_h)

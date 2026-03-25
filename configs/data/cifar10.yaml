@@ -1,6 +1,6 @@
 # Configuration for CIFAR10 dataset
 dataset: cifar10
-data_dir: ${oc.env:DATA_DIR,./data}
+data_dir: ${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}
 batch_size: 128
 num_workers: 4
 image_size: 32

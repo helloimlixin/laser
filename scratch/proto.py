@@ -4695,12 +4695,65 @@ def _compute_quantized_rq_losses(
     coeff_focal_gamma: float = 0.0,
     coeff_logits: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
-    """Return the plain shared-vocab CE used by the simplified quantized path."""
-    del atom_loss_weight, coeff_loss_weight, coeff_depth_weighting, coeff_focal_gamma, coeff_logits
+    """Split shared-vocab CE into atom/coeff views while keeping one total loss."""
     if per_token_ce.numel() == 0:
         raise ValueError("Expected non-empty per-token CE tensor")
+    del coeff_logits
+
+    def _depth_weights(depth_steps: int, mode: str, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if depth_steps <= 0:
+            raise ValueError("depth_steps must be positive")
+        mode = str(mode).strip().lower()
+        if mode == "none":
+            return torch.ones(depth_steps, device=device, dtype=dtype)
+        if mode == "linear":
+            weights = torch.arange(depth_steps, 0, -1, device=device, dtype=dtype)
+        elif mode == "inverse_rank":
+            weights = 1.0 / torch.arange(1, depth_steps + 1, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unsupported coeff_depth_weighting: {mode!r}")
+        return weights / weights.mean().clamp_min(1e-8)
+
     token_ce_loss = per_token_ce.mean()
-    return token_ce_loss, None, None, token_ce_loss
+    atom_terms = per_token_ce[..., 0::2]
+    coeff_terms = per_token_ce[..., 1::2]
+
+    atom_ce_loss = atom_terms.mean() if atom_terms.numel() > 0 else None
+
+    coeff_ce_loss = None
+    coeff_weighted_terms = None
+    if coeff_terms.numel() > 0:
+        coeff_weighted_terms = coeff_terms
+        depth_weights = _depth_weights(
+            coeff_terms.size(-1),
+            coeff_depth_weighting,
+            device=coeff_terms.device,
+            dtype=coeff_terms.dtype,
+        )
+        coeff_weighted_terms = coeff_weighted_terms * depth_weights.view(
+            *([1] * (coeff_terms.ndim - 1)),
+            coeff_terms.size(-1),
+        )
+        coeff_focal_gamma = float(max(0.0, coeff_focal_gamma))
+        if coeff_focal_gamma > 0.0:
+            pt = torch.exp(-coeff_terms.clamp_min(0.0))
+            coeff_weighted_terms = coeff_weighted_terms * (1.0 - pt).pow(coeff_focal_gamma)
+        coeff_ce_loss = coeff_weighted_terms.mean()
+
+    total_numerator = per_token_ce.new_tensor(0.0)
+    total_denominator = per_token_ce.new_tensor(0.0)
+    atom_loss_weight = float(atom_loss_weight)
+    coeff_loss_weight = float(coeff_loss_weight)
+    if atom_ce_loss is not None:
+        total_numerator = total_numerator + atom_loss_weight * atom_terms.sum()
+        total_denominator = total_denominator + atom_loss_weight * atom_terms.numel()
+    if coeff_ce_loss is not None and coeff_weighted_terms is not None:
+        total_numerator = total_numerator + coeff_loss_weight * coeff_weighted_terms.sum()
+        total_denominator = total_denominator + coeff_loss_weight * coeff_weighted_terms.numel()
+    if total_denominator.item() <= 0.0:
+        raise ValueError("Expected positive quantized loss denominator")
+    total_loss = total_numerator / total_denominator
+    return token_ce_loss, atom_ce_loss, coeff_ce_loss, total_loss
 
 
 def train_stage2_transformer(
@@ -5024,11 +5077,19 @@ def train_stage2_transformer(
                 else:
                     tok_grid = tok_flat.view(B, H * W, D).clone()
                     logits = transformer(tok_grid)
-                    ce_loss = F.cross_entropy(
+                    per_token_ce = F.cross_entropy(
                         logits.reshape(-1, vocab),
                         tok_grid.reshape(-1),
+                        reduction="none",
+                    ).view(B, H * W, D)
+                    ce_loss, atom_ce_loss, coeff_ce_loss, loss = _compute_quantized_rq_losses(
+                        per_token_ce,
+                        atom_loss_weight=rq_atom_loss_weight,
+                        coeff_loss_weight=rq_coeff_loss_weight,
+                        coeff_depth_weighting=coeff_depth_weighting,
+                        coeff_focal_gamma=coeff_focal_gamma,
+                        coeff_logits=None,
                     )
-                    loss = ce_loss
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)

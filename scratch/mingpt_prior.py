@@ -18,14 +18,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+try:
+    from transformer_core import (
+        TransformerBlock,
+        init_transformer_module_weights,
+        private_long_tensor,
+        run_transformer_blocks,
+    )
+except ModuleNotFoundError:
+    from scratch.transformer_core import (
+        TransformerBlock,
+        init_transformer_module_weights,
+        private_long_tensor,
+        run_transformer_blocks,
+    )
 
-
-def _private_long_tensor(
-    x: torch.Tensor,
-    *,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    return x.to(device=device, dtype=torch.long).clone()
+_private_long_tensor = private_long_tensor
 
 
 @dataclass
@@ -73,76 +81,6 @@ def build_mingpt_quantized_prior_config(
     )
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
-        super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}")
-        self.n_heads = int(n_heads)
-        self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_drop_p = float(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
-        if kv_cache is not None:
-            k_prev, v_prev = kv_cache
-            k = torch.cat([k_prev, k], dim=2)
-            v = torch.cat([v_prev, v], dim=2)
-
-        new_kv = (k, v)
-        drop_p = self.attn_drop_p if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=(kv_cache is None),
-            dropout_p=drop_p,
-        )
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.out_proj(out)
-        out = self.resid_dropout(out)
-        return out, new_kv
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        h = self.ln1(x)
-        attn_out, new_kv = self.attn(h, kv_cache=kv_cache)
-        x = x + attn_out
-        x = x + self.ffn(self.ln2(x))
-        return x, new_kv
-
-
 class MinGPTQuantizedPrior(nn.Module):
     def __init__(self, cfg: MinGPTQuantizedPriorConfig):
         super().__init__()
@@ -186,18 +124,8 @@ class MinGPTQuantizedPrior(nn.Module):
             persistent=True,
         )
 
-        self.apply(self._init_weights)
+        self.apply(init_transformer_module_weights)
         nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.zeros_(module.bias)
-            nn.init.ones_(module.weight)
 
     def _flatten_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.ndim != 3:
@@ -229,9 +157,8 @@ class MinGPTQuantizedPrior(nn.Module):
         idx: torch.Tensor,
     ) -> torch.Tensor:
         x = self._embed(idx, past_len=0)
-        for block in self.blocks:
-            x, _ = block(x)
-        logits = self.token_head(self.ln_f(x))
+        x, _ = run_transformer_blocks(x, self.blocks, self.ln_f)
+        logits = self.token_head(x)
         return self._masked_logits(logits, start_pos=0)
 
     def forward(
@@ -266,11 +193,13 @@ class MinGPTQuantizedPrior(nn.Module):
         start_pos: int,
     ) -> Tuple[torch.Tensor, list[Tuple[torch.Tensor, torch.Tensor]]]:
         x = self._embed(idx, past_len=start_pos)
-        new_cache = []
-        for block_idx, block in enumerate(self.blocks):
-            x, kv = block(x, kv_cache=None if kv_cache is None else kv_cache[block_idx])
-            new_cache.append(kv)
-        logits = self.token_head(self.ln_f(x))
+        x, new_cache = run_transformer_blocks(
+            x,
+            self.blocks,
+            self.ln_f,
+            kv_cache=kv_cache,
+        )
+        logits = self.token_head(x)
         logits = self._masked_logits(logits, start_pos=start_pos)
         return logits, new_cache
 

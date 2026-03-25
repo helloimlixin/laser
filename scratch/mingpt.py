@@ -17,67 +17,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+try:
+    from transformer_core import (
+        TransformerBlock as Block,
+        init_transformer_module_weights,
+        run_transformer_blocks,
+    )
+except ModuleNotFoundError:
+    from scratch.transformer_core import (
+        TransformerBlock as Block,
+        init_transformer_module_weights,
+        run_transformer_blocks,
+    )
 
 KVCache = list[Tuple[torch.Tensor, torch.Tensor]]
-
-
-# ---------------------------------------------------------------------------
-# Transformer building blocks
-# ---------------------------------------------------------------------------
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.1):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
-        self.qkv = nn.Linear(n_embd, 3 * n_embd)
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.dropout = dropout
-        self.resid_drop = nn.Dropout(dropout)
-
-    def forward(
-        self, x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        B, T, C = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        if kv_cache is not None:
-            k = torch.cat([kv_cache[0], k], dim=2)
-            v = torch.cat([kv_cache[1], v], dim=2)
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=(self.dropout if self.training else 0.0),
-            is_causal=(kv_cache is None and T > 1),
-        )
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_drop(self.proj(out)), (k, v)
-
-
-class Block(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.1):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, dropout)
-        self.mlp = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-
-    def forward(
-        self, x: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        attn_out, new_cache = self.attn(self.ln1(x), kv_cache=kv_cache)
-        x = x + attn_out
-        x = x + self.mlp(self.ln2(x))
-        return x, new_cache
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +60,17 @@ class MinGPT(nn.Module):
         )
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
-            [Block(n_embd, n_head, dropout) for _ in range(n_layer)]
+            [
+                Block(
+                    n_embd,
+                    n_head,
+                    4 * n_embd,
+                    dropout,
+                    attn_bias=True,
+                    out_proj_bias=True,
+                )
+                for _ in range(n_layer)
+            ]
         )
         self.ln_f = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
@@ -115,19 +78,9 @@ class MinGPT(nn.Module):
             nn.Embedding(num_classes, n_embd) if num_classes else None
         )
 
-        self.apply(self._init_weights)
+        self.apply(init_transformer_module_weights)
         nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
         print(f"MinGPT: block_size={block_size}, vocab_size={vocab_size}")
-
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
 
     def _embed(
         self, idx: torch.Tensor, class_idx, past_len: int,
@@ -143,9 +96,8 @@ class MinGPT(nn.Module):
 
     def forward(self, idx, targets=None, class_idx=None, type_ids=None):
         x = self._embed(idx, class_idx, past_len=0, type_ids=type_ids)
-        for block in self.blocks:
-            x, _ = block(x)
-        logits = self.head(self.ln_f(x))
+        x, _ = run_transformer_blocks(x, self.blocks, self.ln_f)
+        logits = self.head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
@@ -167,11 +119,13 @@ class MinGPT(nn.Module):
                 f"block_size={self.block_size}",
             )
         x = self._embed(idx, class_idx, past_len, type_ids=type_ids)
-        new_cache: KVCache = []
-        for i, block in enumerate(self.blocks):
-            x, kv = block(x, kv_cache=kv_cache[i] if kv_cache else None)
-            new_cache.append(kv)
-        return self.head(self.ln_f(x)), new_cache
+        x, new_cache = run_transformer_blocks(
+            x,
+            self.blocks,
+            self.ln_f,
+            kv_cache=kv_cache,
+        )
+        return self.head(x), new_cache
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, class_idx=None,

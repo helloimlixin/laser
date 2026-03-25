@@ -1,6 +1,6 @@
 # configs/data/imagenette2.yaml
 dataset: imagenette2
-data_dir: ${hydra:runtime.cwd}/data/imagenette2
+data_dir: ${oc.env:IMAGENETTE2_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/imagenette2}
 batch_size: 32
 num_workers: 4
 image_size: 224
