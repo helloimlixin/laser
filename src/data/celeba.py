@@ -1,6 +1,6 @@
 import os
 import warnings
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Tuple, Union, List
 
@@ -15,6 +15,24 @@ from src.data.config import DataConfig
 
 
 IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+
+
+def _is_readable_rgb_image(path: Path) -> bool:
+    try:
+        with Image.open(path) as img:
+            img.convert("RGB").load()
+        return True
+    except Exception:
+        return False
+
+
+def _filter_readable_paths(paths: List[Path]) -> List[Path]:
+    if not paths:
+        return []
+    workers = min(32, max(4, (os.cpu_count() or 4) * 2))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        ok = list(pool.map(_is_readable_rgb_image, paths))
+    return [p for p, keep in zip(paths, ok) if keep]
 
 
 class FlatImageDataset(Dataset):
@@ -50,7 +68,7 @@ class FlatImageDataset(Dataset):
         attempts = 0
         failures = []
         last_exc = None
-        while attempts < 10:
+        while attempts < min(256, num_items):
             path = self.image_paths[index % num_items]
             try:
                 with Image.open(path) as img:
@@ -99,8 +117,8 @@ class CelebADataModule(pl.LightningDataModule):
             os.environ.get('CELEBA_DIR', ''),
             '/home/xl598/Data/celeba/img_align_celeba',
             '/home/xl598/Data/celeba',
-            str(Path.cwd() / 'data' / 'celeba'),
-            str(Path(__file__).resolve().parents[2] / 'data' / 'celeba'),
+            str((Path.cwd() / '..' / 'data' / 'celeba').resolve()),
+            str(Path(__file__).resolve().parents[3] / 'data' / 'celeba'),
         ]
 
         for c in candidates:
@@ -119,6 +137,8 @@ class CelebADataModule(pl.LightningDataModule):
         pass
 
     def setup(self, stage=None):
+        if self.train_dataset is not None:
+            return
         data_dir = self._resolve_data_dir()
         augment = self.config.augment
 
@@ -146,6 +166,20 @@ class CelebADataModule(pl.LightningDataModule):
         ])
 
         base_dataset = FlatImageDataset(data_dir, transform=None)
+        raw_paths = base_dataset.image_paths
+        valid_paths = _filter_readable_paths(raw_paths)
+        dropped = len(raw_paths) - len(valid_paths)
+        if dropped:
+            warnings.warn(
+                f"CelebA: skipped {dropped} unreadable or corrupt file(s) under {data_dir}. "
+                f"Re-download or repair those images if you need the full dataset."
+            )
+        if len(valid_paths) < 3:
+            raise RuntimeError(
+                f"Fewer than 3 readable images in {data_dir} after validation "
+                f"({len(valid_paths)} left, {dropped} dropped)."
+            )
+        base_dataset = FlatImageDataset(data_dir, transform=None, paths=valid_paths)
         num_items = len(base_dataset)
         num_train = int(0.90 * num_items)
         num_val = int(0.05 * num_items)

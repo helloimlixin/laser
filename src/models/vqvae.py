@@ -51,8 +51,10 @@ class VQVAE(pl.LightningModule):
         self.learning_rate = learning_rate
         self.beta = beta
         self.perceptual_weight = perceptual_weight
-        self.log_images_every_n_steps = 100
         self.compute_fid = compute_fid
+        self._viz_train = None
+        self._viz_val = None
+        self._viz_test = None
 
         # Initialize model components
         self.encoder = Encoder(in_channels=in_channels,
@@ -249,37 +251,49 @@ class VQVAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """Perform the training step."""
         metrics = self.compute_metrics(batch, prefix='train')
-
-        if batch_idx % self.log_images_every_n_steps == 0:
-            self._log_images(metrics['x'], metrics['x_recon'], split='train')
-
+        self._viz_train = (metrics['x'], metrics['x_recon'])
         return metrics
+
+    def on_train_epoch_end(self):
+        if self._viz_train is not None:
+            x, x_recon = self._viz_train
+            self._log_images(x, x_recon, split='train')
+            self._viz_train = None
 
     def validation_step(self, batch, batch_idx):
         """Perform the validation step."""
         metrics = self.compute_metrics(batch, prefix='val')
-
-        if batch_idx % self.log_images_every_n_steps == 0:
-            self._log_images(metrics['x'], metrics['x_recon'], split='val')
-
+        self._viz_val = (metrics['x'], metrics['x_recon'])
         return metrics
+
+    def on_validation_epoch_end(self):
+        if self._viz_val is not None:
+            x, x_recon = self._viz_val
+            self._log_images(x, x_recon, split='val')
+            self._viz_val = None
+
+    def on_test_epoch_start(self):
+        """Reset test-only metrics before aggregating over the full test set."""
+        self._viz_test = None
+        if self.test_fid is not None:
+            self.test_fid.reset()
 
     def test_step(self, batch, batch_idx):
         """Perform the test step."""
-        # Compute all metrics
         metrics = self.compute_metrics(batch, prefix='test')
+        self._viz_test = (metrics['x'], metrics['x_recon'])
+        return metrics
 
-        # Log images periodically
-        if batch_idx % self.log_images_every_n_steps == 0:
-            self._log_images(metrics['x'], metrics['x_recon'], split='test')
-
-        # Existing FID handling
+    def on_test_epoch_end(self):
+        """Log reconstructions and compute FID after the full test set."""
+        if self._viz_test is not None:
+            x, x_recon = self._viz_test
+            self._log_images(x, x_recon, split='test')
+            self._viz_test = None
         if self.test_fid is not None:
             fid_score = self.test_fid.compute()
             self.log('test/fid', fid_score, sync_dist=True)
             self.test_fid.reset()
-
-        return metrics
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""

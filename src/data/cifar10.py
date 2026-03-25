@@ -11,7 +11,7 @@ class CIFAR10DataModule(pl.LightningDataModule):
         if config is None:
             config = DataConfig(
                 dataset='cifar10',
-                data_dir='./data',
+                data_dir='../data',
                 batch_size=128,
                 num_workers=4,
                 image_size=32,

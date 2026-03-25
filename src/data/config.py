@@ -7,7 +7,7 @@ class DataConfig:
     dataset: str
     data_dir: str
     batch_size: int = 128
-    num_workers: int = 4
+    num_workers: int = 8
     image_size: Union[int, Tuple[int, int]] = 32
     mean: Tuple[float, float, float] = (0.4914, 0.4822, 0.4465)  # CIFAR10 default
     std: Tuple[float, float, float] = (0.2470, 0.2435, 0.2616)   # CIFAR10 default
