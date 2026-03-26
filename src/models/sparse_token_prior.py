@@ -14,6 +14,38 @@ from .mingpt_prior import MinGPTQuantizedPrior, MinGPTQuantizedPriorConfig
 from .spatial_prior import SpatialDepthPrior, SpatialDepthPriorConfig
 
 
+def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
+    cfg = getattr(prior, "cfg", None)
+    if isinstance(prior, SpatialDepthPrior) and isinstance(cfg, SpatialDepthPriorConfig):
+        return {
+            "prior_architecture": "spatial_depth",
+            "prior_d_model": int(cfg.d_model),
+            "prior_n_heads": int(cfg.n_heads),
+            "prior_n_spatial_layers": int(cfg.n_spatial_layers),
+            "prior_n_depth_layers": int(cfg.n_depth_layers),
+            "prior_n_global_spatial_tokens": int(cfg.n_global_spatial_tokens),
+            "prior_d_ff": int(cfg.d_ff),
+            "prior_dropout": float(cfg.dropout),
+            "prior_atom_vocab_size": int(
+                cfg.atom_vocab_size if cfg.atom_vocab_size is not None else cfg.vocab_size
+            ),
+            "prior_coeff_vocab_size": int(cfg.coeff_vocab_size or 0),
+            "prior_coeff_max": float(cfg.coeff_max),
+        }
+    if isinstance(prior, MinGPTQuantizedPrior) and isinstance(cfg, MinGPTQuantizedPriorConfig):
+        return {
+            "prior_architecture": "mingpt",
+            "prior_d_model": int(cfg.d_model),
+            "prior_n_heads": int(cfg.n_heads),
+            "prior_n_layers": int(cfg.n_layers),
+            "prior_d_ff": int(cfg.d_ff),
+            "prior_dropout": float(cfg.dropout),
+            "prior_atom_vocab_size": int(cfg.atom_vocab_size),
+            "prior_coeff_vocab_size": int(cfg.coeff_vocab_size),
+        }
+    return {"prior_architecture": prior.__class__.__name__.lower()}
+
+
 def compute_quantized_rq_losses(
     per_token_ce: torch.Tensor,
     atom_loss_weight: float,
@@ -142,6 +174,7 @@ def build_sparse_prior_from_cache(
 ) -> nn.Module:
     """Build a maintained sparse-token prior from a cached token grid."""
     H, W, D = token_cache_grid_shape(cache)
+    meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
     if cache.get("coeffs_flat") is not None:
         raise NotImplementedError("Maintained sparse-token prior training currently supports quantized caches only.")
 
@@ -154,11 +187,14 @@ def build_sparse_prior_from_cache(
 
     architecture = str(architecture).strip().lower()
     if architecture == "spatial_depth":
+        coeff_bin_values = meta.get("coeff_bin_values")
+        coeff_max = float(meta.get("coef_max", 24.0))
         return SpatialDepthPrior(
             SpatialDepthPriorConfig(
                 vocab_size=total_vocab_size,
                 atom_vocab_size=atom_vocab_size,
                 coeff_vocab_size=coeff_vocab_size,
+                coeff_bin_values=coeff_bin_values,
                 H=H,
                 W=W,
                 D=D,
@@ -170,6 +206,7 @@ def build_sparse_prior_from_cache(
                 n_global_spatial_tokens=int(n_global_spatial_tokens),
                 d_ff=int(d_ff),
                 dropout=float(dropout),
+                coeff_max=coeff_max,
             )
         )
     if architecture == "mingpt":
@@ -219,6 +256,7 @@ class SparseTokenPriorModule(pl.LightningModule):
         self.coeff_depth_weighting = str(coeff_depth_weighting).strip().lower()
         self.coeff_focal_gamma = float(max(0.0, coeff_focal_gamma))
         self.save_hyperparameters(ignore=["prior"])
+        self.save_hyperparameters(_prior_checkpoint_hparams(prior))
 
     def configure_optimizers(self):
         optimizer_cls = torch.optim.AdamW if self.weight_decay > 0 else torch.optim.Adam

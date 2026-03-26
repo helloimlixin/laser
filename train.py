@@ -28,6 +28,8 @@ from datetime import datetime
 
 # Reduce DeepSpeed info logs
 os.environ.setdefault("DEEPSPEED_LOG_LEVEL", "warning")
+# Required by cuBLAS for deterministic kernels on supported CUDA paths.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 torch.set_float32_matmul_precision('medium')
 
@@ -65,6 +67,11 @@ def train(cfg: DictConfig):
     ckpt_path = getattr(cfg, "ckpt_path", None)
     if ckpt_path:
         print(f"\nResume checkpoint: {ckpt_path}")
+    deterministic = bool(getattr(cfg.train, "deterministic", False))
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
 
     # Print detailed experiment configuration
     print("\n" + "="*50)
@@ -94,8 +101,6 @@ def train(cfg: DictConfig):
     if cfg.model.type == "laser":
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
-        if hasattr(cfg.model, "patch_size"):
-            print(f"Latent Patch Size: {cfg.model.patch_size}")
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -109,6 +114,8 @@ def train(cfg: DictConfig):
     print(f"Devices: {cfg.train.devices}")
     print(f"Precision: {cfg.train.precision}")
     print(f"Gradient Clip Value: {cfg.train.gradient_clip_val}")
+    print(f"Deterministic: {deterministic}")
+    print(f"Run Test After Fit: {bool(getattr(cfg.train, 'run_test_after_fit', False))}")
     
     print("\nWandB Configuration:")
     print(f"Project: {cfg.wandb.project}")
@@ -140,7 +147,7 @@ def train(cfg: DictConfig):
     print("="*50 + "\n")
 
     # Set random seed for reproducibility
-    pl.seed_everything(cfg.seed)
+    pl.seed_everything(cfg.seed, workers=True)
     
     # Print GPU information
     print(f"GPU available: {torch.cuda.is_available()}")
@@ -236,30 +243,16 @@ def train(cfg: DictConfig):
             'compute_fid': cfg.model.compute_fid,
             'bottleneck_loss_weight': getattr(cfg.model, 'bottleneck_loss_weight', 0.5),
             'sparsity_level': cfg.model.sparsity_level,
-            'use_online_learning': getattr(cfg.model, 'use_online_learning', False),
-            'use_backprop_only': getattr(cfg.model, 'use_backprop_only', False),
-            'dict_learning_rate': getattr(cfg.model, 'dict_learning_rate', 0.1),
-            'sparse_solver': getattr(cfg.model, 'sparse_solver', 'omp'),
-            'iht_iterations': getattr(cfg.model, 'iht_iterations', 10),
-            'iht_step_size': getattr(cfg.model, 'iht_step_size', None),
-            'fista_alpha': getattr(cfg.model, 'fista_alpha', 0.1),
-            'fista_tolerance': getattr(cfg.model, 'fista_tolerance', 1e-3),
-            'fista_max_steps': getattr(cfg.model, 'fista_max_steps', 50),
+            'dict_learning_rate': getattr(cfg.model, 'dict_learning_rate', None),
+            'patch_based': getattr(cfg.model, 'patch_based', True),
+            'patch_size': getattr(cfg.model, 'patch_size', 4),
+            'patch_stride': getattr(cfg.model, 'patch_stride', 2),
+            'patch_reconstruction': getattr(cfg.model, 'patch_reconstruction', 'hann'),
             'sparsity_reg_weight': getattr(cfg.model, 'sparsity_reg_weight', 0.01),
-            'patch_size': getattr(cfg.model, 'patch_size', 1),
-            'patch_stride': getattr(cfg.model, 'patch_stride', None),
-            'multi_res_dct_weight': getattr(cfg.model, 'multi_res_dct_weight', 0.0),
-            'multi_res_dct_levels': getattr(cfg.model, 'multi_res_dct_levels', 3),
-            'multi_res_grad_weight': getattr(cfg.model, 'multi_res_grad_weight', 0.0),
-            'multi_res_grad_levels': getattr(cfg.model, 'multi_res_grad_levels', 3),
-            'per_pixel_sparse_coding': getattr(cfg.model, 'per_pixel_sparse_coding', False),
-            'patch_flatten_order': getattr(cfg.model, 'patch_flatten_order', 'channel_first'),
-            # Pattern quantization for autoregressive generation
-            'use_pattern_quantizer': getattr(cfg.model, 'use_pattern_quantizer', False),
-            'num_patterns': getattr(cfg.model, 'num_patterns', 2048),
-            'pattern_commitment_cost': getattr(cfg.model, 'pattern_commitment_cost', 0.25),
-            'pattern_ema_decay': getattr(cfg.model, 'pattern_ema_decay', 0.99),
-            'pattern_temperature': getattr(cfg.model, 'pattern_temperature', 1.0),
+            'coherence_weight': getattr(cfg.model, 'coherence_weight', 0.0),
+            'log_images_every_n_steps': getattr(cfg.model, 'log_images_every_n_steps', 100),
+            'diag_log_interval': getattr(cfg.model, 'diag_log_interval', 0),
+            'enable_val_latent_visuals': getattr(cfg.model, 'enable_val_latent_visuals', False),
         }
         model = LASER(**model_params)
     elif cfg.model.type == "vqvae":
@@ -343,7 +336,7 @@ def train(cfg: DictConfig):
         gradient_clip_val=cfg.train.gradient_clip_val,
         log_every_n_steps=cfg.train.log_every_n_steps,
         val_check_interval=val_check_interval,
-        deterministic=True,
+        deterministic=deterministic,
         enable_progress_bar=True,
         enable_model_summary=(str(cfg.train.precision) == "32"),
         reload_dataloaders_every_n_epochs=0,
@@ -352,6 +345,9 @@ def train(cfg: DictConfig):
 
     # Train and test model (use PyTorch defaults for matmul precision to avoid API mixing)
     trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
+
+    if not bool(getattr(cfg.train, "run_test_after_fit", False)):
+        return
 
     # Ensure all ranks finish training before launching the single-GPU test pass
     if getattr(trainer, "strategy", None) and hasattr(trainer.strategy, "barrier"):
@@ -367,7 +363,7 @@ def train(cfg: DictConfig):
         devices=1,
         logger=wandb_logger,
         precision=cfg.train.precision,
-        deterministic=True,
+        deterministic=deterministic,
         enable_progress_bar=True,
         enable_model_summary=(str(cfg.train.precision) == "32")
     )

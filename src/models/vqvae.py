@@ -6,10 +6,9 @@ import torchvision
 
 from .encoder import Encoder
 from .decoder import Decoder
-from .bottleneck import VectorQuantizer
+from .bottleneck import VectorQuantizerEMA
 from .lpips import LPIPS
 
-import torchmetrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
 import wandb
@@ -50,6 +49,7 @@ class VQVAE(pl.LightningModule):
         # Store model parameters
         self.learning_rate = learning_rate
         self.beta = beta
+        self.decay = decay
         self.perceptual_weight = perceptual_weight
         self.compute_fid = compute_fid
         self._viz_train = None
@@ -67,11 +67,11 @@ class VQVAE(pl.LightningModule):
                                         kernel_size=1,
                                         stride=1)
         
-        # Use Zalando-style non-EMA vector quantizer
-        self.vector_quantizer = VectorQuantizer(
+        self.vector_quantizer = VectorQuantizerEMA(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
-            commitment_cost=commitment_cost
+            commitment_cost=commitment_cost,
+            ema_decay=decay,
         )
 
         self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
@@ -91,18 +91,23 @@ class VQVAE(pl.LightningModule):
         self.lpips = LPIPS() if self.perceptual_weight > 0 else None
 
         if self.compute_fid:
-            self.test_fid = torchmetrics.image.FrechetInceptionDistance(
-                feature=64,
-                normalize=True
-            )
+            self.test_fid = FrechetInceptionDistance(feature=64, normalize=True)
         else:
             self.test_fid = None
 
-        # Compute PSNR on de-normalized [0,1] images
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        # Separate metric instances per split avoid state leakage and let us
+        # control what shows up in the progress bar.
+        self.train_psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.val_psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.test_psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.val_ssim = StructuralSimilarityIndexMeasure()
+        self.test_ssim = StructuralSimilarityIndexMeasure()
 
         # Save hyperparameters for logging
         self.save_hyperparameters()
+
+    def _trainer_ref(self):
+        return self.__dict__.get("_trainer", None)
 
     def encode_to_indices(self, x):
         """
@@ -217,15 +222,19 @@ class VQVAE(pl.LightningModule):
                 self.test_fid.update(x_recon_fid, real=False)
                 self.test_fid.update(x_fid, real=True)
 
-        # Log all metrics (sync across devices for epoch-level aggregation)
-        self.log(f'{prefix}/loss', total_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/recon_loss', recon_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/vq_loss', vq_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/perceptual_loss', perceptual_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/perplexity', perplexity, on_step=True, on_epoch=True, sync_dist=True)
+        log_kwargs = dict(
+            on_step=prefix == 'train',
+            on_epoch=True,
+            sync_dist=prefix != 'train',
+        )
+        self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
+        self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
+        self.log(f'{prefix}/vq_loss', vq_loss, **log_kwargs)
+        self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
+        self.log(f'{prefix}/perplexity', perplexity, prog_bar=True, **log_kwargs)
 
         # Add PSNR calculation on de-normalized [0,1] images for stable progression
-        dm = getattr(getattr(self, "trainer", None), "datamodule", None)
+        dm = getattr(self._trainer_ref(), "datamodule", None)
         if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
             mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
             std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
@@ -234,8 +243,18 @@ class VQVAE(pl.LightningModule):
         else:
             x_dn = ((x + 1.0) / 2.0).clamp(0.0, 1.0)
             recon_dn = ((recon_raw + 1.0) / 2.0).clamp(0.0, 1.0)
-        psnr = self.psnr(x_dn, recon_dn)
-        self.log(f'{prefix}/psnr', psnr, on_step=True, on_epoch=True, sync_dist=True)
+        ssim = None
+        if prefix == 'train':
+            psnr = self.train_psnr(recon_dn, x_dn)
+        elif prefix == 'val':
+            psnr = self.val_psnr(recon_dn, x_dn)
+            ssim = self.val_ssim(recon_dn, x_dn)
+        else:
+            psnr = self.test_psnr(recon_dn, x_dn)
+            ssim = self.test_ssim(recon_dn, x_dn)
+        self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
+        if ssim is not None:
+            self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
 
         return {
             'loss': total_loss,
@@ -244,6 +263,7 @@ class VQVAE(pl.LightningModule):
             'perceptual_loss': perceptual_loss,
             'perplexity': perplexity,
             'psnr': psnr,
+            'ssim': ssim,
             'x': x_vis,
             'x_recon': recon_vis
         }
@@ -310,7 +330,7 @@ class VQVAE(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val/loss_epoch",  # Metric to monitor
+                "monitor": "val/loss",
             }
         }
 
@@ -324,7 +344,7 @@ class VQVAE(pl.LightningModule):
             split (str): Data split (train/val/test)
         """
         # Only log from rank zero in DDP to avoid multi-process logger contention
-        if getattr(getattr(self, "trainer", None), "is_global_zero", False) is False:
+        if getattr(self._trainer_ref(), "is_global_zero", False) is False:
             return
         # Take first 16 images
         x = x[:32]
@@ -332,7 +352,7 @@ class VQVAE(pl.LightningModule):
 
         # Create grids with smaller size
         # De-normalize using datamodule config if available; otherwise assume [-1,1] → [0,1]
-        dm = getattr(getattr(self, "trainer", None), "datamodule", None)
+        dm = getattr(self._trainer_ref(), "datamodule", None)
         if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
             mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
             std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
@@ -369,6 +389,4 @@ class VQVAE(pl.LightningModule):
 if __name__ == "__main__":
     vqvae = VQVAE(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32, num_embeddings=1024, embedding_dim=32, commitment_cost=0.25, decay=0.99, perceptual_weight=0.1, learning_rate=1e-4, beta=1.0, compute_fid=True)
     x = torch.randn(4, 3, 256, 256)  # batch_size x 3 x 256 x 256
-    print(vqvae(x).shape)  # batch_size x 3 x 256 x 256
-
-
+    print(vqvae(x)[0].shape)  # batch_size x 3 x 256 x 256

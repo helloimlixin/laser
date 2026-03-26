@@ -4,6 +4,7 @@ data_dir: ${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}
 batch_size: 128
 num_workers: 4
 image_size: 32
+seed: ${seed}
 mean: [0.4914, 0.4822, 0.4465]
 std: [0.2470, 0.2435, 0.2616]
 augment: true 

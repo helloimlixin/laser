@@ -1,6 +1,7 @@
 import os
 from typing import Optional, Tuple, List
 import lightning as pl
+import torch
 from torch.utils.data import DataLoader
 from dataclasses import dataclass
 import logging
@@ -19,6 +20,7 @@ class ImageNette2Config:
     image_size: int
     batch_size: int
     num_workers: int
+    seed: int
     mean: List[float]
     std: List[float]
 
@@ -30,6 +32,7 @@ class ImageNette2Config:
             image_size=config.image_size,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
+            seed=int(getattr(config, "seed", 42)),
             mean=config.mean,
             std=config.std
         )
@@ -57,6 +60,11 @@ class Imagenette2DataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_dataset = None
         self.transform = None
+
+    def _loader_generator(self, offset: int = 0) -> torch.Generator:
+        generator = torch.Generator()
+        generator.manual_seed(int(self.config.seed) + int(offset))
+        return generator
 
     def setup_transforms(self) -> None:
         """Initialize data transforms."""
@@ -117,7 +125,8 @@ class Imagenette2DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=False
+            pin_memory=False,
+            generator=self._loader_generator(0),
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -130,7 +139,8 @@ class Imagenette2DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
-            pin_memory=False
+            pin_memory=False,
+            generator=self._loader_generator(1),
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -144,5 +154,6 @@ class Imagenette2DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
-            pin_memory=False
+            pin_memory=False,
+            generator=self._loader_generator(2),
         )

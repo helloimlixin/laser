@@ -23,6 +23,11 @@ class CIFAR10DataModule(pl.LightningDataModule):
         self.cifar_train = None
         self.cifar_val = None  # Rename this variable
 
+    def _loader_generator(self, offset=0):
+        generator = torch.Generator()
+        generator.manual_seed(int(self.config.seed) + int(offset))
+        return generator
+
     def prepare_data(self):
         """Download data if needed"""
         CIFAR10(self.config.data_dir, train=True, download=True)
@@ -77,7 +82,8 @@ class CIFAR10DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            generator=self._loader_generator(0),
         )
 
     def val_dataloader(self):
@@ -86,7 +92,8 @@ class CIFAR10DataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            generator=self._loader_generator(1),
         )
 
     def test_dataloader(self):

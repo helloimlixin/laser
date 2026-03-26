@@ -1,11 +1,10 @@
 # AR Transformer Training Configuration
-# Usage: python train_ar.py laser_ckpt=/path/to/laser.ckpt
+# Usage: python train_ar.py token_cache_path=/path/to/tokens_cache.pt
 
 # =============================================================================
-# Optional inputs. Pattern mode needs `laser_ckpt`; sparse prior modes need
-# `token_cache_path`.
+# Sparse prior training requires a token cache produced by the maintained
+# sparse-code extraction pipeline.
 # =============================================================================
-laser_ckpt: null
 token_cache_path: null
 
 # =============================================================================
@@ -19,21 +18,15 @@ output_dir: outputs/ar
 # =============================================================================
 ar:
   # Training path:
-  # - pattern: legacy pattern-quantizer AR model
   # - sparse_spatial_depth: quantized sparse-token spatial+depth prior
   # - sparse_mingpt: quantized sparse-token flat minGPT prior
-  type: pattern
+  type: sparse_spatial_depth
 
-  # Vocabulary size. Leave null to auto-resolve from the LASER checkpoint
-  # (pattern mode) or sparse-token cache metadata (sparse prior modes).
+  # Vocabulary size. Leave null to auto-resolve from sparse-token cache metadata.
   vocab_size: null
 
-  # Sequence length (number of patches per image)
-  # Default assumes 128x128 images, encoder downsample x4, patch_size=8/patch_stride=8 → 4x4=16 tokens
-  seq_len: 16
-
-  # Sparse-token-only options. In sparse modes the token grid shape comes from
-  # the cache, while these vocab settings define the atom/bin split.
+  # Sparse-token options. The token grid shape comes from the cache, while
+  # these vocab settings define the atom/bin split.
   atom_vocab_size: null
   coeff_vocab_size: null
   n_global_spatial_tokens: 0
@@ -56,7 +49,7 @@ ar:
   max_steps: 50000
   min_lr_ratio: 0.01
 
-  # Quantized sparse-token loss shaping. Ignored by pattern mode.
+  # Quantized sparse-token loss shaping.
   atom_loss_weight: 1.0
   coeff_loss_weight: 1.0
   coeff_depth_weighting: none
@@ -77,6 +70,10 @@ train_ar:
   validation_split: 0.05
   test_split: 0.05
   max_items: 0
+  sample_every_n_steps: 0
+  sample_num_images: 4
+  sample_temperature: 1.0
+  sample_top_k: 0
 
 # =============================================================================
 # Dataset Configuration (same as LASER training)
@@ -84,7 +81,7 @@ train_ar:
 data:
   dataset: cifar10
   data_dir: ${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}
-  batch_size: 64  # For pattern extraction
+  batch_size: 64
   num_workers: 4
   image_size: 128
   mean: [0.5, 0.5, 0.5]
@@ -95,5 +92,5 @@ data:
 # =============================================================================
 wandb:
   project: laser-ar
-  name: ar_transformer
+  name: sparse_token_prior
   save_dir: outputs/wandb

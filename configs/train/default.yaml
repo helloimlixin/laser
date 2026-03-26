@@ -7,6 +7,10 @@ devices: 2
 strategy: "ddp"
 precision: 32
 gradient_clip_val: 1.0
+deterministic: true
 log_every_n_steps: 100
 early_stopping_patience: null # Disable early stopping by default to run full max_epochs
-val_check_interval: 2000
+# Fractional values in (0, 1] are epoch-relative in Lightning.
+# 1.0 = validate once at the end of every epoch.
+val_check_interval: 1.0
+run_test_after_fit: false

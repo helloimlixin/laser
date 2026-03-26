@@ -580,7 +580,8 @@ class SpatialDepthPrior(nn.Module):
     ) -> torch.Tensor:
         if logits.ndim != 4:
             raise ValueError(f"Expected [B, T, D, V] logits, got {tuple(logits.shape)}")
-        masked = logits
+        depth_mask = self._depth_token_mask.view(1, 1, self.rollout_depth, self.cfg.vocab_size)
+        masked = logits.masked_fill(~depth_mask, float("-inf"))
         if tokens is not None:
             if tokens.shape != logits.shape[:3]:
                 raise ValueError(
@@ -780,6 +781,7 @@ class SpatialDepthPrior(nn.Module):
         depth_idx: int,
         prev_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        logits = logits.masked_fill(~self._depth_token_mask[depth_idx].view(1, -1), float("-inf"))
         prev_atoms = None
         if prev_tokens is not None and depth_idx > 0:
             if self.real_valued_coeffs or not self.autoregressive_coeffs:

@@ -1,0 +1,144 @@
+_wandb:
+    value:
+        cli_version: 0.22.3
+        e:
+            pavs7ts72cf1zes1l8kkcdvbe9ewzaf2:
+                args:
+                    - --dataset
+                    - celeba
+                    - --data_dir
+                    - ../../data/celeba
+                    - --image_size
+                    - "128"
+                    - --out_dir
+                    - ./runs/celeba128_scratch_coeff_group_smoke
+                    - --seed
+                    - "0"
+                    - --devices
+                    - "2"
+                    - --batch_size
+                    - "128"
+                    - --stage1_epochs
+                    - "1"
+                    - --stage1_lr
+                    - "2e-4"
+                    - --bottleneck_weight
+                    - "2.0"
+                    - --ae_num_downsamples
+                    - "2"
+                    - --embedding_dim
+                    - "96"
+                    - --num_atoms
+                    - "8192"
+                    - --sparsity_level
+                    - "8"
+                    - --commitment_cost
+                    - "0.4"
+                    - --bottleneck_patch_size
+                    - "4"
+                    - --usage_ema_decay
+                    - "0.99"
+                    - --usage_balance_alpha
+                    - "0.5"
+                    - --dead_atom_threshold
+                    - "0.001"
+                    - --dead_atom_interval
+                    - "200"
+                    - --stage2_epochs
+                    - "1"
+                    - --stage2_lr
+                    - "3e-4"
+                    - --stage2_batch_size
+                    - "16"
+                    - --no_stage2_resume_from_last
+                    - --stage2_sample_every_steps
+                    - "2000"
+                    - --stage2_sample_temperature
+                    - "0.60"
+                    - --stage2_sample_top_k
+                    - "24"
+                    - --stage2_atom_focus_ratio
+                    - "0.0"
+                    - --stage2_coeff_ramp_ratio
+                    - "0.0"
+                    - --stage2_direct_coeff_loss_weight
+                    - "1.0"
+                    - --stage2_coeff_loss_weight
+                    - "0.05"
+                    - --stage2_coeff_l2_normalize
+                    - --stage2_grouped_sampling
+                    - --stage2_grouped_sampling_method
+                    - kmeans
+                    - --stage2_grouped_sampling_kmeans_iters
+                    - "12"
+                    - --wandb_group
+                    - sparse_coeff_group_smoke
+                    - --wandb_name
+                    - celeba128_scratch_coeff_group_smoke
+                codePath: scratch/proto.py
+                codePathLocal: proto.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "12.9"
+                disk:
+                    /:
+                        total: "1955110866944"
+                        used: "1031049089024"
+                email: helloimlixin@gmail.com
+                executable: /home/xl598/anaconda3/envs/laser/bin/python3
+                git:
+                    commit: 46bbab6c5a97baf9bacd706ed82915795f4a9d04
+                    remote: https://github.com/helloimlixin/laser.git
+                gpu: NVIDIA RTX 4000 Ada Generation
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 6144
+                      memoryTotal: "21469593600"
+                      name: NVIDIA RTX 4000 Ada Generation
+                      uuid: GPU-e98589b4-157b-ff52-72dc-68faded7b576
+                    - architecture: Ada
+                      cudaCores: 6144
+                      memoryTotal: "21469593600"
+                      name: NVIDIA RTX 4000 Ada Generation
+                      uuid: GPU-37604416-81ff-3afc-d739-52ff1c0d9871
+                host: sarwate-exxact
+                memory:
+                    total: "134532345856"
+                os: Linux-5.15.0-143-generic-x86_64-with-glibc2.35
+                program: /home/xl598/Projects/laser/scratch/proto.py
+                python: CPython 3.12.3
+                root: ./wandb
+                startedAt: "2026-02-28T05:40:20.477968Z"
+                writerId: pavs7ts72cf1zes1l8kkcdvbe9ewzaf2
+        m:
+            - "1": trainer/global_step
+              "6":
+                - 3
+              "7": []
+            - "2": '*'
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 41
+                - 50
+                - 106
+            "2":
+                - 1
+                - 41
+                - 50
+                - 106
+            "3":
+                - 7
+                - 13
+                - 61
+                - 66
+            "4": 3.12.3
+            "5": 0.22.3
+            "12": 0.22.3
+            "13": linux-x86_64

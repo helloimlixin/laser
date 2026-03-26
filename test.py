@@ -31,7 +31,6 @@ model = LASER(
     learning_rate=1e-4,
     beta=0.9,
     perceptual_weight=1.0,
-    patch_size=1,
 )
 print("✓ Model created successfully")
 
@@ -41,14 +40,15 @@ model.eval()
 x = torch.randn(2, 3, 64, 64)
 
 with torch.no_grad():
-    recon, bottleneck_loss, coeffs = model(x)
+    recon, bottleneck_loss, sparse_codes = model(x)
 
 print(f"✓ Forward pass successful")
 print(f"   Input shape: {x.shape}")
 print(f"   Reconstruction shape: {recon.shape}")
 print(f"   Bottleneck loss: {bottleneck_loss.item():.6f}")
-print(f"   Coefficients shape: {coeffs.shape}")
-print(f"   Sparsity: {(coeffs.abs() > 1e-6).sum(dim=0).float().mean().item():.2f} atoms/pixel")
+print(f"   Support shape: {sparse_codes.support.shape}")
+print(f"   Values shape: {sparse_codes.values.shape}")
+print(f"   Sparsity: {(sparse_codes.values.abs() > 1e-6).float().sum(dim=-1).mean().item():.2f} atoms/pixel")
 
 # Test reconstruction quality
 print("\n3. Testing reconstruction quality...")
@@ -58,6 +58,7 @@ print(f"✓ MSE: {mse:.6f}")
 # Test compute_metrics
 print("\n4. Testing compute_metrics...")
 model.eval()
+model.log = lambda *args, **kwargs: None
 batch = (x,)
 loss, recon_vis, x_vis = model.compute_metrics(batch, prefix='test')
 print(f"✓ Metrics computed")
@@ -70,7 +71,7 @@ trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"   Total parameters: {total_params:,}")
 print(f"   Trainable parameters: {trainable_params:,}")
 print(f"   Dictionary atoms: {model.bottleneck.num_embeddings}")
-print(f"   Atom dimension: {model.bottleneck.atom_dim}")
+print(f"   Atom dimension: {model.bottleneck.embedding_dim}")
 
 print("\n" + "="*60)
 print("ALL CHECKS PASSED ✓")

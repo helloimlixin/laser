@@ -97,6 +97,11 @@ class CelebADataModule(pl.LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
 
+    def _loader_generator(self, offset: int = 0) -> torch.Generator:
+        generator = torch.Generator()
+        generator.manual_seed(int(self.config.seed) + int(offset))
+        return generator
+
     def _resolve_data_dir(self) -> str:
         """Resolve a directory that actually contains CelebA images."""
         def has_images(path_str: str) -> bool:
@@ -188,7 +193,7 @@ class CelebADataModule(pl.LightningDataModule):
         if num_items < 3:
             raise RuntimeError("CelebA dataset must contain at least three images for train/val/test splits.")
 
-        generator = torch.Generator().manual_seed(42)
+        generator = torch.Generator().manual_seed(int(self.config.seed))
         indices = torch.randperm(num_items, generator=generator)
         train_idx = indices[:num_train]
         val_idx = indices[num_train:num_train + num_val]
@@ -222,6 +227,7 @@ class CelebADataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
+            seed_offset=0,
         )
 
     def val_dataloader(self):
@@ -231,6 +237,7 @@ class CelebADataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=val_workers,
+            seed_offset=1,
         )
 
     def test_dataloader(self):
@@ -240,9 +247,10 @@ class CelebADataModule(pl.LightningDataModule):
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=test_workers,
+            seed_offset=2,
         )
 
-    def _build_loader(self, dataset, batch_size, shuffle, num_workers):
+    def _build_loader(self, dataset, batch_size, shuffle, num_workers, seed_offset):
         if dataset is None:
             return None
         kwargs = dict(
@@ -252,6 +260,7 @@ class CelebADataModule(pl.LightningDataModule):
             num_workers=num_workers,
             pin_memory=False,
             persistent_workers=(num_workers > 0),
+            generator=self._loader_generator(seed_offset),
         )
         if num_workers > 0:
             kwargs['timeout'] = 120

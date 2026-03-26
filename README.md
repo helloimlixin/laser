@@ -2,12 +2,12 @@
 
 This repository provides autoencoder models with dictionary learning for image reconstruction:
 
-- **LASER (Learnable Adaptive Structured Embedding Representation)** — Dictionary learning VAE with IHT/K-SVD sparse coding and flexible dictionary update strategies.
+- **LASER (Learnable Adaptive Structured Embedding Representation)** — Dictionary learning VAE with OMP sparse coding and flexible dictionary update strategies.
 - **VQ-VAE (Vector Quantized VAE)** — Baseline model with discrete latent codes and a learnable codebook.
 
 ## Features
 
-- 🚀 Advanced dictionary learning with multiple sparse coding algorithms (IHT, OMP, Top-K)
+- 🚀 OMP-based dictionary learning with configurable sparsity
 - ⚡ GPU-friendly implementation with AMP-aware sparse coding
 - 📊 Comprehensive metrics: MSE, PSNR, SSIM, LPIPS, FID
 - 🔧 Modular architecture powered by PyTorch Lightning and Hydra
@@ -51,7 +51,6 @@ pip install -r requirements.txt
 │   │   ├── laser.py        # LASER model
 │   │   ├── vqvae.py        # VQ-VAE baseline
 │   │   ├── lpips.py
-│   │   └── losses.py
 │   └── visualizations/     # Visualization utilities
 ├── tests/                  # Unit tests
 ├── train.py                # Main training script
@@ -63,7 +62,7 @@ pip install -r requirements.txt
 ### Training
 
 ```bash
-# Train LASER with IHT sparse coding
+# Train LASER with OMP sparse coding
 python train.py model=laser data=cifar10
 
 # Train LASER on CelebA
@@ -88,6 +87,36 @@ pytest tests/test_decoder.py -v
 python test.py --checkpoint path/to/checkpoint.ckpt --dataset celeba
 ```
 
+### Quick Smoke Test
+
+Run a tiny end-to-end CelebA smoke test that:
+- builds an 8192-image symlinked subset
+- trains a tiny stage-1 LASER model
+- saves a stage-1 input/reconstruction preview
+- extracts a sparse token cache
+- saves a token-cache decode preview
+- trains a tiny stage-2 sparse prior on the full extracted train split
+- generates a small sample sheet
+
+```bash
+python scripts/smoke_e2e.py
+```
+
+Useful overrides:
+
+```bash
+# Use a specific CelebA directory
+python scripts/smoke_e2e.py --data-dir /path/to/celeba
+
+# Rebuild outputs from scratch
+python scripts/smoke_e2e.py --clean
+
+# Compare against the non-patch bottleneck
+python scripts/smoke_e2e.py --no-patch-based
+```
+
+The generated samples are still a smoke-test artifact, but the defaults now give stage-2 a bit more signal. In practice the most useful outputs are usually `stage1_recon_preview.png`, `token_cache_decode_preview.png`, and then `samples.png` in that order.
+
 ## Configuration
 
 All configuration is managed through Hydra. Adjust the YAML files under `configs/` or override settings directly from the command line:
@@ -96,8 +125,8 @@ All configuration is managed through Hydra. Adjust the YAML files under `configs
 # Override specific parameters
 python train.py model=laser data=celeba train.max_epochs=100 model.sparsity_level=8
 
-# Use different sparse coding algorithm
-python train.py model=laser model.sparse_solver=iht model.iht_iterations=10
+# Tune sparse coding capacity
+python train.py model=laser model.sparsity_level=10 model.num_embeddings=1024
 
 # Enable online dictionary learning
 python train.py model=laser model.use_online_learning=true model.use_backprop_only=false
@@ -107,7 +136,7 @@ python train.py model=laser model.use_online_learning=true model.use_backprop_on
 
 ### Overview
 
-LASER (Learnable Adaptive Structured Embedding Representation) is a dictionary learning VAE that supports multiple sparse coding algorithms and dictionary update strategies. It alternates between:
+LASER (Learnable Adaptive Structured Embedding Representation) is a dictionary learning VAE that uses OMP sparse coding with configurable dictionary update strategies. It alternates between:
 1. **Sparse Coding**: Find sparse coefficients using Orthogonal Matching Pursuit (OMP)
 2. **Dictionary Update**: Update each atom sequentially using rank-1 SVD approximations
 
@@ -136,7 +165,6 @@ dl = DictionaryLearning(
     sparsity_level=8,         # Number of non-zero coefficients
     commitment_cost=0.25,     # Weight for commitment loss
     ksvd_iterations=1,        # Number of K-SVD updates per forward pass
-    patch_size=8,            # Spatial patch size (8x8 patches)
 )
 
 # Forward pass
@@ -151,23 +179,18 @@ z_reconstructed, loss, coefficients = dl(z_encoded)
 - **commitment_cost**: Weight for the encoder commitment loss term (encourages encoder to match dictionary reconstruction)
 - **dictionary_weight**: Weight for the dictionary reconstruction loss (controls how fast dictionary learns via backprop). Default: 1.0
 - **ksvd_iterations**: Number of K-SVD dictionary update iterations per forward pass
-- **patch_size**: Spatial patch size for patch-based processing (1 = pixel-level, 8 = 8×8 patches)
 
 **Note**: Dictionary atoms are always normalized to unit L2 norm for numerical stability.
 
-### Sparse Coding Algorithms
+### Sparse Coding
 
-LASER supports three sparse coding methods:
-
-1. **IHT (Iterative Hard Thresholding)**: True sparse coding with iterative optimization
-2. **OMP (Orthogonal Matching Pursuit)**: Greedy selection with least-squares refinement  
-3. **Top-K**: Fast approximate sparse coding (single matrix multiplication)
+LASER currently uses **Orthogonal Matching Pursuit (OMP)** for sparse coding. OMP greedily selects atoms and refines coefficients with least-squares solves at each step, which keeps the support genuinely sparse and produces higher-quality reconstructions than the removed heuristic solver paths.
 
 ### Dictionary Learning Features
 
-1. **Multiple Sparse Coding Algorithms**: Choose between IHT, OMP, or Top-K
+1. **OMP Sparse Coding**: Greedy sparse pursuit with least-squares refinement
 2. **Flexible Dictionary Updates**: Backprop-only, K-SVD, or online learning
-3. **Patch-based Processing**: Reduces computational complexity by processing spatial patches
+3. **Per-location Sparse Coding**: Sparse codes are produced directly on the latent grid
 4. **Automatic Atom Normalization**: All atoms normalized to unit L2 norm for stability
 5. **Training/Eval Mode Support**: Dictionary updates enabled in training, frozen in eval
 6. **L1 Sparsity Regularization**: Encourages true sparsity in coefficients
@@ -202,11 +225,10 @@ For each atom k in the dictionary:
 - SVD computation can be expensive for large dictionaries
 - Not fully differentiable (uses straight-through estimator)
 - Sequential atom updates don't parallelize as well
-- Memory usage scales with batch size × num_patches
+- Memory usage scales with batch size × latent spatial positions
 
 **Recommendations:**
 - Use moderate dictionary sizes (K=256-512) for best performance
-- Increase patch_size to reduce number of tokens
 - Set ksvd_iterations=1 for faster training
 - Dictionary atoms are always normalized for stability
 
@@ -214,9 +236,7 @@ For each atom k in the dictionary:
 
 ```bash
 # Run dictionary learning tests
-pytest tests/test_bottleneck.py::test_ksvd_basic -v
-pytest tests/test_bottleneck.py::test_dictionary_learning_shapes -v
-pytest tests/test_bottleneck.py::test_iht_sparse_coding -v
+pytest tests/test_bottleneck.py -v
 
 # Run LASER model tests
 pytest tests/test_laser.py -v
@@ -242,7 +262,6 @@ model = LASER(
     commitment_cost=0.25,
     learning_rate=1e-4,
     ksvd_iterations=1,
-    patch_size=8,  # 8x8 spatial patches
 )
 
 # Forward pass
@@ -255,13 +274,13 @@ The straight-through estimator ensures gradients flow back to the encoder during
 
 ### Dictionary Learning Methods
 
-K-SVD VAE supports three dictionary learning modes and multiple sparse coding algorithms:
+K-SVD VAE supports three dictionary learning modes with OMP sparse coding:
 
-### Sparse Coding Algorithms
+### Sparse Coding
 
-The bottleneck supports three sparse coding methods via the `sparse_solver` parameter:
+The bottleneck uses OMP sparse coding:
 
-#### 1. OMP (Orthogonal Matching Pursuit) - Default
+#### OMP (Orthogonal Matching Pursuit)
 ```yaml
 sparse_solver: omp
 ```
@@ -281,63 +300,6 @@ sparse_solver: omp
 - When reconstruction quality is critical
 - Small to medium datasets
 - When you can afford the computational cost
-
-#### 2. IHT (Iterative Hard Thresholding) - Recommended for Speed/Quality Balance
-```yaml
-sparse_solver: iht
-iht_iterations: 10      # More iterations = better approximation
-iht_step_size: null     # Auto-compute from spectral norm (recommended)
-```
-
-**Description**: True iterative sparse coding that alternates between gradient steps and hard thresholding.
-
-**Algorithm:**
-```python
-for iteration in range(iht_iterations):
-    residual = X - D @ coefficients
-    gradient = D.T @ residual
-    coefficients += step_size * gradient
-    coefficients = hard_threshold(coefficients, k=sparsity_level)
-```
-
-**Advantages:**
-- ✓ True sparse coding (proper optimization algorithm)
-- ✓ Fast (simple matrix-vector operations)
-- ✓ Theoretically grounded (converges under RIP condition)
-- ✓ Adjustable quality via `iht_iterations`
-- ✓ Automatic step size from spectral norm
-
-**Disadvantages:**
-- ✗ Slower than top-k (but faster than OMP)
-- ✗ Requires multiple iterations to converge
-
-**When to Use:**
-- **Recommended default** for most use cases
-- Good balance between speed and quality
-- When you want proper sparse coding without OMP overhead
-- Training on medium to large datasets
-
-**Tuning:**
-- `iht_iterations=5-10`: Good balance (default: 10)
-- `iht_iterations=15-20`: Better quality, slower
-- `iht_step_size=null`: Auto-compute (recommended)
-- `iht_step_size=0.5-1.0`: Manual override if needed
-
-#### 3. Top-K - Fastest (Not Recommended)
-```yaml
-sparse_solver: topk
-```
-
-**Description**: Simple selection of top-k atoms by correlation (single matrix multiplication).
-
-**Advantages:**
-- ✓ Fastest (single matmul + top-k)
-- ✓ Simplest implementation
-
-**Disadvantages:**
-- ✗ Not true sparse coding (just selection, no optimization)
-- ✗ Can select weak atoms, leading to overfitting
-- ✗ No iterative refinement
 
 **When to Use:**
 - Only when speed is absolutely critical
@@ -481,9 +443,7 @@ Override specific parameters:
 ```bash
 python train.py model=laser data=celeba \
     model.num_embeddings=256 \
-    model.sparsity_level=16 \
-    model.sparse_solver=iht \
-    model.patch_size=8
+    model.sparsity_level=16
 ```
 
 #### Logged Metrics
@@ -496,8 +456,6 @@ The following metrics are tracked during training:
   - `train/bottleneck_loss`, `val/bottleneck_loss` (dictionary learning bottleneck loss)
   - `train/perceptual_loss`, `val/perceptual_loss` (LPIPS)
   - `train/sparsity_loss`, `val/sparsity_loss` (L1 regularization on coefficients)
-  - `train/mr_dct_loss`, `val/mr_dct_loss` (multi-resolution DCT, if enabled)
-  - `train/mr_grad_loss`, `val/mr_grad_loss` (multi-resolution gradient)
 - **Quality metrics**: 
   - `train/psnr`, `val/psnr` (Peak Signal-to-Noise Ratio)
   - `train/ssim`, `val/ssim` (Structural Similarity Index)
@@ -511,14 +469,10 @@ The following metrics are tracked during training:
    - 1-2 iterations for speed
    - 3-5 iterations for quality
 
-3. **Patch Size**:
-   - Use 1 (pixel-level) for best quality but slower training
-   - Use 4-8 for faster training on large images with some quality trade-off
-
-4. **Perceptual Loss**: Essential for good visual quality
+3. **Perceptual Loss**: Essential for good visual quality
    - Set to 0.5-1.0 for best results
 
-5. **Monitor Sparsity**: Should stay around `sparsity_level / num_embeddings`
+4. **Monitor Sparsity**: Should stay around `sparsity_level / num_embeddings`
    - If too high: increase commitment_cost
    - If too low: decrease commitment_cost
 
@@ -530,7 +484,6 @@ The following metrics are tracked during training:
 **Training is slow**
 - Solutions:
   - Reduce `ksvd_iterations` to 1
-  - Increase `patch_size` to 4 or 8
   - Reduce `num_embeddings`
 
 **Poor reconstruction quality**
@@ -538,14 +491,12 @@ The following metrics are tracked during training:
   - Increase `sparsity_level`
   - Increase `num_embeddings`
   - Increase `perceptual_weight`
-  - Decrease `patch_size` to 1 (pixel-level)
 
 **Validation loss not improving (overfitting)**
 - Solutions:
   - Reduce dictionary update frequency
   - Increase encoder/decoder capacity
   - Use data augmentation
-  - Lower `patch_size` for finer granularity
 
 **SVD errors during training**
 - Solution: This is handled internally with try-except. If it persists, reduce learning rate to stabilize encoder outputs.
@@ -817,7 +768,7 @@ pytest tests/test_codebook_visualization.py::test_visualize_codebook_embeddings 
 **Visualization Improvements**:
 - 📊 **L1 norm visualization**: Uses sum of absolute coefficients for stable, interpretable heatmaps
 - 📊 **Percentile normalization**: Robust 1-99th percentile clipping for clean contrast
-- 📊 **Fold/unfold mapping**: Properly maps patch-based coefficients to pixel space for visualization
+- 📊 **Latent-grid upsampling**: Maps sparse energy from the latent grid back to image space for visualization
 - 📊 **RGB space embeddings**: PCA, t-SNE, and UMAP projections reveal codebook structure and diversity
 
 Run visualizations:
@@ -952,150 +903,30 @@ class HybridVAE(pl.LightningModule):
 - Superior reconstruction metrics
 - Good for analysis and understanding
 
-## Sparse Coding Performance Comparison
+## Sparse Coding Notes
 
-### Algorithm Comparison Summary
+LASER now uses a single sparse coder: **Orthogonal Matching Pursuit (OMP)**.
 
-| Algorithm | Speed | Quality | Sparsity Enforcement | Overfitting Risk | Recommendation |
-|-----------|-------|---------|---------------------|------------------|----------------|
-| **OMP** | Slow | Best | Strong (LS refinement) | Low | Use for best quality |
-| **IHT** | Medium | Good | Strong (iterative) | Low | **Recommended default** |
-| **Top-K** | Fast | Poor | Weak (just selection) | High | Avoid for production |
+**What to expect from OMP:**
+- Strong sparsity enforcement with least-squares coefficient refinement
+- Better reconstruction quality than the removed heuristic solver paths
+- Higher per-step cost than a simple top-k selection because each pursuit step solves a small linear system
 
-### Why IHT (Iterative Hard Thresholding) is Recommended
-
-**IHT Algorithm:**
-```python
-# Initialize coefficients to zero
-α = 0
-
-# Iterate to minimize ||X - D*α||² subject to ||α||₀ ≤ k
-for t in range(iterations):
-    residual = X - D @ α           # Compute reconstruction error
-    gradient = D.T @ residual      # Gradient of loss
-    α = α + step_size * gradient   # Gradient descent step
-    α = HardThreshold_k(α)         # Keep only top-k coefficients
-```
-
-**Key Advantages:**
-1. ✅ **True Sparse Coding**: Proper optimization algorithm (not just selection)
-2. ✅ **Iterative Refinement**: Progressively minimizes reconstruction error
-3. ✅ **Theoretical Guarantees**: Converges to local optimum under RIP condition
-4. ✅ **Prevents Overfitting**: Hard thresholding enforces sparsity at each iteration
-5. ✅ **Faster than OMP**: Simple matrix ops, no linear system solve
-6. ✅ **Better than Top-K**: Optimizes reconstruction, not just correlation
-
-**Performance Metrics (expected with IHT):**
-- `train/sparsity`: ~0.03-0.10 (true sparsity!)
-- Lower `train/recon_loss` than top-k
-- Smaller train/val gap (better generalization)
-- Stable training dynamics
-
-### Top-K Problems (Why We Switched Away)
-
-**Top-K is NOT sparse coding:**
-```python
-# Top-K: Just selects atoms with highest correlation
-correlations = D.T @ X
-top_k_indices = argmax_k(abs(correlations))
-coefficients[top_k_indices] = correlations[top_k_indices]
-# Problem: No optimization! Just correlation-based selection
-```
-
-**Issues with Top-K:**
-1. ❌ **Not an optimization algorithm** - just greedy selection
-2. ❌ **Selects weak atoms** - can pick atoms with low correlation
-3. ❌ **No iterative refinement** - single pass, no improvement
-4. ❌ **Overfitting** - observed sparsity ~1.0 (uses almost all atoms!)
-5. ❌ **No theoretical guarantees** - not guaranteed to minimize reconstruction error
-
-**Observed Problems in Training:**
-```
-With Top-K:
-  train/sparsity: 0.9999 (99.99% - essentially dense!)
-  train/recon_loss: higher
-  val/loss >> train/loss (overfitting)
-
-With IHT:
-  train/sparsity: 0.03-0.10
-  train/recon_loss: lower (proper optimization)
-  val/loss ≈ train/loss (better generalization)
-```
-
-### IHT Configuration & Tuning
-
-**Default Configuration (Recommended):**
+**Primary tuning knobs:**
 ```yaml
 # configs/model/laser.yaml
-sparse_solver: iht
-iht_iterations: 10          # Good balance
-iht_step_size: null         # Auto-compute (recommended)
 sparsity_level: 8           # Number of non-zero coefficients
+num_embeddings: 2048        # Dictionary size
 sparsity_reg_weight: 0.01   # L1 regularization
+orthogonality_weight: 0.01  # Atom decorrelation penalty
 ```
 
-**Tuning Guidelines:**
-
-**For Better Quality (slower training):**
-```yaml
-iht_iterations: 15-20       # More iterations
-iht_step_size: null         # Keep auto
+**Healthy training indicators:**
 ```
-
-**For Faster Training (slight quality loss):**
-```yaml
-iht_iterations: 5-7         # Fewer iterations
-iht_step_size: 0.9          # Manually set (skip spectral norm computation)
-```
-
-**For Maximum Sparsity:**
-```yaml
-sparsity_level: 4-6         # Fewer active atoms
-sparsity_reg_weight: 0.05   # Stronger L1 penalty
-iht_iterations: 15          # More iterations for better approximation
-```
-
-### Step Size Selection
-
-IHT requires step size μ ≤ 1/L where L = ||D||²₂ (spectral norm squared).
-
-**Auto-compute (default):**
-```yaml
-iht_step_size: null
-```
-- Uses fast power iteration to estimate spectral norm
-- Conservative step size: μ = 0.9 / L²
-- Recommended for most use cases
-
-**Manual override:**
-```yaml
-iht_step_size: 0.5-1.0
-```
-- Faster (skips spectral norm computation)
-- Use if dictionary is well-normalized (||D||₂ ≈ 1)
-- Start with 0.9, reduce if training unstable
-
-### Monitoring IHT Training
-
-**Healthy Training Indicators:**
-```
-✅ train/sparsity: 0.03-0.10
-✅ train/sparsity_loss: decreasing
-✅ train/recon_loss: steadily decreasing  
-✅ val/loss ≈ train/loss (gap < 20%)
-✅ val/psnr: increasing over epochs
-```
-
-**Warning Signs:**
-```
-⚠️ train/sparsity > 0.5 (too many atoms used)
-   → Increase sparsity_reg_weight
-   
-⚠️ train/recon_loss not decreasing
-   → Reduce iht_step_size or increase iht_iterations
-   
-⚠️ val/loss >> train/loss (overfitting)
-   → Increase sparsity_reg_weight and weight_decay
+train/sparsity: stable and well below 1.0
+train/recon_loss: steadily decreasing
+val/loss: tracking train/loss without a large gap
+val/psnr: increasing over epochs
 ```
 
 ## Overfitting Prevention & Regularization
@@ -1309,9 +1140,7 @@ After generating the token files, launch AR/ImageGPT training with:
 
 ```bash
 python train_ar.py \
-  ar_tokens_dir=outputs/ar_tokens/celeba/ \
-  laser_ckpt=outputs/checkpoints/run_xxxxxxxx/laser/last.ckpt \
+  token_cache_path=outputs/ar_tokens/celeba/tokens_cache.pt \
   data.dataset=celeba
 ```
-- Replace `run_xxxxxxxx` with your actual LASER checkpoint run directory.
-- Make sure your AR training script is set up to load token files from `ar_tokens_dir`.
+- Replace the cache path with your actual sparse-token cache artifact.

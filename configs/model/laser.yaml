@@ -14,42 +14,19 @@ num_hiddens: 128
 # Dictionary size (number of atoms/embeddings)
 # Typical range: 128-1024
 # Higher = more expressive, slower sparse coding
-# For overcomplete dictionary: num_embeddings > atom_dim
-# With patch_size=8 and embedding_dim=16: atom_dim=1024, so need >1024
-num_embeddings: 2048
+# For an overcomplete dictionary, choose more atoms than embedding channels.
+num_embeddings: 1024
 
-# Channel dimension of encoder output (NOT the full atom dimension!)
-# Should match encoder output channels
+# Channel dimension of encoder output
 # Typical range: 16-128
-# NOTE: The actual dictionary atom dimension = embedding_dim × patch_size²
-#       With embedding_dim=16 and patch_size=4: atom_dim = 16 × 16 = 256
 # Higher values = more expressive atoms, better reconstruction quality
-embedding_dim: 16
+embedding_dim: 4
 
-# Spatial patch size for patch-based dictionary learning
-# Options: 1 (pixel-level), 2, 4, 8, 16, or tuple (h, w)
-# 1 = pixel-level (atom_dim = embedding_dim), best quality, slowest
-# 4 = patch-level (atom_dim = embedding_dim × 16), good balance
-# 8 = patch-level (atom_dim = embedding_dim × 64), faster, lower quality
-# 16+ = large patches, fastest, lower quality
-# IMPORTANT: Larger patches = longer dictionary atoms = more parameters
-patch_size: 8
-
-# Patch stride; default is equal to patch_size (no overlap).
-# Set to patch_size / 2 for 50% overlap (e.g., stride=4 when patch_size=8).
-patch_stride: 8
-
-# Patch flattening order: 'channel_first' (C,H,W) or 'spatial_first' (H,W,C)
-# spatial_first groups channel info together, may help with high-dim patches
-patch_flatten_order: spatial_first
-
-# Sparsity level (max number of non-zero coefficients per signal/patch)
+# Sparsity level (max number of non-zero coefficients per latent location)
 # Must be < num_embeddings
 # Typical range: 4-32
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
-# With patch_size > 1: each patch gets its own sparse representation
-# For 1024-dim patches, need higher sparsity (~3% density)
 bottleneck_loss_weight: 1.0
 
 # Lower sparsity to ease coding when using backprop-only dictionary learning
@@ -72,29 +49,26 @@ commitment_cost: 0.25
 # Weight applied to bottleneck loss inside total loss
 # Lower to prevent bottleneck term from dominating total objective
 
-# Dictionary learning: backprop-only, no online updates
-use_online_learning: false
-dict_learning_rate: 0.0
+# Optional dictionary-specific learning rate.
+# null = share the main optimizer learning rate, like proto.py stage-1.
+dict_learning_rate: 2.5e-4
 
-# Sparse coding: OMP only
-sparse_solver: omp
-iht_iterations: 0
-iht_step_size: null
-fista_alpha: 0.0
-fista_tolerance: 0.0
-fista_max_steps: 0
-lista_layers: 0
-lista_tied_weights: false
-lista_initial_threshold: 0.0
-
-use_backprop_only: true
+# Latent patch sparse coding.
+# Mirrors the scratch patch bottleneck, but keeps the maintained src path
+# limited to sparse coding plus reconstruction only.
+patch_based: true
+patch_size: 4
+patch_stride: 2
+# With 50% overlap, Hann overlap-add gives exact reconstruction when the
+# patch coefficients reconstruct each patch exactly.
+patch_reconstruction: hann
 
 # L1 regularization weight on sparse coefficients
 # Typical range: 0.0-0.1
 # 0.0 = no regularization
 # 0.01 = mild regularization (recommended)
 # 0.05-0.1 = strong regularization (max sparsity)
-# Increase this if still overfitting with backprop-only mode
+# Increase this if the sparse codes are still too dense.
 sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regularization
 
 # Perceptual loss weight (LPIPS)
@@ -102,14 +76,8 @@ sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regul
 # 0.0 = no perceptual loss
 # 0.5-1.0 = good balance (recommended)
 # Higher = better perceptual quality, slower training
-# TEMPORARILY DISABLED: VGG16 causes OOM with DDP
+# Disabled by default because LPIPS dominates step time and can OOM under DDP.
 perceptual_weight: 0.5
-
-# Learning rate for encoder/decoder/dictionary (if use_backprop_only=true)
-# Typical range: 1e-4 to 1e-3
-# 1e-4 = stable, slower
-# 1e-3 = faster, may be unstable
-learning_rate: 4e-4
 
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99
@@ -123,63 +91,16 @@ compute_fid: true
 # Log reconstruction images to W&B every N steps
 # Typical range: 100-1000
 # Lower = more frequent logging, larger logs
-log_images_every_n_steps: 100
+log_images_every_n_steps: 500
 
-# Multi-resolution DCT loss weight
-# Typical range: 0.0-1.0
-# 0.0 = disabled
-# 0.5 = recommended for high-frequency detail preservation
-multi_res_dct_weight: 0.0
+# Extra train-only diagnostics; 0 disables them.
+diag_log_interval: 0
 
-# Number of pyramid levels for multi-resolution DCT loss
-# Typical range: 2-4
-multi_res_dct_levels: 3
+# Run an extra validation forward pass for PCA/heatmap logging.
+# Disabled by default because it adds a full bottleneck pass each val epoch.
+enable_val_latent_visuals: false
 
-# Multi-resolution gradient loss weight
-# Typical range: 0.0-1.0
-# 0.0 = disabled
-# 0.5 = recommended for edge preservation
-multi_res_grad_weight: 0.0
-
-# Number of pyramid levels for multi-resolution gradient loss
-# Typical range: 2-4
-multi_res_grad_levels: 3
-
-# Dictionary orthogonality loss weight
-# Encourages decorrelated dictionary atoms for better sparse coding
-# Typical range: 0.0-0.1
-# 0.0 = disabled
-# 0.01 = mild decorrelation (recommended)
-# 0.05-0.1 = strong decorrelation (may hurt reconstruction)
-orthogonality_weight: 0.01
-
-# =============================================================================
-# Pattern Quantization for Autoregressive Generation
-# =============================================================================
-# Enable pattern quantization to map sparse codes to discrete tokens.
-# This reduces token sequence length from (num_patches × sparsity) to num_patches.
-# For 128×128 images with patch_size=8: 16 tokens instead of 512 tokens.
-# Options: true (enable), false (disable, default)
-use_pattern_quantizer: false
-
-# Number of discrete patterns (vocabulary size for autoregressive model)
-# Typical range: 1024-8192
-# Higher = more expressive, larger model
-# Should be >= num_embeddings for good coverage
-num_patterns: 2048
-
-# Commitment cost for pattern matching (encourages codes to match patterns)
-# Typical range: 0.1-1.0
-# 0.25 = good default (same as VQ-VAE)
-pattern_commitment_cost: 0.25
-
-# EMA decay for pattern updates (higher = slower, more stable)
-# Typical range: 0.9-0.999
-# 0.99 = good default
-pattern_ema_decay: 0.99
-
-# Temperature for pattern matching (lower = harder assignment)
-# Typical range: 0.1-2.0
-# 1.0 = standard cosine similarity
-# 0.5 = sharper (more confident assignments)
-pattern_temperature: 1.0
+# Optional dictionary coherence penalty.
+# Proto.py keeps this disabled by default and relies on normalized atoms plus
+# projected gradients for the main dictionary-learning behavior.
+coherence_weight: 0.0

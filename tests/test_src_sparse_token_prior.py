@@ -1,6 +1,7 @@
 import torch
 
 from src.models.sparse_token_prior import (
+    SparseTokenPriorModule,
     build_sparse_prior_from_cache,
     compute_quantized_rq_losses,
 )
@@ -60,7 +61,11 @@ def test_build_sparse_prior_from_cache_uses_cache_shape_and_vocab_split():
     cache = {
         "tokens_flat": torch.zeros(4, 8, dtype=torch.int32),
         "shape": (1, 2, 4),
-        "meta": {"num_atoms": 3},
+        "meta": {
+            "num_atoms": 3,
+            "coef_max": 7.5,
+            "coeff_bin_values": torch.tensor([-1.0, 0.0], dtype=torch.float32),
+        },
     }
 
     model = build_sparse_prior_from_cache(
@@ -82,3 +87,30 @@ def test_build_sparse_prior_from_cache_uses_cache_shape_and_vocab_split():
     assert model.cfg.D == 4
     assert model.atom_vocab_size == 3
     assert model.coeff_vocab_size == 2
+    assert model.cfg.coeff_max == 7.5
+    assert torch.equal(model.cfg.coeff_bin_values, torch.tensor([-1.0, 0.0]))
+
+
+def test_sparse_token_prior_module_saves_prior_architecture_metadata():
+    cfg = SpatialDepthPriorConfig(
+        vocab_size=5,
+        atom_vocab_size=3,
+        coeff_vocab_size=2,
+        H=1,
+        W=2,
+        D=4,
+        real_valued_coeffs=False,
+        d_model=8,
+        n_heads=2,
+        n_spatial_layers=2,
+        n_depth_layers=1,
+        n_global_spatial_tokens=1,
+        d_ff=16,
+        dropout=0.0,
+    )
+    module = SparseTokenPriorModule(prior=SpatialDepthPrior(cfg))
+
+    assert module.hparams["prior_architecture"] == "spatial_depth"
+    assert module.hparams["prior_n_heads"] == 2
+    assert module.hparams["prior_n_spatial_layers"] == 2
+    assert module.hparams["prior_n_depth_layers"] == 1

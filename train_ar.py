@@ -1,13 +1,11 @@
 """
 Training entrypoint for autoregressive models on LASER-derived tokens.
 
-Supports two maintained paths:
-1. `pattern`: legacy pattern-quantizer AR transformer.
-2. `sparse_spatial_depth` / `sparse_mingpt`: quantized sparse-token priors
-   trained from a cached token grid.
+Supports the maintained sparse-token prior paths:
+1. `sparse_spatial_depth`
+2. `sparse_mingpt`
 """
 
-import math
 import os
 import warnings
 from datetime import datetime
@@ -33,21 +31,18 @@ from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, Ri
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig
+from torchvision.utils import save_image
 
-from src.data.celeba import CelebADataModule
-from src.data.cifar10 import CIFAR10DataModule
-from src.data.config import DataConfig
-from src.data.imagenette2 import Imagenette2DataModule
-from src.data.pattern_dataset import PatternDataModule
-from src.data.token_cache import TokenCacheDataModule
+from src.data.token_cache import TokenCacheDataModule, load_token_cache
 from src.pl_trainer_util import resolve_val_check_interval
-from src.models.ar_transformer import ARTransformer
 from src.models.laser import LASER
 from src.models.sparse_token_prior import (
     SparseTokenPriorModule,
     build_sparse_prior_from_cache,
     infer_sparse_vocab_sizes,
+    token_cache_grid_shape,
 )
+from src.stage2_paths import infer_latest_token_cache
 
 torch.set_float32_matmul_precision("medium")
 
@@ -66,95 +61,100 @@ progress_bar = RichProgressBar(
 )
 
 
-def _build_base_datamodule(cfg: DictConfig):
-    if cfg.data.dataset == "cifar10":
-        return CIFAR10DataModule(DataConfig.from_dict(cfg.data))
-    if cfg.data.dataset == "imagenette2":
-        return Imagenette2DataModule(DataConfig.from_dict(cfg.data))
-    if cfg.data.dataset == "celeba":
-        return CelebADataModule(DataConfig.from_dict(cfg.data))
-    raise ValueError(f"Unsupported dataset: {cfg.data.dataset}")
+class PeriodicStage2SamplingCallback(pl.Callback):
+    def __init__(
+        self,
+        *,
+        token_cache_path: str,
+        sample_dir: str,
+        every_n_steps: int = 0,
+        num_samples: int = 4,
+        temperature: float = 1.0,
+        top_k: int = 0,
+    ):
+        super().__init__()
+        self.token_cache_path = str(token_cache_path)
+        self.sample_dir = Path(sample_dir).expanduser().resolve()
+        self.every_n_steps = max(0, int(every_n_steps))
+        self.num_samples = max(1, int(num_samples))
+        self.temperature = float(temperature)
+        self.top_k = int(top_k)
+        self._last_sampled_step = -1
+        self._cache = None
+        self._stage1 = None
 
+    def _ensure_ready(self, device: torch.device):
+        if self._cache is None:
+            self._cache = load_token_cache(self.token_cache_path)
+        if self._stage1 is None:
+            meta = self._cache.get("meta", {}) if isinstance(self._cache, dict) else {}
+            stage1_checkpoint = meta.get("stage1_checkpoint")
+            if not stage1_checkpoint:
+                raise RuntimeError(
+                    f"Token cache {self.token_cache_path} is missing meta.stage1_checkpoint for periodic sampling."
+                )
+            self._stage1 = LASER.load_from_checkpoint(stage1_checkpoint, map_location="cpu").eval().to(device)
+        else:
+            self._stage1 = self._stage1.to(device)
 
-def _to_tuple(val):
-    if isinstance(val, (list, tuple)):
-        return int(val[0]), int(val[1])
-    return int(val), int(val)
+    @torch.no_grad()
+    def _sample_and_save(self, trainer: pl.Trainer, pl_module: pl.LightningModule, step: int):
+        device = pl_module.device
+        self._ensure_ready(device)
+        cache = self._cache
+        meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+        token_h, token_w, token_depth = token_cache_grid_shape(cache)
+        coeff_vocab_size = int(meta.get("coeff_vocab_size") or meta.get("n_bins") or 0)
+        coeff_bin_values = meta.get("coeff_bin_values")
+        if coeff_vocab_size <= 0 or coeff_bin_values is None:
+            raise RuntimeError(
+                f"Token cache {self.token_cache_path} is missing coefficient quantization metadata for sampling."
+            )
+        latent_hw = meta.get("latent_hw")
+        if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
+            latent_hw = (int(latent_hw[0]), int(latent_hw[1]))
+        else:
+            latent_hw = None
 
+        top_k = None if self.top_k <= 0 else self.top_k
+        token_grid = pl_module.generate_tokens(
+            self.num_samples,
+            temperature=self.temperature,
+            top_k=top_k,
+        ).view(self.num_samples, token_h, token_w, token_depth)
+        images = self._stage1.decode_from_tokens(
+            token_grid.to(device=device, dtype=torch.long),
+            latent_hw=latent_hw,
+            coeff_vocab_size=coeff_vocab_size,
+            coeff_bin_values=torch.as_tensor(coeff_bin_values, dtype=torch.float32, device=device),
+        ).detach().cpu()
 
-def _pattern_expected_seq_len(cfg: DictConfig, laser_model: LASER) -> int:
-    patch_h, patch_w = _to_tuple(laser_model.hparams.patch_size)
-    patch_stride_cfg = getattr(laser_model.hparams, "patch_stride", None)
-    stride_h, stride_w = _to_tuple(patch_stride_cfg) if patch_stride_cfg is not None else (patch_h, patch_w)
-    latent_h = math.ceil(cfg.data.image_size / 4)
-    latent_w = math.ceil(cfg.data.image_size / 4)
-    pad_h = (patch_h - (latent_h % patch_h)) % patch_h
-    pad_w = (patch_w - (latent_w % patch_w)) % patch_w
-    padded_h = latent_h + pad_h
-    padded_w = latent_w + pad_w
-    n_h = (padded_h - patch_h) // stride_h + 1
-    n_w = (padded_w - patch_w) // stride_w + 1
-    return n_h * n_w
+        self.sample_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = self.sample_dir / f"step_{step:07d}.png"
+        auto_path = self.sample_dir / f"step_{step:07d}_autocontrast.png"
+        nrow = max(1, int(self.num_samples ** 0.5))
+        save_image(images, raw_path, nrow=nrow, normalize=True, value_range=(-1.0, 1.0))
+        save_image(images, auto_path, nrow=nrow, normalize=True, scale_each=True)
+        print(f"Saved stage-2 samples at step {step}: {raw_path}")
 
-
-def _build_pattern_model(cfg: DictConfig):
-    if not cfg.laser_ckpt:
-        raise ValueError("pattern mode requires laser_ckpt")
-
-    print(f"\nLoading LASER model from: {cfg.laser_ckpt}")
-    laser_model = LASER.load_from_checkpoint(cfg.laser_ckpt, map_location="cpu")
-    laser_model.eval()
-
-    if not laser_model.use_pattern_quantizer:
-        raise ValueError(
-            "LASER bottleneck quantization is disabled. Use the external sparse-code "
-            "+ k-means quantization pipeline to create patterns before AR training."
-        )
-
-    resolved_vocab_size = int(laser_model.bottleneck.num_patterns)
-    if cfg.ar.vocab_size is None or int(cfg.ar.vocab_size) != resolved_vocab_size:
-        print(
-            f"Adjusting AR vocab_size from {cfg.ar.vocab_size} to {resolved_vocab_size} "
-            "to match the LASER pattern vocabulary"
-        )
-        cfg.ar.vocab_size = resolved_vocab_size
-
-    datamodule = PatternDataModule(
-        laser_checkpoint=cfg.laser_ckpt,
-        base_datamodule=_build_base_datamodule(cfg),
-        batch_size=cfg.train_ar.batch_size,
-        num_workers=cfg.data.num_workers,
-        cache=True,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-
-    expected_seq_len = _pattern_expected_seq_len(cfg, laser_model)
-    if cfg.ar.seq_len != expected_seq_len:
-        print(f"Adjusting AR seq_len from {cfg.ar.seq_len} to {expected_seq_len} to match the patch grid")
-        cfg.ar.seq_len = expected_seq_len
-
-    model = ARTransformer(
-        vocab_size=cfg.ar.vocab_size,
-        seq_len=cfg.ar.seq_len,
-        d_model=cfg.ar.d_model,
-        n_heads=cfg.ar.n_heads,
-        n_layers=cfg.ar.n_layers,
-        d_ff=cfg.ar.d_ff,
-        dropout=cfg.ar.dropout,
-        learning_rate=cfg.ar.learning_rate,
-        weight_decay=cfg.ar.weight_decay,
-        warmup_steps=cfg.ar.warmup_steps,
-        max_steps=cfg.ar.max_steps,
-        use_bos=cfg.ar.use_bos,
-        use_eos=cfg.ar.use_eos,
-    )
-    model.set_laser_model(laser_model, log_images_every_n_epochs=1, num_samples=8)
-    return model, datamodule
-
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.every_n_steps <= 0 or not trainer.is_global_zero:
+            return
+        step = int(trainer.global_step)
+        if step <= 0 or step == self._last_sampled_step or (step % self.every_n_steps) != 0:
+            return
+        self._sample_and_save(trainer, pl_module, step)
+        self._last_sampled_step = step
 
 def _build_sparse_model(cfg: DictConfig, mode: str):
     if not cfg.token_cache_path:
-        raise ValueError("Sparse prior modes require token_cache_path")
+        inferred = infer_latest_token_cache(ar_output_dir=cfg.output_dir)
+        if inferred is None:
+            raise ValueError(
+                f"Sparse prior modes require token_cache_path, and no cache could be inferred under {Path(str(cfg.output_dir)).expanduser().resolve() / 'token_cache'}"
+            )
+        cfg.token_cache_path = str(inferred)
+        print(f"Inferred token_cache_path: {cfg.token_cache_path}")
 
     datamodule = TokenCacheDataModule(
         cache_path=cfg.token_cache_path,
@@ -208,21 +208,26 @@ def _build_sparse_model(cfg: DictConfig, mode: str):
         coeff_depth_weighting=cfg.ar.coeff_depth_weighting,
         coeff_focal_gamma=cfg.ar.coeff_focal_gamma,
     )
+    model.save_hyperparameters(
+        {
+            "token_cache_path": str(Path(str(cfg.token_cache_path)).expanduser().resolve()),
+            "resolved_atom_vocab_size": int(atom_vocab_size),
+            "resolved_coeff_vocab_size": int(coeff_vocab_size),
+            "resolved_total_vocab_size": int(total_vocab_size),
+        }
+    )
     return model, datamodule
 
 
 @hydra.main(config_path="configs", config_name="config_ar", version_base="1.2")
 def train_ar(cfg: DictConfig):
-    mode = str(getattr(cfg.ar, "type", "pattern")).strip().lower()
+    mode = str(getattr(cfg.ar, "type", "sparse_spatial_depth")).strip().lower()
 
     print("\n" + "=" * 60)
     print("TOKEN MODEL TRAINING")
     print("=" * 60)
     print(f"\nMode: {mode}")
-    if mode == "pattern":
-        print(f"LASER Checkpoint: {cfg.laser_ckpt}")
-    else:
-        print(f"Token Cache: {cfg.token_cache_path}")
+    print(f"Token Cache: {cfg.token_cache_path}")
 
     print("\nModel Config:")
     print(f"  Vocab Size: {cfg.ar.vocab_size}")
@@ -231,12 +236,9 @@ def train_ar(cfg: DictConfig):
     print(f"  Layers: {cfg.ar.n_layers}")
     print(f"  FF Dim: {cfg.ar.d_ff}")
     print(f"  Dropout: {cfg.ar.dropout}")
-    if mode == "pattern":
-        print(f"  Sequence Length: {cfg.ar.seq_len}")
-    else:
-        print(f"  Atom Vocab Size: {cfg.ar.atom_vocab_size}")
-        print(f"  Coeff Vocab Size: {cfg.ar.coeff_vocab_size}")
-        print(f"  Global Spatial Tokens: {cfg.ar.n_global_spatial_tokens}")
+    print(f"  Atom Vocab Size: {cfg.ar.atom_vocab_size}")
+    print(f"  Coeff Vocab Size: {cfg.ar.coeff_vocab_size}")
+    print(f"  Global Spatial Tokens: {cfg.ar.n_global_spatial_tokens}")
 
     print("\nTraining Config:")
     print(f"  Learning Rate: {cfg.ar.learning_rate}")
@@ -252,13 +254,9 @@ def train_ar(cfg: DictConfig):
     if torch.cuda.is_available():
         print(f"GPU device: {torch.cuda.get_device_name(0)}")
 
-    if mode == "pattern":
-        model, datamodule = _build_pattern_model(cfg)
-    elif mode in {"sparse_spatial_depth", "sparse_mingpt"}:
+    if mode in {"sparse_spatial_depth", "sparse_mingpt"}:
         model, datamodule = _build_sparse_model(cfg, mode)
         print(f"Sparse token grid shape: {datamodule.token_shape}")
-        if cfg.laser_ckpt:
-            print("Sparse prior mode ignores laser_ckpt for visualization because the maintained src LASER path does not decode sparse token caches yet.")
     else:
         raise ValueError(f"Unsupported ar.type: {cfg.ar.type}")
 
@@ -267,15 +265,11 @@ def train_ar(cfg: DictConfig):
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_prefix = "ar" if mode == "pattern" else mode
-    ckpt_dir = os.path.join(cfg.output_dir, "checkpoints", f"{run_prefix}_{timestamp}")
+    ckpt_dir = os.path.join(cfg.output_dir, "checkpoints", f"{mode}_{timestamp}")
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"\nCheckpoint directory: {ckpt_dir}")
 
-    if mode == "pattern":
-        run_name = f"ar_transformer_{cfg.data.dataset}_{timestamp}"
-    else:
-        run_name = f"{mode}_{Path(str(cfg.token_cache_path)).stem}_{timestamp}"
+    run_name = f"{mode}_{Path(str(cfg.token_cache_path)).stem}_{timestamp}"
 
     wandb_logger = WandbLogger(
         project=cfg.wandb.project,
@@ -285,10 +279,8 @@ def train_ar(cfg: DictConfig):
     wandb_logger.log_hyperparams(
         {
             "training_mode": mode,
-            "laser_ckpt": cfg.laser_ckpt,
             "token_cache_path": cfg.token_cache_path,
             "ar_vocab_size": cfg.ar.vocab_size,
-            "ar_seq_len": getattr(cfg.ar, "seq_len", None),
             "ar_d_model": cfg.ar.d_model,
             "ar_n_heads": cfg.ar.n_heads,
             "ar_n_layers": cfg.ar.n_layers,
@@ -310,6 +302,18 @@ def train_ar(cfg: DictConfig):
         LearningRateMonitor(logging_interval="step"),
         progress_bar,
     ]
+    sample_every_n_steps = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
+    if sample_every_n_steps > 0:
+        callbacks.append(
+            PeriodicStage2SamplingCallback(
+                token_cache_path=str(cfg.token_cache_path),
+                sample_dir=os.path.join(cfg.output_dir, "samples", f"{mode}_{timestamp}"),
+                every_n_steps=sample_every_n_steps,
+                num_samples=int(getattr(cfg.train_ar, "sample_num_images", 4) or 4),
+                temperature=float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
+                top_k=int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+            )
+        )
 
     val_check_interval = resolve_val_check_interval(
         datamodule, getattr(cfg.train_ar, "val_check_interval", 1.0)

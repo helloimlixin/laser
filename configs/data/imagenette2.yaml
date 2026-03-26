@@ -4,5 +4,6 @@ data_dir: ${oc.env:IMAGENETTE2_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../dat
 batch_size: 32
 num_workers: 4
 image_size: 224
+seed: ${seed}
 mean: [0.5, 0.5, 0.5]
 std: [0.5, 0.5, 0.5]
