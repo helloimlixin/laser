@@ -117,6 +117,156 @@ python scripts/smoke_e2e.py --no-patch-based
 
 The generated samples are still a smoke-test artifact, but the defaults now give stage-2 a bit more signal. In practice the most useful outputs are usually `stage1_recon_preview.png`, `token_cache_decode_preview.png`, and then `samples.png` in that order.
 
+### Recommended GPU Commands
+
+The commands below assume:
+- two GPUs visible as `CUDA_VISIBLE_DEVICES=0,1`
+- W&B logging enabled
+- local CelebA images at `/home/xl598/Projects/data/celeba`
+
+#### Dual-GPU Smoke Run
+
+This is the maintained one-command pipeline for a quick end-to-end sanity run:
+- builds a subset
+- trains stage 1
+- extracts the token cache
+- trains stage 2
+- generates samples
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/smoke_e2e.py \
+  --clean \
+  --device auto \
+  --train-accelerator gpu \
+  --devices 2 \
+  --subset-size 8192 \
+  --image-size 128 \
+  --num-embeddings 4096 \
+  --sparsity-level 8 \
+  --coeff-bins 256 \
+  --stage1-batch-size 16 \
+  --stage2-batch-size 16 \
+  --stage1-epochs 2 \
+  --stage2-epochs 2 \
+  --stage2-sample-every-n-steps 200 \
+  --stage2-sample-num-images 4 \
+  --stage1-num-hiddens 128 \
+  --stage1-embedding-dim 16 \
+  --stage1-num-residual-blocks 2 \
+  --stage1-num-residual-hiddens 32 \
+  --stage2-d-model 128 \
+  --stage2-n-heads 4 \
+  --stage2-n-layers 4 \
+  --stage2-d-ff 512 \
+  --temperature 0.9 \
+  --top-k 64
+```
+
+During stage-2 training, periodic samples are saved under:
+
+```text
+<output-root>/ar/samples/<run_name>/step_0000200.png
+<output-root>/ar/samples/<run_name>/step_0000200_autocontrast.png
+```
+
+Useful smoke outputs:
+- `stage1_recon_preview.png`
+- `stage1_recon_preview_autocontrast.png`
+- `token_cache_decode_preview.png`
+- `token_cache_decode_preview_autocontrast.png`
+- `samples.png`
+- `samples_autocontrast.png`
+
+Interpretation:
+- If `stage1_recon_preview` looks bad, stage 1 is still too weak.
+- If `token_cache_decode_preview` looks okay but `samples` looks bad, stage 2 is the bottleneck.
+
+#### Full-Dataset Stage 1
+
+For the real full dataset, prefer the maintained entrypoints directly instead of `scripts/smoke_e2e.py`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 train.py \
+  model=laser \
+  data=celeba \
+  data.data_dir=/home/xl598/Projects/data/celeba \
+  data.image_size=128 \
+  data.batch_size=16 \
+  data.num_workers=8 \
+  train.accelerator=gpu \
+  train.devices=2 \
+  train.strategy=auto \
+  train.max_epochs=2 \
+  wandb.project=laser \
+  wandb.name=celeba_full_stage1 \
+  model.num_embeddings=4096 \
+  model.sparsity_level=8 \
+  model.num_hiddens=128 \
+  model.embedding_dim=16 \
+  model.num_residual_blocks=2 \
+  model.num_residual_hiddens=32 \
+  model.patch_based=true \
+  model.patch_size=4 \
+  model.patch_stride=2 \
+  model.patch_reconstruction=hann \
+  model.compute_fid=false \
+  model.log_images_every_n_steps=0
+```
+
+#### Full-Dataset Token Cache Extraction
+
+```bash
+python3 extract_token_cache.py \
+  --dataset celeba \
+  --data-dir /home/xl598/Projects/data/celeba \
+  --split train \
+  --batch-size 16 \
+  --num-workers 8 \
+  --image-size 128 \
+  --device auto \
+  --coeff-bins 256 \
+  --coeff-max auto
+```
+
+#### Full-Dataset Stage 2
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 train_ar.py \
+  output_dir=outputs/ar \
+  token_cache_path=null \
+  data.dataset=celeba \
+  data.data_dir=/home/xl598/Projects/data/celeba \
+  data.image_size=128 \
+  data.num_workers=8 \
+  ar.type=sparse_spatial_depth \
+  ar.d_model=128 \
+  ar.n_heads=4 \
+  ar.n_layers=4 \
+  ar.d_ff=512 \
+  wandb.project=laser-ar \
+  wandb.name=celeba_full_stage2 \
+  train_ar.batch_size=16 \
+  train_ar.max_epochs=2 \
+  train_ar.accelerator=gpu \
+  train_ar.devices=2 \
+  train_ar.sample_every_n_steps=200 \
+  train_ar.sample_num_images=4
+```
+
+#### Generation
+
+```bash
+python3 generate_ar.py \
+  --device auto \
+  --num-samples 16 \
+  --batch-size 8
+```
+
+This will infer the latest maintained:
+- stage-1 checkpoint
+- stage-2 checkpoint
+- token cache
+
 ## Configuration
 
 All configuration is managed through Hydra. Adjust the YAML files under `configs/` or override settings directly from the command line:
