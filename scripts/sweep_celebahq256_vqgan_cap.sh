@@ -2,12 +2,18 @@
 # Sweep: CelebA-HQ 256x256 with VQGAN-level encoder/decoder capacity.
 #
 # Based on the promising CIFAR-10 run f70yglfn (src_pf_p4s4_k16_d4k_stage2),
-# scaled up for 256x256 images with increased encoder/decoder capacity:
-#   - num_hiddens: 128 -> 256
-#   - num_residual_blocks: 2 -> 4
-#   - num_residual_hiddens: 32 -> 128
+# scaled up for 256x256 images with increased encoder/decoder capacity.
 #
 # Full 3-stage pipeline: stage 1 (autoencoder) + token extraction + stage 2 (AR prior).
+# Dictionary atom animation enabled (enable_val_latent_visuals=true).
+#
+# Axes explored:
+#   - Patch layout: p4s4 (tile), p8s8 (tile), p4s2 (hann), p8s4 (hann), non-patched
+#   - Dictionary size: K=1024, 4096, 8192, 16384
+#   - Sparsity: k=8, 16, 24, 32
+#   - Embedding dim: d=4, 8, 16
+#   - Coefficient bound: coef_max=3, 5, 8
+#   - Encoder/decoder capacity: high (h=256/res=4/rh=128), medium (h=192/res=3/rh=96)
 #
 # Usage:
 #   ./scripts/sweep_celebahq256_vqgan_cap.sh
@@ -19,7 +25,6 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # -- Cluster ----------------------------------------------------------------
-# Auto-select partition based on idle GPU nodes
 if [[ "${PARTITION:-auto}" == "auto" ]]; then
   gpu_idle=$(sinfo -p gpu -h -o '%A' 2>/dev/null | awk -F/ '{print $2}' || echo 0)
   gpu_rh_idle=$(sinfo -p gpu-redhat -h -o '%A' 2>/dev/null | awk -F/ '{print $2}' || echo 0)
@@ -46,33 +51,27 @@ DATASET="${DATASET:-celeba}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
-# -- Model capacity (VQGAN-level) ------------------------------------------
-NUM_HIDDENS="${NUM_HIDDENS:-256}"
-NUM_RES_BLOCKS="${NUM_RES_BLOCKS:-4}"
-NUM_RES_HIDDENS="${NUM_RES_HIDDENS:-128}"
-
-# -- Stage 1 (autoencoder) ------------------------------------------------
+# -- Stage 1 defaults -------------------------------------------------------
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-20}"
 STAGE1_LR="${STAGE1_LR:-1.5e-4}"
 DICT_LR="${DICT_LR:-2.5e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.01}"
-COEF_MAX="${COEF_MAX:-3}"
 PERCEPTUAL_WEIGHT="${PERCEPTUAL_WEIGHT:-0.5}"
 
-# -- Stage 2 (AR prior) ---------------------------------------------------
+# -- Stage 2 defaults -------------------------------------------------------
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-100}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-2}"
 STAGE2_LR="${STAGE2_LR:-3e-4}"
 COEFF_BINS="${COEFF_BINS:-256}"
 SAMPLE_TEMP="${SAMPLE_TEMP:-0.5}"
-# Larger AR model for 256x256 (16x16 spatial = 256 positions vs 4 on CIFAR-10)
+# AR model matches the proven CIFAR-10 config from f70yglfn
 AR_D_MODEL="${AR_D_MODEL:-512}"
 AR_N_HEADS="${AR_N_HEADS:-8}"
 AR_N_LAYERS="${AR_N_LAYERS:-12}"
 AR_D_FF="${AR_D_FF:-1024}"
 
-# -- Output / logging ------------------------------------------------------
+# -- Output / logging -------------------------------------------------------
 OUT_ROOT="${OUT_ROOT:-/scratch/$USER/runs/celebahq256_vqgan_cap_sweep}"
 WANDB_PROJECT="${WANDB_PROJECT:-laser}"
 WANDB_MODE="${WANDB_MODE:-online}"
@@ -82,11 +81,11 @@ JOB_PREFIX="${JOB_PREFIX:-chq256vc}"
 CASE_FILTER="${CASE_FILTER:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
-# -- Container (Amarel) ----------------------------------------------------
+# -- Container (Amarel) -----------------------------------------------------
 IMAGE="${IMAGE:-docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime}"
 PYDEPS="${PYDEPS:-/scratch/$USER/.pydeps/laser_src_py311}"
 
-# -- Pre-flight -------------------------------------------------------------
+# -- Pre-flight --------------------------------------------------------------
 echo "=== Login node GPU check ==="
 nvidia-smi 2>/dev/null || echo "(no GPUs on login node -- compute nodes will have them)"
 echo ""
@@ -99,28 +98,52 @@ fi
 
 mkdir -p "$OUT_ROOT"
 
-# -- Cases: name | patch_based | num_embeddings | sparsity | embedding_dim | patch_size | patch_stride | patch_recon
+# -- Cases: name | patch_based | num_embeddings | sparsity | embedding_dim | patch_size | patch_stride | patch_recon | coef_max | num_hiddens | num_res_blocks | num_res_hiddens
 #
-# Base: proven p4s4_k16_d4k from f70yglfn, with VQGAN-level enc/dec capacity.
-# Sweep over dictionary size, sparsity, embedding dim, and patch layout.
+# Use "-" to inherit defaults (coef_max=3, h=256, res=4, rh=128).
 #
 cases=(
-  # --- Anchor: direct scale-up of f70yglfn ---
-  "p4s4_k16_d4k|true|4096|16|4|4|4|tile"
+  # ===== Anchor: direct scale-up of f70yglfn =====
+  "p4s4_k16_d4k|true|4096|16|4|4|4|tile|-|-|-|-"
 
-  # --- More atoms ---
-  "p4s4_k16_d8k|true|8192|16|4|4|4|tile"
+  # ===== Dictionary size =====
+  "p4s4_k16_d8k|true|8192|16|4|4|4|tile|-|-|-|-"
+  "p4s4_k16_d16k|true|16384|16|4|4|4|tile|-|-|-|-"
+  "p4s4_k24_d4k|true|4096|24|4|4|4|tile|-|-|-|-"
+  "p4s4_k24_d8k|true|8192|24|4|4|4|tile|-|-|-|-"
+  "p4s4_k24_d16k|true|16384|24|4|4|4|tile|-|-|-|-"
 
-  # --- Higher sparsity ---
-  "p4s4_k24_d4k|true|4096|24|4|4|4|tile"
-  "p4s4_k24_d8k|true|8192|24|4|4|4|tile"
+  # ===== Sparsity extremes =====
+  "p4s4_k8_d4k|true|4096|8|4|4|4|tile|-|-|-|-"
+  "p4s4_k32_d4k|true|4096|32|4|4|4|tile|-|-|-|-"
+  "p4s4_k32_d8k|true|8192|32|4|4|4|tile|-|-|-|-"
 
-  # --- Larger embedding dim ---
-  "p4s4_k16_d4k_e8|true|4096|16|8|4|4|tile"
+  # ===== Embedding dim =====
+  "p4s4_k16_d4k_e8|true|4096|16|8|4|4|tile|-|-|-|-"
+  "p4s4_k16_d4k_e16|true|4096|16|16|4|4|tile|-|-|-|-"
 
-  # --- Larger patches (more spatial compression) ---
-  "p8s8_k24_d4k|true|4096|24|4|8|8|tile"
-  "p8s8_k32_d8k|true|8192|32|4|8|8|tile"
+  # ===== Larger non-overlapping patches =====
+  "p8s8_k24_d4k|true|4096|24|4|8|8|tile|-|-|-|-"
+  "p8s8_k32_d8k|true|8192|32|4|8|8|tile|-|-|-|-"
+
+  # ===== Overlapping patches with Hann stitching =====
+  "p4s2h_k16_d4k|true|4096|16|4|4|2|hann|-|-|-|-"
+  "p4s2h_k24_d4k|true|4096|24|4|4|2|hann|-|-|-|-"
+  "p8s4h_k16_d4k|true|4096|16|4|8|4|hann|-|-|-|-"
+  "p8s4h_k24_d4k|true|4096|24|4|8|4|hann|-|-|-|-"
+
+  # ===== Coefficient bound =====
+  "p4s4_k16_d4k_cm5|true|4096|16|4|4|4|tile|5|-|-|-"
+  "p4s4_k16_d4k_cm8|true|4096|16|4|4|4|tile|8|-|-|-"
+  "p4s4_k24_d4k_cm5|true|4096|24|4|4|4|tile|5|-|-|-"
+
+  # ===== Medium capacity (h=192, res=3, rh=96) =====
+  "p4s4_k16_d4k_med|true|4096|16|4|4|4|tile|-|192|3|96"
+  "p4s4_k24_d4k_med|true|4096|24|4|4|4|tile|-|192|3|96"
+
+  # ===== Non-patched baselines =====
+  "nopatch_k8_d1k|false|1024|8|16|4|4|tile|-|-|-|-"
+  "nopatch_k16_d4k|false|4096|16|16|4|4|tile|-|-|-|-"
 )
 
 CASE_FILTER="${CASE_FILTER// /}"
@@ -128,17 +151,24 @@ submitted=0
 
 for case_spec in "${cases[@]}"; do
   IFS='|' read -r case_name patch_based num_embeddings sparsity embedding_dim \
-    patch_size patch_stride patch_recon <<< "$case_spec"
+    patch_size patch_stride patch_recon \
+    case_coef_max case_hiddens case_res_blocks case_res_hiddens <<< "$case_spec"
 
   if [[ -n "$CASE_FILTER" && ",$CASE_FILTER," != *",$case_name,"* ]]; then
     continue
   fi
 
+  # Resolve per-case overrides
+  coef_max="${case_coef_max}"; [[ "$coef_max" == "-" ]] && coef_max="3"
+  num_hiddens="${case_hiddens}"; [[ "$num_hiddens" == "-" ]] && num_hiddens="256"
+  num_res_blocks="${case_res_blocks}"; [[ "$num_res_blocks" == "-" ]] && num_res_blocks="4"
+  num_res_hiddens="${case_res_hiddens}"; [[ "$num_res_hiddens" == "-" ]] && num_res_hiddens="128"
+
   run_name="${RUN_PREFIX}_${case_name}"
   job_name="${JOB_PREFIX}-${case_name}"
   run_dir="$OUT_ROOT/$run_name"
 
-  echo "[Sweep] $case_name  patch=$patch_based  K=$num_embeddings  k=$sparsity  d=$embedding_dim  p=${patch_size}s${patch_stride}  hiddens=$NUM_HIDDENS  res=$NUM_RES_BLOCKS"
+  echo "[Sweep] $case_name  patch=$patch_based  K=$num_embeddings  k=$sparsity  d=$embedding_dim  p=${patch_size}s${patch_stride}($patch_recon)  cm=$coef_max  h=$num_hiddens  res=$num_res_blocks"
 
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "  (dry run -- skipped)"
@@ -170,24 +200,24 @@ cd "$PROJECT_DIR"
 
 STAGE1_DIR="$run_dir/stage1"
 STAGE2_DIR="$run_dir/stage2"
-TOKEN_CACHE="$run_dir/token_cache_q${COEFF_BINS}_cm${COEF_MAX}.pt"
+TOKEN_CACHE="$run_dir/token_cache_q${COEFF_BINS}_cm${coef_max}.pt"
 mkdir -p "\$STAGE1_DIR" "\$STAGE2_DIR"
 
 echo ""
 echo "========================================"
-echo "STAGE 1: Autoencoder (VQGAN-cap, coef_max=$COEF_MAX)"
+echo "STAGE 1: Autoencoder (coef_max=$coef_max)"
 echo "  $run_name  patch=$patch_based  K=$num_embeddings  k=$sparsity  d=$embedding_dim"
-echo "  hiddens=$NUM_HIDDENS  res_blocks=$NUM_RES_BLOCKS  res_hiddens=$NUM_RES_HIDDENS"
-echo "  image_size=${IMAGE_SIZE}  batch_size=$BATCH_SIZE  lr=$STAGE1_LR"
+echo "  hiddens=$num_hiddens  res_blocks=$num_res_blocks  res_hiddens=$num_res_hiddens"
+echo "  recon=$patch_recon  image_size=${IMAGE_SIZE}  batch_size=$BATCH_SIZE  lr=$STAGE1_LR"
 echo "========================================"
 
 python train.py \\
   seed=42 \\
   output_dir="\$STAGE1_DIR" \\
   model=laser \\
-  model.num_hiddens=$NUM_HIDDENS \\
-  model.num_residual_blocks=$NUM_RES_BLOCKS \\
-  model.num_residual_hiddens=$NUM_RES_HIDDENS \\
+  model.num_hiddens=$num_hiddens \\
+  model.num_residual_blocks=$num_res_blocks \\
+  model.num_residual_hiddens=$num_res_hiddens \\
   model.num_embeddings=$num_embeddings \\
   model.embedding_dim=$embedding_dim \\
   model.sparsity_level=$sparsity \\
@@ -195,7 +225,7 @@ python train.py \\
   model.patch_size=$patch_size \\
   model.patch_stride=$patch_stride \\
   model.patch_reconstruction=$patch_recon \\
-  model.coef_max=$COEF_MAX \\
+  model.coef_max=$coef_max \\
   model.dict_learning_rate=$DICT_LR \\
   model.perceptual_weight=$PERCEPTUAL_WEIGHT \\
   model.log_images_every_n_steps=200 \\
@@ -229,7 +259,7 @@ echo "Using stage-1 checkpoint: \$STAGE1_CKPT"
 
 echo ""
 echo "========================================"
-echo "TOKEN EXTRACTION (bins=$COEFF_BINS, coef_max=$COEF_MAX)"
+echo "TOKEN EXTRACTION (bins=$COEFF_BINS, coef_max=$coef_max)"
 echo "========================================"
 
 python extract_token_cache.py \\
@@ -241,7 +271,7 @@ python extract_token_cache.py \\
   --batch-size $BATCH_SIZE \\
   --num-workers $NUM_WORKERS \\
   --seed 42 \\
-  --coeff-max $COEF_MAX \\
+  --coeff-max $coef_max \\
   --coeff-bins $COEFF_BINS \\
   --coeff-quantization uniform
 
