@@ -595,13 +595,18 @@ def _resolve_run_id(explicit: Optional[str] = None, fallback_timestamp: Optional
 
 
 def _build_run_artifact_tag(args) -> str:
+    patch_reconstruction = _canonical_patch_reconstruction(
+        getattr(args, "patch_reconstruction", None),
+        patch_size=getattr(args, "patch_size", None),
+        patch_stride=getattr(args, "patch_stride", None),
+    )
     payload_fields = (
         ("dataset", getattr(args, "dataset", None)),
         ("image_size", getattr(args, "image_size", None)),
         ("patch_based", getattr(args, "patch_based", None)),
         ("patch_size", getattr(args, "patch_size", None)),
         ("patch_stride", getattr(args, "patch_stride", None)),
-        ("patch_reconstruction", getattr(args, "patch_reconstruction", None)),
+        ("patch_reconstruction", patch_reconstruction),
         ("quantize_sparse_coeffs", getattr(args, "quantize_sparse_coeffs", None)),
         ("variational_coeffs", getattr(args, "variational_coeffs", None)),
         ("embedding_dim", getattr(args, "embedding_dim", None)),
@@ -636,6 +641,28 @@ def _build_run_artifact_tag(args) -> str:
             parts.append(f"t{launch_timestamp}")
     parts.append(f"h{digest}")
     return "__".join(parts)
+
+
+def _canonical_patch_reconstruction(
+    patch_reconstruction: Optional[str],
+    *,
+    patch_size: Optional[int],
+    patch_stride: Optional[int],
+) -> str:
+    mode = "center_crop" if patch_reconstruction is None else str(patch_reconstruction).strip().lower()
+    if mode not in ("center_crop", "hann", "tile"):
+        raise ValueError("patch_reconstruction must be 'center_crop', 'hann', or 'tile'")
+    if patch_size is not None and patch_stride is not None:
+        try:
+            patch_size_i = int(patch_size)
+            patch_stride_i = int(patch_stride)
+        except (TypeError, ValueError):
+            patch_size_i = None
+            patch_stride_i = None
+        if patch_size_i is not None and patch_stride_i is not None and patch_stride_i == patch_size_i:
+            # Non-overlapping patches can be stitched directly without overlap-aware blending.
+            return "tile"
+    return mode
 
 
 def _tagged_artifact_path(path: Path, artifact_tag: Optional[str]) -> Path:
@@ -677,14 +704,14 @@ def _unwrap_module(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
 
 
-def _clamp_generated_sparse_coeffs_for_decode(ae: nn.Module, coeffs: torch.Tensor) -> torch.Tensor:
+def _project_real_valued_stage2_coeffs(ae: nn.Module, coeffs: torch.Tensor) -> torch.Tensor:
     """
-    Keep sampled real-valued sparse coeffs inside the stage-1 decode range.
+    Project real-valued sparse coefficients into the bounded stage-2 model space.
 
-    Training can still regress unconstrained real-valued coeffs, but when we
-    unconditionally sample stage-2 and decode those coeffs back through the
-    stage-1 bottleneck we should not let rare outliers explode into painterly
-    artifacts.
+    Scratch stage-1 runs may emit deterministic sparse coefficients with a much
+    wider dynamic range than the stage-2 prior head and sampling path assume.
+    Keep cached teacher-forcing inputs, regression targets, and preview decode
+    coeffs on the same bounded manifold.
     """
     ae_module = _unwrap_module(ae)
     coeffs = _nan_to_num_tensor(ae_module.clamp_sparse_coeffs(coeffs))
@@ -701,6 +728,10 @@ def _clamp_generated_sparse_coeffs_for_decode(ae: nn.Module, coeffs: torch.Tenso
     if not math.isfinite(coef_max_value) or coef_max_value <= 0.0:
         return coeffs
     return coeffs.clamp(-coef_max_value, coef_max_value)
+
+
+def _clamp_generated_sparse_coeffs_for_decode(ae: nn.Module, coeffs: torch.Tensor) -> torch.Tensor:
+    return _project_real_valued_stage2_coeffs(ae, coeffs)
 
 
 def build_stage2_model(
@@ -1886,7 +1917,7 @@ class PatchDictionaryLearningTokenized(nn.Module):
 
     Extracts overlapping patches from the latent feature map using F.unfold,
     runs batched OMP on each patch vector, then reconstructs the latent via
-    one of two overlap strategies:
+    one of three stitching strategies:
 
       "center_crop" (default) — take only the center patch_stride×patch_stride
           region of each reconstructed patch and tile non-overlappingly.
@@ -1899,7 +1930,12 @@ class PatchDictionaryLearningTokenized(nn.Module):
           on the exact signal; for OMP-approximated patches it blends
           smoothly rather than averaging equally.
 
-    Both modes pad by (patch_size - patch_stride) // 2 before unfolding so
+      "tile" — direct patch tiling with no crop or overlap weighting. This is
+          the natural reconstruction for non-overlapping patches
+          (patch_stride == patch_size), and overlapping requests are
+          automatically normalized to this mode when patches do not overlap.
+
+    All modes pad by (patch_size - patch_stride) // 2 before unfolding so
     that the output covers the full H × W spatial extent.
 
     The dictionary has shape [patch_dim, num_embeddings] where
@@ -1969,9 +2005,11 @@ class PatchDictionaryLearningTokenized(nn.Module):
                 "variational_coeff_min_std cannot exceed variational_coeff_prior_std: "
                 f"{self.variational_coeff_min_std} > {self.variational_coeff_prior_std}"
             )
-        if patch_reconstruction not in ("center_crop", "hann"):
-            raise ValueError("patch_reconstruction must be 'center_crop' or 'hann'")
-        self.patch_reconstruction = patch_reconstruction
+        self.patch_reconstruction = _canonical_patch_reconstruction(
+            patch_reconstruction,
+            patch_size=self.patch_size,
+            patch_stride=self.patch_stride,
+        )
         if self.variational_coeffs and self.quantize_sparse_coeffs:
             raise ValueError("variational_coeffs currently requires quantize_sparse_coeffs=False")
 
@@ -2264,10 +2302,46 @@ class PatchDictionaryLearningTokenized(nn.Module):
         H: Optional[int] = None,
         W: Optional[int] = None,
     ) -> torch.Tensor:
-        """Dispatch to center-crop or Hann-window reconstruction."""
+        """Dispatch to the requested patch stitching strategy."""
+        if self.patch_reconstruction == "tile":
+            return self._reconstruct_tile(support, coeffs, H, W)
         if self.patch_reconstruction == "hann":
             return self._reconstruct_hann(support, coeffs, H, W)
         return self._reconstruct_center_crop(support, coeffs, H, W)
+
+    def _reconstruct_tile(
+        self,
+        support: torch.Tensor,
+        coeffs: torch.Tensor,
+        H: Optional[int] = None,
+        W: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Direct patch tiling for non-overlapping patches.
+
+        H, W: original latent spatial dims. When provided, output is cropped
+        to [B, C, H, W].
+        """
+        if self.patch_stride != self.patch_size:
+            raise ValueError(
+                "tile reconstruction requires non-overlapping patches: "
+                f"patch_stride={self.patch_stride}, patch_size={self.patch_size}"
+            )
+        B, nph, npw, D = support.shape
+        C = self.embedding_dim
+
+        dictionary = self._normalize_dict().t()
+        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
+        coeffs_flat = self.clamp_sparse_coeffs(coeffs.to(dictionary.dtype)).reshape(-1, D)
+        atoms = dictionary[support_flat]
+        recon = (atoms * coeffs_flat.unsqueeze(-1)).sum(dim=1)
+
+        recon = recon.view(B, nph, npw, C, self.patch_size, self.patch_size)
+        recon = recon.permute(0, 3, 1, 4, 2, 5).contiguous()
+        recon = recon.view(B, C, nph * self.patch_size, npw * self.patch_size)
+        if H is not None and W is not None:
+            recon = recon[:, :, :H, :W]
+        return recon
 
     def _reconstruct_center_crop(
         self,
@@ -2870,6 +2944,69 @@ def _sample_quality_features(x: torch.Tensor) -> torch.Tensor:
         center_dark_frac20,
         center_dark_frac30,
     ], dim=1)
+
+
+def _sample_tensor_stats_dict(x: Optional[torch.Tensor], prefix: str) -> dict:
+    """Compact scalar summary for a sampled tensor batch."""
+    if x is None:
+        return {}
+    flat = x.detach().float().reshape(-1)
+    if flat.numel() == 0:
+        return {}
+    return {
+        f"{prefix}mean": float(flat.mean().item()),
+        f"{prefix}std": float(flat.std(unbiased=False).item()),
+        f"{prefix}min": float(flat.min().item()),
+        f"{prefix}max": float(flat.max().item()),
+        f"{prefix}abs_mean": float(flat.abs().mean().item()),
+    }
+
+
+def _sample_token_stats_dict(
+    tokens: Optional[torch.Tensor],
+    prefix: str,
+    vocab_size: Optional[int] = None,
+) -> dict:
+    """Compact scalar summary for quantized sampled token grids."""
+    if tokens is None:
+        return {}
+    flat = tokens.detach().reshape(-1).to(dtype=torch.long)
+    if flat.numel() == 0:
+        return {}
+    unique = int(torch.unique(flat).numel())
+    payload = {
+        f"{prefix}mean": float(flat.float().mean().item()),
+        f"{prefix}std": float(flat.float().std(unbiased=False).item()),
+        f"{prefix}min": int(flat.min().item()),
+        f"{prefix}max": int(flat.max().item()),
+        f"{prefix}unique_count": unique,
+    }
+    if vocab_size is not None:
+        payload[f"{prefix}unique_vocab_fraction"] = float(unique) / float(max(1, int(vocab_size)))
+    return payload
+
+
+def _sample_image_stats_dict(x: Optional[torch.Tensor], prefix: str) -> dict:
+    """Compact scalar summary for decoded stage-2 preview images."""
+    if x is None:
+        return {}
+    x_detached = x.detach().float()
+    if x_detached.numel() == 0:
+        return {}
+    x_unit = _to_unit_range(x_detached)
+    brightness = x_unit.mean(dim=(1, 2, 3))
+    saturation = (x_unit.amax(dim=1) - x_unit.amin(dim=1)).mean(dim=(1, 2))
+    contrast = x_unit.std(dim=(1, 2, 3), unbiased=False)
+    return {
+        f"{prefix}pixel_mean": float(x_detached.mean().item()),
+        f"{prefix}pixel_std": float(x_detached.std(unbiased=False).item()),
+        f"{prefix}pixel_min": float(x_detached.min().item()),
+        f"{prefix}pixel_max": float(x_detached.max().item()),
+        f"{prefix}brightness_mean": float(brightness.mean().item()),
+        f"{prefix}brightness_std": float(brightness.std(unbiased=False).item()),
+        f"{prefix}saturation_mean": float(saturation.mean().item()),
+        f"{prefix}contrast_mean": float(contrast.mean().item()),
+    }
 
 
 _SAMPLE_FEAT_BRIGHTNESS_SLICE = slice(7, 8)
@@ -3643,6 +3780,7 @@ def _compute_stage2_sample_fid(
     sample_overbright_weight: float = 1.0,
     sample_reject_dark_z: float = 1.5,
     sample_reject_bright_z: float = 1.5,
+    sample_selection_mode: str = "quality_only",
     sample_sort_by_quality: bool = True,
     sample_image_size: Optional[int] = None,
 ) -> Optional[float]:
@@ -3726,6 +3864,7 @@ def _compute_stage2_sample_fid(
                 overbright_weight=sample_overbright_weight,
                 reject_dark_z=sample_reject_dark_z,
                 reject_bright_z=sample_reject_bright_z,
+                selection_mode=sample_selection_mode,
                 sort_by_quality=sample_sort_by_quality,
             )
             if sample_image_size is not None and int(sample_image_size) > 0:
@@ -4558,6 +4697,7 @@ def precompute_tokens(
             )
         all_tokens.append(flat)
         if coeffs is not None:
+            coeffs = _project_real_valued_stage2_coeffs(ae, coeffs)
             all_coeffs.append(coeffs.view(coeffs.size(0), -1).to(torch.float32).cpu())
         seen += flat.size(0)
         if max_items is not None and seen >= max_items:
@@ -4637,7 +4777,7 @@ def _expected_token_cache_meta(
         "patch_based": bool(args.patch_based),
         "patch_size": int(args.patch_size),
         "patch_stride": int(args.patch_stride),
-        "patch_reconstruction": str(args.patch_reconstruction),
+        "patch_reconstruction": str(getattr(ae.bottleneck, "patch_reconstruction", args.patch_reconstruction)),
         "variational_coeffs": bool(args.variational_coeffs),
         "variational_coeff_kl_weight": float(args.variational_coeff_kl_weight),
         "variational_coeff_prior_std": float(args.variational_coeff_prior_std),
@@ -4681,8 +4821,20 @@ def _token_cache_is_compatible(cache, expected_meta: dict) -> Tuple[bool, str]:
     cache_meta = cache.get("meta")
     if cache_meta is not None:
         for key, expected_value in expected_meta.items():
-            if cache_meta.get(key) != expected_value:
-                return False, f"meta mismatch for {key}: cache={cache_meta.get(key)!r}, expected={expected_value!r}"
+            cache_value = cache_meta.get(key)
+            if key == "patch_reconstruction":
+                expected_value = _canonical_patch_reconstruction(
+                    expected_value,
+                    patch_size=expected_meta.get("patch_size"),
+                    patch_stride=expected_meta.get("patch_stride"),
+                )
+                cache_value = _canonical_patch_reconstruction(
+                    cache_value,
+                    patch_size=cache_meta.get("patch_size"),
+                    patch_stride=cache_meta.get("patch_stride"),
+                )
+            if cache_value != expected_value:
+                return False, f"meta mismatch for {key}: cache={cache_value!r}, expected={expected_value!r}"
 
     return True, "ok"
 
@@ -4778,6 +4930,7 @@ def train_stage2_transformer(
     W: int,
     D: int,
     sample_every_steps: int = 200,
+    sample_start_step: int = 0,
     # ---- LR schedule ----
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.01,
@@ -4802,6 +4955,7 @@ def train_stage2_transformer(
     sample_overbright_weight: float = 1.0,
     sample_reject_dark_z: float = 1.5,
     sample_reject_bright_z: float = 1.5,
+    sample_selection_mode: str = "quality_only",
     sample_sort_by_quality: bool = True,
     sample_image_size: Optional[int] = None,
     sample_reference_stats: Optional[dict] = None,
@@ -4829,6 +4983,7 @@ def train_stage2_transformer(
     total_steps = max(1, epochs * max(1, len(token_loader)))
     warmup_steps = max(0, int(warmup_steps))
     min_lr_ratio = float(max(0.0, min(float(min_lr_ratio), 1.0)))
+    sample_start_step = max(0, int(sample_start_step))
     vocab = transformer_module.cfg.vocab_size
     global_step = 0
     sample_top_k = None if sample_top_k is None or int(sample_top_k) <= 0 else int(sample_top_k)
@@ -4860,6 +5015,12 @@ def train_stage2_transformer(
     sample_reject_bright_z = float(sample_reject_bright_z)
     if sample_reject_bright_z < 0.0:
         raise ValueError("sample_reject_bright_z must be >= 0.")
+    sample_selection_mode = str(sample_selection_mode).strip().lower()
+    if sample_selection_mode not in {"quality_only", "diverse"}:
+        raise ValueError(
+            "sample_selection_mode must be 'quality_only' or 'diverse', "
+            f"got {sample_selection_mode!r}."
+        )
     sample_sort_by_quality = bool(sample_sort_by_quality)
     sample_candidate_factor = max(1, int(sample_candidate_factor))
     stage2_fid_num_samples = max(0, int(stage2_fid_num_samples))
@@ -4924,6 +5085,11 @@ def train_stage2_transformer(
         torch.cuda.empty_cache()
         if is_main_process:
             print("[Stage2] parking stage-1 decoder on CPU between sampling steps")
+    if sample_every_steps > 0 and sample_start_step > 0 and is_main_process:
+        print(
+            f"[Stage2] delaying preview sampling until step {sample_start_step} "
+            f"(then every {sample_every_steps} steps)"
+        )
     num_batches = max(1, len(token_loader))
     if coeff_loss_type == "gaussian_nll" and not real_valued:
         raise ValueError("stage2 coeff_loss_type='gaussian_nll' requires real-valued sparse coefficients")
@@ -4979,27 +5145,33 @@ def train_stage2_transformer(
                 if real_valued:
                     # Take private copies before stage-2 forward/recon paths so
                     # CE targets, masking tokens, and latent-reconstruction
-                    # indices do not share storage with the dataloader batch.
+                    # indices do not alias each other across the rollout paths.
                     tok_grid = tok_flat.view(B, H * W, D).clone()
-                    coeff_grid = coeff_flat.view(B, H * W, D).clone()
+                    coeff_grid = _project_real_valued_stage2_coeffs(
+                        ae_decode,
+                        coeff_flat.view(B, H * W, D).clone(),
+                    )
+                    ce_tok_grid = tok_grid.detach().clone()
+                    forward_tok_grid = tok_grid.detach().clone()
+                    forward_mask_tok_grid = ce_tok_grid.detach().clone()
                     if gaussian_coeffs:
                         atom_logits, coeff_pred, coeff_logvar_pred, depth_h = transformer(
-                            tok_grid,
+                            forward_tok_grid,
                             coeff_grid,
-                            mask_tokens=tok_grid,
+                            mask_tokens=forward_mask_tok_grid,
                             return_features=True,
                         )
                     else:
                         atom_logits, coeff_pred, depth_h = transformer(
-                            tok_grid,
+                            forward_tok_grid,
                             coeff_grid,
-                            mask_tokens=tok_grid,
+                            mask_tokens=forward_mask_tok_grid,
                             return_features=True,
                         )
                         coeff_logvar_pred = None
                     ce_loss = F.cross_entropy(
                         atom_logits.reshape(-1, vocab),
-                        tok_grid.reshape(-1),
+                        ce_tok_grid.reshape(-1),
                     )
                     pred_coeff = ae_decode.clamp_sparse_coeffs(coeff_pred)
                     target_coeff = ae_decode.clamp_sparse_coeffs(coeff_grid)
@@ -5054,22 +5226,25 @@ def train_stage2_transformer(
                             pred_coeff.view(B, H, W, D),
                         )
                         with torch.no_grad():
+                            target_tok_grid = ce_tok_grid.detach().clone()
                             target_latent = _reconstruct_stage2_sparse_latent(
                                 ae_decode,
-                                tok_grid.view(B, H, W, D),
+                                target_tok_grid.view(B, H, W, D),
                                 target_coeff.view(B, H, W, D),
                             )
                         coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
                     else:
+                        pred_tok_grid = ce_tok_grid.detach().clone()
                         pred_latent = _reconstruct_stage2_sparse_latent(
                             ae_decode,
-                            tok_grid.view(B, H, W, D),
+                            pred_tok_grid.view(B, H, W, D),
                             pred_coeff.view(B, H, W, D),
                         )
                         with torch.no_grad():
+                            target_tok_grid = ce_tok_grid.detach().clone()
                             target_latent = _reconstruct_stage2_sparse_latent(
                                 ae_decode,
-                                tok_grid.view(B, H, W, D),
+                                target_tok_grid.view(B, H, W, D),
                                 target_coeff.view(B, H, W, D),
                             )
                         coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
@@ -5184,7 +5359,11 @@ def train_stage2_transformer(
                     step_value=global_step,
                 )
 
-            if sample_every_steps > 0 and (global_step % sample_every_steps == 0):
+            should_sample = False
+            if sample_every_steps > 0 and global_step >= sample_start_step:
+                should_sample = ((global_step - sample_start_step) % sample_every_steps == 0)
+
+            if should_sample:
                 opt.zero_grad(set_to_none=True)
                 _barrier()
                 if is_main_process:
@@ -5201,23 +5380,33 @@ def train_stage2_transformer(
                             int(sample_batch_size) * sample_candidate_factor,
                         )
                     decode_batch_size = max(1, min(8, int(sample_batch_size)))
-                    print(
-                        f"[Stage2] sampling at step {global_step} "
-                        f"(keep={sample_batch_size}, candidates={candidate_batch_size}, "
-                        f"atom_temp={sample_temperature}, atom_top_k={sample_top_k}, "
-                        f"coeff_mode={sample_coeff_mode}, "
-                        f"coeff_temp={sample_temperature if resolved_sample_coeff_temperature is None else resolved_sample_coeff_temperature}, "
-                        f"select_q={sample_selection_quality_weight}, "
-                        f"brightness_q={sample_brightness_weight}, "
-                        f"overbright_q={sample_overbright_weight}, "
-                        f"reject_dark_z={sample_reject_dark_z}, "
-                        f"reject_bright_z={sample_reject_bright_z}, "
-                        f"sort_by_quality={sample_sort_by_quality})..."
-                    )
+                    sample_parts = [
+                        f"keep={sample_batch_size}",
+                        f"candidates={candidate_batch_size}",
+                        f"atom_temp={sample_temperature}",
+                        f"atom_top_k={sample_top_k}",
+                    ]
+                    if real_valued:
+                        sample_parts.append(f"coeff_mode={sample_coeff_mode}")
+                        sample_parts.append(
+                            "coeff_temp="
+                            f"{sample_temperature if resolved_sample_coeff_temperature is None else resolved_sample_coeff_temperature}"
+                        )
+                    sample_parts.extend([
+                        f"select_q={sample_selection_quality_weight}",
+                        f"brightness_q={sample_brightness_weight}",
+                        f"overbright_q={sample_overbright_weight}",
+                        f"reject_dark_z={sample_reject_dark_z}",
+                        f"reject_bright_z={sample_reject_bright_z}",
+                        f"selection_mode={sample_selection_mode}",
+                        f"sort_by_quality={sample_sort_by_quality}",
+                    ])
+                    print(f"[Stage2] sampling at step {global_step} ({', '.join(sample_parts)})...")
                     try:
                         with torch.no_grad():
                             if device.type == "cuda":
                                 torch.cuda.empty_cache()
+                            sample_debug_payload = {}
                             if real_valued:
                                 atoms_gen, coeffs_gen = transformer_module.generate(
                                     batch_size=candidate_batch_size,
@@ -5239,6 +5428,12 @@ def train_stage2_transformer(
                                     coeffs=coeffs_gen,
                                     decode_batch_size=decode_batch_size,
                                 )
+                                sample_debug_payload.update(
+                                    _sample_tensor_stats_dict(atoms_gen, "stage2/sample_atoms_")
+                                )
+                                sample_debug_payload.update(
+                                    _sample_tensor_stats_dict(coeffs_gen, "stage2/sample_coeffs_")
+                                )
                                 del atoms_gen
                                 del coeffs_gen
                             else:
@@ -5256,8 +5451,18 @@ def train_stage2_transformer(
                                     tokens_gen,
                                     decode_batch_size=decode_batch_size,
                                 )
+                                sample_debug_payload.update(
+                                    _sample_token_stats_dict(
+                                        tokens_gen,
+                                        "stage2/sample_tokens_",
+                                        vocab_size=vocab,
+                                    )
+                                )
                                 del tokens_gen
                             imgs_raw = imgs[:min(int(sample_batch_size), int(imgs.size(0)))].clone()
+                            sample_debug_payload.update(
+                                _sample_image_stats_dict(imgs_raw, "stage2/sample_raw_")
+                            )
                             imgs = _select_best_stage2_samples(
                                 imgs,
                                 keep=sample_batch_size,
@@ -5267,6 +5472,7 @@ def train_stage2_transformer(
                                 overbright_weight=sample_overbright_weight,
                                 reject_dark_z=sample_reject_dark_z,
                                 reject_bright_z=sample_reject_bright_z,
+                                selection_mode=sample_selection_mode,
                                 sort_by_quality=sample_sort_by_quality,
                             )
                             if sample_image_size is not None and int(sample_image_size) > 0:
@@ -5277,6 +5483,9 @@ def train_stage2_transformer(
                                         mode="bilinear",
                                         align_corners=False,
                                     )
+                            sample_debug_payload.update(
+                                _sample_image_stats_dict(imgs, "stage2/sample_selected_")
+                            )
                     finally:
                         if offload_decode_model:
                             ae_decode.to("cpu")
@@ -5303,6 +5512,36 @@ def train_stage2_transformer(
                         step_value=global_step,
                         caption=f"step={global_step}",
                     )
+                    if sample_debug_payload:
+                        _log_wandb(
+                            wandb_run,
+                            sample_debug_payload,
+                            step_metric="stage2/step",
+                            step_value=global_step,
+                        )
+                        raw_brightness = float(sample_debug_payload.get("stage2/sample_raw_brightness_mean", float("nan")))
+                        selected_brightness = float(sample_debug_payload.get("stage2/sample_selected_brightness_mean", float("nan")))
+                        raw_std = float(sample_debug_payload.get("stage2/sample_raw_pixel_std", float("nan")))
+                        selected_std = float(sample_debug_payload.get("stage2/sample_selected_pixel_std", float("nan")))
+                        if real_valued:
+                            coeff_abs_mean = float(sample_debug_payload.get("stage2/sample_coeffs_abs_mean", float("nan")))
+                            print(
+                                f"[Stage2] sample stats step {global_step}: "
+                                f"raw_brightness={raw_brightness:.4f} raw_std={raw_std:.4f} "
+                                f"selected_brightness={selected_brightness:.4f} selected_std={selected_std:.4f} "
+                                f"coeff_abs_mean={coeff_abs_mean:.4f}"
+                            )
+                        else:
+                            token_mean = float(sample_debug_payload.get("stage2/sample_tokens_mean", float("nan")))
+                            token_std = float(sample_debug_payload.get("stage2/sample_tokens_std", float("nan")))
+                            token_vocab_frac = float(sample_debug_payload.get("stage2/sample_tokens_unique_vocab_fraction", float("nan")))
+                            print(
+                                f"[Stage2] sample stats step {global_step}: "
+                                f"token_mean={token_mean:.2f} token_std={token_std:.2f} "
+                                f"token_vocab_frac={token_vocab_frac:.4f} "
+                                f"raw_brightness={raw_brightness:.4f} raw_std={raw_std:.4f} "
+                                f"selected_brightness={selected_brightness:.4f} selected_std={selected_std:.4f}"
+                            )
                     print(f"[Stage2] sampling done at step {global_step}")
                 _barrier()
                 transformer.train()
@@ -5356,6 +5595,7 @@ def train_stage2_transformer(
                         sample_overbright_weight=sample_overbright_weight,
                         sample_reject_dark_z=sample_reject_dark_z,
                         sample_reject_bright_z=sample_reject_bright_z,
+                        sample_selection_mode=sample_selection_mode,
                         sample_sort_by_quality=sample_sort_by_quality,
                         sample_image_size=sample_image_size,
                     )
@@ -5382,7 +5622,6 @@ def train_stage2_transformer(
                         step_metric="stage2/step",
                         step_value=global_step,
                     )
-
         _barrier()
         if is_main_process:
             os.makedirs(out_dir, exist_ok=True)
@@ -5817,8 +6056,12 @@ def main():
         "--patch_reconstruction",
         type=str,
         default="center_crop",
-        choices=["center_crop", "hann"],
-        help="Patch reconstruction mode: 'center_crop' (no averaging) or 'hann' (weighted overlap-add).",
+        choices=["center_crop", "hann", "tile"],
+        help=(
+            "Patch reconstruction mode: 'center_crop' (center-tile), "
+            "'hann' (weighted overlap-add), or 'tile' (direct non-overlap stitching). "
+            "When patch_stride == patch_size, overlap-aware modes are normalized to 'tile'."
+        ),
     )
 
     parser.add_argument("--tf_d_model", type=int, default=512)
@@ -5869,6 +6112,12 @@ def main():
         help="Compute stage-2 sample FID every N stage-2 epochs (0 disables it).",
     )
     parser.add_argument("--stage2_sample_every_steps", type=int, default=2000)
+    parser.add_argument(
+        "--stage2_sample_start_step",
+        type=int,
+        default=0,
+        help="Delay stage-2 preview sampling until this global step (0 keeps the old immediate behavior).",
+    )
     parser.add_argument("--stage2_sample_batch_size", type=int, default=32)
     parser.add_argument(
         "--stage2_sample_candidate_factor",
@@ -5921,6 +6170,15 @@ def main():
         help="Hard rejection threshold in reference-standard-deviation units for abnormally bright preview candidates. <= 0 disables rejection.",
     )
     parser.add_argument(
+        "--stage2_sample_selection_mode",
+        choices=["quality_only", "diverse"],
+        default="quality_only",
+        help=(
+            "How to rerank oversampled stage-2 preview candidates. "
+            "'quality_only' is safer for color fidelity; 'diverse' can surface outlier hues/textures."
+        ),
+    )
+    parser.add_argument(
         "--stage2_sample_sort_by_quality",
         dest="stage2_sample_sort_by_quality",
         action="store_true",
@@ -5945,6 +6203,8 @@ def main():
         raise ValueError(f"coef_mu must be > 0 when coef_quantization='mu_law', got {args.coef_mu}")
     if args.stage2_sample_temperature <= 0.0:
         raise ValueError("stage2_sample_temperature must be > 0.")
+    if args.stage2_sample_start_step < 0:
+        raise ValueError("stage2_sample_start_step must be >= 0.")
     if math.isfinite(args.stage2_sample_coeff_temperature) and args.stage2_sample_coeff_temperature <= 0.0:
         raise ValueError("stage2_sample_coeff_temperature must be > 0 when set.")
     if args.stage2_sample_quality_weight < 0.0:
@@ -6670,6 +6930,17 @@ def main():
         tokens_flat = tokens_flat[:expected_items]
         if coeffs_flat is not None:
             coeffs_flat = coeffs_flat[:expected_items]
+    if coeffs_flat is not None:
+        coeffs_flat_raw = coeffs_flat
+        coeffs_flat = _project_real_valued_stage2_coeffs(laser, coeffs_flat.to(torch.float32))
+        if is_main_process:
+            coeff_delta = (coeffs_flat_raw.to(torch.float32) - coeffs_flat).abs()
+            clipped_fraction = float((coeff_delta > 1e-6).float().mean().item())
+            if clipped_fraction > 0.0:
+                print(
+                    "[Stage2] projecting cached real-valued coeffs into bounded stage-2 space "
+                    f"(clipped_fraction={clipped_fraction:.4f})"
+                )
     real_valued = (coeffs_flat is not None)
     sample_reference_stats = _compute_stage2_sample_reference_stats(
         laser,
@@ -6781,6 +7052,7 @@ def main():
         W=W,
         D=D,
         sample_every_steps=args.stage2_sample_every_steps,
+        sample_start_step=args.stage2_sample_start_step,
         sample_batch_size=args.stage2_sample_batch_size,
         sample_candidate_factor=args.stage2_sample_candidate_factor,
         sample_temperature=args.stage2_sample_temperature,
@@ -6795,6 +7067,7 @@ def main():
         sample_overbright_weight=args.stage2_sample_overbright_weight,
         sample_reject_dark_z=args.stage2_sample_reject_dark_z,
         sample_reject_bright_z=args.stage2_sample_reject_bright_z,
+        sample_selection_mode=args.stage2_sample_selection_mode,
         sample_sort_by_quality=args.stage2_sample_sort_by_quality,
         sample_image_size=args.stage2_sample_image_size,
         sample_reference_stats=sample_reference_stats,

@@ -53,6 +53,11 @@ commitment_cost: 0.25
 # null = share the main optimizer learning rate, like proto.py stage-1.
 dict_learning_rate: 2.5e-4
 
+# Optional hard bound on sparse coefficients for downstream quantization.
+# null keeps the previous unconstrained least-squares updates.
+coef_max: null
+bounded_omp_refine_steps: 8
+
 # Latent patch sparse coding.
 # Mirrors the scratch patch bottleneck, but keeps the maintained src path
 # limited to sparse coding plus reconstruction only.

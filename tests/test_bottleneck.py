@@ -145,6 +145,54 @@ def test_dictionary_learning_tolerates_removed_omp_kwargs():
     assert dl.num_embeddings == 8
 
 
+def test_batch_omp_with_coef_max_hard_bounds_coefficients():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=2,
+        coef_max=1.0,
+        bounded_omp_refine_steps=16,
+    )
+    dictionary = torch.eye(2)
+    signals = torch.tensor([[3.0], [-2.0]], dtype=torch.float32)
+
+    support, values = dl.batch_omp_with_support(signals, dictionary)
+
+    assert support.tolist() == [[0, 1]]
+    assert torch.allclose(values, torch.tensor([[1.0, -1.0]]), atol=1e-4)
+    assert float(values.abs().max()) <= 1.0 + 1e-6
+
+
+def test_dictionary_learning_forward_hard_bounds_patch_coefficients():
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=1,
+        sparsity_level=4,
+        patch_based=True,
+        patch_size=2,
+        patch_stride=2,
+        coef_max=1.0,
+        bounded_omp_refine_steps=16,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(torch.eye(4))
+
+    z = torch.tensor(
+        [[[[2.0, -1.5],
+           [0.25, -3.0]]]],
+        dtype=torch.float32,
+    )
+
+    z_out, loss, sparse_codes = dl(z)
+
+    expected = z.clamp(-1.0, 1.0)
+    assert torch.isfinite(loss)
+    assert torch.allclose(z_out, expected, atol=1e-4)
+    assert float(sparse_codes.values.abs().max()) <= 1.0 + 1e-6
+    assert float(dl._last_diag["coeff_abs_max"]) <= 1.0 + 1e-6
+    assert float(dl._last_diag["coeff_clip_frac"]) > 0.0
+
+
 def test_patch_dictionary_learning_preserves_latent_shape():
     torch.manual_seed(0)
     dl = DictionaryLearning(

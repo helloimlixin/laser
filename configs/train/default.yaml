@@ -14,3 +14,6 @@ early_stopping_patience: null # Disable early stopping by default to run full ma
 # 1.0 = validate once at the end of every epoch.
 val_check_interval: 1.0
 run_test_after_fit: false
+# Cosine LR schedule with warmup (0 = no warmup)
+warmup_steps: 0
+min_lr_ratio: 0.01

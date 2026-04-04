@@ -13,7 +13,11 @@ from torchvision.utils import save_image
 from src.data.token_cache import load_token_cache
 from src.models.laser import LASER
 from src.models.mingpt_prior import MinGPTQuantizedPrior, MinGPTQuantizedPriorConfig
-from src.models.sparse_token_prior import SparseTokenPriorModule, token_cache_grid_shape
+from src.models.sparse_token_prior import (
+    SparseTokenPriorModule,
+    build_sparse_prior_from_hparams,
+    token_cache_grid_shape,
+)
 from src.models.spatial_prior import SpatialDepthPrior, SpatialDepthPriorConfig
 from src.stage2_paths import infer_latest_stage1_checkpoint, infer_latest_stage2_checkpoint, infer_latest_token_cache
 
@@ -300,6 +304,19 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Grid columns for the saved sample sheet. 0 uses sqrt(num_samples).",
     )
+    parser.add_argument(
+        "--coeff-temperature",
+        type=float,
+        default=None,
+        help="Optional override for real-valued coefficient sampling temperature.",
+    )
+    parser.add_argument(
+        "--coeff-sample-mode",
+        type=str,
+        default=None,
+        choices=["gaussian", "mean"],
+        help="Optional override for real-valued coefficient sampling mode.",
+    )
     return parser.parse_args()
 
 
@@ -340,8 +357,7 @@ def main():
         print(f"Inferred token cache: {args.token_cache}")
 
     cache = load_token_cache(args.token_cache)
-    if cache.get("coeffs_flat") is not None:
-        raise NotImplementedError("Maintained generation currently supports quantized sparse-token caches only.")
+    real_valued_cache = cache.get("coeffs_flat") is not None
     token_h, token_w, token_depth = token_cache_grid_shape(cache)
 
     if args.stage1_checkpoint is None:
@@ -370,34 +386,17 @@ def main():
     stage1 = LASER.load_from_checkpoint(args.stage1_checkpoint, map_location="cpu")
     stage1.eval().to(device)
 
-    architecture = _resolve_prior_architecture(stage2_payload, args.architecture)
+    build_hparams = dict(stage2_hparams)
+    if args.architecture != "auto":
+        build_hparams["prior_architecture"] = str(args.architecture)
+    if args.n_heads is not None:
+        build_hparams["prior_n_heads"] = int(args.n_heads)
+    if args.dropout is not None:
+        build_hparams["prior_dropout"] = float(args.dropout)
+    if args.coeff_max is not None:
+        build_hparams["prior_coeff_max"] = float(args.coeff_max)
 
-    atom_vocab_size = int(
-        stage2_hparams.get("prior_atom_vocab_size")
-        or cache.get("meta", {}).get("num_atoms")
-        or stage1.bottleneck.num_embeddings
-    )
-    total_vocab_size = int(_checkpoint_state_dict(stage2_payload)["prior.token_head.weight"].shape[0])
-    coeff_vocab_size = int(stage2_hparams.get("prior_coeff_vocab_size") or (total_vocab_size - atom_vocab_size))
-    coeff_bin_values = _resolve_coeff_bin_values(
-        coeff_vocab_size=coeff_vocab_size,
-        cache=cache,
-        stage2_hparams=stage2_hparams,
-        coeff_max_override=args.coeff_max,
-        coeff_quantization_override=args.coeff_quantization,
-        coeff_mu_override=args.coeff_mu,
-    )
-
-    prior = _build_prior(
-        payload=stage2_payload,
-        cache=cache,
-        architecture=architecture,
-        atom_vocab_size=atom_vocab_size,
-        coeff_vocab_size=coeff_vocab_size,
-        coeff_bin_values=coeff_bin_values,
-        n_heads_override=args.n_heads,
-        dropout_override=args.dropout,
-    )
+    prior = build_sparse_prior_from_hparams(cache, hparams=build_hparams)
     stage2 = SparseTokenPriorModule.load_from_checkpoint(
         args.stage2_checkpoint,
         map_location="cpu",
@@ -408,24 +407,57 @@ def main():
     latent_hw = _resolve_latent_hw(stage1, cache, args.image_size)
     top_k = None if int(args.top_k) <= 0 else int(args.top_k)
 
+    # Pre-resolve coeff_bin_values once for the quantized path.
+    if not real_valued_cache:
+        coeff_bin_values = getattr(prior.cfg, "coeff_bin_values", None)
+        if coeff_bin_values is None:
+            coeff_vocab_size = getattr(prior.cfg, "coeff_vocab_size", None)
+            coeff_bin_values = _resolve_coeff_bin_values(
+                coeff_vocab_size=int(coeff_vocab_size or 0),
+                cache=cache,
+                stage2_hparams=build_hparams,
+                coeff_max_override=args.coeff_max,
+                coeff_quantization_override=args.coeff_quantization,
+                coeff_mu_override=args.coeff_mu,
+            )
+
     generated_images = []
     generated_tokens = []
+    generated_coeffs = []
     remaining = int(args.num_samples)
     while remaining > 0:
         cur_batch = min(int(args.batch_size), remaining)
-        token_grid = stage2.generate_tokens(
-            cur_batch,
-            temperature=float(args.temperature),
-            top_k=top_k,
-        ).view(cur_batch, token_h, token_w, token_depth)
-        images = stage1.decode_from_tokens(
-            token_grid.to(device=device, dtype=torch.long),
-            latent_hw=latent_hw,
-            atom_vocab_size=atom_vocab_size,
-            coeff_vocab_size=coeff_vocab_size,
-            coeff_bin_values=coeff_bin_values.to(device),
-        )
-        generated_tokens.append(token_grid.cpu())
+        if real_valued_cache:
+            atom_ids, coeffs = stage2.generate_sparse_codes(
+                cur_batch,
+                temperature=float(args.temperature),
+                top_k=top_k,
+                coeff_temperature=args.coeff_temperature,
+                coeff_sample_mode=args.coeff_sample_mode,
+            )
+            atom_grid = atom_ids.view(cur_batch, token_h, token_w, token_depth)
+            coeff_grid = coeffs.view(cur_batch, token_h, token_w, token_depth)
+            images = stage1.decode_from_atoms_and_coeffs(
+                atom_grid.to(device=device, dtype=torch.long),
+                coeff_grid.to(device=device, dtype=torch.float32),
+                latent_hw=latent_hw,
+            )
+            generated_tokens.append(atom_grid.cpu())
+            generated_coeffs.append(coeff_grid.cpu())
+        else:
+            token_grid = stage2.generate_tokens(
+                cur_batch,
+                temperature=float(args.temperature),
+                top_k=top_k,
+            ).view(cur_batch, token_h, token_w, token_depth)
+            images = stage1.decode_from_tokens(
+                token_grid.to(device=device, dtype=torch.long),
+                latent_hw=latent_hw,
+                atom_vocab_size=getattr(prior.cfg, "atom_vocab_size", None),
+                coeff_vocab_size=getattr(prior.cfg, "coeff_vocab_size", None),
+                coeff_bin_values=torch.as_tensor(coeff_bin_values, dtype=torch.float32, device=device),
+            )
+            generated_tokens.append(token_grid.cpu())
         generated_images.append(images.cpu())
         remaining -= cur_batch
 
@@ -446,17 +478,19 @@ def main():
         normalize=True,
         scale_each=True,
     )
-    torch.save(
-        {
-            "tokens": tokens,
-            "shape": (token_h, token_w, token_depth),
-            "latent_hw": latent_hw,
-            "stage1_checkpoint": str(args.stage1_checkpoint.expanduser().resolve()),
-            "stage2_checkpoint": str(args.stage2_checkpoint.expanduser().resolve()),
-            "token_cache": str(args.token_cache.expanduser().resolve()),
-        },
-        output_dir / "samples.pt",
-    )
+    payload = {
+        "shape": (token_h, token_w, token_depth),
+        "latent_hw": latent_hw,
+        "stage1_checkpoint": str(args.stage1_checkpoint.expanduser().resolve()),
+        "stage2_checkpoint": str(args.stage2_checkpoint.expanduser().resolve()),
+        "token_cache": str(args.token_cache.expanduser().resolve()),
+    }
+    if real_valued_cache:
+        payload["atom_ids"] = tokens
+        payload["coeffs"] = torch.cat(generated_coeffs, dim=0)
+    else:
+        payload["tokens"] = tokens
+    torch.save(payload, output_dir / "samples.pt")
     print(f"Saved {images.size(0)} samples to {output_dir}")
 
 

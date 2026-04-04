@@ -30,6 +30,7 @@ ar:
   atom_vocab_size: null
   coeff_vocab_size: null
   n_global_spatial_tokens: 0
+  autoregressive_coeffs: true
 
   # Model architecture
   d_model: 512
@@ -54,6 +55,12 @@ ar:
   coeff_loss_weight: 1.0
   coeff_depth_weighting: none
   coeff_focal_gamma: 0.0
+  coeff_loss_type: auto
+  coeff_huber_delta: 0.5
+
+  # Real-valued sparse coefficient sampling defaults. Ignored for quantized caches.
+  sample_coeff_temperature: null
+  sample_coeff_mode: gaussian
 
 # =============================================================================
 # AR Training Configuration
@@ -63,6 +70,7 @@ train_ar:
   max_epochs: 100
   accelerator: gpu
   devices: 1
+  strategy: auto
   precision: 16-mixed
   gradient_clip_val: 1.0
   log_every_n_steps: 10
@@ -71,9 +79,14 @@ train_ar:
   test_split: 0.05
   max_items: 0
   sample_every_n_steps: 0
+  sample_every_n_epochs: 0
   sample_num_images: 4
   sample_temperature: 1.0
   sample_top_k: 0
+  sample_coeff_temperature: null
+  sample_coeff_mode: gaussian
+  sample_log_to_wandb: true
+  log_recon_every_n_steps: 500
 
 # =============================================================================
 # Dataset Configuration (same as LASER training)

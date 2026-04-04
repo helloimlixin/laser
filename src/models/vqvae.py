@@ -222,10 +222,11 @@ class VQVAE(pl.LightningModule):
                 self.test_fid.update(x_recon_fid, real=False)
                 self.test_fid.update(x_fid, real=True)
 
+        # Always synchronize epoch metrics so DDP runs do not emit reduction warnings.
         log_kwargs = dict(
             on_step=prefix == 'train',
             on_epoch=True,
-            sync_dist=prefix != 'train',
+            sync_dist=True,
         )
         self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)

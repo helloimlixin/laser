@@ -313,6 +313,12 @@ class SpatialDepthPrior(nn.Module):
             persistent=True,
         )
 
+    def _clamp_conditioning_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        coeff_max = float(self.cfg.coeff_max)
+        if not math.isfinite(coeff_max) or coeff_max <= 0.0:
+            return coeffs
+        return coeffs.clamp(-coeff_max, coeff_max)
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -515,7 +521,7 @@ class SpatialDepthPrior(nn.Module):
         if self.real_valued_coeffs and self.autoregressive_coeffs:
             if coeffs is None:
                 raise ValueError("coeffs must be provided when real_valued_coeffs=True")
-            coeffs = coeffs.to(device=device, dtype=act_dtype)
+            coeffs = self._clamp_conditioning_coeffs(coeffs.to(device=device, dtype=act_dtype))
             if tuple(coeffs.shape) != (B, T, D):
                 raise ValueError(
                     f"Expected coeffs with shape {(B, T, D)}, got {tuple(coeffs.shape)}"
@@ -898,7 +904,9 @@ class SpatialDepthPrior(nn.Module):
             raise ValueError("prompt_coeffs is only valid when real_valued_coeffs=True")
         if tuple(prompt_coeffs.shape) != expected_shape:
             raise ValueError(f"Expected prompt_coeffs shape {expected_shape}, got {tuple(prompt_coeffs.shape)}")
-        prompt_coeffs = prompt_coeffs.to(device=device, dtype=self._activation_dtype(device))
+        prompt_coeffs = self._clamp_conditioning_coeffs(
+            prompt_coeffs.to(device=device, dtype=self._activation_dtype(device))
+        )
         return prompt_tokens, prompt_coeffs, prompt_mask
 
     @torch.no_grad()

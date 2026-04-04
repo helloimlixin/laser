@@ -110,6 +110,7 @@ def build_spatial_depth_prior_config(
 ) -> SpatialDepthPriorConfig:
     coeff_vocab_size = None
     coeff_bin_values = None
+    bottleneck_coef_max = getattr(bottleneck, "coef_max", None)
     if not real_valued_coeffs:
         coeff_vocab_size = int(bottleneck.n_bins)
         coeff_bin_values = bottleneck._dequantize_coeff(
@@ -132,7 +133,9 @@ def build_spatial_depth_prior_config(
         n_global_spatial_tokens=int(n_global_spatial_tokens),
         d_ff=int(d_ff),
         dropout=float(dropout),
-        coeff_max=float(getattr(bottleneck, "coef_max", coeff_max_fallback)),
+        coeff_max=float(
+            bottleneck_coef_max if bottleneck_coef_max is not None else coeff_max_fallback
+        ),
         gaussian_coeffs=bool(getattr(bottleneck, "variational_coeffs", False)),
         coeff_prior_std=float(getattr(bottleneck, "variational_coeff_prior_std", 0.25)),
         coeff_min_std=float(getattr(bottleneck, "variational_coeff_min_std", 0.01)),

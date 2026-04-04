@@ -39,8 +39,12 @@ class LASER(pl.LightningModule):
             patch_size=4,
             patch_stride=2,
             patch_reconstruction="hann",
+            coef_max=None,
+            bounded_omp_refine_steps=8,
             sparsity_reg_weight=0.01,
             coherence_weight=0.0,
+            warmup_steps=0,
+            min_lr_ratio=0.01,
             **kwargs,
     ):
         """Initialize LASER model.
@@ -67,6 +71,8 @@ class LASER(pl.LightningModule):
             patch_size: latent patch size used for sparse coding
             patch_stride: latent patch stride used for sparse coding
             patch_reconstruction: patch stitching rule, either 'center_crop' or 'hann'
+            coef_max: optional hard bound applied to sparse coefficients during support refinement
+            bounded_omp_refine_steps: projected refinement steps for bounded OMP coefficient updates
             sparsity_reg_weight: L1 regularization weight on sparse coefficients
             coherence_weight: weight for dictionary coherence regularization
         """
@@ -109,6 +115,8 @@ class LASER(pl.LightningModule):
         self.coherence_weight = coherence_weight
         self.diag_log_interval = max(int(diag_log_interval), 0)
         self.enable_val_latent_visuals = bool(enable_val_latent_visuals)
+        self.warmup_steps = max(int(warmup_steps), 0)
+        self.min_lr_ratio = float(min_lr_ratio)
         if dict_learning_rate is not None and float(dict_learning_rate) <= 0.0:
             dict_learning_rate = None
 
@@ -136,6 +144,8 @@ class LASER(pl.LightningModule):
             patch_size=patch_size,
             patch_stride=patch_stride,
             patch_reconstruction=patch_reconstruction,
+            coef_max=coef_max,
+            bounded_omp_refine_steps=bounded_omp_refine_steps,
         )
 
         self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
@@ -179,6 +189,9 @@ class LASER(pl.LightningModule):
 
         # Cache for validation visualization
         self._val_vis_batch = None
+        # Dictionary atom snapshots for trajectory animation
+        self._dict_snapshots = []
+        self._dict_snapshot_steps = []
 
         # Save hyperparameters
         self.save_hyperparameters()
@@ -275,6 +288,19 @@ class LASER(pl.LightningModule):
         return tokens, (int(z_dl.shape[-2]), int(z_dl.shape[-1]))
 
     @torch.no_grad()
+    def encode_to_atoms_and_coeffs(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+        """Encode images to sparse atom ids plus real-valued coefficients."""
+        z_dl, _, sparse_codes = self.encode(x)
+        return (
+            sparse_codes.support,
+            sparse_codes.values,
+            (int(z_dl.shape[-2]), int(z_dl.shape[-1])),
+        )
+
+    @torch.no_grad()
     def infer_latent_hw(self, image_hw: Tuple[int, int]) -> Tuple[int, int]:
         """Infer encoder latent spatial size for a given input image size."""
         image_h, image_w = int(image_hw[0]), int(image_hw[1])
@@ -319,6 +345,54 @@ class LASER(pl.LightningModule):
         return self.decode(z_q)
 
     decode_tokens = decode_from_tokens
+
+    def reconstruct_latent_from_atoms_and_coeffs(
+        self,
+        atom_ids: torch.Tensor,
+        coeffs: torch.Tensor,
+        *,
+        latent_hw: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        """Reconstruct a latent map directly from sparse atom ids and coefficients."""
+        if atom_ids.dim() != 4 or coeffs.dim() != 4:
+            raise ValueError(
+                f"Expected atom_ids/coeffs with shape [B,H,W,D], got {tuple(atom_ids.shape)} and {tuple(coeffs.shape)}"
+            )
+        if tuple(atom_ids.shape) != tuple(coeffs.shape):
+            raise ValueError(
+                f"atom_ids and coeffs shape mismatch: {tuple(atom_ids.shape)} vs {tuple(coeffs.shape)}"
+            )
+
+        if self.bottleneck._is_patch_based():
+            if latent_hw is None:
+                raise ValueError("latent_hw is required for patch-based sparse latent reconstruction")
+            height, width = int(latent_hw[0]), int(latent_hw[1])
+        else:
+            height, width = int(atom_ids.shape[1]), int(atom_ids.shape[2])
+
+        coeffs = coeffs.to(device=atom_ids.device, dtype=self.bottleneck.dictionary.dtype)
+        return self.bottleneck._reconstruct_sparse(
+            atom_ids.to(torch.long),
+            coeffs,
+            height,
+            width,
+        )
+
+    @torch.no_grad()
+    def decode_from_atoms_and_coeffs(
+        self,
+        atom_ids: torch.Tensor,
+        coeffs: torch.Tensor,
+        *,
+        latent_hw: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        """Decode sparse atom ids plus real-valued coefficients back to image space."""
+        z_q = self.reconstruct_latent_from_atoms_and_coeffs(
+            atom_ids,
+            coeffs,
+            latent_hw=latent_hw,
+        )
+        return self.decode(z_q)
 
     def forward(self, x):
         """
@@ -426,10 +500,9 @@ class LASER(pl.LightningModule):
         sparsity = self._support_fraction(sparse_codes)
         effective_sparsity = self._effective_coeff_nonzero_fraction(sparse_codes)
         
-        # Epoch-level metrics must use sync_dist in DDP so Lightning can reduce across ranks.
-        trainer = self._trainer_ref()
-        _ws = getattr(trainer, "world_size", 1) if trainer is not None else 1
-        log_kwargs = dict(on_step=prefix == 'train', on_epoch=True, sync_dist=(_ws > 1))
+        # Keep epoch metrics synchronized across ranks whenever DDP is active.
+        # Relying on a local world_size probe here has been brittle on cluster runs.
+        log_kwargs = dict(on_step=prefix == 'train', on_epoch=True, sync_dist=True)
         self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
         self.log(f'{prefix}/bottleneck_loss', bottleneck_loss, **log_kwargs)
@@ -480,6 +553,210 @@ class LASER(pl.LightningModule):
             self.log('train/diag/recon_nan_frac', nan_frac, **diag_kwargs)
         
         return total_loss, recon_vis, x_vis
+
+    def _snapshot_dictionary(self):
+        """Store a copy of the current dictionary atoms for trajectory animation.
+
+        Called once per validation epoch (not every N training steps) to keep
+        the snapshot list short and the final GIF fast to render.
+        """
+        if not self.enable_val_latent_visuals:
+            return
+        if not getattr(self._trainer_ref(), "is_global_zero", False):
+            return
+        with torch.no_grad():
+            atoms = self.bottleneck.dictionary.detach().cpu().clone()
+        self._dict_snapshots.append(atoms)
+        self._dict_snapshot_steps.append(self.global_step)
+
+    def _pca_basis_and_project(self, snapshots_np):
+        """Compute PCA basis from the final snapshot and project all snapshots."""
+        import numpy as np
+        final = snapshots_np[-1]
+        mean = final.mean(axis=0, keepdims=True)
+        centered = final - mean
+        try:
+            _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
+            basis = vt[:2]
+            total_var = (s_vals ** 2).sum()
+            pc1_var = float(s_vals[0] ** 2 / total_var * 100) if total_var > 0 else 0.0
+            pc2_var = float(s_vals[1] ** 2 / total_var * 100) if len(s_vals) > 1 and total_var > 0 else 0.0
+        except np.linalg.LinAlgError:
+            atom_dim = final.shape[1]
+            basis = np.eye(min(2, atom_dim), atom_dim)
+            pc1_var = pc2_var = 0.0
+        projected = [(snap - mean) @ basis.T for snap in snapshots_np]
+        return projected, mean, basis, pc1_var, pc2_var
+
+    def _log_dict_scatter(self):
+        """Log a static PCA scatter of current dictionary atoms (cheap, once per val epoch)."""
+        if len(self._dict_snapshots) < 1:
+            return
+        if not getattr(self._trainer_ref(), "is_global_zero", False):
+            return
+        logger = getattr(self, "logger", None)
+        experiment = getattr(logger, "experiment", None) if logger else None
+        if experiment is None or not hasattr(experiment, "log"):
+            return
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import tempfile, os
+
+        snapshots_np = [s.t().numpy() for s in self._dict_snapshots]
+        projected, mean, basis, pc1_var, pc2_var = self._pca_basis_and_project(snapshots_np)
+        num_atoms = snapshots_np[-1].shape[0]
+        atom_dim = snapshots_np[-1].shape[1]
+        pts = projected[-1]
+
+        # Color by displacement from initial position (if more than one snapshot)
+        if len(projected) > 1:
+            disp = np.sqrt(((pts - projected[0]) ** 2).sum(axis=1))
+            disp_norm = disp / (disp.max() + 1e-8)
+        else:
+            disp_norm = np.zeros(num_atoms)
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sc = ax.scatter(pts[:, 0], pts[:, 1], c=disp_norm, cmap="plasma",
+                        s=18, alpha=0.85, edgecolors="k", linewidths=0.3)
+        ax.set_title(
+            f"Dictionary Atoms (PCA)  |  Step {self.global_step}  |  "
+            f"{num_atoms} atoms, {atom_dim}-dim",
+            fontsize=10,
+        )
+        ax.set_xlabel(f"PC1 ({pc1_var:.1f}% var)")
+        ax.set_ylabel(f"PC2 ({pc2_var:.1f}% var)")
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
+        cbar.set_label("Displacement from init", fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+        fig.tight_layout()
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            png_path = tmp.name
+        fig.savefig(png_path, dpi=120)
+        plt.close(fig)
+
+        experiment.log({
+            "val/dictionary_scatter": wandb.Image(png_path),
+            "global_step": self.global_step,
+        })
+        try:
+            os.unlink(png_path)
+        except OSError:
+            pass
+
+    def _generate_dict_animation(self):
+        """Build the full trajectory GIF from all accumulated snapshots.
+
+        Called once at the end of training (on_fit_end), not every val epoch.
+        """
+        if len(self._dict_snapshots) < 2:
+            return
+        if not getattr(self._trainer_ref(), "is_global_zero", False):
+            return
+        logger = getattr(self, "logger", None)
+        experiment = getattr(logger, "experiment", None) if logger else None
+        if experiment is None or not hasattr(experiment, "log"):
+            return
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation, PillowWriter
+        import numpy as np
+        import tempfile, os
+
+        snapshots_np = [s.t().numpy() for s in self._dict_snapshots]
+        steps = list(self._dict_snapshot_steps)
+        num_atoms = snapshots_np[0].shape[0]
+        atom_dim = snapshots_np[0].shape[1]
+
+        projected, mean, basis, pc1_var, pc2_var = self._pca_basis_and_project(snapshots_np)
+
+        # Per-frame displacement from initial position
+        displacements = []
+        for proj in projected:
+            disp = np.sqrt(((proj - projected[0]) ** 2).sum(axis=1))
+            displacements.append(disp)
+
+        # Compute global axis limits
+        all_pts = np.concatenate(projected, axis=0)
+        margin = 0.08
+        x_range = max(all_pts[:, 0].max() - all_pts[:, 0].min(), 1e-6)
+        y_range = max(all_pts[:, 1].max() - all_pts[:, 1].min(), 1e-6)
+        x_lim = (all_pts[:, 0].min() - margin * x_range, all_pts[:, 0].max() + margin * x_range)
+        y_lim = (all_pts[:, 1].min() - margin * y_range, all_pts[:, 1].max() + margin * y_range)
+
+        total_disp = displacements[-1]
+        disp_norm = total_disp / (total_disp.max() + 1e-8)
+        cmap = plt.cm.plasma
+        colors = cmap(disp_norm)
+
+        fig, ax = plt.subplots(figsize=(9, 7))
+
+        def update(frame_idx):
+            ax.clear()
+            pts = projected[frame_idx]
+            disp = displacements[frame_idx]
+            step = steps[frame_idx]
+
+            for k in range(num_atoms):
+                trail_x = [projected[t][k, 0] for t in range(frame_idx + 1)]
+                trail_y = [projected[t][k, 1] for t in range(frame_idx + 1)]
+                ax.plot(trail_x, trail_y, color=colors[k], alpha=0.25, lw=0.6)
+
+            sc = ax.scatter(pts[:, 0], pts[:, 1], c=disp_norm, cmap="plasma",
+                            s=18, alpha=0.85, edgecolors="k", linewidths=0.3)
+
+            ax.set_xlim(x_lim)
+            ax.set_ylim(y_lim)
+            ax.set_title(
+                f"Dictionary Atom Trajectories (PCA projection)\n"
+                f"Step {step}  |  {num_atoms} atoms, {atom_dim}-dim  |  "
+                f"Frame {frame_idx + 1}/{len(projected)}",
+                fontsize=10,
+            )
+            ax.set_xlabel(f"PC1 ({pc1_var:.1f}% var)")
+            ax.set_ylabel(f"PC2 ({pc2_var:.1f}% var)")
+
+            mean_disp = float(disp.mean())
+            max_disp = float(disp.max())
+            settled = int((disp < 0.01 * (total_disp.max() + 1e-8)).sum())
+            stats_text = (
+                f"Mean displacement: {mean_disp:.4f}\n"
+                f"Max displacement:  {max_disp:.4f}\n"
+                f"Settled atoms (<1% of max): {settled}/{num_atoms}"
+            )
+            ax.text(
+                0.02, 0.02, stats_text,
+                transform=ax.transAxes, fontsize=7.5,
+                verticalalignment="bottom", fontfamily="monospace",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8),
+            )
+
+            if not hasattr(update, "_cbar_added"):
+                cbar = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
+                cbar.set_label("Relative total displacement", fontsize=8)
+                cbar.ax.tick_params(labelsize=7)
+                update._cbar_added = True
+
+        anim = FuncAnimation(fig, update, frames=len(projected), interval=500)
+        fig.tight_layout()
+        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+            gif_path = tmp.name
+        anim.save(gif_path, writer=PillowWriter(fps=2))
+        plt.close(fig)
+
+        experiment.log({
+            "val/dictionary_atom_trajectories": wandb.Video(gif_path, format="gif"),
+            "global_step": self.global_step,
+        })
+        try:
+            os.unlink(gif_path)
+        except OSError:
+            pass
 
     def training_step(self, batch, batch_idx):
         """Training step."""
@@ -583,7 +860,9 @@ class LASER(pl.LightningModule):
         })
 
     def configure_optimizers(self):
-        """Configure optimizers."""
+        """Configure optimizers with optional cosine LR schedule."""
+        import math
+
         main_params = list(self.encoder.parameters()) + \
                       list(self.pre_bottleneck.parameters()) + \
                       list(self.post_bottleneck.parameters()) + \
@@ -604,7 +883,30 @@ class LASER(pl.LightningModule):
             betas=(self.beta, 0.999),
         )
 
-        return optimizer
+        # Cosine annealing with optional warmup.
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup = self.warmup_steps
+        min_ratio = self.min_lr_ratio
+
+        if total_steps <= 0:
+            return optimizer
+
+        def lr_lambda(step):
+            if step < warmup:
+                return max(min_ratio, step / max(warmup, 1))
+            progress = (step - warmup) / max(total_steps - warmup, 1)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
     
     def _maybe_store_val_batch(self, batch):
         """Cache a small val batch (CPU) for visualization."""
@@ -652,20 +954,37 @@ class LASER(pl.LightningModule):
         return proj_np
 
     def _sparse_heatmaps(self, sparse_codes, image_hw):
-        """Generate per-image sparse-activation heatmaps (mean |coeff| per latent location)."""
+        """Generate per-image sparse coefficient energy heatmaps.
+
+        Uses L2 norm of the coefficient vector at each spatial location,
+        upsampled with nearest-neighbor to preserve sharp patch boundaries.
+        """
         h_in, w_in = image_hw
-        energy = sparse_codes.values.abs().sum(dim=-1) / float(sparse_codes.num_embeddings)
+        # L2 energy per location — highlights where the sparse code is
+        # working hardest to represent the signal.
+        energy = sparse_codes.values.pow(2).sum(dim=-1).sqrt()  # [B, H, W]
         heat = energy.unsqueeze(1)
-        heat = F.interpolate(heat, size=(h_in, w_in), mode='nearest')  # [B,1,H,W]
+        heat = F.interpolate(heat, size=(h_in, w_in), mode='nearest')
         heat_np = []
-        for i in range(energy.shape[0]):
+        for i in range(heat.shape[0]):
             hmap = heat[i, 0]
             hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min() + 1e-6)
             heat_np.append(hmap.detach().cpu().numpy())
         return heat_np
 
+    def _recon_error_heatmaps(self, x, recon, image_hw):
+        """Generate per-pixel reconstruction error heatmaps."""
+        h_in, w_in = image_hw
+        err = (x - recon).pow(2).mean(dim=1, keepdim=True).sqrt()  # [B,1,H,W] RMS per pixel
+        heat_np = []
+        for i in range(err.shape[0]):
+            hmap = err[i, 0]
+            hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min() + 1e-6)
+            heat_np.append(hmap.detach().cpu().numpy())
+        return heat_np
+
     def _log_val_latent_visuals(self):
-        """Log latent RGB projections and sparse-code heatmaps on cached val batch."""
+        """Log latent RGB projections, sparse heatmaps, and reconstruction diagnostics."""
         if not self.enable_val_latent_visuals:
             return
         if not getattr(self._trainer_ref(), "is_global_zero", False):
@@ -682,17 +1001,28 @@ class LASER(pl.LightningModule):
             z = self.pre_bottleneck(z)
             with self._bottleneck_autocast_context(z):
                 z_dl, _, sparse_codes = self.bottleneck(z.float())
+            recon = self.decoder(self.post_bottleneck(z_dl))
+            image_hw = (x.shape[2], x.shape[3])
             latent_rgb = self._latent_rgb_projection(z_dl)
-            heatmaps = self._sparse_heatmaps(sparse_codes, (x.shape[2], x.shape[3]))
+            sparse_heat = self._sparse_heatmaps(sparse_codes, image_hw)
+            error_heat = self._recon_error_heatmaps(x, recon, image_hw)
         log_payload = {}
         import matplotlib.pyplot as plt
         cmap = plt.cm.inferno
+        x_disp = self._denormalize_for_display(x).detach().cpu()
+        recon_disp = self._denormalize_for_display(recon).detach().cpu()
         for idx in range(x.shape[0]):
+            orig_np = x_disp[idx].permute(1, 2, 0).clamp(0, 1).numpy()
+            recon_np = recon_disp[idx].permute(1, 2, 0).clamp(0, 1).numpy()
             latent_img = latent_rgb[idx]
-            heat = heatmaps[idx]
-            heat_rgb = cmap(heat)[..., :3]
-            log_payload.setdefault("val/latent_rgb", []).append(wandb.Image(latent_img, caption=f"latent_rgb_{idx}"))
-            log_payload.setdefault("val/sparse_heatmap", []).append(wandb.Image(heat_rgb, caption=f"sparse_heatmap_{idx}"))
+            sparse_rgb = cmap(sparse_heat[idx])[..., :3]
+            error_rgb = cmap(error_heat[idx])[..., :3]
+            cap = f"idx={idx}"
+            log_payload.setdefault("val/original", []).append(wandb.Image(orig_np, caption=cap))
+            log_payload.setdefault("val/reconstruction", []).append(wandb.Image(recon_np, caption=cap))
+            log_payload.setdefault("val/latent_rgb", []).append(wandb.Image(latent_img, caption=cap))
+            log_payload.setdefault("val/sparse_heatmap", []).append(wandb.Image(sparse_rgb, caption=cap))
+            log_payload.setdefault("val/recon_error_map", []).append(wandb.Image(error_rgb, caption=cap))
         if log_payload:
             log_payload["global_step"] = self.global_step
             self.logger.experiment.log(log_payload)
@@ -707,6 +1037,14 @@ class LASER(pl.LightningModule):
         super().on_validation_epoch_end()
         if self.enable_val_latent_visuals:
             self._log_val_latent_visuals()
+            self._snapshot_dictionary()
+            self._log_dict_scatter()
+            self._ddp_barrier_if_needed()
+
+    def on_fit_end(self):
+        """Generate the full trajectory animation GIF once at the end of training."""
+        if self.enable_val_latent_visuals:
+            self._generate_dict_animation()
             self._ddp_barrier_if_needed()
 
     def on_test_start(self):

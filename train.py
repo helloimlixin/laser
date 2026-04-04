@@ -101,6 +101,11 @@ def train(cfg: DictConfig):
     if cfg.model.type == "laser":
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
+        print(f"Coefficient Bound: {getattr(cfg.model, 'coef_max', None)}")
+        print(
+            "Bounded OMP Refine Steps: "
+            f"{getattr(cfg.model, 'bounded_omp_refine_steps', 8)}"
+        )
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -248,11 +253,15 @@ def train(cfg: DictConfig):
             'patch_size': getattr(cfg.model, 'patch_size', 4),
             'patch_stride': getattr(cfg.model, 'patch_stride', 2),
             'patch_reconstruction': getattr(cfg.model, 'patch_reconstruction', 'hann'),
+            'coef_max': getattr(cfg.model, 'coef_max', None),
+            'bounded_omp_refine_steps': getattr(cfg.model, 'bounded_omp_refine_steps', 8),
             'sparsity_reg_weight': getattr(cfg.model, 'sparsity_reg_weight', 0.01),
             'coherence_weight': getattr(cfg.model, 'coherence_weight', 0.0),
             'log_images_every_n_steps': getattr(cfg.model, 'log_images_every_n_steps', 100),
             'diag_log_interval': getattr(cfg.model, 'diag_log_interval', 0),
             'enable_val_latent_visuals': getattr(cfg.model, 'enable_val_latent_visuals', False),
+            'warmup_steps': int(getattr(cfg.train, 'warmup_steps', 0)),
+            'min_lr_ratio': float(getattr(cfg.train, 'min_lr_ratio', 0.01)),
         }
         model = LASER(**model_params)
     elif cfg.model.type == "vqvae":

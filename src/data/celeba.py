@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Union, List
 
 import lightning as pl
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image, ImageFile
@@ -15,6 +16,10 @@ from src.data.config import DataConfig
 
 
 IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+
+
+def _packed_celeba_file(root: Union[str, Path], image_size: int) -> Path:
+    return Path(root) / f"celeba_{int(image_size)}x{int(image_size)}_rgb_uint8.npy"
 
 
 def _is_readable_rgb_image(path: Path) -> bool:
@@ -89,6 +94,57 @@ class FlatImageDataset(Dataset):
         raise RuntimeError(f"Unrecoverable image loading failure for: {failures}") from last_exc
 
 
+class PackedRGBImageDataset(Dataset):
+    """Read resized RGB uint8 images from a single NumPy memmap file."""
+
+    def __init__(
+        self,
+        root: Union[str, Path],
+        image_size: int,
+        *,
+        mean: Tuple[float, float, float],
+        std: Tuple[float, float, float],
+        random_horizontal_flip: bool = False,
+        indices: Optional[List[int]] = None,
+    ):
+        self.root = Path(root)
+        self.image_size = int(image_size)
+        self.random_horizontal_flip = bool(random_horizontal_flip)
+        self.packed_path = _packed_celeba_file(self.root, self.image_size)
+        if not self.packed_path.exists():
+            raise FileNotFoundError(f"Packed dataset not found: {self.packed_path}")
+
+        self.images = np.load(self.packed_path, mmap_mode="r")
+        expected_shape = (self.image_size, self.image_size, 3)
+        if self.images.ndim != 4 or tuple(self.images.shape[1:]) != expected_shape:
+            raise ValueError(
+                f"Packed dataset at {self.packed_path} has shape {tuple(self.images.shape)}; "
+                f"expected [N, {self.image_size}, {self.image_size}, 3]"
+            )
+        if self.images.dtype != np.uint8:
+            raise ValueError(
+                f"Packed dataset at {self.packed_path} has dtype {self.images.dtype}; expected uint8"
+            )
+
+        self.indices = list(indices) if indices is not None else None
+        self.mean = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+
+    def __len__(self) -> int:
+        if self.indices is not None:
+            return len(self.indices)
+        return int(self.images.shape[0])
+
+    def __getitem__(self, idx: int):
+        if self.indices is not None:
+            idx = int(self.indices[idx])
+        image = torch.from_numpy(np.array(self.images[idx], copy=True)).permute(2, 0, 1).float().div_(255.0)
+        if self.random_horizontal_flip and torch.rand((), dtype=torch.float32).item() < 0.5:
+            image = torch.flip(image, dims=[2])
+        image = (image - self.mean) / self.std
+        return image, 0
+
+
 class CelebADataModule(pl.LightningDataModule):
     def __init__(self, config: DataConfig):
         super().__init__()
@@ -102,8 +158,19 @@ class CelebADataModule(pl.LightningDataModule):
         generator.manual_seed(int(self.config.seed) + int(offset))
         return generator
 
+    def _packed_image_size(self) -> Optional[int]:
+        image_size = self.config.image_size
+        if isinstance(image_size, int):
+            return int(image_size)
+        if len(image_size) == 2 and int(image_size[0]) == int(image_size[1]):
+            return int(image_size[0])
+        return None
+
     def _resolve_data_dir(self) -> str:
-        """Resolve a directory that actually contains CelebA images."""
+        """Resolve a directory that contains raw CelebA images or a packed npy file."""
+
+        packed_image_size = self._packed_image_size()
+
         def has_images(path_str: str) -> bool:
             if not path_str:
                 return False
@@ -116,6 +183,14 @@ class CelebADataModule(pl.LightningDataModule):
                     return True
             return False
 
+        def has_packed(path_str: str) -> bool:
+            if not path_str or packed_image_size is None:
+                return False
+            p = Path(path_str)
+            if not p.exists() or not p.is_dir():
+                return False
+            return _packed_celeba_file(p, packed_image_size).exists()
+
         # Candidate directories in order of preference
         candidates = [
             str(self.config.data_dir) if getattr(self.config, "data_dir", "") else "",
@@ -127,13 +202,14 @@ class CelebADataModule(pl.LightningDataModule):
         ]
 
         for c in candidates:
-            if has_images(c):
+            if has_packed(c) or has_images(c):
                 return c
 
         # If none matched, raise with guidance
         raise RuntimeError(
-            "CelebA images not found. Set CELEBA_DIR to your images folder "
-            "(e.g., /home/xl598/Data/celeba/img_align_celeba) or update data.data_dir."
+            "CelebA data not found. Set CELEBA_DIR/data.data_dir to either a raw images folder "
+            "(e.g., /home/xl598/Data/celeba/img_align_celeba) or a directory containing "
+            f"celeba_{packed_image_size}x{packed_image_size}_rgb_uint8.npy."
         )
 
     def prepare_data(self):
@@ -154,6 +230,42 @@ class CelebADataModule(pl.LightningDataModule):
             resize_to: Tuple[int, int] = (image_size, image_size)
         else:
             resize_to = tuple(image_size)  # type: ignore[arg-type]
+
+        packed_image_size = self._packed_image_size()
+        packed_path = (
+            _packed_celeba_file(data_dir, packed_image_size)
+            if packed_image_size is not None
+            else None
+        )
+
+        if packed_path is not None and packed_path.exists():
+            print(f"[Data] using packed CelebA dataset at {packed_path}")
+            num_items = int(np.load(packed_path, mmap_mode="r").shape[0])
+            if num_items < 3:
+                raise RuntimeError("CelebA packed dataset must contain at least three images for train/val/test splits.")
+
+            generator = torch.Generator().manual_seed(int(self.config.seed))
+            indices = torch.randperm(num_items, generator=generator)
+            num_train = int(0.90 * num_items)
+            num_val = int(0.05 * num_items)
+            train_idx = indices[:num_train].tolist()
+            val_idx = indices[num_train:num_train + num_val].tolist()
+            test_idx = indices[num_train + num_val:].tolist()
+
+            mean = tuple(float(x) for x in self.config.mean)
+            std = tuple(float(x) for x in self.config.std)
+
+            def _make_packed(indices, flip):
+                return PackedRGBImageDataset(
+                    data_dir, packed_image_size,
+                    mean=mean, std=std,
+                    random_horizontal_flip=flip, indices=indices,
+                )
+
+            self.train_dataset = _make_packed(train_idx, flip=augment)
+            self.val_dataset = _make_packed(val_idx, flip=False)
+            self.test_dataset = _make_packed(test_idx, flip=False)
+            return
 
         train_ops = [transforms.Resize(resize_to)]
         if augment:

@@ -140,8 +140,17 @@ def _extract_cache(
     coeff_max: float,
     coeff_quantization: str,
     coeff_mu: float,
-) -> tuple[torch.Tensor, tuple[int, int, int], tuple[int, int]]:
+) -> dict:
+    """Extract a token cache.
+
+    When *coeff_vocab_size* > 0 the cache contains interleaved quantized
+    tokens (``tokens_flat``).  When *coeff_vocab_size* == 0 the cache
+    stores raw atom ids and real-valued coefficients separately
+    (``tokens_flat`` for atom ids, ``coeffs_flat`` for coefficients).
+    """
+    real_valued = int(coeff_vocab_size) <= 0
     all_tokens = []
+    all_coeffs = [] if real_valued else None
     token_shape = None
     latent_hw = None
     seen = 0
@@ -156,17 +165,27 @@ def _extract_cache(
                     break
                 images = images[:keep]
             images = images.to(device=device, non_blocking=True)
-            tokens, batch_latent_hw = model.encode_to_tokens(
-                images,
-                coeff_vocab_size=coeff_vocab_size,
-                coeff_max=coeff_max,
-                coeff_quantization=coeff_quantization,
-                coeff_mu=coeff_mu,
-            )
-            flat = tokens.view(tokens.size(0), -1).to(torch.int32).cpu()
-            all_tokens.append(flat)
 
-            current_shape = (int(tokens.shape[1]), int(tokens.shape[2]), int(tokens.shape[3]))
+            if real_valued:
+                support, values, batch_latent_hw = model.encode_to_atoms_and_coeffs(images)
+                # support: [B, H, W, D] atom ids, values: [B, H, W, D] coeffs
+                flat_atoms = support.view(support.size(0), -1).to(torch.int32).cpu()
+                flat_coeffs = values.view(values.size(0), -1).to(torch.float32).cpu()
+                all_tokens.append(flat_atoms)
+                all_coeffs.append(flat_coeffs)
+                current_shape = (int(support.shape[1]), int(support.shape[2]), int(support.shape[3]))
+            else:
+                tokens, batch_latent_hw = model.encode_to_tokens(
+                    images,
+                    coeff_vocab_size=coeff_vocab_size,
+                    coeff_max=coeff_max,
+                    coeff_quantization=coeff_quantization,
+                    coeff_mu=coeff_mu,
+                )
+                flat = tokens.view(tokens.size(0), -1).to(torch.int32).cpu()
+                all_tokens.append(flat)
+                current_shape = (int(tokens.shape[1]), int(tokens.shape[2]), int(tokens.shape[3]))
+
             if token_shape is None:
                 token_shape = current_shape
                 latent_hw = batch_latent_hw
@@ -185,7 +204,17 @@ def _extract_cache(
     tokens_flat = torch.cat(all_tokens, dim=0)
     if max_items > 0:
         tokens_flat = tokens_flat[:max_items]
-    return tokens_flat.contiguous(), token_shape, latent_hw
+    result = {
+        "tokens_flat": tokens_flat.contiguous(),
+        "shape": token_shape,
+        "latent_hw": latent_hw,
+    }
+    if all_coeffs is not None:
+        coeffs_flat = torch.cat(all_coeffs, dim=0)
+        if max_items > 0:
+            coeffs_flat = coeffs_flat[:max_items]
+        result["coeffs_flat"] = coeffs_flat.contiguous()
+    return result
 
 
 def _token_cache_meta(
@@ -196,15 +225,19 @@ def _token_cache_meta(
     num_items: int,
     latent_hw: Tuple[int, int],
 ) -> dict:
-    coeff_bin_values = model.bottleneck._coeff_bin_values(
-        coeff_vocab_size=int(args.coeff_bins),
-        coeff_max=float(args.coeff_max),
-        coeff_quantization=str(args.coeff_quantization),
-        coeff_mu=float(args.coeff_mu),
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-    ).cpu()
-    return {
+    real_valued = int(args.coeff_bins) <= 0
+    if real_valued:
+        coeff_bin_values = None
+    else:
+        coeff_bin_values = model.bottleneck._coeff_bin_values(
+            coeff_vocab_size=int(args.coeff_bins),
+            coeff_max=float(args.coeff_max),
+            coeff_quantization=str(args.coeff_quantization),
+            coeff_mu=float(args.coeff_mu),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).cpu()
+    meta = {
         "version": 1,
         "dataset": str(config.dataset),
         "split": str(args.split),
@@ -219,14 +252,19 @@ def _token_cache_meta(
         "patch_reconstruction": str(model.bottleneck.patch_reconstruction),
         "embedding_dim": int(model.bottleneck.embedding_dim),
         "latent_hw": (int(latent_hw[0]), int(latent_hw[1])),
-        "n_bins": int(args.coeff_bins),
-        "coeff_vocab_size": int(args.coeff_bins),
         "coef_max": float(args.coeff_max),
-        "coef_quantization": str(args.coeff_quantization),
-        "coef_mu": float(args.coeff_mu),
-        "coeff_bin_values": coeff_bin_values,
         "stage1_checkpoint": str(Path(args.stage1_checkpoint).expanduser().resolve()),
     }
+    if real_valued:
+        meta["quantize_sparse_coeffs"] = False
+    else:
+        meta["quantize_sparse_coeffs"] = True
+        meta["n_bins"] = int(args.coeff_bins)
+        meta["coeff_vocab_size"] = int(args.coeff_bins)
+        meta["coef_quantization"] = str(args.coeff_quantization)
+        meta["coef_mu"] = float(args.coeff_mu)
+        meta["coeff_bin_values"] = coeff_bin_values
+    return meta
 
 
 def _parse_args() -> argparse.Namespace:
@@ -312,7 +350,7 @@ def main():
         )
         print(f"Defaulting token cache output to: {args.output_path}")
 
-    tokens_flat, shape, latent_hw = _extract_cache(
+    cache_result = _extract_cache(
         model,
         loader,
         device=device,
@@ -322,6 +360,9 @@ def main():
         coeff_quantization=str(args.coeff_quantization),
         coeff_mu=float(args.coeff_mu),
     )
+    tokens_flat = cache_result["tokens_flat"]
+    shape = cache_result["shape"]
+    latent_hw = cache_result["latent_hw"]
 
     meta = _token_cache_meta(
         args=args,
@@ -335,6 +376,9 @@ def main():
         "shape": shape,
         "meta": meta,
     }
+    if "coeffs_flat" in cache_result:
+        payload["coeffs_flat"] = cache_result["coeffs_flat"]
+        print(f"Real-valued cache: storing atoms + coefficients (no quantization)")
 
     output_path = Path(args.output_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

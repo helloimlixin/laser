@@ -10,6 +10,7 @@ import os
 import warnings
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 if os.name == "nt":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -27,6 +28,7 @@ from src.lightning_warning_filters import register as register_lightning_warning
 register_lightning_warning_filters()
 import lightning as pl
 import torch
+import wandb
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from lightning.pytorch.loggers import WandbLogger
@@ -35,12 +37,16 @@ from torchvision.utils import save_image
 
 from src.data.token_cache import TokenCacheDataModule, load_token_cache
 from src.pl_trainer_util import resolve_val_check_interval
-from src.models.laser import LASER
 from src.models.sparse_token_prior import (
     SparseTokenPriorModule,
     build_sparse_prior_from_cache,
     infer_sparse_vocab_sizes,
     token_cache_grid_shape,
+)
+from src.stage2_compat import (
+    decode_stage2_outputs,
+    ensure_stage2_cache_metadata,
+    load_stage1_decoder_bundle,
 )
 from src.stage2_paths import infer_latest_token_cache
 
@@ -68,74 +74,140 @@ class PeriodicStage2SamplingCallback(pl.Callback):
         token_cache_path: str,
         sample_dir: str,
         every_n_steps: int = 0,
+        every_n_epochs: int = 0,
         num_samples: int = 4,
         temperature: float = 1.0,
         top_k: int = 0,
+        coeff_temperature=None,
+        coeff_sample_mode: Optional[str] = None,
+        stage1_output_root: str = "outputs",
+        log_to_wandb: bool = False,
     ):
         super().__init__()
         self.token_cache_path = str(token_cache_path)
         self.sample_dir = Path(sample_dir).expanduser().resolve()
         self.every_n_steps = max(0, int(every_n_steps))
+        self.every_n_epochs = max(0, int(every_n_epochs))
         self.num_samples = max(1, int(num_samples))
         self.temperature = float(temperature)
         self.top_k = int(top_k)
+        self.coeff_temperature = None if coeff_temperature is None else float(coeff_temperature)
+        self.coeff_sample_mode = (
+            None if coeff_sample_mode is None else str(coeff_sample_mode).strip().lower()
+        )
+        self.stage1_output_root = str(stage1_output_root)
+        self.log_to_wandb = bool(log_to_wandb)
         self._last_sampled_step = -1
+        self._last_sampled_epoch = -1
         self._cache = None
-        self._stage1 = None
+        self._stage1_bundle = None
 
     def _ensure_ready(self, device: torch.device):
         if self._cache is None:
-            self._cache = load_token_cache(self.token_cache_path)
-        if self._stage1 is None:
-            meta = self._cache.get("meta", {}) if isinstance(self._cache, dict) else {}
-            stage1_checkpoint = meta.get("stage1_checkpoint")
-            if not stage1_checkpoint:
-                raise RuntimeError(
-                    f"Token cache {self.token_cache_path} is missing meta.stage1_checkpoint for periodic sampling."
-                )
-            self._stage1 = LASER.load_from_checkpoint(stage1_checkpoint, map_location="cpu").eval().to(device)
+            raw_cache = load_token_cache(self.token_cache_path)
+            self._cache = ensure_stage2_cache_metadata(
+                raw_cache,
+                token_cache_path=self.token_cache_path,
+                output_root=self.stage1_output_root,
+            )
+        if self._stage1_bundle is None:
+            self._stage1_bundle = load_stage1_decoder_bundle(
+                self._cache,
+                token_cache_path=self.token_cache_path,
+                device=device,
+                output_root=self.stage1_output_root,
+            )
         else:
-            self._stage1 = self._stage1.to(device)
+            self._stage1_bundle.model = self._stage1_bundle.model.to(device)
+
+    def _log_sample_images(
+        self,
+        trainer: pl.Trainer,
+        *,
+        step: int,
+        epoch: Optional[int],
+        raw_path: Path,
+        auto_path: Path,
+    ) -> None:
+        if not self.log_to_wandb:
+            return
+        logger = getattr(trainer, "logger", None)
+        experiment = getattr(logger, "experiment", None)
+        if experiment is None or not hasattr(experiment, "log"):
+            return
+
+        caption_bits = [f"step={step}"]
+        if epoch is not None:
+            caption_bits.append(f"epoch={epoch}")
+        caption = " ".join(caption_bits)
+        experiment.log(
+            {
+                "stage2/samples_raw": wandb.Image(str(raw_path), caption=caption),
+                "stage2/samples_autocontrast": wandb.Image(str(auto_path), caption=caption),
+                "stage2/sample_epoch": epoch,
+            },
+            step=step,
+        )
 
     @torch.no_grad()
-    def _sample_and_save(self, trainer: pl.Trainer, pl_module: pl.LightningModule, step: int):
+    def _sample_and_save(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        *,
+        step: int,
+        epoch: Optional[int] = None,
+    ):
         device = pl_module.device
         self._ensure_ready(device)
         cache = self._cache
-        meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
         token_h, token_w, token_depth = token_cache_grid_shape(cache)
-        coeff_vocab_size = int(meta.get("coeff_vocab_size") or meta.get("n_bins") or 0)
-        coeff_bin_values = meta.get("coeff_bin_values")
-        if coeff_vocab_size <= 0 or coeff_bin_values is None:
-            raise RuntimeError(
-                f"Token cache {self.token_cache_path} is missing coefficient quantization metadata for sampling."
-            )
-        latent_hw = meta.get("latent_hw")
-        if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
-            latent_hw = (int(latent_hw[0]), int(latent_hw[1]))
-        else:
-            latent_hw = None
 
         top_k = None if self.top_k <= 0 else self.top_k
-        token_grid = pl_module.generate_tokens(
+        generated = pl_module.generate_sparse_codes(
             self.num_samples,
             temperature=self.temperature,
             top_k=top_k,
-        ).view(self.num_samples, token_h, token_w, token_depth)
-        images = self._stage1.decode_from_tokens(
-            token_grid.to(device=device, dtype=torch.long),
-            latent_hw=latent_hw,
-            coeff_vocab_size=coeff_vocab_size,
-            coeff_bin_values=torch.as_tensor(coeff_bin_values, dtype=torch.float32, device=device),
-        ).detach().cpu()
+            coeff_temperature=self.coeff_temperature,
+            coeff_sample_mode=self.coeff_sample_mode,
+        )
+        if getattr(pl_module.prior, "real_valued_coeffs", False):
+            atom_ids, coeffs = generated
+            images = decode_stage2_outputs(
+                self._stage1_bundle,
+                atom_ids.view(self.num_samples, token_h, token_w, token_depth),
+                coeffs.view(self.num_samples, token_h, token_w, token_depth),
+                device=device,
+            ).detach().cpu()
+        else:
+            token_grid = generated.view(self.num_samples, token_h, token_w, token_depth)
+            images = decode_stage2_outputs(
+                self._stage1_bundle,
+                token_grid,
+                device=device,
+            ).detach().cpu()
 
         self.sample_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = self.sample_dir / f"step_{step:07d}.png"
-        auto_path = self.sample_dir / f"step_{step:07d}_autocontrast.png"
+        if epoch is None:
+            stem = f"step_{step:07d}"
+        else:
+            stem = f"epoch_{epoch:03d}_step_{step:07d}"
+        raw_path = self.sample_dir / f"{stem}.png"
+        auto_path = self.sample_dir / f"{stem}_autocontrast.png"
         nrow = max(1, int(self.num_samples ** 0.5))
         save_image(images, raw_path, nrow=nrow, normalize=True, value_range=(-1.0, 1.0))
         save_image(images, auto_path, nrow=nrow, normalize=True, scale_each=True)
-        print(f"Saved stage-2 samples at step {step}: {raw_path}")
+        self._log_sample_images(
+            trainer,
+            step=step,
+            epoch=epoch,
+            raw_path=raw_path,
+            auto_path=auto_path,
+        )
+        if epoch is None:
+            print(f"Saved stage-2 samples at step {step}: {raw_path}")
+        else:
+            print(f"Saved stage-2 samples at epoch {epoch}, step {step}: {raw_path}")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self.every_n_steps <= 0 or not trainer.is_global_zero:
@@ -143,7 +215,20 @@ class PeriodicStage2SamplingCallback(pl.Callback):
         step = int(trainer.global_step)
         if step <= 0 or step == self._last_sampled_step or (step % self.every_n_steps) != 0:
             return
-        self._sample_and_save(trainer, pl_module, step)
+        self._sample_and_save(trainer, pl_module, step=step)
+        self._last_sampled_step = step
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.every_n_epochs <= 0 or not trainer.is_global_zero:
+            return
+        epoch = int(trainer.current_epoch) + 1
+        step = int(trainer.global_step)
+        if epoch <= 0 or epoch == self._last_sampled_epoch or (epoch % self.every_n_epochs) != 0:
+            return
+        if step <= 0 or step == self._last_sampled_step:
+            return
+        self._sample_and_save(trainer, pl_module, step=step, epoch=epoch)
+        self._last_sampled_epoch = epoch
         self._last_sampled_step = step
 
 def _build_sparse_model(cfg: DictConfig, mode: str):
@@ -166,36 +251,70 @@ def _build_sparse_model(cfg: DictConfig, mode: str):
         max_items=getattr(cfg.train_ar, "max_items", 0),
     )
     datamodule.setup("fit")
-    architecture = "spatial_depth" if mode == "sparse_spatial_depth" else "mingpt"
-    total_vocab_size, atom_vocab_size, coeff_vocab_size = infer_sparse_vocab_sizes(
+    datamodule.cache = ensure_stage2_cache_metadata(
         datamodule.cache,
-        total_vocab_size=cfg.ar.vocab_size,
-        atom_vocab_size=cfg.ar.atom_vocab_size,
-        coeff_vocab_size=cfg.ar.coeff_vocab_size,
+        token_cache_path=cfg.token_cache_path,
+        output_root=(Path(str(cfg.output_dir)).expanduser().resolve().parent),
     )
-    if cfg.ar.vocab_size != total_vocab_size:
-        print(f"Adjusting sparse vocab_size from {cfg.ar.vocab_size} to {total_vocab_size} from cache metadata")
-        cfg.ar.vocab_size = total_vocab_size
-    if cfg.ar.atom_vocab_size != atom_vocab_size:
-        print(f"Resolved atom_vocab_size = {atom_vocab_size}")
-        cfg.ar.atom_vocab_size = atom_vocab_size
-    if cfg.ar.coeff_vocab_size != coeff_vocab_size:
-        print(f"Resolved coeff_vocab_size = {coeff_vocab_size}")
-        cfg.ar.coeff_vocab_size = coeff_vocab_size
+    architecture = "spatial_depth" if mode == "sparse_spatial_depth" else "mingpt"
+    real_valued_cache = datamodule.cache.get("coeffs_flat") is not None
+    if real_valued_cache and architecture != "spatial_depth":
+        raise ValueError("Real-valued sparse-token caches are only supported with ar.type=sparse_spatial_depth.")
 
     prior = build_sparse_prior_from_cache(
         datamodule.cache,
         architecture=architecture,
-        total_vocab_size=total_vocab_size,
-        atom_vocab_size=atom_vocab_size,
-        coeff_vocab_size=coeff_vocab_size,
+        total_vocab_size=cfg.ar.vocab_size,
+        atom_vocab_size=cfg.ar.atom_vocab_size,
+        coeff_vocab_size=cfg.ar.coeff_vocab_size,
         d_model=cfg.ar.d_model,
         n_heads=cfg.ar.n_heads,
         n_layers=cfg.ar.n_layers,
         d_ff=cfg.ar.d_ff,
         dropout=cfg.ar.dropout,
         n_global_spatial_tokens=cfg.ar.n_global_spatial_tokens,
+        autoregressive_coeffs=cfg.ar.autoregressive_coeffs,
     )
+    if real_valued_cache:
+        atom_vocab_size = int(prior.atom_vocab_size)
+        total_vocab_size = int(prior.cfg.vocab_size)
+        coeff_vocab_size = 0
+    else:
+        total_vocab_size, atom_vocab_size, coeff_vocab_size = infer_sparse_vocab_sizes(
+            datamodule.cache,
+            total_vocab_size=cfg.ar.vocab_size,
+            atom_vocab_size=cfg.ar.atom_vocab_size,
+            coeff_vocab_size=cfg.ar.coeff_vocab_size,
+        )
+    if cfg.ar.vocab_size != total_vocab_size:
+        print(f"Adjusting sparse vocab_size from {cfg.ar.vocab_size} to {total_vocab_size} from cache metadata")
+        cfg.ar.vocab_size = total_vocab_size
+    if cfg.ar.atom_vocab_size != atom_vocab_size:
+        print(f"Resolved atom_vocab_size = {atom_vocab_size}")
+        cfg.ar.atom_vocab_size = atom_vocab_size
+    resolved_coeff_vocab_cfg = None if real_valued_cache else int(coeff_vocab_size)
+    if cfg.ar.coeff_vocab_size != resolved_coeff_vocab_cfg:
+        print(f"Resolved coeff_vocab_size = {resolved_coeff_vocab_cfg}")
+        cfg.ar.coeff_vocab_size = resolved_coeff_vocab_cfg
+
+    coeff_loss_type = getattr(cfg.ar, "coeff_loss_type", "auto")
+    coeff_loss_key = "" if coeff_loss_type is None else str(coeff_loss_type).strip().lower()
+    # Load the stage-1 decoder bundle for recon_mse loss and W&B
+    # reconstruction visualization.  Fall back to None if the checkpoint
+    # cannot be located (recon images will be skipped).
+    try:
+        stage1_bundle = load_stage1_decoder_bundle(
+            datamodule.cache,
+            token_cache_path=cfg.token_cache_path,
+            device="cpu",
+            output_root=(Path(str(cfg.output_dir)).expanduser().resolve().parent),
+        )
+    except Exception as e:
+        stage1_bundle = None
+        if real_valued_cache and coeff_loss_key in {"recon_mse", "gt_atom_recon_mse"}:
+            raise  # required for the loss — can't proceed without it
+        print(f"Warning: could not load stage-1 decoder bundle ({e}); "
+              "reconstruction visualization will be disabled.")
 
     model = SparseTokenPriorModule(
         prior=prior,
@@ -207,6 +326,12 @@ def _build_sparse_model(cfg: DictConfig, mode: str):
         coeff_loss_weight=cfg.ar.coeff_loss_weight,
         coeff_depth_weighting=cfg.ar.coeff_depth_weighting,
         coeff_focal_gamma=cfg.ar.coeff_focal_gamma,
+        coeff_loss_type=cfg.ar.coeff_loss_type,
+        coeff_huber_delta=cfg.ar.coeff_huber_delta,
+        sample_coeff_temperature=cfg.ar.sample_coeff_temperature,
+        sample_coeff_mode=cfg.ar.sample_coeff_mode,
+        stage1_decoder_bundle=stage1_bundle,
+        log_recon_every_n_steps=int(getattr(cfg.train_ar, "log_recon_every_n_steps", 500) or 0),
     )
     model.save_hyperparameters(
         {
@@ -214,6 +339,7 @@ def _build_sparse_model(cfg: DictConfig, mode: str):
             "resolved_atom_vocab_size": int(atom_vocab_size),
             "resolved_coeff_vocab_size": int(coeff_vocab_size),
             "resolved_total_vocab_size": int(total_vocab_size),
+            "token_cache_real_valued": bool(real_valued_cache),
         }
     )
     return model, datamodule
@@ -239,6 +365,8 @@ def train_ar(cfg: DictConfig):
     print(f"  Atom Vocab Size: {cfg.ar.atom_vocab_size}")
     print(f"  Coeff Vocab Size: {cfg.ar.coeff_vocab_size}")
     print(f"  Global Spatial Tokens: {cfg.ar.n_global_spatial_tokens}")
+    print(f"  Autoregressive Coeffs: {cfg.ar.autoregressive_coeffs}")
+    print(f"  Coeff Loss Type: {cfg.ar.coeff_loss_type}")
 
     print("\nTraining Config:")
     print(f"  Learning Rate: {cfg.ar.learning_rate}")
@@ -269,7 +397,8 @@ def train_ar(cfg: DictConfig):
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"\nCheckpoint directory: {ckpt_dir}")
 
-    run_name = f"{mode}_{Path(str(cfg.token_cache_path)).stem}_{timestamp}"
+    configured_run_name = str(getattr(cfg.wandb, "name", "") or "").strip()
+    run_name = configured_run_name or f"{mode}_{Path(str(cfg.token_cache_path)).stem}_{timestamp}"
 
     wandb_logger = WandbLogger(
         project=cfg.wandb.project,
@@ -303,15 +432,21 @@ def train_ar(cfg: DictConfig):
         progress_bar,
     ]
     sample_every_n_steps = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
-    if sample_every_n_steps > 0:
+    sample_every_n_epochs = int(getattr(cfg.train_ar, "sample_every_n_epochs", 0) or 0)
+    if sample_every_n_steps > 0 or sample_every_n_epochs > 0:
         callbacks.append(
             PeriodicStage2SamplingCallback(
                 token_cache_path=str(cfg.token_cache_path),
                 sample_dir=os.path.join(cfg.output_dir, "samples", f"{mode}_{timestamp}"),
                 every_n_steps=sample_every_n_steps,
+                every_n_epochs=sample_every_n_epochs,
                 num_samples=int(getattr(cfg.train_ar, "sample_num_images", 4) or 4),
                 temperature=float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
                 top_k=int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+                coeff_temperature=getattr(cfg.train_ar, "sample_coeff_temperature", cfg.ar.sample_coeff_temperature),
+                coeff_sample_mode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
+                stage1_output_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
+                log_to_wandb=bool(getattr(cfg.train_ar, "sample_log_to_wandb", False)),
             )
         )
 
@@ -322,6 +457,7 @@ def train_ar(cfg: DictConfig):
         max_epochs=cfg.train_ar.max_epochs,
         accelerator=cfg.train_ar.accelerator,
         devices=cfg.train_ar.devices,
+        strategy=getattr(cfg.train_ar, "strategy", "auto"),
         logger=wandb_logger,
         callbacks=callbacks,
         precision=cfg.train_ar.precision,

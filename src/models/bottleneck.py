@@ -249,6 +249,8 @@ class DictionaryLearning(nn.Module):
         patch_size=1,
         patch_stride=None,
         patch_reconstruction="hann",
+        coef_max=None,
+        bounded_omp_refine_steps=8,
         epsilon=1e-10,
         **legacy_kwargs,
     ):
@@ -281,6 +283,16 @@ class DictionaryLearning(nn.Module):
         self.commitment_cost = commitment_cost
         self.epsilon = epsilon
         self.dict_learning_rate = dict_learning_rate
+        self.coef_max = None if coef_max is None else float(coef_max)
+        if self.coef_max is not None:
+            if not math.isfinite(self.coef_max) or self.coef_max <= 0.0:
+                raise ValueError(f"coef_max must be finite and > 0, got {self.coef_max}")
+        self.bounded_omp_refine_steps = int(bounded_omp_refine_steps)
+        if self.bounded_omp_refine_steps < 0:
+            raise ValueError(
+                "bounded_omp_refine_steps must be >= 0, got "
+                f"{self.bounded_omp_refine_steps}"
+            )
         self.patch_based = bool(patch_based)
         effective_patch_size = int(patch_size) if self.patch_based else 1
         self.patch_size = effective_patch_size
@@ -296,11 +308,14 @@ class DictionaryLearning(nn.Module):
             raise ValueError(
                 f"patch_stride ({self.patch_stride}) must be <= patch_size ({self.patch_size})"
             )
-        if patch_reconstruction not in {"center_crop", "hann"}:
+        if patch_reconstruction not in {"center_crop", "hann", "tile"}:
             raise ValueError(
-                "patch_reconstruction must be 'center_crop' or 'hann', got "
+                "patch_reconstruction must be 'center_crop', 'hann', or 'tile', got "
                 f"{patch_reconstruction!r}"
             )
+        # Non-overlapping patches should use tile stitching.
+        if self.patch_stride == self.patch_size and patch_reconstruction != "tile":
+            patch_reconstruction = "tile"
         self.patch_reconstruction = str(patch_reconstruction)
         self.patch_dim = self.embedding_dim * self.patch_size * self.patch_size
 
@@ -394,20 +409,65 @@ class DictionaryLearning(nn.Module):
             int(self.sparsity_level), dim=1, largest=True, sorted=True
         ).indices
 
-    def _solve_support_coefficients(self, correlations, gram, support, dictionary):
-        rhs = correlations.gather(1, support).unsqueeze(-1)
-        gram_support = gram[support.unsqueeze(-1), support.unsqueeze(-2)]
-        reg_eye = torch.eye(
-            int(self.sparsity_level), device=dictionary.device, dtype=dictionary.dtype
-        ).unsqueeze(0)
-        gram_support = gram_support + float(self.epsilon) * reg_eye
+    def _support_gram(self, gram, support):
+        return gram[support.unsqueeze(-1), support.unsqueeze(-2)]
 
+    def _solve_regularized_support_system(
+        self,
+        gram_support: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        reg_eps: Optional[float] = None,
+    ) -> torch.Tensor:
+        support_size = int(rhs.size(1))
+        reg_eps = float(self.epsilon if reg_eps is None else reg_eps)
+        reg_eye = torch.eye(
+            support_size,
+            device=gram_support.device,
+            dtype=gram_support.dtype,
+        ).unsqueeze(0)
+        gram_support = gram_support + reg_eps * reg_eye
+        rhs = rhs.unsqueeze(-1)
         try:
             values = torch.linalg.solve(gram_support, rhs).squeeze(-1)
         except RuntimeError:
-            diag = gram_support.diagonal(dim1=-2, dim2=-1).clamp_min(self.epsilon)
+            diag = gram_support.diagonal(dim1=-2, dim2=-1).clamp_min(
+                max(reg_eps, float(self.epsilon))
+            )
             values = rhs.squeeze(-1) / diag
         return torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _refine_support_coefficients_bounded(
+        self,
+        gram_support: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        init: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.coef_max is None:
+            return self._solve_regularized_support_system(gram_support, rhs)
+
+        coeffs = init
+        if coeffs is None:
+            coeffs = self._solve_regularized_support_system(gram_support, rhs)
+        coeffs = torch.nan_to_num(coeffs, nan=0.0, posinf=0.0, neginf=0.0)
+        coeffs = coeffs.clamp(-self.coef_max, self.coef_max)
+        if self.bounded_omp_refine_steps <= 0:
+            return coeffs
+
+        lipschitz = gram_support.abs().sum(dim=-1).amax(dim=-1)
+        lipschitz = lipschitz.clamp_min(max(float(self.epsilon), 1e-6))
+        step_size = lipschitz.reciprocal().unsqueeze(-1)
+        for _ in range(int(self.bounded_omp_refine_steps)):
+            grad = torch.bmm(gram_support, coeffs.unsqueeze(-1)).squeeze(-1) - rhs
+            coeffs = (coeffs - step_size * grad).clamp(-self.coef_max, self.coef_max)
+        return torch.nan_to_num(coeffs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _solve_support_coefficients(self, correlations, gram, support, dictionary):
+        del dictionary
+        rhs = correlations.gather(1, support)
+        gram_support = self._support_gram(gram, support)
+        return self._refine_support_coefficients_bounded(gram_support, rhs)
 
     def batch_omp_with_support(self, X, D):
         """Scratch-style batched OMP that returns support indices and ordered coefficients."""
@@ -424,8 +484,9 @@ class DictionaryLearning(nn.Module):
 
         dictionary_t = D.t()
         gram = dictionary_t.mm(D)
+        gram_solver = gram
         if diag_eps > 0.0:
-            gram = gram + float(diag_eps) * torch.eye(
+            gram_solver = gram + float(diag_eps) * torch.eye(
                 gram.size(0),
                 device=device,
                 dtype=dtype,
@@ -433,6 +494,7 @@ class DictionaryLearning(nn.Module):
         corr_init = dictionary_t.mm(X).t()
         corr = corr_init.clone()
         dense_coeffs = torch.zeros_like(corr_init)
+        use_bounded_refine = self.coef_max is not None
         cholesky = torch.empty(batch_size, 0, 0, device=device, dtype=dtype)
         support = torch.empty(batch_size, 0, device=device, dtype=torch.long)
         chosen = torch.zeros_like(corr_init, dtype=torch.bool)
@@ -443,54 +505,76 @@ class DictionaryLearning(nn.Module):
             chosen[batch_idx, index] = True
 
             selected = int(support.size(1))
-            diag_g = gram[index, index].view(batch_size, 1, 1)
-            if selected == 0:
-                cholesky = torch.sqrt(torch.clamp(diag_g, min=cholesky_eps))
-            else:
-                expanded_batch_idx = batch_idx.unsqueeze(0).expand(selected, batch_size).t()
-                gram_stack = gram[
-                    support[batch_idx, :],
-                    index[expanded_batch_idx],
-                ].view(batch_size, selected, 1)
-                w = torch.linalg.solve_triangular(cholesky, gram_stack, upper=False)
-                w_t = w.transpose(1, 2)
-                corner = torch.sqrt(
-                    torch.clamp(
-                        diag_g - (w_t ** 2).sum(dim=2, keepdim=True),
-                        min=cholesky_eps,
-                    )
-                )
-                zeros = torch.zeros(batch_size, selected, 1, device=device, dtype=dtype)
-                cholesky = torch.cat(
-                    (
-                        torch.cat((cholesky, zeros), dim=2),
-                        torch.cat((w_t, corner), dim=2),
-                    ),
-                    dim=1,
-                )
-
             support = torch.cat([support, index.unsqueeze(1)], dim=1)
             support_size = int(support.size(1))
-            expanded_batch_idx = batch_idx.unsqueeze(0).expand(support_size, batch_size).t()
-            rhs = corr_init[expanded_batch_idx, support].view(batch_size, support_size, 1)
-            try:
-                coeff_stack = torch.cholesky_solve(rhs, cholesky)
-            except RuntimeError:
-                gram_support = torch.bmm(cholesky, cholesky.transpose(1, 2))
+            if use_bounded_refine:
+                rhs = corr_init.gather(1, support)
+                gram_support = self._support_gram(gram, support)
+                # Derive the regularized sub-Gram from the already-extracted one
+                # instead of re-gathering from gram_solver.
                 reg_eye = torch.eye(
-                    support_size,
-                    device=device,
-                    dtype=dtype,
-                ).expand(batch_size, -1, -1)
-                coeff_stack = torch.linalg.solve(
-                    gram_support + cholesky_eps * reg_eye,
+                    support_size, device=device, dtype=dtype
+                ).unsqueeze(0)
+                gram_support_reg = gram_support + float(diag_eps) * reg_eye
+                init = self._solve_regularized_support_system(
+                    gram_support_reg,
                     rhs,
+                    reg_eps=cholesky_eps,
                 )
-            coeff_stack = torch.nan_to_num(coeff_stack, nan=0.0, posinf=0.0, neginf=0.0)
-            dense_coeffs[batch_idx.unsqueeze(1), support] = coeff_stack.squeeze(-1)
+                coeffs_ordered = self._refine_support_coefficients_bounded(
+                    gram_support,
+                    rhs,
+                    init=init,
+                )
+            else:
+                diag_g = gram_solver[index, index].view(batch_size, 1, 1)
+                if selected == 0:
+                    cholesky = torch.sqrt(torch.clamp(diag_g, min=cholesky_eps))
+                else:
+                    expanded_batch_idx = batch_idx.unsqueeze(0).expand(selected, batch_size).t()
+                    gram_stack = gram_solver[
+                        support[batch_idx, :selected],
+                        index[expanded_batch_idx],
+                    ].view(batch_size, selected, 1)
+                    w = torch.linalg.solve_triangular(cholesky, gram_stack, upper=False)
+                    w_t = w.transpose(1, 2)
+                    corner = torch.sqrt(
+                        torch.clamp(
+                            diag_g - (w_t ** 2).sum(dim=2, keepdim=True),
+                            min=cholesky_eps,
+                        )
+                    )
+                    zeros = torch.zeros(batch_size, selected, 1, device=device, dtype=dtype)
+                    cholesky = torch.cat(
+                        (
+                            torch.cat((cholesky, zeros), dim=2),
+                            torch.cat((w_t, corner), dim=2),
+                        ),
+                        dim=1,
+                    )
+
+                rhs = corr_init.gather(1, support).unsqueeze(-1)
+                try:
+                    coeff_stack = torch.cholesky_solve(rhs, cholesky)
+                except RuntimeError:
+                    gram_support = torch.bmm(cholesky, cholesky.transpose(1, 2))
+                    reg_eye = torch.eye(
+                        support_size,
+                        device=device,
+                        dtype=dtype,
+                    ).expand(batch_size, -1, -1)
+                    coeff_stack = torch.linalg.solve(
+                        gram_support + cholesky_eps * reg_eye,
+                        rhs,
+                    )
+                coeff_stack = torch.nan_to_num(coeff_stack, nan=0.0, posinf=0.0, neginf=0.0)
+                coeffs_ordered = coeff_stack.squeeze(-1)
+
+            dense_coeffs[batch_idx.unsqueeze(1), support] = coeffs_ordered
             coeffs_ordered = dense_coeffs[batch_idx.unsqueeze(1), support]
             coeffs_ordered = torch.nan_to_num(coeffs_ordered, nan=0.0, posinf=0.0, neginf=0.0)
-            beta = coeffs_ordered.unsqueeze(1).bmm(gram[support[batch_idx], :]).squeeze(1)
+            gram_for_corr = gram if use_bounded_refine else gram_solver
+            beta = coeffs_ordered.unsqueeze(1).bmm(gram_for_corr[support, :]).squeeze(1)
             corr = torch.nan_to_num(corr_init - beta, nan=0.0, posinf=0.0, neginf=0.0)
 
         coeffs_ordered = dense_coeffs[batch_idx.unsqueeze(1), support]
@@ -593,7 +677,28 @@ class DictionaryLearning(nn.Module):
         ]
         return recon[:, :, :height, :width]
 
+    def _reconstruct_patches_tile(self, support, values, height, width):
+        """Direct patch tiling for non-overlapping patches (stride == size)."""
+        B, nph, npw, D = support.shape
+        C = self.embedding_dim
+
+        dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon).t()
+        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
+        values_clamped = values.to(dictionary.dtype)
+        if self.coef_max is not None:
+            values_clamped = values_clamped.clamp(-self.coef_max, self.coef_max)
+        values_flat = values_clamped.reshape(-1, D)
+        atoms = dictionary[support_flat]
+        recon = (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
+
+        recon = recon.view(B, nph, npw, C, self.patch_size, self.patch_size)
+        recon = recon.permute(0, 3, 1, 4, 2, 5).contiguous()
+        recon = recon.view(B, C, nph * self.patch_size, npw * self.patch_size)
+        return recon[:, :, :height, :width]
+
     def _reconstruct_sparse(self, support, values, height, width):
+        if self.patch_reconstruction == "tile" and self._is_patch_based():
+            return self._reconstruct_patches_tile(support, values, height, width)
         if self.patch_reconstruction == "hann" and self._is_patch_based():
             return self._reconstruct_patches_hann(support, values, height, width)
         if self._is_patch_based():
@@ -830,14 +935,27 @@ class DictionaryLearning(nn.Module):
         self._last_e_latent_loss = e_latent_loss.detach()
         num_sites = max(int(values.shape[0] * values.shape[1] * values.shape[2]), 1)
         dict_norms = self.dictionary.norm(dim=0).detach()
+        coeff_abs = values.abs()
+        coeff_abs_max = coeff_abs.max().detach()
+        if self.coef_max is None:
+            coeff_clip_frac = coeff_abs.new_zeros(())
+        else:
+            clip_eps = max(float(self.epsilon), float(self.coef_max) * 1e-6)
+            coeff_clip_frac = (
+                (coeff_abs >= (float(self.coef_max) - clip_eps))
+                .to(values.dtype)
+                .mean()
+                .detach()
+            )
         self._last_diag = {
             "dict_norm_max": dict_norms.max(),
             "dict_norm_mean": dict_norms.mean(),
             "dict_norm_min": dict_norms.min(),
             "coeff_abs_mean": (
-                values.abs().sum() / float(self.num_embeddings * num_sites)
+                coeff_abs.sum() / float(self.num_embeddings * num_sites)
             ).detach(),
-            "coeff_abs_max": values.abs().max().detach(),
+            "coeff_abs_max": coeff_abs_max,
+            "coeff_clip_frac": coeff_clip_frac,
         }
 
         z_dl = z_e + (z_dl - z_e).detach()
