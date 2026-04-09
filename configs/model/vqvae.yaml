@@ -10,3 +10,4 @@ commitment_cost: 0.25
 decay: 0.99
 perceptual_weight: 0.
 compute_fid: true
+fid_feature: 2048

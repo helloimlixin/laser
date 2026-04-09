@@ -17,6 +17,7 @@ patch_argparse_for_hydra_on_py314()
 import hydra
 from omegaconf import DictConfig
 
+from src.checkpoint_io import extract_state_dict, load_torch_payload
 from src.lightning_warning_filters import register as register_lightning_warning_filters
 
 register_lightning_warning_filters()
@@ -99,6 +100,7 @@ def train(cfg: DictConfig):
     print(f"Number of Residual Blocks: {cfg.model.num_residual_blocks}")
     print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
     if cfg.model.type == "laser":
+        print(f"Backbone: {getattr(cfg.model, 'backbone', 'simple')}")
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
         print(f"Coefficient Bound: {getattr(cfg.model, 'coef_max', None)}")
@@ -106,6 +108,11 @@ def train(cfg: DictConfig):
             "Bounded OMP Refine Steps: "
             f"{getattr(cfg.model, 'bounded_omp_refine_steps', 8)}"
         )
+        if str(getattr(cfg.model, 'backbone', 'simple')).strip().lower() != "simple":
+            print(f"Downsamples: {getattr(cfg.model, 'num_downsamples', 2)}")
+            print(f"Attention Resolutions: {tuple(getattr(cfg.model, 'attn_resolutions', ())) or ()}")
+            print(f"Use Mid Attention: {bool(getattr(cfg.model, 'use_mid_attention', True))}")
+            print(f"Max Channel Multiplier: {getattr(cfg.model, 'max_ch_mult', 2)}")
     elif cfg.model.type == "vqvae":
         print(f"Number of Embeddings: {cfg.model.num_embeddings}")
     else:
@@ -197,28 +204,12 @@ def train(cfg: DictConfig):
             raise FileNotFoundError(f"No checkpoint file found under directory: {path}")
         return path
 
-    def _extract_state_dict(container):
-        if isinstance(container, dict):
-            if isinstance(container.get('state_dict'), dict):
-                return container['state_dict']
-            module_blob = container.get('module')
-            if isinstance(module_blob, dict):
-                return module_blob.get('state_dict', module_blob)
-            for key in ('model', 'ema', 'model_state_dict', 'net', 'generator'):
-                payload = container.get(key)
-                if isinstance(payload, dict):
-                    return payload
-        return container
-
     def _load_module_state(module, ckpt_path: str, label: str):
         load_path = _resolve_ckpt_file(ckpt_path)
         if not os.path.exists(load_path):
             raise FileNotFoundError(f"Checkpoint not found: {load_path}")
-        try:
-            state = torch.load(load_path, map_location='cpu', weights_only=False)
-        except TypeError:
-            state = torch.load(load_path, map_location='cpu')
-        sd = _extract_state_dict(state)
+        state = load_torch_payload(load_path, map_location='cpu')
+        sd = extract_state_dict(state)
         if not isinstance(sd, dict):
             raise RuntimeError(f"Checkpoint at {load_path} does not contain a valid state_dict")
         missing, unexpected = module.load_state_dict(sd, strict=False)
@@ -241,11 +232,20 @@ def train(cfg: DictConfig):
             'embedding_dim': cfg.model.embedding_dim,
             'num_residual_blocks': cfg.model.num_residual_blocks,
             'num_residual_hiddens': cfg.model.num_residual_hiddens,
+            'backbone': getattr(cfg.model, 'backbone', 'simple'),
+            'resolution': int(cfg.data.image_size if isinstance(cfg.data.image_size, int) else cfg.data.image_size[0]),
+            'num_downsamples': int(getattr(cfg.model, 'num_downsamples', 2)),
+            'attn_resolutions': tuple(getattr(cfg.model, 'attn_resolutions', ())),
+            'dropout': float(getattr(cfg.model, 'dropout', 0.0)),
+            'max_ch_mult': int(getattr(cfg.model, 'max_ch_mult', 2)),
+            'decoder_extra_residual_layers': int(getattr(cfg.model, 'decoder_extra_residual_layers', 1)),
+            'use_mid_attention': bool(getattr(cfg.model, 'use_mid_attention', True)),
             'commitment_cost': cfg.model.commitment_cost,
             'perceptual_weight': cfg.model.perceptual_weight,
             'learning_rate': cfg.train.learning_rate,
             'beta': cfg.train.beta,
             'compute_fid': cfg.model.compute_fid,
+            'fid_feature': getattr(cfg.model, 'fid_feature', 2048),
             'bottleneck_loss_weight': getattr(cfg.model, 'bottleneck_loss_weight', 0.5),
             'sparsity_level': cfg.model.sparsity_level,
             'dict_learning_rate': getattr(cfg.model, 'dict_learning_rate', None),
@@ -278,6 +278,7 @@ def train(cfg: DictConfig):
             'learning_rate': cfg.train.learning_rate,
             'beta': cfg.train.beta,
             'compute_fid': cfg.model.compute_fid,
+            'fid_feature': getattr(cfg.model, 'fid_feature', 2048),
         }
         model = VQVAE(**model_params)
     else:

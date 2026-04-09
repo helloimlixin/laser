@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/p4g.sh"
+
+array_spec="$(p4g_array_spec)"
+
+common_export="ALL,PARTITION=$PARTITION,RUN_ROOT=$RUN_ROOT,DATA_DIR=$DATA_DIR,S1_EPOCHS=$S1_EPOCHS,S2_EPOCHS=$S2_EPOCHS,S1_GPUS=$S1_GPUS,S2_GPUS=$S2_GPUS,S1_CPUS=$S1_CPUS,S2_CPUS=$S2_CPUS,S1_MEM_MB=$S1_MEM_MB,S2_MEM_MB=$S2_MEM_MB,S1_BSZ=$S1_BSZ,S2_BSZ=$S2_BSZ,S1_DICT_LR=$S1_DICT_LR,S1_WARMUP_STEPS=$S1_WARMUP_STEPS,S1_MIN_LR_RATIO=$S1_MIN_LR_RATIO,S1_LOG_EVERY=$S1_LOG_EVERY,S1_VAL_INTERVAL=$S1_VAL_INTERVAL,S1_IMG_EVERY=$S1_IMG_EVERY,S1_DIAG_EVERY=$S1_DIAG_EVERY,S1_LATENT_VIS=$S1_LATENT_VIS,S1_BOTTLENECK_W=$S1_BOTTLENECK_W,S1_PERCEPTUAL_W=$S1_PERCEPTUAL_W,S1_SPARSITY_REG_W=$S1_SPARSITY_REG_W,S1_COHERENCE_W=$S1_COHERENCE_W,S1_BOUNDED_OMP=$S1_BOUNDED_OMP,S2_VAL_INTERVAL=$S2_VAL_INTERVAL,S2_SAMPLE_STEP_EVERY=$S2_SAMPLE_STEP_EVERY,S2_SAMPLE_EPOCH_EVERY=$S2_SAMPLE_EPOCH_EVERY,S2_SAMPLE_IMAGES=$S2_SAMPLE_IMAGES,ATOMS=$ATOMS,K=$K,PATCH=$PATCH,STRIDE=$STRIDE,BINS=$BINS,CMAX=$CMAX,D_MODEL=$D_MODEL,HEADS=$HEADS,LAYERS=$LAYERS,D_FF=$D_FF,WIN_LIST=$WIN_LIST,EMB=$EMB,NHID=$NHID,RBLK=$RBLK,RHID=$RHID"
+
+stage1_id="$(sbatch --parsable --partition="$PARTITION" --gres="gpu:${S1_GPUS}" --cpus-per-task="$S1_CPUS" --mem="$S1_MEM_MB" --export="$common_export" "$ROOT_DIR/scripts/job_p4s1.sbatch")"
+stage2_id="$(sbatch --parsable --partition="$PARTITION" --dependency="afterok:${stage1_id}" --array="$array_spec" --gres="gpu:${S2_GPUS}" --cpus-per-task="$S2_CPUS" --mem="$S2_MEM_MB" --export="$common_export" "$ROOT_DIR/scripts/job_p4s2.sbatch")"
+
+echo "stage1_job=$stage1_id"
+echo "stage2_job=$stage2_id"
+echo "run_root=$RUN_ROOT"
+echo "windows=${WIN_LIST//,/ }"

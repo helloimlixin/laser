@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.models.laser import LASER
+from src.checkpoint_io import load_lightning_module
 from src.data.token_cache import load_token_cache
 from src.stage2_paths import (
     infer_latest_stage1_checkpoint,
@@ -119,7 +120,13 @@ def _write_stage1_preview(stage1_root: Path, subset_dir: Path, *, image_size: in
     checkpoint = infer_latest_stage1_checkpoint(output_root=stage1_root)
     if checkpoint is None:
         raise RuntimeError(f"Could not infer stage-1 checkpoint under {stage1_root}")
-    model = LASER.load_from_checkpoint(checkpoint, map_location="cpu").eval()
+    model = load_lightning_module(
+        LASER,
+        checkpoint,
+        map_location="cpu",
+        strict=False,
+        compute_fid=False,
+    ).eval()
     inputs = _load_preview_batch(subset_dir, image_size=image_size, count=count)
     with torch.inference_mode():
         recon, _, _ = model(inputs)
@@ -139,7 +146,13 @@ def _write_token_cache_preview(ar_root: Path, stage1_root: Path, *, count: int =
     if token_cache is None:
         raise RuntimeError(f"Could not infer token cache under {ar_root}")
 
-    model = LASER.load_from_checkpoint(checkpoint, map_location="cpu").eval()
+    model = load_lightning_module(
+        LASER,
+        checkpoint,
+        map_location="cpu",
+        strict=False,
+        compute_fid=False,
+    ).eval()
     cache = load_token_cache(token_cache)
     shape = cache.get("shape")
     tokens_flat = cache.get("tokens_flat")

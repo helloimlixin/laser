@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 from src.models.encoder import Encoder
 from src.models.decoder import Decoder
+from src.checkpoint_io import load_lightning_module
 
 # Output dirs
 OUT = Path(__file__).resolve().parent / "artifacts" / "codec"
@@ -219,8 +220,14 @@ def test_decoder_dataset(name: str, size: int):
             ckpt = runs[-1] / "vqvae" / "last.ckpt"
             if ckpt.exists():
                 try:
-                    vqvae = VQVAE.load_from_checkpoint(str(ckpt), map_location=device)
-                    vqvae.eval()
+                    vqvae = load_lightning_module(
+                        VQVAE,
+                        ckpt,
+                        map_location="cpu",
+                        strict=False,
+                        compute_fid=False,
+                    )
+                    vqvae = vqvae.to(device).eval()
                 except Exception:
                     vqvae = None
 

@@ -16,3 +16,7 @@ def register() -> None:
         "ignore",
         message=r".*Found \d+ module\(s\) in eval mode at the start of training\..*",
     )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*You are using `torch\.load` with `weights_only=False`.*",
+    )

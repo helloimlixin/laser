@@ -1,40 +1,5 @@
-import importlib.util
-import sys
-from pathlib import Path
-
 import torch
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_module(module_name: str, rel_path: str):
-    path = ROOT / rel_path
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec is not None and spec.loader is not None
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-scratch_laser_transformer = _load_module(
-    "scratch_laser_transformer_direct_sparse_prior_test_module",
-    "scratch/laser_transformer.py",
-)
-sys.modules["laser_transformer"] = scratch_laser_transformer
-scratch_proto = _load_module(
-    "scratch_proto_direct_sparse_prior_test_module",
-    "scratch/proto.py",
-)
-sys.modules["proto"] = scratch_proto
-scratch_direct_sparse_prior = _load_module(
-    "scratch_direct_sparse_prior_test_module",
-    "scratch/laser_direct_sparse_prior.py",
-)
-
-
-build_config = scratch_direct_sparse_prior._build_spatial_depth_prior_config
+from src.models.spatial_prior import build_spatial_depth_prior_config as build_config
 
 
 class _FakeQuantizedBottleneck:
@@ -61,12 +26,13 @@ def test_build_spatial_depth_prior_config_quantized_uses_full_sparse_depth_and_b
         H=3,
         W=4,
         D=8,
-        tf_d_model=64,
-        tf_heads=8,
-        tf_layers=6,
-        tf_ff=128,
-        tf_dropout=0.05,
-        tf_global_tokens=2,
+        d_model=64,
+        n_heads=8,
+        n_spatial_layers=6,
+        n_depth_layers=3,
+        d_ff=128,
+        dropout=0.05,
+        n_global_spatial_tokens=2,
         real_valued_coeffs=False,
         coeff_max_fallback=99.0,
     )
@@ -94,12 +60,13 @@ def test_build_spatial_depth_prior_config_real_valued_disables_coeff_vocab():
         H=2,
         W=2,
         D=6,
-        tf_d_model=48,
-        tf_heads=6,
-        tf_layers=5,
-        tf_ff=96,
-        tf_dropout=0.1,
-        tf_global_tokens=0,
+        d_model=48,
+        n_heads=6,
+        n_spatial_layers=5,
+        n_depth_layers=2,
+        d_ff=96,
+        dropout=0.1,
+        n_global_spatial_tokens=0,
         real_valued_coeffs=True,
         coeff_max_fallback=9.0,
     )

@@ -73,6 +73,84 @@ def test_validation_visual_cache_respects_flag():
     assert enabled._val_vis_batch is not None
 
 
+def test_validation_step_skips_duplicate_recon_grid_for_cached_latent_visuals():
+    model = _build_model(enable_val_latent_visuals=True, log_images_every_n_steps=1)
+    trainer_stub = type("TrainerStub", (), {"is_global_zero": True})()
+    model.__dict__["_trainer"] = trainer_stub
+    batch = torch.randn(4, 3, 16, 16)
+    calls = []
+
+    model.compute_metrics = lambda batch, prefix="val": (
+        torch.tensor(0.0),
+        batch if isinstance(batch, torch.Tensor) else batch[0],
+        batch if isinstance(batch, torch.Tensor) else batch[0],
+    )
+    model.log_images = lambda *args, **kwargs: calls.append(kwargs.get("prefix", "val"))
+
+    model.validation_step(batch, 0)
+    model.validation_step(batch, 1)
+
+    assert calls == ["val"]
+
+
+def test_log_images_uses_global_step_for_wandb_log():
+    model = _build_model(log_images_every_n_steps=1)
+    calls = []
+
+    class _Experiment:
+        def log(self, payload, **kwargs):
+            calls.append((payload, kwargs))
+
+    trainer_stub = type(
+        "TrainerStub",
+        (),
+        {
+            "is_global_zero": True,
+            "global_step": 7,
+            "datamodule": None,
+            "logger": type("LoggerStub", (), {"experiment": _Experiment()})(),
+        },
+    )()
+    model.__dict__["_trainer"] = trainer_stub
+
+    x = torch.rand(2, 3, 8, 8)
+    recon = torch.rand(2, 3, 8, 8)
+    model.log_images(x, recon, prefix="train")
+
+    assert len(calls) == 1
+    assert calls[0][1]["step"] == 7
+
+
+def test_log_images_is_idempotent_per_prefix_and_step():
+    model = _build_model(log_images_every_n_steps=1)
+    calls = []
+
+    class _Experiment:
+        def log(self, payload, **kwargs):
+            calls.append((payload, kwargs))
+
+    trainer_stub = type(
+        "TrainerStub",
+        (),
+        {
+            "is_global_zero": True,
+            "global_step": 11,
+            "datamodule": None,
+            "logger": type("LoggerStub", (), {"experiment": _Experiment()})(),
+        },
+    )()
+    model.__dict__["_trainer"] = trainer_stub
+
+    x = torch.rand(2, 3, 8, 8)
+    recon = torch.rand(2, 3, 8, 8)
+    model.log_images(x, recon, prefix="train")
+    model.log_images(x, recon, prefix="train")
+    model.log_images(x, recon, prefix="val")
+
+    assert len(calls) == 2
+    assert [call[0]["global_step"] for call in calls] == [11, 11]
+
+
 def test_train_psnr_is_logged_to_progress_bar():
     model = _build_model()
     batch = torch.randn(4, 3, 16, 16)
@@ -89,6 +167,12 @@ def test_train_psnr_is_logged_to_progress_bar():
     assert recon.shape == x.shape == batch.shape
     assert any(
         name == "train/psnr" and kwargs.get("prog_bar") is True
+        for name, kwargs in log_calls
+    )
+    assert any(
+        name == "train/psnr"
+        and kwargs.get("on_step") is True
+        and kwargs.get("on_epoch") is False
         for name, kwargs in log_calls
     )
 
@@ -126,6 +210,38 @@ def test_logged_sparsity_uses_fixed_support_budget_not_thresholded_coeffs():
     assert float(logged["train/effective_sparsity"]) == 0.0625
 
 
+def test_sparsity_reg_weight_does_not_change_optimized_loss():
+    batch = torch.randn(2, 3, 16, 16)
+    sparse_codes = laser_module.SparseCodes(
+        support=torch.tensor(
+            [
+                [[[0, 1]]],
+                [[[2, 3]]],
+            ],
+            dtype=torch.long,
+        ),
+        values=torch.tensor(
+            [
+                [[[1.0, 0.5]]],
+                [[[0.25, 0.125]]],
+            ],
+            dtype=torch.float32,
+        ),
+        num_embeddings=8,
+    )
+    base = _build_model(num_embeddings=8, sparsity_level=2, sparsity_reg_weight=0.0)
+    heavy = _build_model(num_embeddings=8, sparsity_level=2, sparsity_reg_weight=100.0)
+    base.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
+    heavy.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
+    base.log = lambda *args, **kwargs: None
+    heavy.log = lambda *args, **kwargs: None
+
+    loss_base, _, _ = base.compute_metrics(batch, prefix="train")
+    loss_heavy, _, _ = heavy.compute_metrics(batch, prefix="train")
+
+    assert torch.isclose(loss_base, loss_heavy)
+
+
 def test_dictionary_is_always_in_optimizer_with_optional_lr_override():
     model = _build_model(dict_learning_rate=5e-4)
 
@@ -138,6 +254,16 @@ def test_dictionary_is_always_in_optimizer_with_optional_lr_override():
 
     assert model.bottleneck.dictionary.requires_grad is True
     assert dict_group["lr"] == 5e-4
+
+
+def test_laser_manual_lr_schedule_applies_first_step_without_scheduler():
+    model = _build_model(learning_rate=1e-3, warmup_steps=10, min_lr_ratio=0.01)
+    model.__dict__["_trainer"] = type("TrainerStub", (), {"estimated_stepping_batches": 100})()
+
+    optimizer = model.configure_optimizers()
+    model._apply_scheduled_lrs(optimizer, step=0)
+
+    assert optimizer.param_groups[0]["lr"] == 1e-5
 
 
 def test_laser_patch_dictionary_learning_runs_end_to_end():
@@ -158,6 +284,42 @@ def test_laser_patch_toggle_can_fall_back_to_per_site_dictionary_learning():
 
     assert torch.isfinite(loss)
     assert recon.shape == x.shape == batch.shape
+
+
+def test_laser_vqgan_backbone_runs_end_to_end():
+    model = _build_model(
+        backbone="vqgan",
+        resolution=16,
+        num_hiddens=32,
+        num_residual_blocks=1,
+        num_downsamples=1,
+        max_ch_mult=1,
+        use_mid_attention=True,
+        patch_based=False,
+    )
+    batch = torch.randn(2, 3, 16, 16)
+
+    loss, recon, x = model.compute_metrics(batch, prefix="train")
+
+    assert torch.isfinite(loss)
+    assert recon.shape == x.shape == batch.shape
+    assert isinstance(model.pre_bottleneck, torch.nn.Identity)
+    assert isinstance(model.post_bottleneck, torch.nn.Identity)
+    assert model.infer_latent_hw((16, 16)) == (8, 8)
+
+
+def test_laser_ddpm_alias_selects_vqgan_backbone():
+    model = _build_model(
+        backbone="ddpm",
+        resolution=16,
+        num_hiddens=32,
+        num_residual_blocks=1,
+        num_downsamples=1,
+        max_ch_mult=1,
+        patch_based=False,
+    )
+
+    assert model.backbone == "vqgan"
 
 
 def test_laser_decode_from_tokens_forwards_quantized_decode_args():

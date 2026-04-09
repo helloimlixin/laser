@@ -14,7 +14,7 @@ export TIME_LIMIT="${TIME_LIMIT:-24:00:00}"
 
 export DATA_DIR="${DATA_DIR:-/cache/home/xl598/Projects/data/celeba}"
 export IMAGE_SIZE="${IMAGE_SIZE:-128}"
-export OUT_DIR="${OUT_DIR:-/scratch/$USER/runs/laser_100ep}"
+export OUT_DIR="${OUT_DIR:-/cache/home/$USER/runs/laser_100ep}"
 
 export STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
 export STAGE2_EPOCHS="${STAGE2_EPOCHS:-100}"

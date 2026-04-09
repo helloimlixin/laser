@@ -18,8 +18,8 @@ def test_infer_latest_stage1_stage2_and_token_cache(tmp_path: Path):
     output_root = tmp_path / "outputs"
     stage1_old = output_root / "checkpoints" / "run_20260325_000000" / "laser" / "last.ckpt"
     stage1_new = output_root / "checkpoints" / "run_20260326_000000" / "laser" / "last.ckpt"
-    stage2_old = output_root / "ar" / "checkpoints" / "sparse_spatial_depth_20260325_000000" / "last.ckpt"
-    stage2_new = output_root / "ar" / "checkpoints" / "sparse_spatial_depth_20260326_000000" / "last.ckpt"
+    stage2_old = output_root / "ar" / "checkpoints" / "s2_20260325_000000" / "last.ckpt"
+    stage2_new = output_root / "ar" / "checkpoints" / "s2_20260326_000000" / "last.ckpt"
     cache_old = output_root / "ar" / "token_cache" / "celeba__train__img128__cb256.pt"
     cache_new = output_root / "ar" / "token_cache" / "celeba__train__img128__cb512.pt"
 

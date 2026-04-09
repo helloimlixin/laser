@@ -37,6 +37,8 @@ class MinGPTQuantizedPriorConfig:
     D: int
     atom_vocab_size: int
     coeff_vocab_size: int
+    window_sites: int = 0
+    n_global_spatial_tokens: int = 0
     d_model: int = 512
     n_heads: int = 8
     n_layers: int = 12
@@ -50,6 +52,8 @@ def build_mingpt_quantized_prior_config(
     H: int,
     W: int,
     D: int,
+    window_sites: int,
+    n_global_spatial_tokens: int,
     d_model: int,
     n_heads: int,
     n_layers: int,
@@ -66,6 +70,8 @@ def build_mingpt_quantized_prior_config(
         D=int(D),
         atom_vocab_size=atom_vocab_size,
         coeff_vocab_size=coeff_vocab_size,
+        window_sites=int(window_sites),
+        n_global_spatial_tokens=int(n_global_spatial_tokens),
         d_model=int(d_model),
         n_heads=int(n_heads),
         n_layers=int(n_layers),
@@ -87,14 +93,37 @@ class MinGPTQuantizedPrior(nn.Module):
         self.coeff_vocab_size = int(cfg.coeff_vocab_size)
         self.content_vocab_size = int(cfg.vocab_size)
         self.sequence_length = int(cfg.H) * int(cfg.W) * int(cfg.D)
+        self.n_global_spatial_tokens = int(cfg.n_global_spatial_tokens)
+        if self.n_global_spatial_tokens < 0:
+            raise ValueError(
+                f"n_global_spatial_tokens must be >= 0, got {self.n_global_spatial_tokens}"
+            )
+        self.total_sequence_length = self.sequence_length + self.n_global_spatial_tokens
+        self.window_sites = int(cfg.window_sites)
+        if self.window_sites < 0:
+            raise ValueError(f"window_sites must be >= 0, got {self.window_sites}")
+        self.n_sites = int(cfg.H) * int(cfg.W)
+        self.window_tokens = self._window_tokens()
         self.bos_token_id = int(cfg.vocab_size)
 
         self.token_emb = nn.Embedding(self.content_vocab_size + 1, cfg.d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, self.sequence_length, cfg.d_model))
+        self.pos_emb = nn.Parameter(torch.zeros(1, self.total_sequence_length, cfg.d_model))
+        self.global_spatial_tokens = None
+        if self.n_global_spatial_tokens > 0:
+            self.global_spatial_tokens = nn.Parameter(
+                torch.zeros(1, self.n_global_spatial_tokens, cfg.d_model)
+            )
         self.dropout = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+                TransformerBlock(
+                    cfg.d_model,
+                    cfg.n_heads,
+                    cfg.d_ff,
+                    cfg.dropout,
+                    window_size=self.window_tokens,
+                    n_global_prefix_tokens=self.n_global_spatial_tokens,
+                )
                 for _ in range(cfg.n_layers)
             ]
         )
@@ -119,6 +148,40 @@ class MinGPTQuantizedPrior(nn.Module):
 
         self.apply(init_transformer_module_weights)
         nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
+        if self.global_spatial_tokens is not None:
+            nn.init.normal_(self.global_spatial_tokens, mean=0.0, std=0.02)
+
+    def _window_tokens(self) -> Optional[int]:
+        if self.window_sites <= 0 or self.window_sites >= self.n_sites:
+            return None
+        return self.window_sites * int(self.cfg.D)
+
+    def _is_atom_step(self, pos: torch.Tensor) -> torch.Tensor:
+        return pos.remainder(self.cfg.D).remainder(2).eq(0)
+
+    def _site_start(self, step: int) -> int:
+        return step - (step % self.cfg.D)
+
+    def _ban_step_vocab(self, logits: torch.Tensor, *, start_pos: int) -> torch.Tensor:
+        pos = torch.arange(start_pos, start_pos + logits.size(1), device=logits.device)
+        atom_steps = self._is_atom_step(pos)
+        if atom_steps.any():
+            logits[:, atom_steps, self.atom_vocab_size :] = float("-inf")
+        coeff_steps = ~atom_steps
+        if coeff_steps.any():
+            logits[:, coeff_steps, : self.atom_vocab_size] = float("-inf")
+        return logits
+
+    def _ban_used_atoms(self, logits: torch.Tensor, seq: torch.Tensor, *, step: int) -> torch.Tensor:
+        if step <= 0 or (step % 2) != 0:
+            return logits
+        site_start = self._site_start(step)
+        used_atoms = seq[:, site_start:step:2]
+        if used_atoms.numel() == 0:
+            return logits
+        logits = logits.clone()
+        logits.scatter_(1, used_atoms.clamp(0, self.atom_vocab_size - 1), float("-inf"))
+        return logits
 
     def _flatten_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.ndim != 3:
@@ -138,19 +201,31 @@ class MinGPTQuantizedPrior(nn.Module):
     ) -> torch.Tensor:
         del type_ids
         x = self.token_emb(idx)
-        x = x + self.pos_emb[:, past_len:past_len + idx.size(1), :]
+        pos_start = self.n_global_spatial_tokens + int(past_len)
+        x = x + self.pos_emb[:, pos_start:pos_start + idx.size(1), :]
         return self.dropout(x)
 
+    def _prefix(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if self.global_spatial_tokens is None:
+            return None
+        prefix = self.global_spatial_tokens.expand(batch_size, -1, -1).to(device=device, dtype=dtype)
+        prefix = prefix + self.pos_emb[:, : self.n_global_spatial_tokens, :].to(device=device, dtype=dtype)
+        return self.dropout(prefix)
+
     def _masked_logits(self, logits: torch.Tensor, *, start_pos: int) -> torch.Tensor:
-        del start_pos
-        return logits
+        return self._ban_step_vocab(logits, start_pos=start_pos)
 
     def _forward_sequence(
         self,
         idx: torch.Tensor,
     ) -> torch.Tensor:
         x = self._embed(idx, past_len=0)
+        prefix = self._prefix(idx.size(0), device=idx.device, dtype=x.dtype)
+        if prefix is not None:
+            x = torch.cat([prefix, x], dim=1)
         x, _ = run_transformer_blocks(x, self.blocks, self.ln_f)
+        if self.n_global_spatial_tokens > 0:
+            x = x[:, self.n_global_spatial_tokens :, :]
         logits = self.token_head(x)
         return self._masked_logits(logits, start_pos=0)
 
@@ -195,6 +270,13 @@ class MinGPTQuantizedPrior(nn.Module):
         logits = self.token_head(x)
         logits = self._masked_logits(logits, start_pos=start_pos)
         return logits, new_cache
+
+    def _prime_prefix_cache(self, batch_size: int, *, device: torch.device) -> Optional[list[Tuple[torch.Tensor, torch.Tensor]]]:
+        prefix = self._prefix(batch_size, device=device, dtype=self.token_emb.weight.dtype)
+        if prefix is None:
+            return None
+        _, kv_cache = run_transformer_blocks(prefix, self.blocks, self.ln_f)
+        return kv_cache
 
     def _sample_from_logits(
         self,
@@ -256,7 +338,8 @@ class MinGPTQuantizedPrior(nn.Module):
 
         seq = torch.empty(batch_size, self.sequence_length, dtype=torch.long, device=device)
         bos = torch.full((batch_size, 1), self.bos_token_id, device=device, dtype=torch.long)
-        logits, kv_cache = self._forward_step(bos, kv_cache=None, start_pos=0)
+        kv_cache = self._prime_prefix_cache(batch_size, device=device)
+        logits, kv_cache = self._forward_step(bos, kv_cache=kv_cache, start_pos=0)
 
         steps = tqdm(
             range(self.sequence_length),
@@ -266,7 +349,7 @@ class MinGPTQuantizedPrior(nn.Module):
             disable=not show_progress,
         )
         for step in steps:
-            step_logits = logits[:, -1, :]
+            step_logits = self._ban_used_atoms(logits[:, -1, :], seq, step=step)
             sampled = self._sample_from_logits(
                 step_logits,
                 temperature=float(temperature),

@@ -1,36 +1,6 @@
-import importlib.util
-import sys
-from pathlib import Path
-
 import torch
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_module(module_name: str, rel_path: str):
-    path = ROOT / rel_path
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec is not None and spec.loader is not None
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-scratch_laser_transformer = _load_module(
-    "scratch_laser_transformer_regression_test_module",
-    "scratch/laser_transformer.py",
-)
-sys.modules["laser_transformer"] = scratch_laser_transformer
-scratch_proto = _load_module(
-    "scratch_proto_spatial_depth_regression_test_module",
-    "scratch/proto.py",
-)
-
-SpatialDepthPrior = scratch_laser_transformer.SpatialDepthPrior
-SpatialDepthPriorConfig = scratch_laser_transformer.SpatialDepthPriorConfig
-compute_quantized_rq_losses = scratch_proto._compute_quantized_rq_losses
+from src.models.sparse_token_prior import compute_quantized_rq_losses
+from src.models.spatial_prior import SpatialDepthPrior, SpatialDepthPriorConfig
 
 
 def test_spatial_depth_prior_real_valued_generation_masks_duplicate_atoms():

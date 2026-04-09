@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-export OUT_DIR="${OUT_DIR:-/scratch/$USER/runs/laser_patch100}"
+export OUT_DIR="${OUT_DIR:-/cache/home/$USER/runs/laser_patch100}"
 export WANDB_NAME="${WANDB_NAME:-patch100}"
 export LOG_PREFIX="${LOG_PREFIX:-patch100}"
 export JOB_NAME="${JOB_NAME:-laser-patch100}"

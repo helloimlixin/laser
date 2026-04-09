@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from src.cache_sort import sort_sparse_pairs, sort_token_pairs
+from src.checkpoint_io import load_lightning_module
 from src.data.celeba import CelebADataModule
 from src.data.cifar10 import CIFAR10DataModule
 from src.data.config import DataConfig
@@ -110,7 +112,13 @@ def main():
     if device.type == "cuda":
         torch.set_float32_matmul_precision("medium")
 
-    model = LASER.load_from_checkpoint(str(checkpoint_path), map_location="cpu").eval().to(device)
+    model = load_lightning_module(
+        LASER,
+        checkpoint_path,
+        map_location="cpu",
+        strict=False,
+        compute_fid=False,
+    ).eval().to(device)
     datamodule = _build_datamodule(args)
     loader = _resolve_loader(datamodule, args.split)
     cache_mode = str(args.cache_mode).strip().lower()
@@ -151,9 +159,11 @@ def main():
                     coeff_quantization=str(args.coeff_quantization),
                     coeff_mu=float(args.coeff_mu),
                 )
+                tokens = sort_token_pairs(tokens)
                 coeffs = None
             else:
                 tokens, coeffs, current_latent_hw = model.encode_to_atoms_and_coeffs(x)
+                tokens, coeffs = sort_sparse_pairs(tokens, coeffs)
             if tuple(current_latent_hw) != tuple(latent_hw):
                 raise RuntimeError(
                     "latent_hw changed across batches: "
@@ -206,6 +216,7 @@ def main():
         "variational_coeffs": bool(getattr(model.hparams, "variational_coeffs", False)),
         "variational_coeff_prior_std": float(getattr(model.hparams, "variational_coeff_prior_std", 0.25)),
         "variational_coeff_min_std": float(getattr(model.hparams, "variational_coeff_min_std", 0.01)),
+        "support_order": "atom_id",
     }
     if quantized_cache:
         meta.update(

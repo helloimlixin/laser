@@ -11,6 +11,21 @@ in_channels: 3
 # Higher = more capacity, slower training
 num_hiddens: 128
 
+# Encoder/decoder backbone.
+# `vqgan` reuses the DDPM/VQGAN-style ResNet+attention backbone from the
+# maintained RQ-AE implementation.
+backbone: vqgan
+
+# VQGAN/DDPM-style encoder/decoder knobs.
+# With `num_downsamples=2` on 128x128 inputs, the latent grid is 32x32, which
+# preserves the current token density while adding a bottleneck attention block.
+num_downsamples: 2
+attn_resolutions: []
+dropout: 0.0
+max_ch_mult: 2
+decoder_extra_residual_layers: 1
+use_mid_attention: true
+
 # Dictionary size (number of atoms/embeddings)
 # Typical range: 128-1024
 # Higher = more expressive, slower sparse coding
@@ -89,9 +104,10 @@ perceptual_weight: 0.5
 # 0.9 = standard default
 beta: 0.9
 
-# Compute FID (Frechet Inception Distance) during testing
-# Options: true (slower, comprehensive), false (faster)
+# Compute reconstruction FID (rFID) during validation/test.
+# This logs `val/rfid` to W&B from stage 1.
 compute_fid: true
+fid_feature: 2048
 
 # Log reconstruction images to W&B every N steps
 # Typical range: 100-1000

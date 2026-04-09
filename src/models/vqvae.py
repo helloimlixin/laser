@@ -27,7 +27,8 @@ class VQVAE(pl.LightningModule):
             perceptual_weight,
             learning_rate,
             beta,
-            compute_fid=False
+            compute_fid=False,
+            fid_feature=2048,
     ):
         """Initialize VQVAE model.
 
@@ -43,6 +44,7 @@ class VQVAE(pl.LightningModule):
             learning_rate: Learning rate for optimization
             beta: Beta parameter for optimizer
             compute_fid: Whether to compute FID metric
+            fid_feature: Inception feature size for reconstruction FID
         """
         super().__init__()
 
@@ -52,6 +54,7 @@ class VQVAE(pl.LightningModule):
         self.decay = decay
         self.perceptual_weight = perceptual_weight
         self.compute_fid = compute_fid
+        self.fid_feature = int(fid_feature)
         self._viz_train = None
         self._viz_val = None
         self._viz_test = None
@@ -91,9 +94,17 @@ class VQVAE(pl.LightningModule):
         self.lpips = LPIPS() if self.perceptual_weight > 0 else None
 
         if self.compute_fid:
-            self.test_fid = FrechetInceptionDistance(feature=64, normalize=True)
+            self.val_rfid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
+            self.test_fid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
         else:
+            self.val_rfid = None
             self.test_fid = None
+        for metric in (self.val_rfid, self.test_fid):
+            if metric is None:
+                continue
+            metric.eval()
+            for p in metric.parameters():
+                p.requires_grad = False
 
         # Separate metric instances per split avoid state leakage and let us
         # control what shows up in the progress bar.
@@ -214,14 +225,6 @@ class VQVAE(pl.LightningModule):
         # Compute total loss
         total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
 
-        # Special handling for test metrics
-        if prefix == 'test':
-            if self.test_fid is not None:
-                x_recon_fid = torch.clamp(recon_raw, 0, 1)
-                x_fid = torch.clamp(x, 0, 1)
-                self.test_fid.update(x_recon_fid, real=False)
-                self.test_fid.update(x_fid, real=True)
-
         # Always synchronize epoch metrics so DDP runs do not emit reduction warnings.
         log_kwargs = dict(
             on_step=prefix == 'train',
@@ -244,6 +247,13 @@ class VQVAE(pl.LightningModule):
         else:
             x_dn = ((x + 1.0) / 2.0).clamp(0.0, 1.0)
             recon_dn = ((recon_raw + 1.0) / 2.0).clamp(0.0, 1.0)
+
+        if prefix == 'val' and self.val_rfid is not None:
+            self.val_rfid.update(x_dn, real=True)
+            self.val_rfid.update(recon_dn, real=False)
+        elif prefix == 'test' and self.test_fid is not None:
+            self.test_fid.update(x_dn, real=True)
+            self.test_fid.update(recon_dn, real=False)
         ssim = None
         if prefix == 'train':
             psnr = self.train_psnr(recon_dn, x_dn)
@@ -287,7 +297,16 @@ class VQVAE(pl.LightningModule):
         self._viz_val = (metrics['x'], metrics['x_recon'])
         return metrics
 
+    def on_validation_epoch_start(self):
+        if self.val_rfid is not None:
+            self.val_rfid = self.val_rfid.to(self.device)
+            self.val_rfid.reset()
+
     def on_validation_epoch_end(self):
+        if self.val_rfid is not None:
+            rfid_score = self.val_rfid.compute()
+            self.log('val/rfid', rfid_score, sync_dist=True)
+            self.val_rfid.reset()
         if self._viz_val is not None:
             x, x_recon = self._viz_val
             self._log_images(x, x_recon, split='val')
@@ -296,7 +315,10 @@ class VQVAE(pl.LightningModule):
     def on_test_epoch_start(self):
         """Reset test-only metrics before aggregating over the full test set."""
         self._viz_test = None
+        if self.val_rfid is not None:
+            self.val_rfid.reset()
         if self.test_fid is not None:
+            self.test_fid = self.test_fid.to(self.device)
             self.test_fid.reset()
 
     def test_step(self, batch, batch_idx):

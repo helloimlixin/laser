@@ -1,5 +1,5 @@
-# AR Transformer Training Configuration
-# Usage: python train_ar.py token_cache_path=/path/to/tokens_cache.pt
+# Maintained stage-2 config
+# Usage: python train_s2.py token_cache_path=/path/to/tokens_cache.pt
 
 # =============================================================================
 # Sparse prior training requires a token cache produced by the maintained
@@ -14,12 +14,13 @@ seed: 42
 output_dir: outputs/ar
 
 # =============================================================================
-# AR Transformer Model Configuration
+# Stage-2 Model Configuration
 # =============================================================================
 ar:
-  # Training path:
-  # - sparse_spatial_depth: quantized sparse-token spatial+depth prior
-  # - sparse_mingpt: quantized sparse-token flat minGPT prior
+  # Maintained training path:
+  # - sparse_spatial_depth / spatial_depth: sparse-token spatial+depth prior
+  # - gpt / mingpt: simple GPT over the flattened quantized token stream
+  #   (set ar.window_sites > 0 for local sliding-window attention on longer grids)
   type: sparse_spatial_depth
 
   # Vocabulary size. Leave null to auto-resolve from sparse-token cache metadata.
@@ -29,6 +30,7 @@ ar:
   # these vocab settings define the atom/bin split.
   atom_vocab_size: null
   coeff_vocab_size: null
+  window_sites: 0
   n_global_spatial_tokens: 0
   autoregressive_coeffs: true
 
@@ -55,6 +57,9 @@ ar:
   coeff_loss_weight: 1.0
   coeff_depth_weighting: none
   coeff_focal_gamma: 0.0
+  # For real-valued autoregressive coefficients, prefer recon_mse for
+  # generation-focused runs. gt_atom_recon_mse reconstructs with ground-truth
+  # atom supports and can mismatch unconditional sampling.
   coeff_loss_type: auto
   coeff_huber_delta: 0.5
 
@@ -63,7 +68,7 @@ ar:
   sample_coeff_mode: gaussian
 
 # =============================================================================
-# AR Training Configuration
+# Stage-2 Training Configuration
 # =============================================================================
 train_ar:
   batch_size: 256
@@ -78,6 +83,10 @@ train_ar:
   validation_split: 0.05
   test_split: 0.05
   max_items: 0
+  # Optional latent crop for stage-2 training. When set, stage 2 trains on
+  # fixed HxW token crops from each cached latent grid instead of full images.
+  crop_h_sites: 0
+  crop_w_sites: 0
   sample_every_n_steps: 0
   sample_every_n_epochs: 0
   sample_num_images: 4
@@ -89,21 +98,23 @@ train_ar:
   log_recon_every_n_steps: 500
 
 # =============================================================================
-# Dataset Configuration (same as LASER training)
+# Token-cache loader settings
+# Maintained stage-2 training reads dataset/image metadata from the token cache.
+# Only num_workers is used directly by train_s2.py.
 # =============================================================================
 data:
-  dataset: cifar10
-  data_dir: ${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}
-  batch_size: 64
+  dataset: null
+  data_dir: null
+  batch_size: null
   num_workers: 4
-  image_size: 128
-  mean: [0.5, 0.5, 0.5]
-  std: [0.5, 0.5, 0.5]
+  image_size: null
+  mean: null
+  std: null
 
 # =============================================================================
-# Wandb Logging
+# W&B Logging
 # =============================================================================
 wandb:
   project: laser-ar
-  name: sparse_token_prior
+  name: s2
   save_dir: outputs/wandb

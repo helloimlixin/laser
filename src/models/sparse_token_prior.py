@@ -11,7 +11,7 @@ import torchvision.utils
 
 from src.stage2_compat import decode_stage2_outputs, reconstruct_stage2_sparse_latent
 
-from .mingpt_prior import MinGPTQuantizedPrior, MinGPTQuantizedPriorConfig
+from .gpt_prior import GPTPrior, GPTPriorConfig
 from .spatial_prior import SpatialDepthPrior, SpatialDepthPriorConfig
 
 
@@ -20,6 +20,9 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
     if isinstance(prior, SpatialDepthPrior) and isinstance(cfg, SpatialDepthPriorConfig):
         return {
             "prior_architecture": "spatial_depth",
+            "prior_H": int(cfg.H),
+            "prior_W": int(cfg.W),
+            "prior_D": int(cfg.D),
             "prior_d_model": int(cfg.d_model),
             "prior_n_heads": int(cfg.n_heads),
             "prior_n_spatial_layers": int(cfg.n_spatial_layers),
@@ -38,9 +41,12 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
             "prior_coeff_prior_std": float(cfg.coeff_prior_std),
             "prior_coeff_min_std": float(cfg.coeff_min_std),
         }
-    if isinstance(prior, MinGPTQuantizedPrior) and isinstance(cfg, MinGPTQuantizedPriorConfig):
+    if isinstance(prior, GPTPrior) and isinstance(cfg, GPTPriorConfig):
         return {
-            "prior_architecture": "mingpt",
+            "prior_architecture": "gpt",
+            "prior_H": int(cfg.H),
+            "prior_W": int(cfg.W),
+            "prior_D": int(cfg.D),
             "prior_d_model": int(cfg.d_model),
             "prior_n_heads": int(cfg.n_heads),
             "prior_n_layers": int(cfg.n_layers),
@@ -48,6 +54,8 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
             "prior_dropout": float(cfg.dropout),
             "prior_atom_vocab_size": int(cfg.atom_vocab_size),
             "prior_coeff_vocab_size": int(cfg.coeff_vocab_size),
+            "prior_window_sites": int(cfg.window_sites),
+            "prior_n_global_spatial_tokens": int(cfg.n_global_spatial_tokens),
         }
     return {"prior_architecture": prior.__class__.__name__.lower()}
 
@@ -194,6 +202,8 @@ def build_sparse_prior_from_cache(
     total_vocab_size: Optional[int],
     atom_vocab_size: Optional[int],
     coeff_vocab_size: Optional[int],
+    grid_shape: Optional[Tuple[int, int, int]] = None,
+    window_sites: int = 0,
     d_model: int,
     n_heads: int,
     n_layers: int,
@@ -203,10 +213,15 @@ def build_sparse_prior_from_cache(
     autoregressive_coeffs: bool = True,
 ) -> nn.Module:
     """Build a maintained sparse-token prior from a cached token grid."""
-    H, W, D = token_cache_grid_shape(cache)
+    if grid_shape is None:
+        H, W, D = token_cache_grid_shape(cache)
+    else:
+        H, W, D = (int(grid_shape[0]), int(grid_shape[1]), int(grid_shape[2]))
     meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
     real_valued_coeffs = cache.get("coeffs_flat") is not None
     architecture = str(architecture).strip().lower()
+    if architecture == "mingpt":
+        architecture = "gpt"
 
     if real_valued_coeffs:
         if architecture != "spatial_depth":
@@ -275,17 +290,17 @@ def build_sparse_prior_from_cache(
                 autoregressive_coeffs=bool(autoregressive_coeffs),
             )
         )
-    if architecture == "mingpt":
-        if int(n_global_spatial_tokens) != 0:
-            raise ValueError("mingpt sparse prior does not support global spatial tokens.")
-        return MinGPTQuantizedPrior(
-            MinGPTQuantizedPriorConfig(
+    if architecture == "gpt":
+        return GPTPrior(
+            GPTPriorConfig(
                 vocab_size=total_vocab_size,
                 H=H,
                 W=W,
                 D=D,
                 atom_vocab_size=atom_vocab_size,
                 coeff_vocab_size=coeff_vocab_size,
+                window_sites=int(window_sites),
+                n_global_spatial_tokens=int(n_global_spatial_tokens),
                 d_model=int(d_model),
                 n_heads=int(n_heads),
                 n_layers=int(n_layers),
@@ -305,6 +320,8 @@ def build_sparse_prior_from_hparams(
     architecture = str(hparams.get("prior_architecture", "")).strip().lower()
     if not architecture:
         raise ValueError("Checkpoint hparams are missing prior_architecture")
+    if architecture == "mingpt":
+        architecture = "gpt"
     real_valued_coeffs = bool(hparams.get("prior_real_valued_coeffs", False))
     gaussian_coeffs = bool(hparams.get("prior_gaussian_coeffs", False))
     autoregressive_coeffs = bool(hparams.get("prior_autoregressive_coeffs", True))
@@ -323,7 +340,15 @@ def build_sparse_prior_from_hparams(
     if coeff_vocab_size in (None, 0):
         coeff_vocab_size = hparams.get("prior_coeff_vocab_size")
 
-    H, W, D = token_cache_grid_shape(cache)
+    saved_shape = (
+        hparams.get("prior_H"),
+        hparams.get("prior_W"),
+        hparams.get("prior_D"),
+    )
+    if all(v not in (None, 0) for v in saved_shape):
+        H, W, D = (int(saved_shape[0]), int(saved_shape[1]), int(saved_shape[2]))
+    else:
+        H, W, D = token_cache_grid_shape(cache)
     meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
     if real_valued_coeffs:
         atom_vocab_size = infer_sparse_atom_vocab_size(cache, atom_vocab_size=atom_vocab_size)
@@ -365,17 +390,19 @@ def build_sparse_prior_from_hparams(
             )
         )
 
-    if architecture == "mingpt":
+    if architecture == "gpt":
         if real_valued_coeffs:
-            raise ValueError("mingpt checkpoints do not support real-valued sparse coefficients.")
-        return MinGPTQuantizedPrior(
-            MinGPTQuantizedPriorConfig(
+            raise ValueError("gpt checkpoints do not support real-valued sparse coefficients.")
+        return GPTPrior(
+            GPTPriorConfig(
                 vocab_size=total_vocab_size,
                 H=H,
                 W=W,
                 D=D,
                 atom_vocab_size=atom_vocab_size,
                 coeff_vocab_size=coeff_vocab_size,
+                window_sites=int(hparams.get("prior_window_sites", 0)),
+                n_global_spatial_tokens=int(hparams.get("prior_n_global_spatial_tokens", 0)),
                 d_model=int(hparams["prior_d_model"]),
                 n_heads=int(hparams["prior_n_heads"]),
                 n_layers=int(hparams["prior_n_layers"]),
@@ -432,8 +459,51 @@ class SparseTokenPriorModule(pl.LightningModule):
         self.log_recon_every_n_steps = max(0, int(log_recon_every_n_steps))
         self._last_recon_logged_step = -1
         self._cached_val_batch = None
+        self._lr_base_lrs = ()
+        self._lr_total_steps = 1
         self.save_hyperparameters(ignore=["prior", "stage1_decoder_bundle"])
         self.save_hyperparameters(_prior_checkpoint_hparams(prior))
+
+    def _wandb_step(self, experiment=None, *, requested_step: Optional[int] = None) -> int:
+        step = int(self.global_step if requested_step is None else requested_step)
+        exp = experiment
+        if exp is None:
+            logger = getattr(self, "logger", None)
+            exp = getattr(logger, "experiment", None) if logger is not None else None
+        if exp is not None:
+            for attr in ("step", "_step"):
+                raw = getattr(exp, attr, None)
+                if raw is None:
+                    continue
+                try:
+                    step = max(step, int(raw))
+                except (TypeError, ValueError):
+                    continue
+        return step
+
+    def _wandb_epoch_end_step(self, experiment=None, *, requested_step: Optional[int] = None) -> int:
+        base = int(self.global_step if requested_step is None else requested_step)
+        return self._wandb_step(experiment, requested_step=base + 1)
+
+    def _lr_multiplier_for_step(self, step: int) -> float:
+        if self.warmup_steps <= 0 and self.min_lr_ratio >= 1.0:
+            return 1.0
+        total_steps = max(1, int(getattr(self, "_lr_total_steps", 1)))
+        warmup_steps = min(self.warmup_steps, max(0, total_steps - 1))
+        cur_step = max(0, int(step)) + 1
+        if warmup_steps > 0 and cur_step <= warmup_steps:
+            return max(0.01, cur_step / float(max(1, warmup_steps)))
+        progress = (cur_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
+
+    def _apply_scheduled_lrs(self, optimizer, step: int) -> None:
+        if not self._lr_base_lrs:
+            self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
+        scale = self._lr_multiplier_for_step(step)
+        for group, base_lr in zip(optimizer.param_groups, self._lr_base_lrs):
+            group["lr"] = float(base_lr) * float(scale)
 
     def _resolve_coeff_loss_type(self, requested: Optional[str]) -> Optional[str]:
         text = "" if requested is None else str(requested).strip().lower()
@@ -556,14 +626,14 @@ class SparseTokenPriorModule(pl.LightningModule):
                 )
             coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
 
-        loss = ce_loss + self.coeff_loss_weight * coeff_reg_loss
+        loss = self.atom_loss_weight * ce_loss + self.coeff_loss_weight * coeff_reg_loss
         atom_preds = atom_logits.argmax(dim=-1)
         atom_accuracy = (atom_preds == tok_grid).float().mean()
         coeff_mae = (pred_coeff - target_coeff).abs().mean()
 
         log_kwargs = dict(
             on_step=(prefix == "train"),
-            on_epoch=True,
+            on_epoch=(prefix != "train"),
             sync_dist=True,
             batch_size=bsz,
             prog_bar=(prefix != "test"),
@@ -586,25 +656,15 @@ class SparseTokenPriorModule(pl.LightningModule):
     def configure_optimizers(self):
         optimizer_cls = torch.optim.AdamW if self.weight_decay > 0 else torch.optim.Adam
         optimizer = optimizer_cls(self.prior.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        if self.warmup_steps <= 0 and self.min_lr_ratio >= 1.0:
-            return optimizer
+        trainer = getattr(self, "_trainer", None)
+        estimated_steps = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
+        self._lr_total_steps = max(1, int(estimated_steps or 1))
+        self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
+        return optimizer
 
-        estimated_steps = getattr(self.trainer, "estimated_stepping_batches", None)
-        total_steps = max(1, int(estimated_steps or 1))
-        warmup_steps = min(self.warmup_steps, max(0, total_steps - 1))
-        min_lr_ratio = self.min_lr_ratio
-
-        def lr_lambda(step: int) -> float:
-            cur_step = int(step) + 1
-            if warmup_steps > 0 and cur_step <= warmup_steps:
-                return max(0.01, cur_step / float(max(1, warmup_steps)))
-            progress = (cur_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
+        self._apply_scheduled_lrs(optimizer, step=int(getattr(self, "global_step", 0)))
+        optimizer.step(closure=optimizer_closure)
 
     def _shared_step(self, batch, prefix: str) -> torch.Tensor:
         if getattr(self.prior, "real_valued_coeffs", False):
@@ -637,7 +697,7 @@ class SparseTokenPriorModule(pl.LightningModule):
 
         log_kwargs = dict(
             on_step=(prefix == "train"),
-            on_epoch=True,
+            on_epoch=(prefix != "train"),
             sync_dist=True,
             batch_size=bsz,
             prog_bar=(prefix != "test"),
@@ -754,14 +814,16 @@ class SparseTokenPriorModule(pl.LightningModule):
         pred_grid = torch.nan_to_num(pred_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
         import wandb as _wandb
+        step = self._wandb_epoch_end_step(experiment)
         experiment.log(
             {
                 "val/recon_images": [
                     _wandb.Image(gt_grid.permute(1, 2, 0).numpy(), caption="Ground Truth"),
                     _wandb.Image(pred_grid.permute(1, 2, 0).numpy(), caption="Predicted"),
                 ],
-                "global_step": self.global_step,
+                "global_step": step,
             },
+            step=step,
         )
 
     def test_step(self, batch, batch_idx):

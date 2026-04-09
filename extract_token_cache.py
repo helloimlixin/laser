@@ -11,6 +11,8 @@ import lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from src.cache_sort import sort_sparse_pairs, sort_token_pairs
+from src.checkpoint_io import load_lightning_module
 from src.data.celeba import CelebADataModule
 from src.data.cifar10 import CIFAR10DataModule
 from src.data.config import DataConfig
@@ -168,6 +170,7 @@ def _extract_cache(
 
             if real_valued:
                 support, values, batch_latent_hw = model.encode_to_atoms_and_coeffs(images)
+                support, values = sort_sparse_pairs(support, values)
                 # support: [B, H, W, D] atom ids, values: [B, H, W, D] coeffs
                 flat_atoms = support.view(support.size(0), -1).to(torch.int32).cpu()
                 flat_coeffs = values.view(values.size(0), -1).to(torch.float32).cpu()
@@ -182,6 +185,7 @@ def _extract_cache(
                     coeff_quantization=coeff_quantization,
                     coeff_mu=coeff_mu,
                 )
+                tokens = sort_token_pairs(tokens)
                 flat = tokens.view(tokens.size(0), -1).to(torch.int32).cpu()
                 all_tokens.append(flat)
                 current_shape = (int(tokens.shape[1]), int(tokens.shape[2]), int(tokens.shape[3]))
@@ -237,6 +241,10 @@ def _token_cache_meta(
             device=torch.device("cpu"),
             dtype=torch.float32,
         ).cpu()
+    backbone = str(getattr(model, "backbone", getattr(model.hparams, "backbone", "simple")))
+    attn_resolutions = tuple(
+        int(v) for v in getattr(model, "attn_resolutions", getattr(model.hparams, "attn_resolutions", ()))
+    )
     meta = {
         "version": 1,
         "dataset": str(config.dataset),
@@ -253,7 +261,23 @@ def _token_cache_meta(
         "embedding_dim": int(model.bottleneck.embedding_dim),
         "latent_hw": (int(latent_hw[0]), int(latent_hw[1])),
         "coef_max": float(args.coeff_max),
+        "backbone": backbone,
+        "num_downsamples": int(getattr(model, "num_downsamples", getattr(model.hparams, "num_downsamples", 2))),
+        "attn_resolutions": attn_resolutions,
+        "dropout": float(getattr(model, "dropout", getattr(model.hparams, "dropout", 0.0))),
+        "max_ch_mult": int(getattr(model, "max_ch_mult", getattr(model.hparams, "max_ch_mult", 2))),
+        "decoder_extra_residual_layers": int(
+            getattr(
+                model,
+                "decoder_extra_residual_layers",
+                getattr(model.hparams, "decoder_extra_residual_layers", 1),
+            )
+        ),
+        "use_mid_attention": bool(
+            getattr(model, "use_mid_attention", getattr(model.hparams, "use_mid_attention", False))
+        ),
         "stage1_checkpoint": str(Path(args.stage1_checkpoint).expanduser().resolve()),
+        "support_order": "atom_id",
     }
     if real_valued:
         meta["quantize_sparse_coeffs"] = False
@@ -318,9 +342,11 @@ def main():
         num_workers=int(args.num_workers),
     )
 
-    model = LASER.load_from_checkpoint(
+    model = load_lightning_module(
+        LASER,
         args.stage1_checkpoint,
         map_location="cpu",
+        strict=False,
         compute_fid=False,
     )
     model.eval().to(device)

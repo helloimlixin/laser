@@ -1,23 +1,3 @@
-"""Backward-compatible shim for the spatial-depth transformer implementation."""
+"""Compatibility wrapper for the maintained spatial-depth prior in `src`."""
 
-try:
-    from spatial_prior import (
-        SpatialDepthPrior,
-        SpatialDepthPriorConfig,
-        build_spatial_depth_prior_config,
-        soft_clamp,
-    )
-except ModuleNotFoundError:
-    from scratch.spatial_prior import (
-        SpatialDepthPrior,
-        SpatialDepthPriorConfig,
-        build_spatial_depth_prior_config,
-        soft_clamp,
-    )
-
-__all__ = [
-    "SpatialDepthPrior",
-    "SpatialDepthPriorConfig",
-    "build_spatial_depth_prior_config",
-    "soft_clamp",
-]
+from src.models.spatial_prior import *  # noqa: F401,F403

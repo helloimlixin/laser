@@ -1,3 +1,6 @@
+import os
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,14 +9,36 @@ import torchvision
 from contextlib import nullcontext
 from typing import Optional, Sequence, Tuple
 
-from .encoder import Encoder
-from .decoder import Decoder
+from .encoder import Encoder as SimpleEncoder
+from .decoder import Decoder as SimpleDecoder
 from .bottleneck import DictionaryLearning, SparseCodes
 from .lpips import LPIPS
+from .rq_ae import Decoder as VQGANDecoder
+from .rq_ae import Encoder as VQGANEncoder
 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
 import wandb
+
+
+def _canonical_backbone(raw) -> str:
+    name = "simple" if raw is None else str(raw).strip().lower()
+    if name in {"simple", "legacy", "cnn", "vqvae"}:
+        return "simple"
+    if name in {"vqgan", "ddpm", "unet", "rqvae", "attn", "attention"}:
+        return "vqgan"
+    raise ValueError(f"Unsupported LASER backbone: {raw!r}")
+
+
+def _canonical_attn_resolutions(values) -> Tuple[int, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        raw = values.strip()
+        if not raw:
+            return ()
+        return tuple(sorted({int(part) for part in raw.split(",") if part.strip()}))
+    return tuple(sorted({int(v) for v in values}))
 
 class LASER(pl.LightningModule):
     def __init__(
@@ -28,9 +53,18 @@ class LASER(pl.LightningModule):
             commitment_cost,
             learning_rate,
             beta,
+            backbone="simple",
+            resolution=None,
+            num_downsamples=2,
+            attn_resolutions=(),
+            dropout=0.0,
+            max_ch_mult=2,
+            decoder_extra_residual_layers=1,
+            use_mid_attention=True,
             bottleneck_loss_weight=0.5,
             perceptual_weight=1.0,
             compute_fid=False,
+            fid_feature=2048,
             log_images_every_n_steps=100,
             diag_log_interval=0,
             enable_val_latent_visuals=False,
@@ -57,12 +91,21 @@ class LASER(pl.LightningModule):
             sparsity_level: Number of non-zero coefficients in sparse coding
             num_residual_blocks: Number of residual blocks
             num_residual_hiddens: Number of hidden units in residual blocks
+            backbone: encoder/decoder family, either 'simple' or VQGAN/DDPM-style aliases
+            resolution: input image resolution for the VQGAN-style backbone
+            num_downsamples: number of spatial downsampling stages for the VQGAN-style backbone
+            attn_resolutions: spatial resolutions that should include self-attention blocks
+            dropout: residual-block dropout for the VQGAN-style backbone
+            max_ch_mult: cap on channel multipliers for the VQGAN-style backbone
+            decoder_extra_residual_layers: extra decoder residual blocks per level for the VQGAN-style backbone
+            use_mid_attention: whether to keep the bottleneck self-attention block enabled
             commitment_cost: Commitment cost for bottleneck
             learning_rate: Learning rate for encoder/decoder
             beta: Beta parameter for Adam optimizer
             bottleneck_loss_weight: Weight for bottleneck loss term in total loss
             perceptual_weight: Weight for perceptual loss
             compute_fid: Whether to compute FID
+            fid_feature: Inception feature size for reconstruction FID
             log_images_every_n_steps: image logging cadence; 0 disables image logging
             diag_log_interval: diagnostic logging cadence; 0 disables extra train diagnostics
             enable_val_latent_visuals: whether to run the extra validation PCA/heatmap pass
@@ -73,7 +116,7 @@ class LASER(pl.LightningModule):
             patch_reconstruction: patch stitching rule, either 'center_crop' or 'hann'
             coef_max: optional hard bound applied to sparse coefficients during support refinement
             bounded_omp_refine_steps: projected refinement steps for bounded OMP coefficient updates
-            sparsity_reg_weight: L1 regularization weight on sparse coefficients
+            sparsity_reg_weight: legacy diagnostic weight for sparse coefficient magnitude
             coherence_weight: weight for dictionary coherence regularization
         """
         super(LASER, self).__init__()
@@ -110,6 +153,7 @@ class LASER(pl.LightningModule):
         self.perceptual_weight = perceptual_weight
         self.log_images_every_n_steps = max(int(log_images_every_n_steps), 0)
         self.compute_fid = compute_fid
+        self.fid_feature = int(fid_feature)
         self.sparsity_reg_weight = sparsity_reg_weight
         self.bottleneck_loss_weight = bottleneck_loss_weight
         self.coherence_weight = coherence_weight
@@ -117,21 +161,75 @@ class LASER(pl.LightningModule):
         self.enable_val_latent_visuals = bool(enable_val_latent_visuals)
         self.warmup_steps = max(int(warmup_steps), 0)
         self.min_lr_ratio = float(min_lr_ratio)
+        self.backbone = _canonical_backbone(backbone)
+        self.resolution = None if resolution is None else int(resolution)
+        self.num_downsamples = int(num_downsamples)
+        self.attn_resolutions = _canonical_attn_resolutions(attn_resolutions)
+        self.dropout = float(dropout)
+        self.max_ch_mult = int(max_ch_mult)
+        self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
+        self.use_mid_attention = bool(use_mid_attention)
         if dict_learning_rate is not None and float(dict_learning_rate) <= 0.0:
             dict_learning_rate = None
+        if self.num_downsamples < 0:
+            raise ValueError(f"num_downsamples must be non-negative, got {self.num_downsamples}")
+        if self.max_ch_mult <= 0:
+            raise ValueError(f"max_ch_mult must be positive, got {self.max_ch_mult}")
+        if self.decoder_extra_residual_layers < 0:
+            raise ValueError(
+                "decoder_extra_residual_layers must be non-negative, "
+                f"got {self.decoder_extra_residual_layers}"
+            )
+        if self.backbone == "vqgan" and (self.resolution is None or self.resolution <= 0):
+            raise ValueError("resolution must be a positive integer when backbone='vqgan'")
 
-        # Initialize encoder
-        self.encoder = Encoder(
-            in_channels=in_channels,
-            num_hiddens=num_hiddens,
-            num_residual_blocks=num_residual_blocks,
-            num_residual_hiddens=num_residual_hiddens
-        )
-
-        self.pre_bottleneck = nn.Conv2d(in_channels=num_hiddens,
-                                        out_channels=embedding_dim,
-                                        kernel_size=1,
-                                        stride=1)
+        if self.backbone == "simple":
+            self.encoder = SimpleEncoder(
+                in_channels=in_channels,
+                num_hiddens=num_hiddens,
+                num_residual_blocks=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+            )
+            self.pre_bottleneck = nn.Conv2d(
+                in_channels=num_hiddens,
+                out_channels=embedding_dim,
+                kernel_size=1,
+                stride=1,
+            )
+            self.post_bottleneck = nn.Conv2d(
+                in_channels=embedding_dim,
+                out_channels=num_hiddens,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            )
+            self.decoder = SimpleDecoder(
+                in_channels=num_hiddens,
+                num_hiddens=num_hiddens,
+                num_residual_blocks=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+            )
+        else:
+            ch_mult = tuple(min(2 ** i, self.max_ch_mult) for i in range(self.num_downsamples + 1))
+            enc_dec_kwargs = dict(
+                ch=num_hiddens,
+                out_ch=in_channels,
+                ch_mult=ch_mult,
+                num_res_blocks=num_residual_blocks,
+                attn_resolutions=self.attn_resolutions,
+                dropout=self.dropout,
+                resamp_with_conv=True,
+                in_channels=in_channels,
+                resolution=self.resolution,
+                z_channels=embedding_dim,
+                use_mid_attention=self.use_mid_attention,
+            )
+            self.encoder = VQGANEncoder(**enc_dec_kwargs)
+            self.pre_bottleneck = nn.Identity()
+            self.post_bottleneck = nn.Identity()
+            self.decoder = VQGANDecoder(
+                **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
+            )
 
         # Initialize Dictionary Learning bottleneck
         self.bottleneck = DictionaryLearning(
@@ -146,20 +244,6 @@ class LASER(pl.LightningModule):
             patch_reconstruction=patch_reconstruction,
             coef_max=coef_max,
             bounded_omp_refine_steps=bounded_omp_refine_steps,
-        )
-
-        self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
-                                         out_channels=num_hiddens,
-                                         kernel_size=3,
-                                         stride=1,
-                                         padding=1)
-
-        # Initialize decoder
-        self.decoder = Decoder(
-            in_channels=num_hiddens,
-            num_hiddens=num_hiddens,
-            num_residual_blocks=num_residual_blocks,
-            num_residual_hiddens=num_residual_hiddens
         )
 
         # Initialize LPIPS for perceptual loss only if used
@@ -177,14 +261,19 @@ class LASER(pl.LightningModule):
         self.val_ssim = StructuralSimilarityIndexMeasure()
         self.test_ssim = StructuralSimilarityIndexMeasure()
 
-        # Initialize metrics for Frechet Inception Distance (FID Score)
+        # Initialize reconstruction FID metrics per split so W&B can track
+        # stage-1 validation rFID without leaking metric state across splits.
         if self.compute_fid:
-            self.test_fid = FrechetInceptionDistance(feature=64, normalize=True)
+            self.val_rfid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
+            self.test_fid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
         else:
+            self.val_rfid = None
             self.test_fid = None
-        if self.test_fid is not None:
-            self.test_fid.eval()
-            for p in self.test_fid.parameters():
+        for metric in (self.val_rfid, self.test_fid):
+            if metric is None:
+                continue
+            metric.eval()
+            for p in metric.parameters():
                 p.requires_grad = False
 
         # Cache for validation visualization
@@ -192,6 +281,10 @@ class LASER(pl.LightningModule):
         # Dictionary atom snapshots for trajectory animation
         self._dict_snapshots = []
         self._dict_snapshot_steps = []
+        # Dedupe manual media logs per prefix and optimizer step.
+        self._media_log_steps = set()
+        self._lr_base_lrs = ()
+        self._lr_total_steps = 1
 
         # Save hyperparameters
         self.save_hyperparameters()
@@ -220,6 +313,74 @@ class LASER(pl.LightningModule):
     def _trainer_ref(self):
         return self.__dict__.get("_trainer", None)
 
+    def _is_log_rank_zero(self):
+        trainer = self._trainer_ref()
+        if trainer is not None:
+            flag = getattr(trainer, "is_global_zero", None)
+            if flag is not None:
+                return bool(flag)
+        try:
+            return int(getattr(self, "global_rank", 0)) == 0
+        except Exception:
+            pass
+        for env_key in ("RANK", "SLURM_PROCID"):
+            raw = os.environ.get(env_key)
+            if raw is None:
+                continue
+            try:
+                return int(raw) == 0
+            except ValueError:
+                continue
+        return True
+
+    def _claim_media_log(self, prefix, step):
+        key = (str(prefix), int(step))
+        if key in self._media_log_steps:
+            return False
+        self._media_log_steps.add(key)
+        return True
+
+    def _wandb_step(self, experiment=None, *, requested_step: Optional[int] = None) -> int:
+        step = int(self.global_step if requested_step is None else requested_step)
+        exp = experiment
+        if exp is None:
+            logger = getattr(self, "logger", None)
+            exp = getattr(logger, "experiment", None) if logger is not None else None
+        if exp is not None:
+            for attr in ("step", "_step"):
+                raw = getattr(exp, attr, None)
+                if raw is None:
+                    continue
+                try:
+                    step = max(step, int(raw))
+                except (TypeError, ValueError):
+                    continue
+        return step
+
+    def _wandb_epoch_end_step(self, experiment=None, *, requested_step: Optional[int] = None) -> int:
+        base = int(self.global_step if requested_step is None else requested_step)
+        return self._wandb_step(experiment, requested_step=base + 1)
+
+    def _lr_multiplier_for_step(self, step: int) -> float:
+        if self.warmup_steps <= 0 and self.min_lr_ratio >= 1.0:
+            return 1.0
+        total_steps = max(1, int(getattr(self, "_lr_total_steps", 1)))
+        warmup = min(self.warmup_steps, max(0, total_steps - 1))
+        step = max(0, int(step))
+        if warmup > 0 and step < warmup:
+            return max(self.min_lr_ratio, step / float(max(1, warmup)))
+        progress = (step - warmup) / float(max(1, total_steps - warmup))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
+
+    def _apply_scheduled_lrs(self, optimizer, step: int) -> None:
+        if not self._lr_base_lrs:
+            self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
+        scale = self._lr_multiplier_for_step(step)
+        for group, base_lr in zip(optimizer.param_groups, self._lr_base_lrs):
+            group["lr"] = float(base_lr) * float(scale)
+
     def on_fit_start(self):
         self.bottleneck.normalize_dictionary_()
 
@@ -231,6 +392,7 @@ class LASER(pl.LightningModule):
         # Renormalize after the step: Lightning runs zero_grad (and on_before_zero_grad)
         # after forward but before backward inside the optimizer closure, so in-place
         # dictionary updates there break autograd for the current batch.
+        self._apply_scheduled_lrs(optimizer, step=int(getattr(self, "global_step", 0)))
         optimizer.step(closure=optimizer_closure)
         self.bottleneck.normalize_dictionary_()
 
@@ -465,11 +627,12 @@ class LASER(pl.LightningModule):
             coherence_loss = recon_raw.new_zeros(())
 
         # Total loss
+        # Sparse codes are inferred outside autograd, so sparsity_loss is a
+        # diagnostic scalar rather than an optimization term.
         total_loss = (
             recon_loss +
             self.bottleneck_loss_weight * bottleneck_loss +
             self.perceptual_weight * perceptual_loss +
-            self.sparsity_reg_weight * sparsity_loss +
             self.coherence_weight * coherence_loss
         )
         
@@ -485,6 +648,13 @@ class LASER(pl.LightningModule):
         else:
             x_dn = (x_clean + 1.0) / 2.0
             recon_dn = (recon_clean + 1.0) / 2.0
+
+        if prefix == 'val' and self.val_rfid is not None:
+            self.val_rfid.update(x_dn, real=True)
+            self.val_rfid.update(recon_dn, real=False)
+        elif prefix == 'test' and self.test_fid is not None:
+            self.test_fid.update(x_dn, real=True)
+            self.test_fid.update(recon_dn, real=False)
 
         ssim = None
         if prefix == 'train':
@@ -502,13 +672,18 @@ class LASER(pl.LightningModule):
         
         # Keep epoch metrics synchronized across ranks whenever DDP is active.
         # Relying on a local world_size probe here has been brittle on cluster runs.
-        log_kwargs = dict(on_step=prefix == 'train', on_epoch=True, sync_dist=True)
+        log_kwargs = dict(
+            on_step=(prefix == 'train'),
+            on_epoch=(prefix != 'train'),
+            sync_dist=True,
+        )
         self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
         self.log(f'{prefix}/bottleneck_loss', bottleneck_loss, **log_kwargs)
         self.log(f'{prefix}/weighted_bottleneck_loss', self.bottleneck_loss_weight * bottleneck_loss, **log_kwargs)
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
         self.log(f'{prefix}/sparsity_loss', sparsity_loss, **log_kwargs)
+        self.log(f'{prefix}/weighted_sparsity_loss', self.sparsity_reg_weight * sparsity_loss, **log_kwargs)
         self.log(f'{prefix}/coherence_loss', coherence_loss, **log_kwargs)
         if psnr is not None:
             self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
@@ -638,10 +813,14 @@ class LASER(pl.LightningModule):
         fig.savefig(png_path, dpi=120)
         plt.close(fig)
 
-        experiment.log({
-            "val/dictionary_scatter": wandb.Image(png_path),
-            "global_step": self.global_step,
-        })
+        step = self._wandb_epoch_end_step(experiment)
+        experiment.log(
+            {
+                "val/dictionary_scatter": wandb.Image(png_path),
+                "global_step": step,
+            },
+            step=step,
+        )
         try:
             os.unlink(png_path)
         except OSError:
@@ -749,10 +928,14 @@ class LASER(pl.LightningModule):
         anim.save(gif_path, writer=PillowWriter(fps=2))
         plt.close(fig)
 
-        experiment.log({
-            "val/dictionary_atom_trajectories": wandb.Video(gif_path, format="gif"),
-            "global_step": self.global_step,
-        })
+        step = self._wandb_epoch_end_step(experiment)
+        experiment.log(
+            {
+                "val/dictionary_atom_trajectories": wandb.Video(gif_path, format="gif"),
+                "global_step": step,
+            },
+            step=step,
+        )
         try:
             os.unlink(gif_path)
         except OSError:
@@ -775,8 +958,9 @@ class LASER(pl.LightningModule):
             self._maybe_store_val_batch(batch)
         loss, recon, x = self.compute_metrics(batch, prefix='val')
         
-        # Log images periodically
-        if self._should_log_images(batch_idx):
+        # When latent visuals are enabled, batch 0 is logged in richer form at
+        # validation epoch end, so skip the duplicate simple recon grid here.
+        if self._should_log_images(batch_idx) and not (self.enable_val_latent_visuals and batch_idx == 0):
             self.log_images(x, recon, prefix='val')
             self._ddp_barrier_if_needed()
         
@@ -785,19 +969,7 @@ class LASER(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         """Test step."""
         loss, recon, x = self.compute_metrics(batch, prefix='test')
-        
-        # Update FID if enabled
-        if self.test_fid is not None:
-            # Ensure the TorchMetrics module lives on the same device as the current rank
-            fid_device = x.device
-            self.test_fid = self.test_fid.to(fid_device)
-            x_fid = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
-            recon_fid = torch.nan_to_num(recon.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
-            x_fid = ((x_fid + 1.0) / 2.0).clamp_(0.0, 1.0).to(fid_device, dtype=torch.float32)
-            recon_fid = ((recon_fid + 1.0) / 2.0).clamp_(0.0, 1.0).to(fid_device, dtype=torch.float32)
-            self.test_fid.update(x_fid, real=True)
-            self.test_fid.update(recon_fid, real=False)
-        
+
         # Log images periodically
         if self._should_log_images(batch_idx):
             self.log_images(x, recon, prefix='test')
@@ -815,10 +987,13 @@ class LASER(pl.LightningModule):
     def log_images(self, x, recon, prefix='val', max_images=8):
         """Log reconstruction images to wandb."""
         # Only log from rank zero in DDP to avoid multi-process logger contention
-        if getattr(self._trainer_ref(), "is_global_zero", False) is False:
+        if not self._is_log_rank_zero():
             return
         # If logger is disabled or doesn't support experiment logging, skip
         if not getattr(self, "logger", None) or not hasattr(self.logger, "experiment") or not hasattr(self.logger.experiment, "log"):
+            return
+        step = self._wandb_step()
+        if not self._claim_media_log(prefix, step):
             return
         
         # Take a small fixed subset to keep W&B logging cheap.
@@ -850,19 +1025,20 @@ class LASER(pl.LightningModule):
         recon_grid = recon_grid.cpu().numpy().transpose(1, 2, 0)
         
         # Log to wandb
-        self.logger.experiment.log({
-            f"{prefix}/images": [
-                wandb.Image(x_grid, caption="Original"),
-                wandb.Image(recon_grid, caption="Reconstructed")
-            ],
-            f"{prefix}/reconstruction_error": F.mse_loss(recon, x).item(),
-            "global_step": self.global_step
-        })
+        self.logger.experiment.log(
+            {
+                f"{prefix}/images": [
+                    wandb.Image(x_grid, caption="Original"),
+                    wandb.Image(recon_grid, caption="Reconstructed")
+                ],
+                f"{prefix}/reconstruction_error": F.mse_loss(recon, x).item(),
+                "global_step": step
+            },
+            step=step,
+        )
 
     def configure_optimizers(self):
         """Configure optimizers with optional cosine LR schedule."""
-        import math
-
         main_params = list(self.encoder.parameters()) + \
                       list(self.pre_bottleneck.parameters()) + \
                       list(self.post_bottleneck.parameters()) + \
@@ -882,31 +1058,11 @@ class LASER(pl.LightningModule):
             param_groups,
             betas=(self.beta, 0.999),
         )
-
-        # Cosine annealing with optional warmup.
-        total_steps = self.trainer.estimated_stepping_batches
-        warmup = self.warmup_steps
-        min_ratio = self.min_lr_ratio
-
-        if total_steps <= 0:
-            return optimizer
-
-        def lr_lambda(step):
-            if step < warmup:
-                return max(min_ratio, step / max(warmup, 1))
-            progress = (step - warmup) / max(total_steps - warmup, 1)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_ratio + (1.0 - min_ratio) * cosine
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
+        trainer = self._trainer_ref()
+        estimated_steps = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
+        self._lr_total_steps = max(1, int(estimated_steps or 1))
+        self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
+        return optimizer
     
     def _maybe_store_val_batch(self, batch):
         """Cache a small val batch (CPU) for visualization."""
@@ -1024,17 +1180,25 @@ class LASER(pl.LightningModule):
             log_payload.setdefault("val/sparse_heatmap", []).append(wandb.Image(sparse_rgb, caption=cap))
             log_payload.setdefault("val/recon_error_map", []).append(wandb.Image(error_rgb, caption=cap))
         if log_payload:
-            log_payload["global_step"] = self.global_step
-            self.logger.experiment.log(log_payload)
+            step = self._wandb_epoch_end_step()
+            log_payload["global_step"] = step
+            self.logger.experiment.log(log_payload, step=step)
         self.train()
         self._val_vis_batch = None
 
     def on_validation_epoch_start(self):
         super().on_validation_epoch_start()
         self._val_vis_batch = None
+        if self.val_rfid is not None:
+            self.val_rfid = self.val_rfid.to(self.device)
+            self.val_rfid.reset()
 
     def on_validation_epoch_end(self):
         super().on_validation_epoch_end()
+        if self.val_rfid is not None:
+            rfid_score = self.val_rfid.compute()
+            self.log('val/rfid', rfid_score, sync_dist=True)
+            self.val_rfid.reset()
         if self.enable_val_latent_visuals:
             self._log_val_latent_visuals()
             self._snapshot_dictionary()

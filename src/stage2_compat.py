@@ -1,20 +1,14 @@
-"""Compatibility helpers for maintained stage-2 training/sampling.
+"""Compatibility helpers for maintained stage-2 training/sampling."""
 
-These helpers bridge the newer Lightning entrypoints with scratch-era
-token caches and stage-1 checkpoints so we can decode generated token grids
-without routing everything back through `scratch/sample.py`.
-"""
-
-import importlib.util
 import math
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Set, Tuple, Union
 
 import torch
 
-from .models.laser import LASER
+from .checkpoint_io import build_lightning_module, extract_state_dict, load_torch_payload
+from .models.rq_ae import PatchDictionaryLearningTokenized, RQAE
 from .stage2_paths import infer_latest_stage1_checkpoint
 
 
@@ -28,63 +22,52 @@ class Stage1DecodeBundle:
     coeff_bin_values: Optional[torch.Tensor]
 
 
-_SCRATCH_PROTO_MODULE = None
+def _bundle_patch_layout(bundle: Stage1DecodeBundle) -> tuple[bool, int]:
+    model = bundle.model
+    bottleneck = getattr(model, "bottleneck", None)
+    if bottleneck is not None:
+        patch_based = getattr(bottleneck, "patch_based", None)
+        if patch_based is None:
+            patch_based = isinstance(bottleneck, PatchDictionaryLearningTokenized)
+        patch_stride = int(getattr(bottleneck, "patch_stride", 1) or 1)
+        return bool(patch_based), max(1, patch_stride)
+
+    hparams = getattr(model, "hparams", None)
+    if hparams is not None:
+        patch_based = bool(getattr(hparams, "patch_based", False))
+        patch_stride = int(getattr(hparams, "patch_stride", 1) or 1)
+        return patch_based, max(1, patch_stride)
+
+    return False, 1
 
 
-def load_torch_payload(path):
-    resolved = Path(path).expanduser().resolve()
-    try:
-        return torch.load(resolved, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(resolved, map_location="cpu")
+def _resolve_decode_latent_hw(
+    bundle: Stage1DecodeBundle,
+    *,
+    token_hw: Tuple[int, int],
+    latent_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int]:
+    token_h, token_w = int(token_hw[0]), int(token_hw[1])
+    patch_based, patch_stride = _bundle_patch_layout(bundle)
+    requested_hw = None if latent_hw is None else (int(latent_hw[0]), int(latent_hw[1]))
 
+    if not patch_based:
+        if requested_hw is not None:
+            return requested_hw
+        return (token_h, token_w)
 
-def extract_state_dict(payload):
-    if isinstance(payload, dict):
-        if isinstance(payload.get("state_dict"), dict):
-            return payload["state_dict"]
-        module_blob = payload.get("module")
-        if isinstance(module_blob, dict):
-            return module_blob.get("state_dict", module_blob)
-        for key in ("model", "ema", "model_state_dict", "net", "generator"):
-            blob = payload.get(key)
-            if isinstance(blob, dict):
-                return blob
-    return payload
+    if requested_hw is not None and requested_hw != (token_h, token_w):
+        return requested_hw
 
+    bundle_hw = bundle.latent_hw
+    if bundle_hw is not None:
+        bundle_hw = (int(bundle_hw[0]), int(bundle_hw[1]))
+        train_token_h = int(math.ceil(bundle_hw[0] / float(patch_stride)))
+        train_token_w = int(math.ceil(bundle_hw[1] / float(patch_stride)))
+        if (token_h, token_w) == (train_token_h, train_token_w):
+            return bundle_hw
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _load_scratch_proto_module():
-    global _SCRATCH_PROTO_MODULE
-    if _SCRATCH_PROTO_MODULE is not None:
-        return _SCRATCH_PROTO_MODULE
-
-    repo_root = _repo_root()
-    scratch_root = repo_root / "scratch"
-    module_path = _repo_root() / "scratch" / "proto.py"
-    if not module_path.exists():
-        raise FileNotFoundError(f"scratch proto module not found: {module_path}")
-
-    spec = importlib.util.spec_from_file_location("laser_stage2_scratch_proto", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to import scratch proto module from {module_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    original_sys_path = list(sys.path)
-    try:
-        prepend_paths = [str(scratch_root), str(repo_root)]
-        for candidate in reversed(prepend_paths):
-            if candidate not in sys.path:
-                sys.path.insert(0, candidate)
-        spec.loader.exec_module(module)
-    finally:
-        sys.path = original_sys_path
-    _SCRATCH_PROTO_MODULE = module
-    return module
-
+    return (token_h * patch_stride, token_w * patch_stride)
 
 def _indexed_block_count(keys, prefix: str) -> int:
     import re
@@ -98,7 +81,72 @@ def _indexed_block_count(keys, prefix: str) -> int:
     return len(indices)
 
 
-def _infer_scratch_stage1_config(state_dict: dict, token_cache: dict) -> dict:
+def _cache_sparse_depth(token_cache: dict, *, quantized_sparse_coeffs: bool) -> int:
+    shape = token_cache.get("shape")
+    if not isinstance(shape, (tuple, list)) or len(shape) != 3:
+        return 0
+    depth = int(shape[2])
+    if not quantized_sparse_coeffs:
+        return depth
+    return max(1, depth // 2)
+
+
+def _infer_rq_patch_layout(
+    state_dict: dict,
+    token_cache: dict,
+    metadata: dict,
+    *,
+    embedding_dim: int,
+    num_downsamples: int,
+) -> tuple[bool, int, int, str]:
+    patch_based = metadata.get("patch_based")
+    dictionary_rows = int(state_dict["bottleneck.dictionary"].shape[0])
+    inferred_patch_size = None
+    if embedding_dim > 0 and dictionary_rows % embedding_dim == 0:
+        patch_area = int(dictionary_rows // embedding_dim)
+        if patch_area > 1:
+            patch_size = int(round(math.sqrt(patch_area)))
+            if patch_size * patch_size == patch_area:
+                inferred_patch_size = patch_size
+                if patch_based is None:
+                    patch_based = True
+        elif patch_based is None:
+            patch_based = False
+    if patch_based is None:
+        patch_based = False
+    patch_based = bool(patch_based)
+
+    if patch_based:
+        patch_size = int(metadata.get("patch_size", inferred_patch_size or 8))
+        latent_hw = metadata.get("latent_hw") or token_cache.get("latent_hw")
+        if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
+            latent_h, latent_w = int(latent_hw[0]), int(latent_hw[1])
+        else:
+            image_size = metadata.get("image_size")
+            if image_size is None:
+                latent_h = latent_w = 0
+            else:
+                latent_side = max(1, int(image_size) // (2 ** max(0, int(num_downsamples))))
+                latent_h = latent_w = latent_side
+        inferred_patch_stride = None
+        shape = token_cache.get("shape")
+        if isinstance(shape, (tuple, list)) and len(shape) == 3 and latent_h > 0 and latent_w > 0:
+            token_h, token_w = int(shape[0]), int(shape[1])
+            stride_h = max(1, math.ceil(latent_h / max(1, token_h)))
+            stride_w = max(1, math.ceil(latent_w / max(1, token_w)))
+            if stride_h == stride_w:
+                inferred_patch_stride = stride_h
+        patch_stride = int(metadata.get("patch_stride", inferred_patch_stride or max(1, patch_size // 2)))
+    else:
+        patch_size = int(metadata.get("patch_size", 1))
+        patch_stride = int(metadata.get("patch_stride", 1))
+
+    default_recon = "tile" if patch_based and patch_stride == patch_size else "center_crop"
+    patch_reconstruction = str(metadata.get("patch_reconstruction", default_recon))
+    return patch_based, patch_size, patch_stride, patch_reconstruction
+
+
+def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
     metadata = token_cache.get("meta") or token_cache.get("metadata") or {}
     dictionary_shape = tuple(state_dict["bottleneck.dictionary"].shape)
     quantize_sparse_coeffs = metadata.get("quantize_sparse_coeffs")
@@ -115,11 +163,24 @@ def _infer_scratch_stage1_config(state_dict: dict, token_cache: dict) -> dict:
             coef_mu = float(math.expm1(1.0 / mu_invlog1p))
 
     num_hiddens = int(state_dict["encoder.conv_in.weight"].shape[0])
+    num_downsamples = max(0, _indexed_block_count(state_dict.keys(), "encoder.down") - 1)
     num_residual_layers = max(1, _indexed_block_count(state_dict.keys(), "encoder.down.0.block"))
     encoder_norm_channels = int(state_dict["encoder.norm_out.weight"].shape[0])
     decoder_blocks_per_level = max(1, _indexed_block_count(state_dict.keys(), "decoder.up.0.block"))
     inferred_use_mid_attention = (
         "encoder.mid.attn_1.q.weight" in state_dict or "decoder.mid.attn_1.q.weight" in state_dict
+    )
+    embedding_dim = int(state_dict["encoder.conv_out.weight"].shape[0])
+    patch_based, patch_size, patch_stride, patch_reconstruction = _infer_rq_patch_layout(
+        state_dict,
+        token_cache,
+        metadata,
+        embedding_dim=embedding_dim,
+        num_downsamples=num_downsamples,
+    )
+    inferred_sparsity_level = _cache_sparse_depth(
+        token_cache,
+        quantized_sparse_coeffs=bool(quantize_sparse_coeffs),
     )
 
     coeff_bin_centers = state_dict.get("bottleneck.coef_bin_centers")
@@ -133,7 +194,7 @@ def _infer_scratch_stage1_config(state_dict: dict, token_cache: dict) -> dict:
     return {
         "in_channels": int(state_dict["encoder.conv_in.weight"].shape[1]),
         "num_hiddens": num_hiddens,
-        "num_downsamples": max(0, _indexed_block_count(state_dict.keys(), "encoder.down") - 1),
+        "num_downsamples": num_downsamples,
         "num_residual_layers": num_residual_layers,
         "resolution": int(metadata.get("image_size", 128)),
         "max_ch_mult": int(metadata.get("max_ch_mult", max(1, encoder_norm_channels // max(1, num_hiddens)))),
@@ -141,9 +202,9 @@ def _infer_scratch_stage1_config(state_dict: dict, token_cache: dict) -> dict:
             metadata.get("decoder_extra_residual_layers", max(0, decoder_blocks_per_level - num_residual_layers))
         ),
         "use_mid_attention": bool(metadata.get("use_mid_attention", inferred_use_mid_attention)),
-        "embedding_dim": int(state_dict["encoder.conv_out.weight"].shape[0]),
+        "embedding_dim": embedding_dim,
         "num_embeddings": int(dictionary_shape[1]),
-        "sparsity_level": int(metadata.get("sparsity_level", token_cache["shape"][2])),
+        "sparsity_level": int(metadata.get("sparsity_level", inferred_sparsity_level)),
         "commitment_cost": 0.25,
         "n_bins": max(1, n_bins),
         "coef_max": max(1e-6, coef_max),
@@ -151,10 +212,10 @@ def _infer_scratch_stage1_config(state_dict: dict, token_cache: dict) -> dict:
         "coef_mu": coef_mu,
         "out_tanh": True,
         "quantize_sparse_coeffs": bool(quantize_sparse_coeffs),
-        "patch_based": bool(metadata.get("patch_based", False)),
-        "patch_size": int(metadata.get("patch_size", 8)),
-        "patch_stride": int(metadata.get("patch_stride", 4)),
-        "patch_reconstruction": str(metadata.get("patch_reconstruction", "center_crop")),
+        "patch_based": patch_based,
+        "patch_size": patch_size,
+        "patch_stride": patch_stride,
+        "patch_reconstruction": patch_reconstruction,
         "variational_coeffs": bool(
             metadata.get(
                 "variational_coeffs",
@@ -249,19 +310,19 @@ def _infer_stage1_metadata_defaults(payload, cache: dict) -> dict:
             inferred["coef_max"] = float(coeff_max)
         return inferred
 
-    scratch_cfg = _infer_scratch_stage1_config(state_dict, cache)
+    rq_cfg = _infer_rq_stage1_config(state_dict, cache)
     inferred.update(
         {
-            "patch_based": bool(scratch_cfg.get("patch_based", False)),
-            "patch_size": int(scratch_cfg.get("patch_size", 8)),
-            "patch_stride": int(scratch_cfg.get("patch_stride", 4)),
-            "patch_reconstruction": str(scratch_cfg.get("patch_reconstruction", "center_crop")),
-            "variational_coeffs": bool(scratch_cfg.get("variational_coeffs", False)),
-            "variational_coeff_prior_std": float(scratch_cfg.get("variational_coeff_prior_std", 0.25)),
-            "variational_coeff_min_std": float(scratch_cfg.get("variational_coeff_min_std", 0.01)),
-            "coef_max": float(scratch_cfg.get("coef_max", 24.0)),
-            "coeff_max": float(scratch_cfg.get("coef_max", 24.0)),
-            "quantize_sparse_coeffs": bool(scratch_cfg.get("quantize_sparse_coeffs", False)),
+            "patch_based": bool(rq_cfg.get("patch_based", False)),
+            "patch_size": int(rq_cfg.get("patch_size", 8)),
+            "patch_stride": int(rq_cfg.get("patch_stride", 4)),
+            "patch_reconstruction": str(rq_cfg.get("patch_reconstruction", "center_crop")),
+            "variational_coeffs": bool(rq_cfg.get("variational_coeffs", False)),
+            "variational_coeff_prior_std": float(rq_cfg.get("variational_coeff_prior_std", 0.25)),
+            "variational_coeff_min_std": float(rq_cfg.get("variational_coeff_min_std", 0.01)),
+            "coef_max": float(rq_cfg.get("coef_max", 24.0)),
+            "coeff_max": float(rq_cfg.get("coef_max", 24.0)),
+            "quantize_sparse_coeffs": bool(rq_cfg.get("quantize_sparse_coeffs", False)),
         }
     )
     return inferred
@@ -412,7 +473,14 @@ def load_stage1_decoder_bundle(
     device = torch.device(device)
     image_size = meta.get("image_size")
     if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
-        model = LASER.load_from_checkpoint(str(checkpoint_path), map_location="cpu").eval().to(device)
+        from .models.laser import LASER
+
+        model = build_lightning_module(
+            LASER,
+            payload,
+            strict=False,
+            compute_fid=False,
+        ).eval().to(device)
         model.requires_grad_(False)
         latent_hw = meta.get("latent_hw")
         if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
@@ -428,19 +496,18 @@ def load_stage1_decoder_bundle(
             coeff_bin_values=coeff_bin_values,
         )
 
-    scratch_cfg = _infer_scratch_stage1_config(state_dict, cache)
-    scratch_proto = _load_scratch_proto_module()
-    model = scratch_proto.LASER(**scratch_cfg)
-    model.load_state_dict(state_dict)
+    rq_cfg = _infer_rq_stage1_config(state_dict, cache)
+    model = RQAE(**rq_cfg)
+    model.load_state_dict(state_dict, strict=False)
     model.eval().to(device)
     model.requires_grad_(False)
     latent_hw = meta.get("latent_hw")
     if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
         latent_hw = (int(latent_hw[0]), int(latent_hw[1]))
     else:
-        latent_hw = _infer_latent_hw_from_model(model, image_size or scratch_cfg.get("resolution"))
+        latent_hw = _infer_latent_hw_from_model(model, image_size or rq_cfg.get("resolution"))
     return Stage1DecodeBundle(
-        kind="scratch",
+        kind="rq",
         model=model,
         checkpoint_path=checkpoint_path,
         latent_hw=latent_hw,
@@ -455,6 +522,7 @@ def decode_stage2_tokens(
     token_grid: torch.Tensor,
     *,
     device=None,
+    latent_hw: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     if device is None:
         try:
@@ -467,8 +535,13 @@ def decode_stage2_tokens(
         bundle.model = bundle.model.to(device)
 
     tokens = token_grid.to(device=device, dtype=torch.long)
-    if bundle.kind == "scratch":
-        return bundle.model.decode_from_tokens(tokens, latent_hw=bundle.latent_hw)
+    target_hw = _resolve_decode_latent_hw(
+        bundle,
+        token_hw=(int(tokens.shape[1]), int(tokens.shape[2])),
+        latent_hw=latent_hw,
+    )
+    if bundle.kind == "rq":
+        return bundle.model.decode_from_tokens(tokens, latent_hw=target_hw)
 
     if bundle.coeff_vocab_size <= 0 or bundle.coeff_bin_values is None:
         raise RuntimeError(
@@ -476,7 +549,7 @@ def decode_stage2_tokens(
         )
     return bundle.model.decode_from_tokens(
         tokens,
-        latent_hw=bundle.latent_hw,
+        latent_hw=target_hw,
         coeff_vocab_size=int(bundle.coeff_vocab_size),
         coeff_bin_values=bundle.coeff_bin_values.to(device=device, dtype=torch.float32),
     )
@@ -488,6 +561,7 @@ def reconstruct_stage2_sparse_latent(
     coeffs: torch.Tensor,
     *,
     device=None,
+    latent_hw: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     if device is None:
         try:
@@ -501,25 +575,30 @@ def reconstruct_stage2_sparse_latent(
 
     atoms = atom_ids.to(device=device, dtype=torch.long)
     values = coeffs.to(device=device, dtype=torch.float32)
-    if bundle.kind == "scratch":
+    target_hw = _resolve_decode_latent_hw(
+        bundle,
+        token_hw=(int(atoms.shape[1]), int(atoms.shape[2])),
+        latent_hw=latent_hw,
+    )
+    if bundle.kind == "rq":
         bundle.model.eval()
         if hasattr(bundle.model, "clamp_sparse_coeffs"):
             values = bundle.model.clamp_sparse_coeffs(values)
-        if getattr(bundle.model.bottleneck, "patch_based", False):
-            if bundle.latent_hw is None:
+        if getattr(bundle.model.bottleneck, "patch_size", None) is not None:
+            if target_hw is None:
                 raise ValueError("latent_hw is required for patch-based sparse latent reconstruction")
             return bundle.model.bottleneck._reconstruct_sparse(
                 atoms,
                 values,
-                int(bundle.latent_hw[0]),
-                int(bundle.latent_hw[1]),
+                int(target_hw[0]),
+                int(target_hw[1]),
             )
         return bundle.model.bottleneck._reconstruct_sparse(atoms, values)
 
     return bundle.model.reconstruct_latent_from_atoms_and_coeffs(
         atoms,
         values,
-        latent_hw=bundle.latent_hw,
+        latent_hw=target_hw,
     )
 
 
@@ -530,9 +609,10 @@ def decode_stage2_outputs(
     coeffs: Optional[torch.Tensor] = None,
     *,
     device=None,
+    latent_hw: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     if coeffs is None:
-        return decode_stage2_tokens(bundle, atoms_or_tokens, device=device)
+        return decode_stage2_tokens(bundle, atoms_or_tokens, device=device, latent_hw=latent_hw)
 
     if device is None:
         try:
@@ -546,6 +626,11 @@ def decode_stage2_outputs(
 
     atoms = atoms_or_tokens.to(device=device, dtype=torch.long)
     values = coeffs.to(device=device, dtype=torch.float32)
-    if bundle.kind == "scratch":
-        return bundle.model.decode_from_atoms_and_coeffs(atoms, values, latent_hw=bundle.latent_hw)
-    return bundle.model.decode_from_atoms_and_coeffs(atoms, values, latent_hw=bundle.latent_hw)
+    target_hw = _resolve_decode_latent_hw(
+        bundle,
+        token_hw=(int(atoms.shape[1]), int(atoms.shape[2])),
+        latent_hw=latent_hw,
+    )
+    if bundle.kind == "rq":
+        return bundle.model.decode_from_atoms_and_coeffs(atoms, values, latent_hw=target_hw)
+    return bundle.model.decode_from_atoms_and_coeffs(atoms, values, latent_hw=target_hw)

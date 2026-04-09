@@ -2,16 +2,17 @@
 
 This repository provides autoencoder models with dictionary learning for image reconstruction:
 
-- **LASER (Learnable Adaptive Structured Embedding Representation)** — Dictionary learning VAE with OMP sparse coding and flexible dictionary update strategies.
+- **LASER (Learnable Adaptive Structured Embedding Representation)** — Sparse dictionary autoencoder with OMP-based latent coding, a VQGAN/DDPM-style stage-1 backbone, and maintained stage-2 sparse-token priors.
 - **VQ-VAE (Vector Quantized VAE)** — Baseline model with discrete latent codes and a learnable codebook.
 
 ## Features
 
 - 🚀 OMP-based dictionary learning with configurable sparsity
+- 🧠 VQGAN/DDPM-style ResNet+attention encoder/decoder for stage 1
 - ⚡ GPU-friendly implementation with AMP-aware sparse coding
 - 📊 Comprehensive metrics: MSE, PSNR, SSIM, LPIPS, FID
 - 🔧 Modular architecture powered by PyTorch Lightning and Hydra
-- 🎯 Multiple dictionary update strategies: backprop-only, K-SVD, online learning
+- 🎯 Maintained stage-2 priors for sparse token generation
 
 ## Installation
 
@@ -231,12 +232,9 @@ python3 extract_token_cache.py \
 #### Full-Dataset Stage 2
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train_ar.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 train_s2.py \
   output_dir=outputs/ar \
   token_cache_path=null \
-  data.dataset=celeba \
-  data.data_dir=/home/xl598/Projects/data/celeba \
-  data.image_size=128 \
   data.num_workers=8 \
   ar.type=sparse_spatial_depth \
   ar.d_model=128 \
@@ -244,7 +242,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 train_ar.py \
   ar.n_layers=4 \
   ar.d_ff=512 \
   wandb.project=laser-ar \
-  wandb.name=celeba_full_stage2 \
+  wandb.name=celeba_s2 \
   train_ar.batch_size=16 \
   train_ar.max_epochs=2 \
   train_ar.accelerator=gpu \
@@ -253,19 +251,56 @@ CUDA_VISIBLE_DEVICES=0,1 python3 train_ar.py \
   train_ar.sample_num_images=4
 ```
 
+The maintained stage-2 path reads dataset and image metadata from the token cache.
+`data.num_workers` still controls the cache loader, but `data.dataset` is only a legacy hint and is not used to pick CIFAR vs CelebA.
+
 #### Generation
 
 ```bash
-python3 generate_ar.py \
-  --device auto \
-  --num-samples 16 \
-  --batch-size 8
+python3 sample_s2.py \
+  --dev auto \
+  -n 16 \
+  -b 8
 ```
 
 This will infer the latest maintained:
 - stage-1 checkpoint
 - stage-2 checkpoint
 - token cache
+
+`train_ar.py`, `sample_ar.py`, and `generate_ar.py` remain available as compatibility wrappers.
+`gen_s2.py` is the short compatibility sampler that still writes `samples.pt`.
+
+#### Local 2-GPU P4 Launcher
+
+For the current `p4s4` experiments on a local machine, use [scripts/local_p4.sh](/scratch/xl598/Projects/laser/scripts/local_p4.sh). It wraps the maintained [run_p4s1.sh](/scratch/xl598/Projects/laser/scripts/run_p4s1.sh) and [run_p4s2.sh](/scratch/xl598/Projects/laser/scripts/run_p4s2.sh) path with conservative defaults for a 2-GPU RTX 4000 box.
+
+```bash
+# Fresh local run: stage 1, token cache, then stage 2.
+DATA_DIR=/data/celebahq_packed_256 \
+RUN_ROOT=$PWD/runs/local_p4 \
+bash scripts/local_p4.sh
+```
+
+```bash
+# Stage-2 only from an existing local run root.
+MODE=s2 \
+RUN_ROOT=$PWD/runs/local_p4 \
+WIN_LIST=32,64 \
+bash scripts/local_p4.sh
+```
+
+```bash
+# Stage-2 only with explicit stage-1 refs.
+MODE=s2 \
+RUN_ROOT=$PWD/runs/local_p4 \
+S1_CKPT=/path/to/last.ckpt \
+CACHE_PT=/path/to/tok_q256.pt \
+WIN_LIST=32 \
+bash scripts/local_p4.sh
+```
+
+Default local settings are intentionally small: `S1_BSZ=1`, `S2_BSZ=1`, `S1_WORKERS=2`, `S2_WORKERS=2`, `PATCH=4`, `STRIDE=4`, `ATOMS=4096`, `K=16`, `BINS=256`, and `WIN_LIST=32`. Raise them only if your local VRAM and host RAM can handle it.
 
 ## Configuration
 
@@ -278,402 +313,321 @@ python train.py model=laser data=celeba train.max_epochs=100 model.sparsity_leve
 # Tune sparse coding capacity
 python train.py model=laser model.sparsity_level=10 model.num_embeddings=1024
 
-# Enable online dictionary learning
-python train.py model=laser model.use_online_learning=true model.use_backprop_only=false
+# Switch to the legacy simple backbone
+python train.py model=laser model.backbone=simple
 ```
 
-## LASER: Dictionary Learning Architecture
+## LASER: Maintained Model Architecture
 
-### Overview
+This section describes the maintained `src/` training and sampling path:
 
-LASER (Learnable Adaptive Structured Embedding Representation) is a dictionary learning VAE that uses OMP sparse coding with configurable dictionary update strategies. It alternates between:
-1. **Sparse Coding**: Find sparse coefficients using Orthogonal Matching Pursuit (OMP)
-2. **Dictionary Update**: Update each atom sequentially using rank-1 SVD approximations
+- stage 1: [train.py](train.py)
+- token extraction: [extract_token_cache.py](extract_token_cache.py)
+- stage 2: [train_s2.py](train_s2.py)
 
-### Comparison: Dictionary Learning Modes
+Older exploratory code under `scratch/` may use different defaults. The section below is the authoritative description of the current maintained model.
 
-LASER supports different dictionary learning strategies:
+### End-to-End Pipeline
 
-| Aspect | K-SVD Mode | Backprop-only Mode | Online Learning Mode |
-|--------|------------|-------------------|---------------------|
-| Dictionary Update | SVD-based, direct update | Gradient descent with backprop | Fast gradient-like updates |
-| Gradients | No gradients on dictionary | Full gradient computation | No gradients on dictionary |
-| Convergence | Often faster for small problems | Scales better with large datasets | Good balance |
-| Atom Quality | High-quality, orthogonal atoms | Depends on learning rate & optimization | Good quality with fast updates |
-| Training Mode | Dictionary updates in forward pass | Standard PyTorch training loop | Updates in forward pass |
-| Best For | Interpretability, small datasets | Large-scale training | Fast iteration, good quality |
+```text
+image x
+  -> stage-1 encoder backbone
+  -> latent feature map z_e
+  -> sparse dictionary bottleneck
+  -> sparse support + coefficients
+  -> straight-through latent z_st
+  -> stage-1 decoder backbone
+  -> reconstruction x_hat
 
-### Usage Example
-
-```python
-from src.models.bottleneck import DictionaryLearning
-
-# Create Dictionary Learning bottleneck
-dl = DictionaryLearning(
-    num_embeddings=512,       # Number of dictionary atoms
-    embedding_dim=64,         # Dimension of each atom
-    sparsity_level=8,         # Number of non-zero coefficients
-    commitment_cost=0.25,     # Weight for commitment loss
-    ksvd_iterations=1,        # Number of K-SVD updates per forward pass
-)
-
-# Forward pass
-z_reconstructed, loss, coefficients = dl(z_encoded)
+sparse support + coefficients
+  -> token cache
+  -> stage-2 sparse prior
+  -> sampled sparse support + coefficients
+  -> stage-1 bottleneck decoder
+  -> stage-1 image decoder
+  -> generated image
 ```
 
-### K-SVD Parameters
+### Design Goals
 
-- **num_embeddings**: Number of atoms in the dictionary (codebook size)
-- **embedding_dim**: Dimensionality of each atom (typically matches input channels)
-- **sparsity_level**: Maximum number of non-zero coefficients per signal
-- **commitment_cost**: Weight for the encoder commitment loss term (encourages encoder to match dictionary reconstruction)
-- **dictionary_weight**: Weight for the dictionary reconstruction loss (controls how fast dictionary learns via backprop). Default: 1.0
-- **ksvd_iterations**: Number of K-SVD dictionary update iterations per forward pass
+- Use a stronger stage-1 image backbone than the older plain VQ-VAE-style CNN, so the autoencoder can model longer-range structure before sparse coding is applied.
+- Keep the latent representation sparse and interpretable by reconstructing each latent site or latent patch from a small number of dictionary atoms.
+- Separate representation learning from generative modeling: stage 1 learns a useful sparse latent space, and stage 2 learns a distribution over that sparse code space.
+- Preserve compatibility across per-site and patch-based bottlenecks by storing explicit latent-shape metadata in the token cache.
 
-**Note**: Dictionary atoms are always normalized to unit L2 norm for numerical stability.
+### Stage 1: Sparse Dictionary Autoencoder
 
-### Sparse Coding
+The maintained stage-1 model lives in [src/models/laser.py](src/models/laser.py). It is a LightningModule that wraps three pieces:
 
-LASER currently uses **Orthogonal Matching Pursuit (OMP)** for sparse coding. OMP greedily selects atoms and refines coefficients with least-squares solves at each step, which keeps the support genuinely sparse and produces higher-quality reconstructions than the removed heuristic solver paths.
+1. An image encoder.
+2. A sparse dictionary bottleneck.
+3. An image decoder.
 
-### Dictionary Learning Features
+The current default config in [configs/model/laser.yaml](configs/model/laser.yaml) uses:
 
-1. **OMP Sparse Coding**: Greedy sparse pursuit with least-squares refinement
-2. **Flexible Dictionary Updates**: Backprop-only, K-SVD, or online learning
-3. **Per-location Sparse Coding**: Sparse codes are produced directly on the latent grid
-4. **Automatic Atom Normalization**: All atoms normalized to unit L2 norm for stability
-5. **Training/Eval Mode Support**: Dictionary updates enabled in training, frozen in eval
-6. **L1 Sparsity Regularization**: Encourages true sparsity in coefficients
-
-### Dictionary Update Process
-
-For each atom k in the dictionary:
-```
-1. Find signals using atom k: ω_k = {i : |α_k,i| > ε}
-2. Compute error without atom k: E_k = X - D·α + d_k·α_k
-3. Restrict E_k to signals using k: E_k^ω
-4. Perform SVD: E_k^ω ≈ u·σ·v^T
-5. Update atom and coefficients: d_k ← u[:,0], α_k[ω_k] ← σ[0]·v[:,0]
-```
-
-### Numerical Stability
-
-- SVD computations performed in float32 for stability
-- Epsilon values prevent division by zero
-- Atom normalization for stable sparse coding
-- Graceful handling of SVD failures
-
-### Performance Considerations
-
-**Advantages:**
-- No gradient computation overhead for dictionary
-- Often converges faster than gradient-based methods
-- Produces high-quality, interpretable atoms
-- Direct control over atom updates
-
-**Limitations:**
-- SVD computation can be expensive for large dictionaries
-- Not fully differentiable (uses straight-through estimator)
-- Sequential atom updates don't parallelize as well
-- Memory usage scales with batch size × latent spatial positions
-
-**Recommendations:**
-- Use moderate dictionary sizes (K=256-512) for best performance
-- Set ksvd_iterations=1 for faster training
-- Dictionary atoms are always normalized for stability
-
-### Test Coverage
-
-```bash
-# Run dictionary learning tests
-pytest tests/test_bottleneck.py -v
-
-# Run LASER model tests
-pytest tests/test_laser.py -v
-
-# Run all tests
-pytest tests/ -v
+```yaml
+model:
+  type: laser
+  backbone: vqgan
+  num_hiddens: 128
+  num_downsamples: 2
+  num_residual_blocks: 2
+  num_residual_hiddens: 32
+  max_ch_mult: 2
+  decoder_extra_residual_layers: 1
+  use_mid_attention: true
+  attn_resolutions: []
+  num_embeddings: 1024
+  embedding_dim: 4
+  sparsity_level: 8
+  patch_based: true
+  patch_size: 4
+  patch_stride: 2
+  patch_reconstruction: hann
 ```
 
-### LASER Architecture
+At `128x128`, `num_downsamples=2` produces a `32x32` latent grid. With `num_hiddens=128` and `max_ch_mult=2`, the default channel schedule is effectively:
+
+```text
+128x128x3
+  -> 128x128x128
+  ->  64x64x128
+  ->  64x64x256
+  ->  32x32x256
+  ->  32x32x4   (embedding_dim)
+```
+
+#### Encoder Backbone
+
+The default `backbone: vqgan` reuses the maintained DDPM/VQGAN-style encoder from [src/models/rq_ae.py](src/models/rq_ae.py):
+
+- `conv_in`: a `3x3` convolution lifts RGB into the base channel width.
+- Resolution levels: each level applies `num_residual_blocks` ResNet blocks, optional self-attention at configured resolutions, and a learned downsample except at the last level.
+- Middle block: `ResnetBlock -> AttnBlock -> ResnetBlock`.
+- Output projection: `GroupNorm -> SiLU -> 3x3 conv` to `embedding_dim`.
+
+Important details:
+
+- `attn_resolutions: []` does **not** mean “no attention anywhere”. With `use_mid_attention: true`, the model still keeps a middle attention block at the coarsest latent resolution.
+- This is the main mechanism used to inject longer-range spatial mixing into stage 1 without paying the cost of attention at every resolution.
+- The older compatibility backbone still exists as `backbone: simple`, but the maintained default is now `vqgan`.
+
+#### Decoder Backbone
+
+The decoder mirrors the encoder, again using the maintained implementation in [src/models/rq_ae.py](src/models/rq_ae.py):
+
+- `conv_in` maps the latent tensor back to the decoder width.
+- Middle block: `ResnetBlock -> AttnBlock -> ResnetBlock`.
+- Upsampling pyramid: each level applies residual blocks, optional attention, and learned upsampling.
+- `decoder_extra_residual_layers` adds extra residual capacity on the decoder side without changing the latent resolution.
+- Final projection: `GroupNorm -> SiLU -> 3x3 conv` back to RGB.
+
+For the `vqgan` backbone, [src/models/laser.py](src/models/laser.py) sets `pre_bottleneck` and `post_bottleneck` to identity layers, because the encoder already emits `embedding_dim` channels and the decoder already consumes them directly. The older `simple` backbone still uses explicit `1x1` and `3x3` projections around the bottleneck.
+
+#### Sparse Dictionary Bottleneck
+
+The bottleneck is implemented in [src/models/bottleneck.py](src/models/bottleneck.py). It stores a learnable overcomplete dictionary and reconstructs each latent location or latent patch from a sparse combination of atoms.
+
+Core ideas:
+
+- Dictionary shape:
+  - per-site coding: `(embedding_dim, num_embeddings)`
+  - patch-based coding: `(embedding_dim * patch_size * patch_size, num_embeddings)`
+- The dictionary is explicitly normalized to unit norm.
+- Dictionary gradients are projected off the radial direction so atom normalization remains meaningful during optimization.
+- The support size is fixed to `sparsity_level`.
+
+There are two maintained sparse-coding modes:
+
+- `patch_based=false`
+  - Sparse coding happens independently at each latent site.
+  - The implementation uses a fast top-k atom selection followed by a regularized least-squares coefficient solve.
+- `patch_based=true`
+  - Sparse coding happens on unfolded latent patches.
+  - The implementation uses batched Orthogonal Matching Pursuit with ordered support selection and coefficient refinement.
+  - Patch reconstruction can use `center_crop`, `hann`, or `tile` stitching.
+  - When `patch_stride == patch_size`, the code automatically switches to `tile` stitching because patches do not overlap.
+
+Coefficient handling:
+
+- `coef_max=null` leaves coefficients unbounded.
+- Setting `coef_max` clamps coefficients and enables a bounded projected refinement loop inside OMP.
+- This is the path used when stage 2 needs stable coefficient quantization ranges.
+
+The bottleneck outputs three things:
+
+- `z_dl`: the reconstructed latent map from the sparse code
+- `loss`: the bottleneck loss
+- `SparseCodes`: structured sparse support and coefficient tensors
+
+The bottleneck loss is:
+
+```text
+dl_latent_loss = mse(z_dl, stopgrad(z_e))
+e_latent_loss  = mse(stopgrad(z_dl), z_e)
+bottleneck_loss = dl_latent_loss + commitment_cost * e_latent_loss
+```
+
+The forward pass then applies a straight-through estimator:
+
+```text
+z_st = z_e + (z_dl - z_e).detach()
+```
+
+So the decoder sees the sparse reconstruction, but the encoder still receives a clean gradient signal.
+
+#### Stage-1 Training Loss
+
+The full stage-1 objective in [src/models/laser.py](src/models/laser.py) is:
+
+```text
+total_loss =
+    recon_loss
+  + bottleneck_loss_weight * bottleneck_loss
+  + perceptual_weight * perceptual_loss
+  + coherence_weight * coherence_loss
+```
+
+Notes:
+
+- `recon_loss` is pixel MSE in normalized image space.
+- `perceptual_loss` uses LPIPS when enabled.
+- `coherence_loss` penalizes highly correlated dictionary atoms.
+- `sparsity_reg_weight` is currently logged as a diagnostic term, but it is not part of the optimized loss in the maintained path.
+
+### Tokenization and Cache Design
+
+The token cache is the interface between stage 1 and stage 2.
+
+For quantized sparse codes:
+
+- each sparse slot becomes an interleaved token pair
+- token layout is `[atom_0, coeff_0, atom_1, coeff_1, ...]`
+- coefficient-bin tokens are offset by `num_atoms`
+- cache depth is `2 * sparsity_level`
+
+For real-valued sparse codes:
+
+- atom ids are stored in `tokens_flat`
+- real-valued coefficients are stored separately in `coeffs_flat`
+- cache depth is `sparsity_level`
+
+Every maintained cache also stores metadata such as:
+
+- `shape = (H, W, D)` for the token grid
+- `latent_hw` for the full latent spatial size
+- patch layout settings
+- coefficient quantization settings
+- stage-1 backbone settings such as `backbone`, `num_downsamples`, `attn_resolutions`, `max_ch_mult`, and `use_mid_attention`
+
+That metadata is important because patch-based token grids and latent grids are not always the same shape. Stage-2 decoding uses the stored `latent_hw` and patch layout to reconstruct the correct latent tensor before calling the decoder.
+
+### Stage 2: Sparse-Token Priors
+
+The maintained stage-2 training path is [train_s2.py](train_s2.py). It trains a transformer prior over the cached sparse representation instead of over pixels.
+
+The default config in [configs/config_ar.yaml](configs/config_ar.yaml) uses:
+
+- `ar.type=sparse_spatial_depth`
+- `d_model=512`
+- `n_heads=8`
+- `n_layers=6`
+- `d_ff=2048`
+
+#### Spatial-Depth Prior
+
+The default prior is implemented in [src/models/spatial_prior.py](src/models/spatial_prior.py). It factorizes generation into:
+
+1. A spatial transformer over raster-ordered `(H, W)` sites.
+2. A depth transformer over the `D` sparse slots inside each site.
+
+This design is deliberate:
+
+- the spatial model handles coarse image layout and cross-location structure
+- the depth model handles the within-site sparse tuple structure
+- the model can optionally prepend learned global spatial tokens for extra shared context
+
+For real-valued caches, the depth stage can predict:
+
+- direct scalar coefficients
+- Gaussian coefficient parameters for stochastic coefficient sampling
+
+For quantized caches, the depth stage emits a shared discrete vocabulary containing both atom ids and coefficient bins.
+
+#### GPT Prior
+
+The alternative prior is the quantized flat GPT implementation in [src/models/mingpt_prior.py](src/models/mingpt_prior.py).
+
+It:
+
+- flattens the entire `H * W * D` token grid into one causal sequence
+- operates directly on the interleaved quantized token stream
+- supports `window_sites` for sliding-window local attention on long sequences
+- supports optional learned global prefix tokens
+
+Tradeoff:
+
+- the GPT prior is architecturally simpler
+- the spatial-depth prior preserves the distinction between “where” and “which sparse slot inside that site”
+- real-valued coefficient caches are only supported by the spatial-depth prior
+
+### Why the Model Is Structured This Way
+
+- The stage-1 VQGAN/DDPM-style backbone gives the autoencoder a stronger inductive bias for images than the older plain CNN stack.
+- Middle attention adds a global mixing step at the bottleneck scale, which is a cheap way to improve long-range coherence.
+- The sparse dictionary bottleneck forces the latent space to be compositional: each latent site or patch is reconstructed from a small subset of atoms.
+- Patch-based sparse coding lets atoms represent larger local structures than a single latent pixel and supports overlap-aware reconstruction.
+- Stage 2 works on sparse tokens instead of pixels, so generative modeling happens in a compressed, semantically richer space.
+- Cache metadata makes stage-2 decoding robust across per-site and patch-based models, quantized and real-valued coefficients, and different stage-1 backbones.
+
+### Practical Defaults and Interpretation
+
+- The current maintained stage-1 default is `backbone: vqgan`.
+- The current maintained stage-2 default is `ar.type: sparse_spatial_depth`.
+- `attn_resolutions: []` with `use_mid_attention: true` means the model keeps bottleneck attention but avoids expensive higher-resolution attention by default.
+- `patch_based: true`, `patch_size: 4`, `patch_stride: 2`, and `patch_reconstruction: hann` are the default maintained sparse-latent settings.
+- The recent sweep scripts may override these patch settings to non-overlapping variants such as `p4s4` or `p8s8`, but they still use the same maintained `src` architecture.
+
+### Key Files
+
+- [src/models/laser.py](src/models/laser.py): stage-1 LightningModule, training losses, logging, and backbone selection
+- [src/models/rq_ae.py](src/models/rq_ae.py): VQGAN/DDPM-style encoder and decoder reused by the maintained LASER path
+- [src/models/bottleneck.py](src/models/bottleneck.py): sparse dictionary bottleneck, patch extraction, OMP, coefficient quantization, and latent reconstruction
+- [extract_token_cache.py](extract_token_cache.py): stage-1 to stage-2 interface and cache metadata emission
+- [src/models/spatial_prior.py](src/models/spatial_prior.py): default spatial-depth stage-2 prior
+- [src/models/mingpt_prior.py](src/models/mingpt_prior.py): flat quantized GPT prior
+- [src/stage2_compat.py](src/stage2_compat.py): stage-1 bundle loading and stage-2 decode compatibility helpers
+- [tests/test_src_laser_model.py](tests/test_src_laser_model.py): maintained stage-1 regression coverage
+- [tests/test_s2.py](tests/test_s2.py): stage-2 compatibility and decode-shape regression coverage
+
+### Minimal Stage-1 Example
 
 ```python
 from src.models.laser import LASER
 
-# Initialize LASER
 model = LASER(
     in_channels=3,
     num_hiddens=128,
-    num_embeddings=512,
-    embedding_dim=64,
+    num_embeddings=1024,
+    embedding_dim=4,
     sparsity_level=8,
     num_residual_blocks=2,
-    num_residual_hiddens=64,
+    num_residual_hiddens=32,
+    backbone="vqgan",
+    resolution=128,
+    num_downsamples=2,
+    max_ch_mult=2,
+    decoder_extra_residual_layers=1,
+    use_mid_attention=True,
+    patch_based=True,
+    patch_size=4,
+    patch_stride=2,
+    patch_reconstruction="hann",
     commitment_cost=0.25,
-    learning_rate=1e-4,
-    ksvd_iterations=1,
+    learning_rate=2e-4,
+    beta=0.9,
 )
-
-# Forward pass
-x_recon, loss, coeffs = model(x)
 ```
-
-The straight-through estimator ensures gradients flow back to the encoder during training, while the dictionary can be updated either:
-1. **Via K-SVD/Online Learning**: Direct updates using SVD or gradient-like online learning (no gradients)
-2. **Via Backpropagation**: Gradient-based learning controlled by `dictionary_weight` parameter
-
-### Dictionary Learning Methods
-
-K-SVD VAE supports three dictionary learning modes with OMP sparse coding:
-
-### Sparse Coding
-
-The bottleneck uses OMP sparse coding:
-
-#### OMP (Orthogonal Matching Pursuit)
-```yaml
-sparse_solver: omp
-```
-
-**Description**: Greedy algorithm with least-squares refinement at each iteration.
-
-**Advantages:**
-- ✓ Best reconstruction quality
-- ✓ Proper orthogonalization of selected atoms
-- ✓ Least-squares coefficient refinement
-
-**Disadvantages:**
-- ✗ Slower than top-k (requires solving linear system at each iteration)
-- ✗ More complex implementation
-
-**When to Use:**
-- When reconstruction quality is critical
-- Small to medium datasets
-- When you can afford the computational cost
-
-**When to Use:**
-- Only when speed is absolutely critical
-- Prototyping / quick experiments
-- Not recommended for final models
-
-### Dictionary Learning Methods
-
-#### 1. Gradient-Based Learning (Default - Fastest)
-```yaml
-# configs/model/laser.yaml
-use_online_learning: false
-ksvd_iterations: 0
-dictionary_weight: 5.0  # Higher = faster dictionary updates
-```
-
-**Loss Formula:**
-```python
-loss = commitment_cost * e_latent_loss + dictionary_weight * dl_latent_loss
-loss = 0.25 * encoder_loss + 5.0 * dictionary_loss
-```
-
-Where:
-- `e_latent_loss` (encoder commitment): MSE(encoder_output, dictionary_reconstruction.detach()) - gradients flow to encoder
-- `dl_latent_loss` (dictionary reconstruction): MSE(dictionary_reconstruction, encoder_output.detach()) - gradients flow to dictionary
-
-**Key Parameters:**
-- `dictionary_weight`: Controls dictionary learning speed (default: 1.0, recommended: 2.0-10.0)
-  - Higher values → stronger gradients → faster dictionary adaptation
-  - Lower values → slower, more stable dictionary learning
-  - Similar to VQ-VAE's codebook loss weight (typically 1.0)
-
-**Advantages:**
-- ✓ Fastest training (no SVD computation)
-- ✓ Full integration with PyTorch autograd
-- ✓ Scales well with large dictionaries
-- ✓ Easy to tune via `dictionary_weight`
-
-**When to Use:**
-- Large-scale datasets (ImageNet, etc.)
-- Large dictionaries (K > 512)
-- When speed is critical
-- When you want standard gradient-based optimization
-
-#### 2. Online Dictionary Learning
-```yaml
-use_online_learning: true
-ksvd_iterations: 0
-dict_learning_rate: 0.5  # Higher = faster updates
-```
-
-Fast vectorized updates similar to online SGD for dictionaries:
-```python
-gradient = residual @ coefficients.T
-dictionary += dict_learning_rate * gradient / usage_counts
-```
-
-**Advantages:**
-- ✓ Fast (vectorized, no SVD)
-- ✓ Direct dictionary control
-- ✓ No gradient computation overhead
-
-**When to Use:**
-- Medium-scale datasets
-- When you want control over dictionary updates separate from encoder
-- Moderate dictionary sizes (K=256-512)
-
-#### 3. K-SVD Updates (Classical)
-```yaml
-use_online_learning: false
-ksvd_iterations: 2
-```
-
-Classical K-SVD with SVD-based atom refinement.
-
-**Advantages:**
-- ✓ High-quality atoms
-- ✓ Often faster convergence on small datasets
-
-**Disadvantages:**
-- ✗ Slower (SVD computation)
-- ✗ Sequential atom updates
-
-**When to Use:**
-- Small datasets (CIFAR-10, MNIST)
-- When interpretability is critical
-- Research/analysis of dictionary structure
-
-### Tuning Dictionary Learning Speed
-
-For gradient-based learning, control update speed via `dictionary_weight`:
-
-```bash
-# Slow, stable dictionary learning
-python train.py model=laser model.dictionary_weight=1.0
-
-# Moderate speed (recommended starting point)
-python train.py model=laser model.dictionary_weight=5.0
-
-# Fast dictionary adaptation
-python train.py model=laser model.dictionary_weight=10.0
-```
-
-**Effect on Training:**
-- Higher `dictionary_weight` → Dictionary adapts faster to encoder outputs
-- Lower `dictionary_weight` → More stable but slower dictionary learning
-- Balance with `commitment_cost` (encoder side) for best results
-
-**Comparison with VQ-VAE:**
-```python
-# VQ-VAE loss (for reference)
-loss = q_latent_loss + commitment_cost * e_latent_loss
-loss = 1.0 * codebook_loss + 0.25 * encoder_loss
-
-# K-SVD VAE loss (gradient-based)
-loss = commitment_cost * e_latent_loss + dictionary_weight * dl_latent_loss
-loss = 0.25 * encoder_loss + 5.0 * dictionary_loss
-```
-
-With `dictionary_weight=5.0`, the dictionary receives **5× stronger learning signal** than VQ-VAE's codebook!
-
-### K-SVD Training Guide
-
-#### Training Commands
-
-Train K-SVD VAE on different datasets:
-
-```bash
-# CIFAR-10 (32×32 images)
-python train.py model=laser data=cifar10
-
-# CelebA (256×256 images)
-python train.py model=laser data=celeba
-
-# Imagenette2 (256×256 images)
-python train.py model=laser data=imagenette2
-```
-
-Override specific parameters:
-
-```bash
-python train.py model=laser data=celeba \
-    model.num_embeddings=256 \
-    model.sparsity_level=16
-```
-
-#### Logged Metrics
-
-The following metrics are tracked during training:
-
-- **Loss metrics**: `train/loss`, `val/loss` (total loss)
-- **Component losses**: 
-  - `train/recon_loss`, `val/recon_loss` (MSE reconstruction)
-  - `train/bottleneck_loss`, `val/bottleneck_loss` (dictionary learning bottleneck loss)
-  - `train/perceptual_loss`, `val/perceptual_loss` (LPIPS)
-  - `train/sparsity_loss`, `val/sparsity_loss` (L1 regularization on coefficients)
-- **Quality metrics**: 
-  - `train/psnr`, `val/psnr` (Peak Signal-to-Noise Ratio)
-  - `train/ssim`, `val/ssim` (Structural Similarity Index)
-- **Sparsity**: `train/sparsity`, `val/sparsity` (average number of active atoms)
-
-#### Tips for Best Results
-
-1. **Start Small**: Begin with fewer atoms (256-512) and moderate sparsity (8-16)
-
-2. **Tune K-SVD Iterations**: 
-   - 1-2 iterations for speed
-   - 3-5 iterations for quality
-
-3. **Perceptual Loss**: Essential for good visual quality
-   - Set to 0.5-1.0 for best results
-
-4. **Monitor Sparsity**: Should stay around `sparsity_level / num_embeddings`
-   - If too high: increase commitment_cost
-   - If too low: decrease commitment_cost
-
-#### Troubleshooting
-
-**Dictionary atoms not being used**
-- Solution: Increase `ksvd_iterations` or decrease `sparsity_level`
-
-**Training is slow**
-- Solutions:
-  - Reduce `ksvd_iterations` to 1
-  - Reduce `num_embeddings`
-
-**Poor reconstruction quality**
-- Solutions:
-  - Increase `sparsity_level`
-  - Increase `num_embeddings`
-  - Increase `perceptual_weight`
-
-**Validation loss not improving (overfitting)**
-- Solutions:
-  - Reduce dictionary update frequency
-  - Increase encoder/decoder capacity
-  - Use data augmentation
-
-**SVD errors during training**
-- Solution: This is handled internally with try-except. If it persists, reduce learning rate to stabilize encoder outputs.
-
-#### Evaluation
-
-After training, load and evaluate checkpoints:
-
-```python
-from src.models.laser import LASER
-
-# Load checkpoint
-model = LASER.load_from_checkpoint('outputs/checkpoints/run_xxx/last.ckpt')
-model.eval()
-
-# Run inference
-with torch.no_grad():
-    recon, loss, coeffs = model(images)
-```
-
-### Additional References
-
-- Y. C. Pati, R. Rezaiifar and P. S. Krishnaprasad, "Orthogonal matching pursuit: Recursive function approximation with applications to wavelet decomposition," Asilomar Conference on Signals, Systems and Computers, 1993.
-
-### References
-
-M. Aharon, M. Elad and A. Bruckstein, "K-SVD: An Algorithm for Designing Overcomplete Dictionaries for Sparse Representation," in IEEE Transactions on Signal Processing, vol. 54, no. 11, pp. 4311-4322, Nov. 2006.
 
 ## Bottleneck Visualizations
 
@@ -1067,7 +1021,7 @@ LASER now uses a single sparse coder: **Orthogonal Matching Pursuit (OMP)**.
 # configs/model/laser.yaml
 sparsity_level: 8           # Number of non-zero coefficients
 num_embeddings: 2048        # Dictionary size
-sparsity_reg_weight: 0.01   # L1 regularization
+sparsity_reg_weight: 0.01   # Coefficient-magnitude diagnostic weight
 orthogonality_weight: 0.01  # Atom decorrelation penalty
 ```
 
@@ -1123,18 +1077,18 @@ optimizer = torch.optim.AdamW(
 )
 ```
 
-#### 3. **No L1 Sparsity Regularization**
+#### 3. **Coefficient Magnitude Tracking**
 
-**Problem**: No explicit penalty on coefficient magnitude to encourage true sparsity.
+**Problem**: Sparse coefficients are inferred outside autograd, so a naive L1 term does not change optimization.
 
-**Fix**: Added L1 regularization on sparse coefficients:
+**Current behavior**: Track coefficient magnitude as a diagnostic instead of treating it as an optimizer term:
 ```python
 sparsity_loss = torch.abs(coefficients).mean()
 total_loss = (
     recon_loss +
     10 * bottleneck_loss +
     self.perceptual_weight * perceptual_loss +
-    self.sparsity_reg_weight * sparsity_loss  # L1 penalty
+    # sparsity_loss is logged for monitoring only
     ...
 )
 ```
@@ -1142,7 +1096,7 @@ total_loss = (
 **Configuration**:
 ```yaml
 # configs/model/laser.yaml
-sparsity_reg_weight: 0.01  # L1 regularization weight
+sparsity_reg_weight: 0.01  # Diagnostic scaling for logged coeff magnitude
 ```
 
 #### 4. **Backprop-Only Mode Defeats Sparsity**
@@ -1187,9 +1141,10 @@ commitment_cost: 1.0  # Up from 0.5
 num_embeddings: 128  # Down from 256
 ```
 
-3. **Increase Sparsity Constraint**:
+3. **Tighten Actual Sparsity Mechanisms**:
 ```yaml
-sparsity_reg_weight: 0.05  # Up from 0.01
+num_embeddings: 128
+sparsity_level: 4
 ```
 
 4. **Add Dropout** (requires code changes):
@@ -1289,7 +1244,7 @@ python scripts/kmeans_quantize_sparse_codes.py \
 After generating the token files, launch AR/ImageGPT training with:
 
 ```bash
-python train_ar.py \
+python train_s2.py \
   token_cache_path=outputs/ar_tokens/celeba/tokens_cache.pt \
   data.dataset=celeba
 ```
