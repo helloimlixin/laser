@@ -16,12 +16,16 @@ class Encoder(nn.Module):
         num_residual_layers=None,
         num_residual_hiddens=None,
         num_residual_blocks=None,  # backward compatibility alias
+        num_downsamples=2,
     ):
         super().__init__()
 
         # Backward compatibility: allow num_residual_blocks parameter name
         if num_residual_layers is None:
             num_residual_layers = num_residual_blocks
+        self.num_downsamples = int(num_downsamples)
+        if self.num_downsamples < 2:
+            raise ValueError(f"num_downsamples must be >= 2, got {self.num_downsamples}")
 
         self._conv_1 = nn.Conv2d(
             in_channels=in_channels,
@@ -36,6 +40,18 @@ class Encoder(nn.Module):
             kernel_size=4,
             stride=2,
             padding=1,
+        )
+        self._extra_down = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    in_channels=num_hiddens,
+                    out_channels=num_hiddens,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                )
+                for _ in range(max(0, self.num_downsamples - 2))
+            ]
         )
         self._conv_3 = nn.Conv2d(
             in_channels=num_hiddens,
@@ -56,6 +72,8 @@ class Encoder(nn.Module):
         x = F.relu(x)
         x = self._conv_2(x)
         x = F.relu(x)
+        for conv in self._extra_down:
+            x = F.relu(conv(x))
         x = self._conv_3(x)
         return self._residual_stack(x)
 

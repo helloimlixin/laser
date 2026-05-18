@@ -1,4 +1,4 @@
-"""Short stage-2 sampling helpers."""
+"""Short stage-2 transformer sampling helpers."""
 
 import math
 from dataclasses import dataclass
@@ -21,12 +21,13 @@ from src.stage2_paths import infer_latest_stage2_checkpoint, infer_latest_token_
 
 S1_META_KEYS = {
     "stage1_checkpoint",
+    "stage1_model_type",
     "patch_based",
     "patch_size",
     "patch_stride",
     "patch_reconstruction",
     "variational_coeffs",
-    "variational_coeff_prior_std",
+    "variational_coeff_target_std",
     "variational_coeff_min_std",
     "image_size",
     "latent_hw",
@@ -304,7 +305,7 @@ def _legacy_hps(payload, cache: dict, *, arch="auto", heads=None, drop=None, cma
             cmax if cmax is not None else hps.get("prior_coeff_max", meta.get("coeff_max", meta.get("coef_max", 24.0)))
         )
         out["prior_coeff_prior_std"] = float(
-            hps.get("prior_coeff_prior_std", meta.get("variational_coeff_prior_std", 0.25))
+            hps.get("prior_coeff_prior_std", meta.get("variational_coeff_target_std", 0.25))
         )
         out["prior_coeff_min_std"] = float(
             hps.get("prior_coeff_min_std", meta.get("variational_coeff_min_std", 0.01))
@@ -612,15 +613,13 @@ def sample_slide(
     )
 
 
-def save_grid(imgs: torch.Tensor, out_dir, *, stem="samples", nrow: Optional[int] = None) -> Tuple[Path, Path]:
+def save_grid(imgs: torch.Tensor, out_dir, *, stem="samples", nrow: Optional[int] = None) -> Path:
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     nrow = pick_nrow(int(imgs.size(0)), nrow)
-    raw = out_dir / f"{stem}.png"
-    auto = out_dir / f"{stem}_auto.png"
-    save_image(imgs, raw, nrow=nrow, normalize=True, value_range=(-1.0, 1.0))
-    save_image(imgs, auto, nrow=nrow, normalize=True, scale_each=True)
-    return raw, auto
+    direct = out_dir / f"{stem}.png"
+    save_image(imgs, direct, nrow=nrow, normalize=True, value_range=(-1.0, 1.0))
+    return direct
 
 
 def pack_dump(batch: Batch, run: Run) -> dict:

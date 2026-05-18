@@ -342,11 +342,17 @@ class CelebADataModule(pl.LightningDataModule):
             seed_offset=0,
         )
 
+    def _eval_batch_size(self) -> int:
+        raw = getattr(self.config, "eval_batch_size", None)
+        if raw is None or int(raw) <= 0:
+            return int(self.config.batch_size)
+        return int(raw)
+
     def val_dataloader(self):
         val_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
         return self._build_loader(
             dataset=self.val_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=self._eval_batch_size(),
             shuffle=False,
             num_workers=val_workers,
             seed_offset=1,
@@ -356,7 +362,7 @@ class CelebADataModule(pl.LightningDataModule):
         test_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
         return self._build_loader(
             dataset=self.test_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=self._eval_batch_size(),
             shuffle=False,
             num_workers=test_workers,
             seed_offset=2,

@@ -12,30 +12,35 @@ in_channels: 3
 num_hiddens: 128
 
 # Encoder/decoder backbone.
-# `vqgan` reuses the DDPM/VQGAN-style ResNet+attention backbone from the
-# maintained RQ-AE implementation.
-backbone: vqgan
+# Keep the default aligned with the VQ-VAE baseline so LASER vs VQ-VAE sweeps
+# compare bottlenecks instead of unrelated image autoencoder architectures.
+# Use `vqgan` only for explicit RQ-AE/VQGAN architecture experiments.
+backbone: simple
 
-# VQGAN/DDPM-style encoder/decoder knobs.
-# With `num_downsamples=2` on 128x128 inputs, the latent grid is 32x32, which
-# preserves the current token density while adding a bottleneck attention block.
+# Encoder/decoder knobs.
+# Match the default VQ-VAE image config: 256x256 inputs become 64x64 latents.
 num_downsamples: 2
 attn_resolutions: []
 dropout: 0.0
-max_ch_mult: 2
+# VQGAN-only width schedule. Ignored by the default simple VQ-VAE-style stack.
+channel_multipliers: [1, 1, 2, 2, 4]
+backbone_latent_channels: 512
+max_ch_mult: 4
 decoder_extra_residual_layers: 1
-use_mid_attention: true
+use_mid_attention: false
+out_tanh: false
+bypass_bottleneck: false
 
 # Dictionary size (number of atoms/embeddings)
 # Typical range: 128-1024
 # Higher = more expressive, slower sparse coding
 # For an overcomplete dictionary, choose more atoms than embedding channels.
-num_embeddings: 1024
+num_embeddings: 512
 
 # Channel dimension of encoder output
-# Typical range: 16-128
+# Typical range: 16-512
 # Higher values = more expressive atoms, better reconstruction quality
-embedding_dim: 4
+embedding_dim: 64
 
 # Sparsity level (max number of non-zero coefficients per latent location)
 # Must be < num_embeddings
@@ -43,8 +48,12 @@ embedding_dim: 4
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
 bottleneck_loss_weight: 1.0
+recon_mse_weight: 1.0
+recon_l1_weight: 0.0
+recon_edge_weight: 0.0
 
-# Lower sparsity to ease coding when using backprop-only dictionary learning
+# Sparse support per latent site. This is the bottleneck-specific analogue to
+# one VQ-VAE codebook index per latent site.
 sparsity_level: 8
 
 # Number of residual blocks in encoder/decoder
@@ -54,7 +63,7 @@ num_residual_blocks: 2
 
 # Number of hidden units in residual blocks
 # Typical range: 16-128
-num_residual_hiddens: 32
+num_residual_hiddens: 64
 
 # Commitment cost (weight for encoder loss term)
 # Typical range: 0.1-1.0
@@ -65,7 +74,8 @@ commitment_cost: 0.25
 # Lower to prevent bottleneck term from dominating total objective
 
 # Optional dictionary-specific learning rate.
-# null = share the main optimizer learning rate, like proto.py stage-1.
+# Keep dictionary updates a bit below the encoder/decoder LR for the VQ-VAE
+# matched f4 profile.
 dict_learning_rate: 2.5e-4
 
 # Optional hard bound on sparse coefficients for downstream quantization.
@@ -73,15 +83,56 @@ dict_learning_rate: 2.5e-4
 coef_max: null
 bounded_omp_refine_steps: 8
 
+# EMA-like dictionary usage tracking. The dictionary remains a DDP-synchronized
+# parameter, while per-atom usage counts smooth the dictionary gradient so a few
+# frequent atoms do not dominate large overcomplete patch dictionaries.
+dictionary_usage_ema_decay: 0.99
+dictionary_usage_grad_scale: 0.0
+dictionary_usage_grad_min: 0.1
+dictionary_usage_grad_max: 10.0
+
+# Optional variational posterior over continuous sparse coefficients.
+# This keeps the support depth fixed while giving stage 2 a Gaussian
+# coefficient target when caches are extracted with coeff_bins=0.
+#
+# Note (May 2026, A3): the historical "KL" term here is a Gaussian KL whose
+# reference mean is the data-dependent OMP coefficient, so it acts as an L2
+# refinement-around-OMP regularizer rather than a KL to a fixed prior. Keys
+# were renamed for honesty: variational_coeff_kl_weight ->
+# variational_coeff_refine_weight, variational_coeff_prior_std ->
+# variational_coeff_target_std. Old configs/checkpoints will raise a
+# TypeError directing you here.
+variational_coeffs: false
+variational_coeff_refine_weight: 0.0
+variational_coeff_target_std: 0.25
+variational_coeff_min_std: 0.01
+
+# A2 switch (May 2026): when true, skip the straight-through estimator inside
+# the bottleneck so decoder gradients flow into the dictionary atoms (and the
+# coeff_variational_* networks in variational mode). Off by default — current
+# training matches the legacy proto/VQ-style behavior where the dictionary
+# learns only from dl_latent_loss. Turning this on usually requires raising
+# commitment_cost so the encoder stays pinned to the dictionary manifold.
+dictionary_through_decoder: false
+
+# Dictionary atom update.
+# `gradient` uses the standard Adam path. `online_ksvd` removes the dictionary
+# from Adam and applies a mini-batch K-SVD-style least-squares atom update on
+# the fixed OMP supports after each training step.
+dictionary_update_mode: gradient
+dictionary_ksvd_lr: 0.2
+dictionary_ksvd_update_every: 1
+dictionary_ksvd_min_usage: 1
+dictionary_ksvd_max_atoms_per_step: 512
+
 # Latent patch sparse coding.
-# Mirrors the scratch patch bottleneck, but keeps the maintained src path
-# limited to sparse coding plus reconstruction only.
-patch_based: true
-patch_size: 4
+# Keep this disabled for the RQ-AE encoder/decoder stack while reconstruction
+# quality is being validated. The sparse bottleneck operates per 16x16 latent
+# site instead of extracting/stitching latent patches.
+patch_based: false
+patch_size: 2
 patch_stride: 2
-# With 50% overlap, Hann overlap-add gives exact reconstruction when the
-# patch coefficients reconstruct each patch exactly.
-patch_reconstruction: hann
+patch_reconstruction: tile
 
 # L1 regularization weight on sparse coefficients
 # Typical range: 0.0-0.1
@@ -92,12 +143,11 @@ patch_reconstruction: hann
 sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regularization
 
 # Perceptual loss weight (LPIPS)
-# Typical range: 0.0-2.0
-# 0.0 = no perceptual loss
-# 0.5-1.0 = good balance (recommended)
-# Higher = better perceptual quality, slower training
-# Disabled by default because LPIPS dominates step time and can OOM under DDP.
-perceptual_weight: 0.5
+# Keep disabled while validating reconstruction capacity. The scratch reference
+# trains stage 1 with MSE reconstruction only.
+perceptual_weight: 0.0
+perceptual_start_step: 0
+perceptual_warmup_steps: 0
 
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99
@@ -117,9 +167,15 @@ log_images_every_n_steps: 500
 # Extra train-only diagnostics; 0 disables them.
 diag_log_interval: 0
 
-# Run an extra validation forward pass for PCA/heatmap logging.
-# Disabled by default because it adds a full bottleneck pass each val epoch.
-enable_val_latent_visuals: false
+# Run an extra validation forward pass for W&B latent visuals:
+# - val/sparse_heatmap
+# - val/dictionary_scatter
+# - val/dictionary_atom_trajectories at fit end
+enable_val_latent_visuals: true
+
+# Large dictionaries are sampled for PCA scatter/GIF logging to keep W&B media
+# and end-of-fit rendering manageable.
+codebook_visual_max_vectors: 1024
 
 # Optional dictionary coherence penalty.
 # Proto.py keeps this disabled by default and relies on normalized atoms plus

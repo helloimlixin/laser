@@ -1,5 +1,7 @@
+import ast
 import os
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -13,18 +15,39 @@ from .encoder import Encoder as SimpleEncoder
 from .decoder import Decoder as SimpleDecoder
 from .bottleneck import DictionaryLearning, SparseCodes
 from .lpips import LPIPS
+from .audio_codec import AudioDecoder, AudioEncoder, canonical_int_tuple
 from .rq_ae import Decoder as VQGANDecoder
 from .rq_ae import Encoder as VQGANEncoder
+from .scratch_autoencoder import Decoder as ScratchDecoder
+from .scratch_autoencoder import Encoder as ScratchEncoder
+from .utils import fid_has_enough_samples
 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
-import wandb
+
+from src.audio_logging import (
+    audio_config_from_source,
+    build_audio_log_payload,
+    compute_audio_energy_matching_loss,
+    compute_audio_reconstruction_metrics,
+    compute_waveform_multires_stft_loss,
+    extract_audio_metadata_from_batch,
+    has_audio_metadata,
+)
+from src.codebook_visuals import (
+    render_codebook_scatter,
+    save_codebook_trajectory_gif,
+    select_codebook_vectors,
+)
+from src.wandb_media import log_wandb_images, log_wandb_payload, log_wandb_video
 
 
 def _canonical_backbone(raw) -> str:
     name = "simple" if raw is None else str(raw).strip().lower()
     if name in {"simple", "legacy", "cnn", "vqvae"}:
         return "simple"
+    if name in {"scratch", "scratch_vqvae", "conv_residual", "residual_conv"}:
+        return "scratch_vqvae"
     if name in {"vqgan", "ddpm", "unet", "rqvae", "attn", "attention"}:
         return "vqgan"
     raise ValueError(f"Unsupported LASER backbone: {raw!r}")
@@ -39,6 +62,25 @@ def _canonical_attn_resolutions(values) -> Tuple[int, ...]:
             return ()
         return tuple(sorted({int(part) for part in raw.split(",") if part.strip()}))
     return tuple(sorted({int(v) for v in values}))
+
+
+def _canonical_channel_multipliers(values) -> Optional[Tuple[int, ...]]:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        raw = values.strip()
+        if not raw or raw.lower() in {"none", "null"}:
+            return None
+        if raw[0] in "[(":
+            values = ast.literal_eval(raw)
+        else:
+            values = [part for part in raw.split(",") if part.strip()]
+    mults = tuple(int(v) for v in values)
+    if not mults:
+        return None
+    if any(mult <= 0 for mult in mults):
+        raise ValueError(f"channel_multipliers must be positive, got {mults}")
+    return mults
 
 class LASER(pl.LightningModule):
     def __init__(
@@ -55,28 +97,61 @@ class LASER(pl.LightningModule):
             beta,
             backbone="simple",
             resolution=None,
-            num_downsamples=2,
+            num_downsamples=4,
             attn_resolutions=(),
             dropout=0.0,
-            max_ch_mult=2,
+            channel_multipliers=None,
+            backbone_latent_channels=None,
+            max_ch_mult=4,
             decoder_extra_residual_layers=1,
             use_mid_attention=True,
             bottleneck_loss_weight=0.5,
+            recon_mse_weight=1.0,
+            recon_l1_weight=0.0,
+            recon_edge_weight=0.0,
             perceptual_weight=1.0,
+            perceptual_start_step=0,
+            perceptual_warmup_steps=0,
             compute_fid=False,
             fid_feature=2048,
             log_images_every_n_steps=100,
             diag_log_interval=0,
             enable_val_latent_visuals=False,
+            codebook_visual_max_vectors=1024,
             dict_learning_rate=None,
-            patch_based=True,
-            patch_size=4,
+            patch_based=False,
+            patch_size=2,
             patch_stride=2,
-            patch_reconstruction="hann",
+            patch_reconstruction="tile",
             coef_max=None,
             bounded_omp_refine_steps=8,
+            dictionary_usage_ema_decay=0.99,
+            dictionary_usage_grad_scale=0.0,
+            dictionary_usage_grad_min=0.1,
+            dictionary_usage_grad_max=10.0,
+            variational_coeffs=False,
+            variational_coeff_refine_weight=0.0,
+            variational_coeff_target_std=0.25,
+            variational_coeff_min_std=0.01,
+            dictionary_through_decoder=False,
+            dictionary_update_mode="gradient",
+            dictionary_ksvd_lr=0.2,
+            dictionary_ksvd_update_every=1,
+            dictionary_ksvd_min_usage=1,
+            dictionary_ksvd_max_atoms_per_step=512,
             sparsity_reg_weight=0.01,
             coherence_weight=0.0,
+            audio_energy_loss_weight=0.0,
+            audio_multires_loss_weight=0.0,
+            audio_multires_scales=(1, 2, 4, 8),
+            audio_backbone="spectrogram",
+            audio_downsample_rates=(4, 4, 4),
+            audio_dilation_cycle=(1, 3, 9),
+            audio_multires_stft_loss_weight=0.0,
+            audio_multires_stft_fft_sizes=(512, 1024, 2048),
+            audio_waveform_l1_weight=0.0,
+            out_tanh=True,
+            bypass_bottleneck=False,
             warmup_steps=0,
             min_lr_ratio=0.01,
             **kwargs,
@@ -91,11 +166,16 @@ class LASER(pl.LightningModule):
             sparsity_level: Number of non-zero coefficients in sparse coding
             num_residual_blocks: Number of residual blocks
             num_residual_hiddens: Number of hidden units in residual blocks
-            backbone: encoder/decoder family, either 'simple' or VQGAN/DDPM-style aliases
+            backbone: encoder/decoder family: 'simple', 'scratch_vqvae', or VQGAN/DDPM-style aliases
             resolution: input image resolution for the VQGAN-style backbone
-            num_downsamples: number of spatial downsampling stages for the VQGAN-style backbone
+            num_downsamples: number of spatial downsampling stages for variable-depth backbones
             attn_resolutions: spatial resolutions that should include self-attention blocks
             dropout: residual-block dropout for the VQGAN-style backbone
+            channel_multipliers: optional explicit per-level width schedule for the
+                VQGAN-style backbone; overrides max_ch_mult and sets the number of
+                downsampling stages to len(channel_multipliers) - 1
+            backbone_latent_channels: width of the continuous VQGAN/DDPM latent
+                before projecting into the sparse bottleneck embedding_dim
             max_ch_mult: cap on channel multipliers for the VQGAN-style backbone
             decoder_extra_residual_layers: extra decoder residual blocks per level for the VQGAN-style backbone
             use_mid_attention: whether to keep the bottleneck self-attention block enabled
@@ -103,21 +183,57 @@ class LASER(pl.LightningModule):
             learning_rate: Learning rate for encoder/decoder
             beta: Beta parameter for Adam optimizer
             bottleneck_loss_weight: Weight for bottleneck loss term in total loss
+            recon_mse_weight: Weight for pixel MSE reconstruction loss
+            recon_l1_weight: Weight for pixel L1 reconstruction loss
+            recon_edge_weight: Weight for first-order image gradient reconstruction loss
             perceptual_weight: Weight for perceptual loss
+            perceptual_start_step: Global step before which LPIPS is disabled
+            perceptual_warmup_steps: Linear LPIPS ramp length after perceptual_start_step
             compute_fid: Whether to compute FID
             fid_feature: Inception feature size for reconstruction FID
             log_images_every_n_steps: image logging cadence; 0 disables image logging
             diag_log_interval: diagnostic logging cadence; 0 disables extra train diagnostics
-            enable_val_latent_visuals: whether to run the extra validation PCA/heatmap pass
+            enable_val_latent_visuals: whether to log sparse heatmaps and dictionary atom trajectories
+            codebook_visual_max_vectors: max dictionary atoms to draw in PCA scatter/GIF visualizations
             dict_learning_rate: optional learning rate override for dictionary atoms
             patch_based: whether to use latent patch sparse coding instead of per-site coding
             patch_size: latent patch size used for sparse coding
             patch_stride: latent patch stride used for sparse coding
-            patch_reconstruction: patch stitching rule, either 'center_crop' or 'hann'
+            patch_reconstruction: patch stitching rule, one of 'center_crop', 'hann', or 'tile'
             coef_max: optional hard bound applied to sparse coefficients during support refinement
             bounded_omp_refine_steps: projected refinement steps for bounded OMP coefficient updates
+            dictionary_usage_ema_decay: decay for distributed EMA atom usage counts
+            dictionary_usage_grad_scale: exponent for usage-aware dictionary gradient scaling;
+                0 disables it, 0.5 is a conservative EMA-like setting
+            dictionary_usage_grad_min: lower clamp for usage-aware dictionary gradient scaling
+            dictionary_usage_grad_max: upper clamp for usage-aware dictionary gradient scaling
+            variational_coeffs: whether to sample sparse coefficients from a learned posterior
+            variational_coeff_refine_weight: weight for the refinement-around-OMP loss on
+                the coefficient posterior (Gaussian-KL math against a data-dependent
+                reference; renamed from variational_coeff_kl_weight in May 2026)
+            variational_coeff_target_std: std of the reference Gaussian in the refinement
+                term and upper bound on the learned posterior std (renamed from
+                variational_coeff_prior_std in May 2026)
+            variational_coeff_min_std: minimum std allowed in the learned posterior
+            dictionary_through_decoder: when True, skip the straight-through estimator in
+                the bottleneck so decoder gradients flow into the dictionary atoms (and,
+                in variational mode, the coeff_variational_* networks). Off by default to
+                preserve the legacy VQ-style training behavior where the dictionary
+                learns only from dl_latent_loss. If you enable this, consider raising
+                commitment_cost to keep the encoder pinned to the dictionary manifold.
             sparsity_reg_weight: legacy diagnostic weight for sparse coefficient magnitude
             coherence_weight: weight for dictionary coherence regularization
+            audio_energy_loss_weight: weight for audio magnitude-energy matching
+            audio_multires_loss_weight: weight for audio multi-resolution spectrogram matching
+            audio_multires_scales: pooling scales for the multi-resolution audio loss
+            audio_backbone: 'spectrogram' for 2D VCTK features or 'waveform' for raw waveform batches
+            audio_downsample_rates: waveform encoder/decoder stride schedule
+            audio_dilation_cycle: residual dilation cycle for waveform audio blocks
+            audio_multires_stft_loss_weight: weight for raw-waveform multi-resolution STFT loss
+            audio_multires_stft_fft_sizes: FFT sizes for raw-waveform multi-resolution STFT loss
+            audio_waveform_l1_weight: additional raw-waveform L1 loss weight
+            out_tanh: whether to bound decoder output to the normalized target range [-1, 1]
+            bypass_bottleneck: diagnostic mode that trains encoder/decoder without sparse coding
         """
         super(LASER, self).__init__()
 
@@ -143,22 +259,72 @@ class LASER(pl.LightningModule):
         kwargs.pop("per_pixel_sparse_coding", None)
         if legacy_coherence is not None and float(coherence_weight) == 0.0:
             coherence_weight = float(legacy_coherence)
+        # A3 rename (May 2026): refuse the old variational-coefficient names explicitly
+        # rather than letting them fall into the generic "unknown" bucket — they map to
+        # the new names but with different semantics worth flagging.
+        for old_name, new_name in (
+            ("variational_coeff_kl_weight", "variational_coeff_refine_weight"),
+            ("variational_coeff_prior_std", "variational_coeff_target_std"),
+        ):
+            if old_name in kwargs:
+                raise TypeError(
+                    f"{old_name!r} was renamed to {new_name!r} in the May 2026 "
+                    "A3 cleanup; update configs/checkpoints. See LASER docstring."
+                )
         if kwargs:
             unknown = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported LASER arguments: {unknown}")
+
+        in_channels = int(in_channels)
+        if in_channels != 3 and float(perceptual_weight) > 0.0:
+            perceptual_weight = 0.0
+        if in_channels != 3 and bool(compute_fid):
+            compute_fid = False
 
         # Store parameters
         self.learning_rate = learning_rate
         self.beta = beta
         self.perceptual_weight = perceptual_weight
+        self.perceptual_start_step = max(int(perceptual_start_step), 0)
+        self.perceptual_warmup_steps = max(int(perceptual_warmup_steps), 0)
         self.log_images_every_n_steps = max(int(log_images_every_n_steps), 0)
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
         self.sparsity_reg_weight = sparsity_reg_weight
         self.bottleneck_loss_weight = bottleneck_loss_weight
+        self.recon_mse_weight = float(recon_mse_weight)
+        self.recon_l1_weight = float(recon_l1_weight)
+        self.recon_edge_weight = float(recon_edge_weight)
         self.coherence_weight = coherence_weight
+        self.audio_energy_loss_weight = float(audio_energy_loss_weight)
+        self.audio_multires_loss_weight = float(audio_multires_loss_weight)
+        self.audio_multires_scales = tuple(
+            int(scale) for scale in audio_multires_scales if int(scale) > 0
+        )
+        if not self.audio_multires_scales:
+            self.audio_multires_scales = (1,)
+        self.audio_backbone = str(audio_backbone or "spectrogram").strip().lower()
+        if self.audio_backbone in {"2d", "image", "stft", "logmag"}:
+            self.audio_backbone = "spectrogram"
+        if self.audio_backbone in {"raw", "wav"}:
+            self.audio_backbone = "waveform"
+        if self.audio_backbone not in {"spectrogram", "waveform"}:
+            raise ValueError(
+                f"Unsupported LASER audio_backbone {audio_backbone!r}; expected 'spectrogram' or 'waveform'"
+            )
+        self.audio_downsample_rates = canonical_int_tuple(audio_downsample_rates, default=(4, 4, 4))
+        self.audio_dilation_cycle = canonical_int_tuple(audio_dilation_cycle, default=(1, 3, 9))
+        self.audio_multires_stft_loss_weight = float(audio_multires_stft_loss_weight)
+        self.audio_multires_stft_fft_sizes = canonical_int_tuple(
+            audio_multires_stft_fft_sizes,
+            default=(512, 1024, 2048),
+        )
+        self.audio_waveform_l1_weight = float(audio_waveform_l1_weight)
+        self.out_tanh = bool(out_tanh)
+        self.bypass_bottleneck = bool(bypass_bottleneck)
         self.diag_log_interval = max(int(diag_log_interval), 0)
         self.enable_val_latent_visuals = bool(enable_val_latent_visuals)
+        self.codebook_visual_max_vectors = max(1, int(codebook_visual_max_vectors))
         self.warmup_steps = max(int(warmup_steps), 0)
         self.min_lr_ratio = float(min_lr_ratio)
         self.backbone = _canonical_backbone(backbone)
@@ -166,6 +332,10 @@ class LASER(pl.LightningModule):
         self.num_downsamples = int(num_downsamples)
         self.attn_resolutions = _canonical_attn_resolutions(attn_resolutions)
         self.dropout = float(dropout)
+        self.channel_multipliers = _canonical_channel_multipliers(channel_multipliers)
+        self.backbone_latent_channels = (
+            None if backbone_latent_channels is None else int(backbone_latent_channels)
+        )
         self.max_ch_mult = int(max_ch_mult)
         self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.use_mid_attention = bool(use_mid_attention)
@@ -175,6 +345,11 @@ class LASER(pl.LightningModule):
             raise ValueError(f"num_downsamples must be non-negative, got {self.num_downsamples}")
         if self.max_ch_mult <= 0:
             raise ValueError(f"max_ch_mult must be positive, got {self.max_ch_mult}")
+        if self.backbone_latent_channels is not None and self.backbone_latent_channels <= 0:
+            raise ValueError(
+                "backbone_latent_channels must be positive when provided, got "
+                f"{self.backbone_latent_channels}"
+            )
         if self.decoder_extra_residual_layers < 0:
             raise ValueError(
                 "decoder_extra_residual_layers must be non-negative, "
@@ -182,13 +357,61 @@ class LASER(pl.LightningModule):
             )
         if self.backbone == "vqgan" and (self.resolution is None or self.resolution <= 0):
             raise ValueError("resolution must be a positive integer when backbone='vqgan'")
+        if self.backbone == "vqgan":
+            if self.channel_multipliers is None:
+                self.channel_multipliers = tuple(
+                    min(2 ** i, self.max_ch_mult) for i in range(self.num_downsamples + 1)
+                )
+            else:
+                self.num_downsamples = len(self.channel_multipliers) - 1
+            if self.backbone_latent_channels is None:
+                self.backbone_latent_channels = int(embedding_dim)
+        else:
+            self.channel_multipliers = ()
+            self.backbone_latent_channels = int(embedding_dim)
 
-        if self.backbone == "simple":
+        self.is_waveform_audio = self.audio_backbone == "waveform" and int(in_channels) == 1
+        if self.audio_backbone == "waveform" and int(in_channels) != 1:
+            raise ValueError("LASER waveform audio backbone expects in_channels=1")
+
+        if self.is_waveform_audio:
+            self.encoder = AudioEncoder(
+                in_channels=in_channels,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                downsample_rates=self.audio_downsample_rates,
+                dilation_cycle=self.audio_dilation_cycle,
+            )
+            self.pre_bottleneck = nn.Conv1d(
+                in_channels=num_hiddens,
+                out_channels=embedding_dim,
+                kernel_size=1,
+                stride=1,
+            )
+            self.post_bottleneck = nn.Conv1d(
+                in_channels=embedding_dim,
+                out_channels=num_hiddens,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            )
+            self.decoder = AudioDecoder(
+                in_channels=num_hiddens,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                out_channels=in_channels,
+                upsample_rates=self.audio_downsample_rates,
+                dilation_cycle=self.audio_dilation_cycle,
+            )
+        elif self.backbone == "simple":
             self.encoder = SimpleEncoder(
                 in_channels=in_channels,
                 num_hiddens=num_hiddens,
                 num_residual_blocks=num_residual_blocks,
                 num_residual_hiddens=num_residual_hiddens,
+                num_downsamples=self.num_downsamples,
             )
             self.pre_bottleneck = nn.Conv2d(
                 in_channels=num_hiddens,
@@ -208,25 +431,72 @@ class LASER(pl.LightningModule):
                 num_hiddens=num_hiddens,
                 num_residual_blocks=num_residual_blocks,
                 num_residual_hiddens=num_residual_hiddens,
+                num_upsamples=self.num_downsamples,
+            )
+        elif self.backbone == "scratch_vqvae":
+            self.encoder = ScratchEncoder(
+                in_channels=in_channels,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                num_downsamples=self.num_downsamples,
+            )
+            self.pre_bottleneck = nn.Conv2d(
+                in_channels=num_hiddens,
+                out_channels=embedding_dim,
+                kernel_size=1,
+                stride=1,
+            )
+            self.post_bottleneck = nn.Conv2d(
+                in_channels=embedding_dim,
+                out_channels=num_hiddens,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            )
+            self.decoder = ScratchDecoder(
+                in_channels=num_hiddens,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                out_channels=in_channels,
+                num_upsamples=self.num_downsamples,
             )
         else:
-            ch_mult = tuple(min(2 ** i, self.max_ch_mult) for i in range(self.num_downsamples + 1))
             enc_dec_kwargs = dict(
                 ch=num_hiddens,
                 out_ch=in_channels,
-                ch_mult=ch_mult,
+                ch_mult=self.channel_multipliers,
                 num_res_blocks=num_residual_blocks,
                 attn_resolutions=self.attn_resolutions,
                 dropout=self.dropout,
                 resamp_with_conv=True,
                 in_channels=in_channels,
                 resolution=self.resolution,
-                z_channels=embedding_dim,
+                z_channels=self.backbone_latent_channels,
+                double_z=False,
                 use_mid_attention=self.use_mid_attention,
             )
             self.encoder = VQGANEncoder(**enc_dec_kwargs)
-            self.pre_bottleneck = nn.Identity()
-            self.post_bottleneck = nn.Identity()
+            if self.backbone_latent_channels == int(embedding_dim):
+                self.pre_bottleneck = nn.Identity()
+                self.post_bottleneck = nn.Identity()
+            else:
+                # Match Taming's quant_conv/post_quant_conv pattern so the
+                # backbone latent can stay wide even when the sparse
+                # embedding_dim is small.
+                self.pre_bottleneck = nn.Conv2d(
+                    in_channels=self.backbone_latent_channels,
+                    out_channels=embedding_dim,
+                    kernel_size=1,
+                    stride=1,
+                )
+                self.post_bottleneck = nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=self.backbone_latent_channels,
+                    kernel_size=1,
+                    stride=1,
+                )
             self.decoder = VQGANDecoder(
                 **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
             )
@@ -244,7 +514,23 @@ class LASER(pl.LightningModule):
             patch_reconstruction=patch_reconstruction,
             coef_max=coef_max,
             bounded_omp_refine_steps=bounded_omp_refine_steps,
+            dictionary_usage_ema_decay=dictionary_usage_ema_decay,
+            dictionary_usage_grad_scale=dictionary_usage_grad_scale,
+            dictionary_usage_grad_min=dictionary_usage_grad_min,
+            dictionary_usage_grad_max=dictionary_usage_grad_max,
+            variational_coeffs=variational_coeffs,
+            variational_coeff_refine_weight=variational_coeff_refine_weight,
+            variational_coeff_target_std=variational_coeff_target_std,
+            variational_coeff_min_std=variational_coeff_min_std,
+            dictionary_through_decoder=dictionary_through_decoder,
+            dictionary_update_mode=dictionary_update_mode,
+            dictionary_ksvd_lr=dictionary_ksvd_lr,
+            dictionary_ksvd_update_every=dictionary_ksvd_update_every,
+            dictionary_ksvd_min_usage=dictionary_ksvd_min_usage,
+            dictionary_ksvd_max_atoms_per_step=dictionary_ksvd_max_atoms_per_step,
         )
+        if self.bypass_bottleneck:
+            self.bottleneck.requires_grad_(False)
 
         # Initialize LPIPS for perceptual loss only if used
         self.lpips = LPIPS() if self.perceptual_weight > 0 else None
@@ -261,20 +547,11 @@ class LASER(pl.LightningModule):
         self.val_ssim = StructuralSimilarityIndexMeasure()
         self.test_ssim = StructuralSimilarityIndexMeasure()
 
-        # Initialize reconstruction FID metrics per split so W&B can track
-        # stage-1 validation rFID without leaking metric state across splits.
-        if self.compute_fid:
-            self.val_rfid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
-            self.test_fid = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
-        else:
-            self.val_rfid = None
-            self.test_fid = None
-        for metric in (self.val_rfid, self.test_fid):
-            if metric is None:
-                continue
-            metric.eval()
-            for p in metric.parameters():
-                p.requires_grad = False
+        # Lazily instantiate FID metrics only when validation/test actually
+        # starts so stage-1 fit startup does not reserve two extra Inception
+        # networks on every DDP rank.
+        self.val_rfid = None
+        self.test_fid = None
 
         # Cache for validation visualization
         self._val_vis_batch = None
@@ -285,12 +562,55 @@ class LASER(pl.LightningModule):
         self._media_log_steps = set()
         self._lr_base_lrs = ()
         self._lr_total_steps = 1
+        # Updated by configure_optimizers / on_train_start; "uninit" means the
+        # schedule helper hasn't been reached yet — _lr_multiplier_for_step will
+        # behave as if the schedule is disabled when min_lr_ratio>=1 and
+        # warmup_steps<=0 (the no-op guard at the top of the function).
+        self._lr_total_steps_source = "uninit"
 
         # Save hyperparameters
+        backbone = self.backbone
+        resolution = self.resolution
+        num_downsamples = self.num_downsamples
+        attn_resolutions = self.attn_resolutions
+        dropout = self.dropout
+        channel_multipliers = self.channel_multipliers
+        backbone_latent_channels = self.backbone_latent_channels
+        max_ch_mult = self.max_ch_mult
+        decoder_extra_residual_layers = self.decoder_extra_residual_layers
+        use_mid_attention = self.use_mid_attention
         self.save_hyperparameters()
 
-    def _should_log_images(self, batch_idx):
-        return self.log_images_every_n_steps > 0 and batch_idx % self.log_images_every_n_steps == 0
+    def _should_log_images(self, batch_idx, prefix='train'):
+        if self.log_images_every_n_steps <= 0:
+            return False
+        if prefix == 'train':
+            step = int(getattr(self, "global_step", 0))
+            return step > 0 and step % self.log_images_every_n_steps == 0
+        return int(batch_idx) == 0
+
+    def _new_fid_metric(self):
+        metric = FrechetInceptionDistance(feature=self.fid_feature, normalize=True)
+        metric.eval()
+        for p in metric.parameters():
+            p.requires_grad = False
+        return metric
+
+    def _ensure_val_rfid(self):
+        if not self.compute_fid:
+            return None
+        if self.val_rfid is None:
+            self.val_rfid = self._new_fid_metric()
+        self.val_rfid = self.val_rfid.to(self.device)
+        return self.val_rfid
+
+    def _ensure_test_fid(self):
+        if not self.compute_fid:
+            return None
+        if self.test_fid is None:
+            self.test_fid = self._new_fid_metric()
+        self.test_fid = self.test_fid.to(self.device)
+        return self.test_fid
 
     def _ddp_barrier_if_needed(self):
         """Keep ranks aligned after rank-0-only work inside a step (avoids NCCL timeouts)."""
@@ -361,6 +681,52 @@ class LASER(pl.LightningModule):
         base = int(self.global_step if requested_step is None else requested_step)
         return self._wandb_step(experiment, requested_step=base + 1)
 
+    def _resolve_lr_total_steps(self, trainer) -> Tuple[int, str]:
+        """Return ``(total_steps, source)`` for the cosine LR schedule.
+
+        Tries Lightning's estimate first, then the configured ``max_steps``, then
+        ``max_epochs * num_training_batches``. Returns ``(1, "fallback")`` if none
+        of them are finite/positive — callers should treat that as "schedule
+        disabled" and log a warning. The two-step resolve in ``configure_optimizers``
+        plus ``on_train_start`` covers the case where the trainer's estimate isn't
+        ready until after the optimizer has been built (iterable datamodules, etc.).
+        """
+        if trainer is None:
+            return 1, "fallback"
+
+        def _coerce_positive_finite(value) -> Optional[int]:
+            if value is None:
+                return None
+            try:
+                fvalue = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(fvalue) or fvalue <= 0:
+                return None
+            return max(1, int(fvalue))
+
+        candidates = []
+        try:
+            est = getattr(trainer, "estimated_stepping_batches", None)
+        except Exception:
+            est = None
+        candidates.append(("estimated_stepping_batches", est))
+        candidates.append(("max_steps", getattr(trainer, "max_steps", None)))
+        max_epochs = getattr(trainer, "max_epochs", None)
+        num_train_batches = getattr(trainer, "num_training_batches", None)
+        if max_epochs is not None and num_train_batches is not None:
+            try:
+                product = int(max_epochs) * int(num_train_batches)
+            except (TypeError, ValueError):
+                product = None
+            candidates.append(("max_epochs*num_training_batches", product))
+
+        for source, value in candidates:
+            resolved = _coerce_positive_finite(value)
+            if resolved is not None:
+                return resolved, source
+        return 1, "fallback"
+
     def _lr_multiplier_for_step(self, step: int) -> float:
         if self.warmup_steps <= 0 and self.min_lr_ratio >= 1.0:
             return 1.0
@@ -382,11 +748,51 @@ class LASER(pl.LightningModule):
             group["lr"] = float(base_lr) * float(scale)
 
     def on_fit_start(self):
-        self.bottleneck.normalize_dictionary_()
+        super().on_fit_start()
+        if not self.bypass_bottleneck:
+            self.bottleneck.normalize_dictionary_()
+        self._snapshot_dictionary()
+
+    def on_train_start(self):
+        """Re-resolve and report the LR schedule horizon.
+
+        ``configure_optimizers`` runs before some trainer state is finalized
+        (notably ``num_training_batches`` for iterable datamodules). Re-resolve
+        once more before the first training step so the cosine schedule does
+        not silently collapse to ``min_lr_ratio`` because ``_lr_total_steps``
+        was captured as 1. See A4 in the May 2026 review.
+        """
+        super().on_train_start()
+        trainer = self._trainer_ref()
+        total_steps, source = self._resolve_lr_total_steps(trainer)
+        prior_steps = int(getattr(self, "_lr_total_steps", 1))
+        prior_source = str(getattr(self, "_lr_total_steps_source", "uninit"))
+        # Trust whichever resolution actually produced a non-fallback estimate.
+        # Prefer the on_train_start resolution if it improved; otherwise keep
+        # the configure_optimizers value (it may have been the only one that
+        # worked for some trainer configurations).
+        if source != "fallback" and (prior_source == "fallback" or total_steps > prior_steps):
+            self._lr_total_steps = total_steps
+            self._lr_total_steps_source = source
+        if self._lr_total_steps <= 1 and (self.warmup_steps > 0 or self.min_lr_ratio < 1.0):
+            warnings.warn(
+                "LASER cosine LR schedule has _lr_total_steps=1; the schedule will "
+                "collapse to min_lr_ratio immediately. Check trainer.max_steps / "
+                "trainer.max_epochs / dataloader length.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self._is_log_rank_zero():
+            print(
+                f"[LASER] LR schedule horizon: total_steps={self._lr_total_steps} "
+                f"(source={self._lr_total_steps_source}, warmup_steps={self.warmup_steps}, "
+                f"min_lr_ratio={self.min_lr_ratio})"
+            )
 
     def on_before_optimizer_step(self, optimizer):
         del optimizer
-        self.bottleneck.project_dictionary_gradient_()
+        if not self.bypass_bottleneck:
+            self.bottleneck.project_dictionary_gradient_()
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         # Renormalize after the step: Lightning runs zero_grad (and on_before_zero_grad)
@@ -394,7 +800,34 @@ class LASER(pl.LightningModule):
         # dictionary updates there break autograd for the current batch.
         self._apply_scheduled_lrs(optimizer, step=int(getattr(self, "global_step", 0)))
         optimizer.step(closure=optimizer_closure)
-        self.bottleneck.normalize_dictionary_()
+        if not self.bypass_bottleneck:
+            self.bottleneck.online_ksvd_update_()
+            self.bottleneck.normalize_dictionary_()
+
+    def _empty_sparse_codes_like(self, z_e: torch.Tensor) -> SparseCodes:
+        batch_size, _, height, width = z_e.shape
+        shape = (batch_size, height, width, 0)
+        return SparseCodes(
+            support=torch.empty(shape, device=z_e.device, dtype=torch.long),
+            values=z_e.new_empty(shape),
+            num_embeddings=max(int(getattr(self.bottleneck, "num_embeddings", 1)), 1),
+        )
+
+    def _to_bottleneck_input(self, z_e: torch.Tensor) -> torch.Tensor:
+        if self.is_waveform_audio:
+            if z_e.ndim != 3:
+                raise ValueError(f"Expected waveform latent [B, C, T], got {tuple(z_e.shape)}")
+            return z_e.unsqueeze(2)
+        return z_e
+
+    def _from_bottleneck_output(self, z_dl: torch.Tensor) -> torch.Tensor:
+        if self.is_waveform_audio:
+            if z_dl.ndim == 4 and int(z_dl.size(2)) == 1:
+                return z_dl.squeeze(2)
+            if z_dl.ndim == 3:
+                return z_dl
+            raise ValueError(f"Expected waveform bottleneck latent [B, C, 1, T], got {tuple(z_dl.shape)}")
+        return z_dl
 
     def encode(self, x):
         """
@@ -410,6 +843,9 @@ class LASER(pl.LightningModule):
         """
         z_e = self.encoder(x)
         z_e = self.pre_bottleneck(z_e)
+        z_e = self._to_bottleneck_input(z_e)
+        if self.bypass_bottleneck:
+            return z_e, z_e.new_zeros(()), self._empty_sparse_codes_like(z_e)
         with self._bottleneck_autocast_context(z_e):
             z_dl, bottleneck_loss, sparse_codes = self.bottleneck(z_e.float())
         return z_dl, bottleneck_loss, sparse_codes
@@ -424,9 +860,26 @@ class LASER(pl.LightningModule):
         Returns:
             x_recon: reconstruction of the input
         """
+        z_dl = self._from_bottleneck_output(z_dl)
         z_dl = self.post_bottleneck(z_dl)
         x_recon = self.decoder(z_dl)
+        return self._apply_output_activation(x_recon)
+
+    def _apply_output_activation(self, x_recon: torch.Tensor) -> torch.Tensor:
+        if self.out_tanh:
+            return torch.tanh(x_recon)
         return x_recon
+
+    def _effective_perceptual_weight(self, prefix: str) -> float:
+        if prefix != "train" or self.perceptual_weight <= 0:
+            return 0.0
+        step = int(getattr(self, "global_step", 0))
+        if step < self.perceptual_start_step:
+            return 0.0
+        if self.perceptual_warmup_steps <= 0:
+            return float(self.perceptual_weight)
+        progress = (step - self.perceptual_start_step) / float(max(1, self.perceptual_warmup_steps))
+        return float(self.perceptual_weight) * max(0.0, min(1.0, progress))
 
     @torch.no_grad()
     def encode_to_tokens(
@@ -439,6 +892,8 @@ class LASER(pl.LightningModule):
         coeff_mu: float = 0.0,
     ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """Encode images to interleaved quantized sparse tokens."""
+        if self.bypass_bottleneck:
+            raise RuntimeError("encode_to_tokens is unavailable when bypass_bottleneck=true")
         z_dl, _, sparse_codes = self.encode(x)
         tokens, _ = self.bottleneck.sparse_codes_to_tokens(
             sparse_codes,
@@ -455,6 +910,8 @@ class LASER(pl.LightningModule):
         x: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
         """Encode images to sparse atom ids plus real-valued coefficients."""
+        if self.bypass_bottleneck:
+            raise RuntimeError("encode_to_atoms_and_coeffs is unavailable when bypass_bottleneck=true")
         z_dl, _, sparse_codes = self.encode(x)
         return (
             sparse_codes.support,
@@ -469,15 +926,25 @@ class LASER(pl.LightningModule):
         if image_h <= 0 or image_w <= 0:
             raise ValueError(f"image_hw must be positive, got {(image_h, image_w)}")
         device = next(self.parameters()).device
-        dummy = torch.zeros(
-            1,
-            int(self.hparams.in_channels),
-            image_h,
-            image_w,
-            device=device,
-            dtype=torch.float32,
-        )
+        if self.is_waveform_audio:
+            dummy = torch.zeros(
+                1,
+                int(self.hparams.in_channels),
+                image_w,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            dummy = torch.zeros(
+                1,
+                int(self.hparams.in_channels),
+                image_h,
+                image_w,
+                device=device,
+                dtype=torch.float32,
+            )
         z = self.pre_bottleneck(self.encoder(dummy))
+        z = self._to_bottleneck_input(z)
         return int(z.shape[-2]), int(z.shape[-1])
 
     @torch.no_grad()
@@ -566,33 +1033,114 @@ class LASER(pl.LightningModule):
         Returns:
             tuple: (recon, bottleneck_loss, sparse_codes)
         """
-        z = self.encoder(x)
-        z = self.pre_bottleneck(z)
-        with self._bottleneck_autocast_context(z):
-            z_dl, bottleneck_loss, sparse_codes = self.bottleneck(z.float())
-        z_dl = self.post_bottleneck(z_dl)
-        recon = self.decoder(z_dl)
-        return recon, bottleneck_loss, sparse_codes
+        z_dl, bottleneck_loss, sparse_codes = self.encode(x)
+        return self.decode(z_dl), bottleneck_loss, sparse_codes
+
+    def _sparse_coeff_denominator(self, sparse_codes: SparseCodes) -> float:
+        num_sites = max(
+            int(
+                sparse_codes.values.shape[0]
+                * sparse_codes.values.shape[1]
+                * sparse_codes.values.shape[2]
+            ),
+            1,
+        )
+        return float(sparse_codes.num_embeddings * num_sites)
 
     def _dense_coeff_abs_mean(self, sparse_codes: SparseCodes):
-        num_sites = max(int(sparse_codes.values.shape[0] * sparse_codes.values.shape[1] * sparse_codes.values.shape[2]), 1)
-        denom = float(sparse_codes.num_embeddings * num_sites)
-        return sparse_codes.values.abs().sum() / denom
+        return sparse_codes.values.abs().sum() / self._sparse_coeff_denominator(sparse_codes)
 
     def _support_fraction(self, sparse_codes: SparseCodes):
-        num_sites = max(int(sparse_codes.values.shape[0] * sparse_codes.values.shape[1] * sparse_codes.values.shape[2]), 1)
-        denom = float(sparse_codes.num_embeddings * num_sites)
-        return sparse_codes.support.numel() / denom
+        return sparse_codes.support.numel() / self._sparse_coeff_denominator(sparse_codes)
 
     def _effective_coeff_nonzero_fraction(self, sparse_codes: SparseCodes, threshold=1e-6):
-        num_sites = max(int(sparse_codes.values.shape[0] * sparse_codes.values.shape[1] * sparse_codes.values.shape[2]), 1)
-        denom = float(sparse_codes.num_embeddings * num_sites)
-        return (sparse_codes.values.abs() > threshold).float().sum() / denom
+        return (
+            (sparse_codes.values.abs() > threshold).float().sum()
+            / self._sparse_coeff_denominator(sparse_codes)
+        )
+
+    def _reconstruction_edge_loss(self, recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.recon_edge_weight <= 0.0:
+            return recon.new_zeros(())
+        losses = []
+        if recon.shape[-1] > 1:
+            losses.append(
+                F.l1_loss(
+                    recon[..., :, 1:] - recon[..., :, :-1],
+                    target[..., :, 1:] - target[..., :, :-1],
+                )
+            )
+        if recon.shape[-2] > 1:
+            losses.append(
+                F.l1_loss(
+                    recon[..., 1:, :] - recon[..., :-1, :],
+                    target[..., 1:, :] - target[..., :-1, :],
+                )
+            )
+        if not losses:
+            return recon.new_zeros(())
+        return torch.stack(losses).mean()
+
+    def _normalized_audio_unit(self, spec: torch.Tensor, audio_source) -> torch.Tensor:
+        config = audio_config_from_source(audio_source)
+        mean = torch.tensor(config["mean"], dtype=spec.dtype, device=spec.device).view(1, -1, 1, 1)
+        std = torch.tensor(config["std"], dtype=spec.dtype, device=spec.device).view(1, -1, 1, 1)
+        return (spec * std + mean).clamp(0.0, 1.0)
+
+    def _audio_multiresolution_spectrogram_loss(
+        self,
+        recon: torch.Tensor,
+        target: torch.Tensor,
+        audio_source,
+    ) -> dict[str, torch.Tensor]:
+        if self.audio_multires_loss_weight <= 0.0:
+            return {}
+        if recon.ndim != 4 or target.ndim != 4 or int(recon.size(1)) != 1 or int(target.size(1)) != 1:
+            return {}
+
+        recon_unit = self._normalized_audio_unit(recon, audio_source)
+        target_unit = self._normalized_audio_unit(target, audio_source)
+        eps = 1.0e-6
+        l1_terms = []
+        mse_terms = []
+        convergence_terms = []
+        for scale in self.audio_multires_scales:
+            if scale > 1:
+                recon_scaled = F.avg_pool2d(recon_unit, kernel_size=scale, stride=scale, ceil_mode=True)
+                target_scaled = F.avg_pool2d(target_unit, kernel_size=scale, stride=scale, ceil_mode=True)
+            else:
+                recon_scaled = recon_unit
+                target_scaled = target_unit
+            diff = recon_scaled - target_scaled
+            l1_terms.append(diff.abs().mean())
+            mse_terms.append(diff.pow(2).mean())
+            convergence_terms.append(
+                torch.linalg.vector_norm(diff.float())
+                / torch.linalg.vector_norm(target_scaled.float()).clamp_min(eps)
+            )
+
+        l1_loss = torch.stack(l1_terms).mean()
+        mse_loss = torch.stack(mse_terms).mean()
+        convergence_loss = torch.stack(convergence_terms).mean().to(dtype=recon.dtype)
+        freq_profile_loss = F.l1_loss(recon_unit.mean(dim=-1), target_unit.mean(dim=-1))
+        time_profile_loss = F.l1_loss(recon_unit.mean(dim=-2), target_unit.mean(dim=-2))
+        profile_loss = 0.5 * (freq_profile_loss + time_profile_loss)
+        total = l1_loss + 0.5 * mse_loss + 0.25 * convergence_loss + 0.5 * profile_loss
+        return {
+            "audio_multires_loss": total,
+            "audio_multires_l1_loss": l1_loss,
+            "audio_multires_mse_loss": mse_loss,
+            "audio_multires_convergence_loss": convergence_loss,
+            "audio_multires_profile_loss": profile_loss,
+        }
 
     def compute_metrics(self, batch, prefix='train'):
         """Compute metrics for a batch."""
         # Get input
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        audio_meta = extract_audio_metadata_from_batch(batch)
+        is_audio = has_audio_metadata(audio_meta)
+        is_waveform_audio = is_audio and torch.is_tensor(x) and x.ndim == 3
         needs_train_diag = prefix == 'train' and self._should_log_train_diagnostics()
         should_log_distribution_metrics = prefix != 'train' or needs_train_diag
 
@@ -603,7 +1151,14 @@ class LASER(pl.LightningModule):
         x_vis = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
         
         # Compute losses
-        recon_loss = F.mse_loss(recon_raw, x)
+        recon_mse_loss = F.mse_loss(recon_raw, x)
+        recon_l1_loss = F.l1_loss(recon_raw, x)
+        recon_edge_loss = self._reconstruction_edge_loss(recon_raw, x)
+        recon_loss = (
+            self.recon_mse_weight * recon_mse_loss
+            + self.recon_l1_weight * recon_l1_loss
+            + self.recon_edge_weight * recon_edge_loss
+        )
         sparsity_loss = self._dense_coeff_abs_mean(sparse_codes)
         input_mean = input_std = recon_mean = recon_std = None
         if should_log_distribution_metrics:
@@ -611,17 +1166,18 @@ class LASER(pl.LightningModule):
             input_std = x.std()
             recon_mean = recon_raw.mean()
             recon_std = recon_raw.std()
-        diag = getattr(self.bottleneck, "_last_diag", {})
+        diag = {} if self.bypass_bottleneck else getattr(self.bottleneck, "_last_diag", {})
         
         # Perceptual loss - only compute during training for quality
-        if self.lpips is not None and self.perceptual_weight > 0 and prefix == 'train':
+        perceptual_weight = self._effective_perceptual_weight(prefix)
+        if self.lpips is not None and perceptual_weight > 0:
             perceptual_loss = self.lpips(recon_raw, x).mean()
         else:
             perceptual_loss = recon_raw.new_zeros(())
 
         # Proto-style dictionary learning uses a normalized dictionary plus an
         # optional coherence penalty rather than a dense orthogonality target.
-        if self.coherence_weight > 0:
+        if self.coherence_weight > 0 and not self.bypass_bottleneck:
             coherence_loss = self.bottleneck.coherence_penalty()
         else:
             coherence_loss = recon_raw.new_zeros(())
@@ -632,7 +1188,7 @@ class LASER(pl.LightningModule):
         total_loss = (
             recon_loss +
             self.bottleneck_loss_weight * bottleneck_loss +
-            self.perceptual_weight * perceptual_loss +
+            perceptual_weight * perceptual_loss +
             self.coherence_weight * coherence_loss
         )
         
@@ -641,30 +1197,93 @@ class LASER(pl.LightningModule):
         x_clean = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
         recon_clean = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
         if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
-            mean = torch.tensor(dm.config.mean, device=x_clean.device, dtype=x_clean.dtype).view(1, -1, 1, 1)
-            std = torch.tensor(dm.config.std, device=x_clean.device, dtype=x_clean.dtype).view(1, -1, 1, 1)
+            stat_shape = (1, -1, 1) if x_clean.ndim == 3 else (1, -1, 1, 1)
+            mean = torch.tensor(dm.config.mean, device=x_clean.device, dtype=x_clean.dtype).view(*stat_shape)
+            std = torch.tensor(dm.config.std, device=x_clean.device, dtype=x_clean.dtype).view(*stat_shape)
             x_dn = (x_clean * std + mean).clamp(0.0, 1.0)
             recon_dn = (recon_clean * std + mean).clamp(0.0, 1.0)
         else:
             x_dn = (x_clean + 1.0) / 2.0
             recon_dn = (recon_clean + 1.0) / 2.0
 
-        if prefix == 'val' and self.val_rfid is not None:
+        if not is_audio and prefix == 'val' and self.val_rfid is not None:
             self.val_rfid.update(x_dn, real=True)
             self.val_rfid.update(recon_dn, real=False)
-        elif prefix == 'test' and self.test_fid is not None:
+        elif not is_audio and prefix == 'test' and self.test_fid is not None:
             self.test_fid.update(x_dn, real=True)
             self.test_fid.update(recon_dn, real=False)
 
+        psnr = None
         ssim = None
-        if prefix == 'train':
-            psnr = self.train_psnr(recon_dn, x_dn)
-        elif prefix == 'val':
-            psnr = self.val_psnr(recon_dn, x_dn)
-            ssim = self.val_ssim(recon_dn, x_dn)
+        audio_metrics = {}
+        audio_energy_metrics = {}
+        audio_multires_metrics = {}
+        audio_energy_loss = recon_raw.new_zeros(())
+        weighted_audio_energy_loss = recon_raw.new_zeros(())
+        audio_multires_loss = recon_raw.new_zeros(())
+        weighted_audio_multires_loss = recon_raw.new_zeros(())
+        waveform_l1_loss = recon_raw.new_zeros(())
+        weighted_waveform_l1_loss = recon_raw.new_zeros(())
+        weighted_audio_multires_stft_loss = recon_raw.new_zeros(())
+        if not is_audio:
+            if prefix == 'train':
+                psnr = self.train_psnr(recon_dn, x_dn)
+            elif prefix == 'val':
+                psnr = self.val_psnr(recon_dn, x_dn)
+                ssim = self.val_ssim(recon_dn, x_dn)
+            else:
+                psnr = self.test_psnr(recon_dn, x_dn)
+                ssim = self.test_ssim(recon_dn, x_dn)
         else:
-            psnr = self.test_psnr(recon_dn, x_dn)
-            ssim = self.test_ssim(recon_dn, x_dn)
+            dm = getattr(self._trainer_ref(), "datamodule", None)
+            audio_source = getattr(dm, "config", {"dataset": "vctk"})
+            if is_waveform_audio:
+                if self.audio_waveform_l1_weight > 0:
+                    waveform_l1_loss = F.l1_loss(recon_raw, x)
+                    weighted_waveform_l1_loss = self.audio_waveform_l1_weight * waveform_l1_loss
+                    total_loss = total_loss + weighted_waveform_l1_loss
+                if self.audio_multires_stft_loss_weight > 0:
+                    audio_multires_metrics = compute_waveform_multires_stft_loss(
+                        x,
+                        recon_raw,
+                        fft_sizes=self.audio_multires_stft_fft_sizes,
+                    )
+                    if audio_multires_metrics:
+                        audio_multires_loss = audio_multires_metrics["audio_multires_stft_loss"]
+                        weighted_audio_multires_stft_loss = (
+                            self.audio_multires_stft_loss_weight * audio_multires_loss
+                        )
+                        total_loss = total_loss + weighted_audio_multires_stft_loss
+            else:
+                audio_multires_metrics = self._audio_multiresolution_spectrogram_loss(
+                    recon_raw,
+                    x,
+                    audio_source,
+                )
+                if audio_multires_metrics:
+                    audio_multires_loss = audio_multires_metrics["audio_multires_loss"]
+                    weighted_audio_multires_loss = self.audio_multires_loss_weight * audio_multires_loss
+                    total_loss = total_loss + weighted_audio_multires_loss
+            audio_metrics = compute_audio_reconstruction_metrics(
+                x,
+                recon_raw,
+                audio_meta=audio_meta,
+                audio_source=audio_source,
+                compute_visqol=prefix != "train",
+            )
+            if (not is_waveform_audio) and self.audio_energy_loss_weight > 0:
+                audio_energy_metrics = compute_audio_energy_matching_loss(
+                    x,
+                    recon_raw,
+                    audio_meta=audio_meta,
+                    audio_source=audio_source,
+                )
+                audio_energy_loss = audio_energy_metrics.get(
+                    "audio_energy_loss",
+                    recon_raw.new_zeros(()),
+                )
+                weighted_audio_energy_loss = self.audio_energy_loss_weight * audio_energy_loss
+                total_loss = total_loss + weighted_audio_energy_loss
         
         # Compute sparsity
         sparsity = self._support_fraction(sparse_codes)
@@ -676,17 +1295,47 @@ class LASER(pl.LightningModule):
             on_step=(prefix == 'train'),
             on_epoch=(prefix != 'train'),
             sync_dist=True,
+            batch_size=int(x.size(0)),
         )
         self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
+        self.log(f'{prefix}/recon_mse_loss', recon_mse_loss, **log_kwargs)
+        self.log(f'{prefix}/recon_l1_loss', recon_l1_loss, **log_kwargs)
+        self.log(f'{prefix}/recon_edge_loss', recon_edge_loss, **log_kwargs)
         self.log(f'{prefix}/bottleneck_loss', bottleneck_loss, **log_kwargs)
         self.log(f'{prefix}/weighted_bottleneck_loss', self.bottleneck_loss_weight * bottleneck_loss, **log_kwargs)
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
+        self.log(f'{prefix}/weighted_perceptual_loss', perceptual_weight * perceptual_loss, **log_kwargs)
+        self.log(
+            f'{prefix}/perceptual_weight_effective',
+            recon_raw.new_tensor(float(perceptual_weight)),
+            **log_kwargs,
+        )
         self.log(f'{prefix}/sparsity_loss', sparsity_loss, **log_kwargs)
         self.log(f'{prefix}/weighted_sparsity_loss', self.sparsity_reg_weight * sparsity_loss, **log_kwargs)
         self.log(f'{prefix}/coherence_loss', coherence_loss, **log_kwargs)
         if psnr is not None:
             self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
+        if is_audio:
+            for name, value in audio_metrics.items():
+                self.log(f'{prefix}/{name}', value, prog_bar=(name == "audio_lsd"), **log_kwargs)
+            for name, value in audio_energy_metrics.items():
+                self.log(f'{prefix}/{name}', value, prog_bar=False, **log_kwargs)
+            if self.audio_energy_loss_weight > 0:
+                self.log(f'{prefix}/weighted_audio_energy_loss', weighted_audio_energy_loss, **log_kwargs)
+            for name, value in audio_multires_metrics.items():
+                self.log(f'{prefix}/{name}', value, prog_bar=False, **log_kwargs)
+            if self.audio_multires_loss_weight > 0:
+                self.log(f'{prefix}/weighted_audio_multires_loss', weighted_audio_multires_loss, **log_kwargs)
+            if is_waveform_audio and self.audio_waveform_l1_weight > 0:
+                self.log(f'{prefix}/audio_waveform_l1_loss', waveform_l1_loss, **log_kwargs)
+                self.log(f'{prefix}/weighted_audio_waveform_l1_loss', weighted_waveform_l1_loss, **log_kwargs)
+            if is_waveform_audio and self.audio_multires_stft_loss_weight > 0:
+                self.log(
+                    f'{prefix}/weighted_audio_multires_stft_loss',
+                    weighted_audio_multires_stft_loss,
+                    **log_kwargs,
+                )
         if should_log_distribution_metrics:
             self.log(f'{prefix}/input_mean', input_mean, **log_kwargs)
             self.log(f'{prefix}/input_std', input_std, **log_kwargs)
@@ -696,6 +1345,9 @@ class LASER(pl.LightningModule):
             self.log(f'{prefix}/dict_norm_max', diag.get("dict_norm_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/dict_norm_min', diag.get("dict_norm_min", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/dict_norm_mean', diag.get("dict_norm_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/dict_usage_ema_max', diag.get("dict_usage_ema_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/dict_usage_ema_min', diag.get("dict_usage_ema_min", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/dict_usage_ema_mean', diag.get("dict_usage_ema_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/coeff_abs_max', diag.get("coeff_abs_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/coeff_abs_mean', diag.get("coeff_abs_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
             coherence_max, coherence_mean_abs, coherence_rms = self.bottleneck.coherence_stats()
@@ -708,10 +1360,30 @@ class LASER(pl.LightningModule):
         self.log(f'{prefix}/effective_sparsity', effective_sparsity, **log_kwargs)
 
         # Log bottleneck subcomponents for diagnostics
-        if self.bottleneck._last_e_latent_loss is not None:
+        if not self.bypass_bottleneck and self.bottleneck._last_e_latent_loss is not None:
             self.log(f'{prefix}/e_latent_loss', self.bottleneck._last_e_latent_loss, **log_kwargs)
-        if self.bottleneck._last_dl_latent_loss is not None:
+        if not self.bypass_bottleneck and self.bottleneck._last_dl_latent_loss is not None:
             self.log(f'{prefix}/dl_latent_loss', self.bottleneck._last_dl_latent_loss, **log_kwargs)
+        if not self.bypass_bottleneck and getattr(self.bottleneck, "_last_coeff_refine_loss", None) is not None:
+            self.log(f'{prefix}/coeff_refine_loss', self.bottleneck._last_coeff_refine_loss, **log_kwargs)
+        if not self.bypass_bottleneck and getattr(self.bottleneck, "_last_weighted_coeff_refine_loss", None) is not None:
+            self.log(
+                f'{prefix}/weighted_coeff_refine_loss',
+                self.bottleneck._last_weighted_coeff_refine_loss,
+                **log_kwargs,
+            )
+        if not self.bypass_bottleneck and getattr(self.bottleneck, "_last_coeff_posterior_std", None) is not None:
+            self.log(
+                f'{prefix}/coeff_posterior_std',
+                self.bottleneck._last_coeff_posterior_std,
+                **log_kwargs,
+            )
+        if not self.bypass_bottleneck and getattr(self.bottleneck, "_last_coeff_target_std", None) is not None:
+            self.log(
+                f'{prefix}/coeff_target_std',
+                self.bottleneck._last_coeff_target_std,
+                **log_kwargs,
+            )
 
         # Occasional diagnostic logging to catch outlier batches
         if needs_train_diag:
@@ -735,219 +1407,92 @@ class LASER(pl.LightningModule):
         Called once per validation epoch (not every N training steps) to keep
         the snapshot list short and the final GIF fast to render.
         """
-        if not self.enable_val_latent_visuals:
-            return
-        if not getattr(self._trainer_ref(), "is_global_zero", False):
+        if not self.enable_val_latent_visuals or not self._is_log_rank_zero():
             return
         with torch.no_grad():
-            atoms = self.bottleneck.dictionary.detach().cpu().clone()
+            atoms = self.bottleneck.dictionary.detach().t().cpu()
+            atoms = select_codebook_vectors(atoms, self.codebook_visual_max_vectors)
+        step = int(getattr(self, "global_step", 0) or 0)
+        if self._dict_snapshot_steps and self._dict_snapshot_steps[-1] == step:
+            return
         self._dict_snapshots.append(atoms)
-        self._dict_snapshot_steps.append(self.global_step)
-
-    def _pca_basis_and_project(self, snapshots_np):
-        """Compute PCA basis from the final snapshot and project all snapshots."""
-        import numpy as np
-        final = snapshots_np[-1]
-        mean = final.mean(axis=0, keepdims=True)
-        centered = final - mean
-        try:
-            _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
-            basis = vt[:2]
-            total_var = (s_vals ** 2).sum()
-            pc1_var = float(s_vals[0] ** 2 / total_var * 100) if total_var > 0 else 0.0
-            pc2_var = float(s_vals[1] ** 2 / total_var * 100) if len(s_vals) > 1 and total_var > 0 else 0.0
-        except np.linalg.LinAlgError:
-            atom_dim = final.shape[1]
-            basis = np.eye(min(2, atom_dim), atom_dim)
-            pc1_var = pc2_var = 0.0
-        projected = [(snap - mean) @ basis.T for snap in snapshots_np]
-        return projected, mean, basis, pc1_var, pc2_var
+        self._dict_snapshot_steps.append(step)
 
     def _log_dict_scatter(self):
         """Log a static PCA scatter of current dictionary atoms (cheap, once per val epoch)."""
-        if len(self._dict_snapshots) < 1:
+        if not self.enable_val_latent_visuals or not self._is_log_rank_zero():
             return
-        if not getattr(self._trainer_ref(), "is_global_zero", False):
+        if not self._dict_snapshots:
             return
         logger = getattr(self, "logger", None)
-        experiment = getattr(logger, "experiment", None) if logger else None
-        if experiment is None or not hasattr(experiment, "log"):
+        if logger is None:
+            return
+        image = render_codebook_scatter(
+            self._dict_snapshots,
+            self._dict_snapshot_steps,
+            title="Dictionary Atoms (PCA)",
+        )
+        if image is None:
             return
 
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
-        import tempfile, os
-
-        snapshots_np = [s.t().numpy() for s in self._dict_snapshots]
-        projected, mean, basis, pc1_var, pc2_var = self._pca_basis_and_project(snapshots_np)
-        num_atoms = snapshots_np[-1].shape[0]
-        atom_dim = snapshots_np[-1].shape[1]
-        pts = projected[-1]
-
-        # Color by displacement from initial position (if more than one snapshot)
-        if len(projected) > 1:
-            disp = np.sqrt(((pts - projected[0]) ** 2).sum(axis=1))
-            disp_norm = disp / (disp.max() + 1e-8)
-        else:
-            disp_norm = np.zeros(num_atoms)
-
-        fig, ax = plt.subplots(figsize=(8, 6))
-        sc = ax.scatter(pts[:, 0], pts[:, 1], c=disp_norm, cmap="plasma",
-                        s=18, alpha=0.85, edgecolors="k", linewidths=0.3)
-        ax.set_title(
-            f"Dictionary Atoms (PCA)  |  Step {self.global_step}  |  "
-            f"{num_atoms} atoms, {atom_dim}-dim",
-            fontsize=10,
-        )
-        ax.set_xlabel(f"PC1 ({pc1_var:.1f}% var)")
-        ax.set_ylabel(f"PC2 ({pc2_var:.1f}% var)")
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
-        cbar.set_label("Displacement from init", fontsize=8)
-        cbar.ax.tick_params(labelsize=7)
-        fig.tight_layout()
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            png_path = tmp.name
-        fig.savefig(png_path, dpi=120)
-        plt.close(fig)
-
-        step = self._wandb_epoch_end_step(experiment)
-        experiment.log(
-            {
-                "val/dictionary_scatter": wandb.Image(png_path),
-                "global_step": step,
-            },
+        step = self._wandb_epoch_end_step()
+        log_wandb_images(
+            logger,
+            "val/dictionary_scatter",
+            [image],
             step=step,
+            captions=[f"dictionary scatter step={step}"],
         )
-        try:
-            os.unlink(png_path)
-        except OSError:
-            pass
 
     def _generate_dict_animation(self):
         """Build the full trajectory GIF from all accumulated snapshots.
 
         Called once at the end of training (on_fit_end), not every val epoch.
         """
+        if not self.enable_val_latent_visuals or not self._is_log_rank_zero():
+            return
         if len(self._dict_snapshots) < 2:
             return
-        if not getattr(self._trainer_ref(), "is_global_zero", False):
-            return
-        logger = getattr(self, "logger", None)
-        experiment = getattr(logger, "experiment", None) if logger else None
-        if experiment is None or not hasattr(experiment, "log"):
-            return
-
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.animation import FuncAnimation, PillowWriter
-        import numpy as np
         import tempfile, os
 
-        snapshots_np = [s.t().numpy() for s in self._dict_snapshots]
-        steps = list(self._dict_snapshot_steps)
-        num_atoms = snapshots_np[0].shape[0]
-        atom_dim = snapshots_np[0].shape[1]
-
-        projected, mean, basis, pc1_var, pc2_var = self._pca_basis_and_project(snapshots_np)
-
-        # Per-frame displacement from initial position
-        displacements = []
-        for proj in projected:
-            disp = np.sqrt(((proj - projected[0]) ** 2).sum(axis=1))
-            displacements.append(disp)
-
-        # Compute global axis limits
-        all_pts = np.concatenate(projected, axis=0)
-        margin = 0.08
-        x_range = max(all_pts[:, 0].max() - all_pts[:, 0].min(), 1e-6)
-        y_range = max(all_pts[:, 1].max() - all_pts[:, 1].min(), 1e-6)
-        x_lim = (all_pts[:, 0].min() - margin * x_range, all_pts[:, 0].max() + margin * x_range)
-        y_lim = (all_pts[:, 1].min() - margin * y_range, all_pts[:, 1].max() + margin * y_range)
-
-        total_disp = displacements[-1]
-        disp_norm = total_disp / (total_disp.max() + 1e-8)
-        cmap = plt.cm.plasma
-        colors = cmap(disp_norm)
-
-        fig, ax = plt.subplots(figsize=(9, 7))
-
-        def update(frame_idx):
-            ax.clear()
-            pts = projected[frame_idx]
-            disp = displacements[frame_idx]
-            step = steps[frame_idx]
-
-            for k in range(num_atoms):
-                trail_x = [projected[t][k, 0] for t in range(frame_idx + 1)]
-                trail_y = [projected[t][k, 1] for t in range(frame_idx + 1)]
-                ax.plot(trail_x, trail_y, color=colors[k], alpha=0.25, lw=0.6)
-
-            sc = ax.scatter(pts[:, 0], pts[:, 1], c=disp_norm, cmap="plasma",
-                            s=18, alpha=0.85, edgecolors="k", linewidths=0.3)
-
-            ax.set_xlim(x_lim)
-            ax.set_ylim(y_lim)
-            ax.set_title(
-                f"Dictionary Atom Trajectories (PCA projection)\n"
-                f"Step {step}  |  {num_atoms} atoms, {atom_dim}-dim  |  "
-                f"Frame {frame_idx + 1}/{len(projected)}",
-                fontsize=10,
-            )
-            ax.set_xlabel(f"PC1 ({pc1_var:.1f}% var)")
-            ax.set_ylabel(f"PC2 ({pc2_var:.1f}% var)")
-
-            mean_disp = float(disp.mean())
-            max_disp = float(disp.max())
-            settled = int((disp < 0.01 * (total_disp.max() + 1e-8)).sum())
-            stats_text = (
-                f"Mean displacement: {mean_disp:.4f}\n"
-                f"Max displacement:  {max_disp:.4f}\n"
-                f"Settled atoms (<1% of max): {settled}/{num_atoms}"
-            )
-            ax.text(
-                0.02, 0.02, stats_text,
-                transform=ax.transAxes, fontsize=7.5,
-                verticalalignment="bottom", fontfamily="monospace",
-                bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8),
-            )
-
-            if not hasattr(update, "_cbar_added"):
-                cbar = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
-                cbar.set_label("Relative total displacement", fontsize=8)
-                cbar.ax.tick_params(labelsize=7)
-                update._cbar_added = True
-
-        anim = FuncAnimation(fig, update, frames=len(projected), interval=500)
-        fig.tight_layout()
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return
         with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
             gif_path = tmp.name
-        anim.save(gif_path, writer=PillowWriter(fps=2))
-        plt.close(fig)
-
-        step = self._wandb_epoch_end_step(experiment)
-        experiment.log(
-            {
-                "val/dictionary_atom_trajectories": wandb.Video(gif_path, format="gif"),
-                "global_step": step,
-            },
-            step=step,
-        )
         try:
-            os.unlink(gif_path)
-        except OSError:
-            pass
+            saved = save_codebook_trajectory_gif(
+                self._dict_snapshots,
+                self._dict_snapshot_steps,
+                gif_path,
+                title="Dictionary Atom Trajectories (PCA)",
+                fps=2,
+            )
+            if saved is None:
+                return
+            step = self._wandb_epoch_end_step()
+            log_wandb_video(
+                logger,
+                "val/dictionary_atom_trajectories",
+                [str(saved)],
+                step=step,
+                captions=[f"dictionary trajectories step={step}"],
+                formats=["gif"],
+            )
+        finally:
+            try:
+                os.unlink(gif_path)
+            except OSError:
+                pass
 
     def training_step(self, batch, batch_idx):
         """Training step."""
         loss, recon, x = self.compute_metrics(batch, prefix='train')
+        audio_meta = extract_audio_metadata_from_batch(batch)
 
         # Log images periodically
-        if self._should_log_images(batch_idx):
-            self.log_images(x, recon, prefix='train')
+        if self._should_log_images(batch_idx, prefix='train'):
+            self.log_images(x, recon, prefix='train', audio_meta=audio_meta)
             self._ddp_barrier_if_needed()
 
         return loss
@@ -957,11 +1502,13 @@ class LASER(pl.LightningModule):
         if batch_idx == 0:
             self._maybe_store_val_batch(batch)
         loss, recon, x = self.compute_metrics(batch, prefix='val')
+        audio_meta = extract_audio_metadata_from_batch(batch)
         
         # When latent visuals are enabled, batch 0 is logged in richer form at
         # validation epoch end, so skip the duplicate simple recon grid here.
-        if self._should_log_images(batch_idx) and not (self.enable_val_latent_visuals and batch_idx == 0):
-            self.log_images(x, recon, prefix='val')
+        skip_simple_val_log = self._supports_val_latent_heatmaps() and batch_idx == 0
+        if self._should_log_images(batch_idx, prefix='val') and not skip_simple_val_log:
+            self.log_images(x, recon, prefix='val', audio_meta=audio_meta)
             self._ddp_barrier_if_needed()
         
         return loss
@@ -969,10 +1516,11 @@ class LASER(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         """Test step."""
         loss, recon, x = self.compute_metrics(batch, prefix='test')
+        audio_meta = extract_audio_metadata_from_batch(batch)
 
         # Log images periodically
-        if self._should_log_images(batch_idx):
-            self.log_images(x, recon, prefix='test')
+        if self._should_log_images(batch_idx, prefix='test'):
+            self.log_images(x, recon, prefix='test', audio_meta=audio_meta)
             self._ddp_barrier_if_needed()
         
         return loss
@@ -980,17 +1528,18 @@ class LASER(pl.LightningModule):
     def on_test_epoch_end(self):
         """Compute FID at the end of test epoch."""
         if self.test_fid is not None:
-            fid_score = self.test_fid.compute()
-            self.log('test/fid', fid_score, sync_dist=True)
+            if fid_has_enough_samples(self.test_fid):
+                fid_score = self.test_fid.compute()
+                self.log('test/fid', fid_score, sync_dist=True)
             self.test_fid.reset()
 
-    def log_images(self, x, recon, prefix='val', max_images=8):
+    def log_images(self, x, recon, prefix='val', max_images=8, audio_meta=None):
         """Log reconstruction images to wandb."""
         # Only log from rank zero in DDP to avoid multi-process logger contention
         if not self._is_log_rank_zero():
             return
-        # If logger is disabled or doesn't support experiment logging, skip
-        if not getattr(self, "logger", None) or not hasattr(self.logger, "experiment") or not hasattr(self.logger.experiment, "log"):
+        logger = getattr(self, "logger", None)
+        if logger is None:
             return
         step = self._wandb_step()
         if not self._claim_media_log(prefix, step):
@@ -999,10 +1548,32 @@ class LASER(pl.LightningModule):
         # Take a small fixed subset to keep W&B logging cheap.
         x = x[:max_images]
         recon = recon[:max_images]
+
+        dm = getattr(self._trainer_ref(), "datamodule", None)
+        if torch.is_tensor(x) and x.ndim == 3:
+            payload = {
+                f"{prefix}/reconstruction_error": F.mse_loss(recon, x).item(),
+            }
+            if audio_meta is not None and dm is not None and hasattr(dm, "config"):
+                payload.update(
+                    build_audio_log_payload(
+                        x,
+                        recon,
+                        audio_meta=audio_meta,
+                        audio_source=dm.config,
+                        split=prefix,
+                        max_items=min(4, max_images),
+                        artifact_dir=(
+                            getattr(self.logger, "save_dir", None)
+                            or getattr(self._trainer_ref(), "default_root_dir", None)
+                        ),
+                    )
+                )
+            log_wandb_payload(logger, payload, step=step)
+            return
         
         # Create image grids
         # De-normalize using datamodule config if available; otherwise assume [-1,1] → [0,1]
-        dm = getattr(self._trainer_ref(), "datamodule", None)
         if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
             mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
             std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
@@ -1020,22 +1591,34 @@ class LASER(pl.LightningModule):
         x_grid = torch.nan_to_num(x_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         recon_grid = torch.nan_to_num(recon_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         
-        # Convert to numpy and transpose to correct format (H,W,C)
-        x_grid = x_grid.cpu().numpy().transpose(1, 2, 0)
-        recon_grid = recon_grid.cpu().numpy().transpose(1, 2, 0)
+        # Convert to display-friendly arrays. W&B accepts 2D grayscale arrays,
+        # which keeps single-channel spectrogram logging simple and explicit.
+        x_grid = self._wandb_display_array(x_grid)
+        recon_grid = self._wandb_display_array(recon_grid)
         
-        # Log to wandb
-        self.logger.experiment.log(
-            {
-                f"{prefix}/images": [
-                    wandb.Image(x_grid, caption="Original"),
-                    wandb.Image(recon_grid, caption="Reconstructed")
-                ],
-                f"{prefix}/reconstruction_error": F.mse_loss(recon, x).item(),
-                "global_step": step
-            },
+        log_wandb_images(
+            logger,
+            f"{prefix}/images",
+            [x_grid, recon_grid],
             step=step,
+            captions=["Original", "Reconstructed"],
         )
+        payload = {
+            f"{prefix}/reconstruction_error": F.mse_loss(recon, x).item(),
+        }
+        if audio_meta is not None and dm is not None and hasattr(dm, "config"):
+            payload.update(
+                build_audio_log_payload(
+                    x,
+                    recon,
+                    audio_meta=audio_meta,
+                    audio_source=dm.config,
+                    split=prefix,
+                    max_items=min(4, max_images),
+                    artifact_dir=getattr(self.logger, "save_dir", None) or getattr(self._trainer_ref(), "default_root_dir", None),
+                )
+            )
+        log_wandb_payload(logger, payload, step=step)
 
     def configure_optimizers(self):
         """Configure optimizers with optional cosine LR schedule."""
@@ -1043,30 +1626,44 @@ class LASER(pl.LightningModule):
                       list(self.pre_bottleneck.parameters()) + \
                       list(self.post_bottleneck.parameters()) + \
                       list(self.decoder.parameters())
+        bottleneck_aux_params = []
+        dictionary_params = []
+        if not self.bypass_bottleneck:
+            for name, param in self.bottleneck.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name == "dictionary":
+                    dictionary_params.append(param)
+                else:
+                    bottleneck_aux_params.append(param)
 
         param_groups = [
             {"params": main_params, "lr": self.learning_rate},
         ]
+        if bottleneck_aux_params:
+            param_groups.append({"params": bottleneck_aux_params, "lr": self.learning_rate})
 
         # Match proto.py: shared Adam, with an optional dictionary-specific LR.
         dict_lr = getattr(self.bottleneck, "dict_learning_rate", None)
         if dict_lr is None:
             dict_lr = self.learning_rate
-        param_groups.append({"params": [self.bottleneck.dictionary], "lr": dict_lr})
+        if dictionary_params:
+            param_groups.append({"params": dictionary_params, "lr": dict_lr})
 
         optimizer = torch.optim.Adam(
             param_groups,
             betas=(self.beta, 0.999),
         )
         trainer = self._trainer_ref()
-        estimated_steps = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
-        self._lr_total_steps = max(1, int(estimated_steps or 1))
+        total_steps, source = self._resolve_lr_total_steps(trainer)
+        self._lr_total_steps = total_steps
+        self._lr_total_steps_source = source
         self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
         return optimizer
     
     def _maybe_store_val_batch(self, batch):
         """Cache a small val batch (CPU) for visualization."""
-        if not self.enable_val_latent_visuals:
+        if not self._supports_val_latent_heatmaps():
             return
         if not getattr(self._trainer_ref(), "is_global_zero", False):
             return
@@ -1080,6 +1677,10 @@ class LASER(pl.LightningModule):
         y_keep = y[:4].detach().cpu() if y is not None and hasattr(y, "detach") else None
         self._val_vis_batch = (x_keep, y_keep)
 
+    def _supports_val_latent_heatmaps(self):
+        """Whether image-space validation latent heatmaps apply to this run."""
+        return bool(self.enable_val_latent_visuals and not self.is_waveform_audio)
+
     def _denormalize_for_display(self, x):
         """Convert normalized tensor to [0,1] range for visualization."""
         dm = getattr(self._trainer_ref(), "datamodule", None)
@@ -1090,6 +1691,14 @@ class LASER(pl.LightningModule):
         else:
             x_disp = (x + 1.0) / 2.0
         return x_disp.clamp(0.0, 1.0)
+
+    def _wandb_display_array(self, tensor: torch.Tensor):
+        tensor = torch.nan_to_num(tensor.detach().cpu(), nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        if tensor.dim() != 3:
+            raise ValueError(f"Expected CHW tensor for display, got shape {tuple(tensor.shape)}")
+        if tensor.shape[0] == 1:
+            return tensor[0].numpy()
+        return tensor.numpy().transpose(1, 2, 0)
 
     def _latent_rgb_projection(self, z_latent):
         """Project latent feature maps to RGB via PCA (per-batch)."""
@@ -1141,7 +1750,7 @@ class LASER(pl.LightningModule):
 
     def _log_val_latent_visuals(self):
         """Log latent RGB projections, sparse heatmaps, and reconstruction diagnostics."""
-        if not self.enable_val_latent_visuals:
+        if not self._supports_val_latent_heatmaps():
             return
         if not getattr(self._trainer_ref(), "is_global_zero", False):
             return
@@ -1151,53 +1760,84 @@ class LASER(pl.LightningModule):
             return
         x_cpu, _ = self._val_vis_batch
         x = x_cpu.to(self.device)
+        was_training = bool(self.training)
         self.eval()
-        with torch.no_grad():
-            z = self.encoder(x)
-            z = self.pre_bottleneck(z)
-            with self._bottleneck_autocast_context(z):
-                z_dl, _, sparse_codes = self.bottleneck(z.float())
-            recon = self.decoder(self.post_bottleneck(z_dl))
-            image_hw = (x.shape[2], x.shape[3])
-            latent_rgb = self._latent_rgb_projection(z_dl)
-            sparse_heat = self._sparse_heatmaps(sparse_codes, image_hw)
-            error_heat = self._recon_error_heatmaps(x, recon, image_hw)
-        log_payload = {}
-        import matplotlib.pyplot as plt
-        cmap = plt.cm.inferno
-        x_disp = self._denormalize_for_display(x).detach().cpu()
-        recon_disp = self._denormalize_for_display(recon).detach().cpu()
-        for idx in range(x.shape[0]):
-            orig_np = x_disp[idx].permute(1, 2, 0).clamp(0, 1).numpy()
-            recon_np = recon_disp[idx].permute(1, 2, 0).clamp(0, 1).numpy()
-            latent_img = latent_rgb[idx]
-            sparse_rgb = cmap(sparse_heat[idx])[..., :3]
-            error_rgb = cmap(error_heat[idx])[..., :3]
-            cap = f"idx={idx}"
-            log_payload.setdefault("val/original", []).append(wandb.Image(orig_np, caption=cap))
-            log_payload.setdefault("val/reconstruction", []).append(wandb.Image(recon_np, caption=cap))
-            log_payload.setdefault("val/latent_rgb", []).append(wandb.Image(latent_img, caption=cap))
-            log_payload.setdefault("val/sparse_heatmap", []).append(wandb.Image(sparse_rgb, caption=cap))
-            log_payload.setdefault("val/recon_error_map", []).append(wandb.Image(error_rgb, caption=cap))
-        if log_payload:
-            step = self._wandb_epoch_end_step()
-            log_payload["global_step"] = step
-            self.logger.experiment.log(log_payload, step=step)
-        self.train()
-        self._val_vis_batch = None
+        try:
+            with torch.no_grad():
+                z = self.encoder(x)
+                z = self.pre_bottleneck(z)
+                with self._bottleneck_autocast_context(z):
+                    z_dl, _, sparse_codes = self.bottleneck(z.float())
+                recon = self._apply_output_activation(self.decoder(self.post_bottleneck(z_dl)))
+                image_hw = (x.shape[2], x.shape[3])
+                latent_rgb = self._latent_rgb_projection(z_dl)
+                sparse_heat = self._sparse_heatmaps(sparse_codes, image_hw)
+                error_heat = self._recon_error_heatmaps(x, recon, image_hw)
+            log_payload = {}
+            import matplotlib.pyplot as plt
+            cmap = plt.cm.inferno
+            x_disp = self._denormalize_for_display(x).detach().cpu()
+            recon_disp = self._denormalize_for_display(recon).detach().cpu()
+            for idx in range(x.shape[0]):
+                orig_np = self._wandb_display_array(x_disp[idx])
+                recon_np = self._wandb_display_array(recon_disp[idx])
+                latent_img = latent_rgb[idx]
+                sparse_rgb = cmap(sparse_heat[idx])[..., :3]
+                error_rgb = cmap(error_heat[idx])[..., :3]
+                cap = f"idx={idx}"
+                log_payload.setdefault(
+                    "val/original",
+                    {"kind": "image", "items": [], "caption": []},
+                )
+                log_payload["val/original"]["items"].append(orig_np)
+                log_payload["val/original"]["caption"].append(cap)
+                log_payload.setdefault(
+                    "val/reconstruction",
+                    {"kind": "image", "items": [], "caption": []},
+                )
+                log_payload["val/reconstruction"]["items"].append(recon_np)
+                log_payload["val/reconstruction"]["caption"].append(cap)
+                log_payload.setdefault(
+                    "val/latent_rgb",
+                    {"kind": "image", "items": [], "caption": []},
+                )
+                log_payload["val/latent_rgb"]["items"].append(latent_img)
+                log_payload["val/latent_rgb"]["caption"].append(cap)
+                log_payload.setdefault(
+                    "val/sparse_heatmap",
+                    {"kind": "image", "items": [], "caption": []},
+                )
+                log_payload["val/sparse_heatmap"]["items"].append(sparse_rgb)
+                log_payload["val/sparse_heatmap"]["caption"].append(cap)
+                log_payload.setdefault(
+                    "val/recon_error_map",
+                    {"kind": "image", "items": [], "caption": []},
+                )
+                log_payload["val/recon_error_map"]["items"].append(error_rgb)
+                log_payload["val/recon_error_map"]["caption"].append(cap)
+            if log_payload:
+                step = self._wandb_epoch_end_step()
+                log_wandb_payload(self.logger, log_payload, step=step)
+        finally:
+            if was_training:
+                self.train()
+            self._val_vis_batch = None
 
     def on_validation_epoch_start(self):
         super().on_validation_epoch_start()
         self._val_vis_batch = None
-        if self.val_rfid is not None:
-            self.val_rfid = self.val_rfid.to(self.device)
-            self.val_rfid.reset()
+        metric = self._ensure_val_rfid()
+        if metric is not None:
+            metric.reset()
 
     def on_validation_epoch_end(self):
         super().on_validation_epoch_end()
         if self.val_rfid is not None:
-            rfid_score = self.val_rfid.compute()
-            self.log('val/rfid', rfid_score, sync_dist=True)
+            # Skip compute() if no updates landed this epoch (e.g. audio runs
+            # with compute_fid=true never call update — see fid_has_enough_samples).
+            if fid_has_enough_samples(self.val_rfid):
+                rfid_score = self.val_rfid.compute()
+                self.log('val/rfid', rfid_score, sync_dist=True)
             self.val_rfid.reset()
         if self.enable_val_latent_visuals:
             self._log_val_latent_visuals()
@@ -1208,12 +1848,13 @@ class LASER(pl.LightningModule):
     def on_fit_end(self):
         """Generate the full trajectory animation GIF once at the end of training."""
         if self.enable_val_latent_visuals:
+            self._snapshot_dictionary()
+            self._log_dict_scatter()
             self._generate_dict_animation()
             self._ddp_barrier_if_needed()
 
     def on_test_start(self):
         super().on_test_start()
-        if self.test_fid is not None:
-            # Align metric buffers with the rank's device and clear any stale states
-            self.test_fid = self.test_fid.to(self.device)
-            self.test_fid.reset()
+        metric = self._ensure_test_fid()
+        if metric is not None:
+            metric.reset()

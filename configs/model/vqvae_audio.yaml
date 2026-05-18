@@ -1,0 +1,8 @@
+defaults:
+  - vqvae
+  - _self_
+
+in_channels: 1
+perceptual_weight: 0.0
+compute_fid: false
+audio_energy_loss_weight: 0.25

@@ -7,6 +7,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _gaussian_kl_to_fixed_mean(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    target_mean: torch.Tensor,
+    target_std: float,
+) -> torch.Tensor:
+    """KL(q || p) for diagonal Gaussians where p uses a fixed std and mean.
+
+    Note: this is a mathematically-valid Gaussian KL, but inside ``DictionaryLearning``
+    the ``target_mean`` is the *data-dependent* OMP coefficient (taken under no_grad).
+    That makes the resulting loss a **refinement-around-OMP regularizer**, not a KL
+    against a fixed prior. See ``DictionaryLearning.forward`` for the role this term
+    plays in the objective. The historical name "coefficient KL" is preserved here
+    for the math primitive, but the caller-side names have been changed to
+    ``coeff_refine_loss`` / ``variational_coeff_refine_weight`` to match the
+    behavior.
+    """
+    target_std = float(max(target_std, 1e-6))
+    target_var = target_std * target_std
+    var = logvar.exp().clamp_min(1e-8)
+    sq_mean = (mu - target_mean).square()
+    kl = 0.5 * ((var + sq_mean) / target_var - 1.0 + math.log(target_var) - logvar)
+    return kl.mean()
+
+
 @dataclass
 class SparseCodes:
     support: torch.Tensor
@@ -25,9 +50,21 @@ def _dictionary_abs_offdiag_cosines(
     dictionary: torch.Tensor,
     eps: float,
     detach: bool,
+    max_atoms: Optional[int] = None,
 ):
     atoms = dictionary.detach() if detach else dictionary
     atoms = _normalize_dictionary(atoms, eps=eps)
+    if max_atoms is not None and int(atoms.size(1)) > int(max_atoms):
+        num_atoms = int(atoms.size(1))
+        count = max(1, int(max_atoms))
+        step = float(num_atoms) / float(count)
+        indices = (
+            torch.arange(count, device=atoms.device, dtype=torch.float32)
+            .mul(step)
+            .floor()
+            .to(torch.long)
+        )
+        atoms = atoms.index_select(1, indices)
     gram = atoms.t() @ atoms
     gram = gram - torch.diag_embed(torch.diagonal(gram))
     return gram.abs(), int(gram.size(0) * max(gram.size(0) - 1, 0))
@@ -114,6 +151,8 @@ class VectorQuantizerEMA(nn.Module):
         commitment_cost=0.25,
         ema_decay=0.99,
         epsilon=1e-10,
+        codebook_init=False,
+        dead_code_threshold=0.0,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -121,6 +160,8 @@ class VectorQuantizerEMA(nn.Module):
         self.commitment_cost = commitment_cost
         self.ema_decay = ema_decay
         self.epsilon = epsilon
+        self.codebook_init = bool(codebook_init)
+        self.dead_code_threshold = float(dead_code_threshold)
 
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         self.embedding.weight.data.normal_()
@@ -130,6 +171,43 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer(
             "_ema_w", torch.randn(num_embeddings, embedding_dim)
         )
+        self.register_buffer("_codebook_initialized", torch.tensor(False))
+
+    def _sample_batch_vectors(self, z_flat: torch.Tensor, count: int) -> torch.Tensor:
+        count = int(count)
+        if z_flat.ndim != 2 or int(z_flat.size(0)) <= 0:
+            raise ValueError("Cannot sample codebook vectors from an empty latent batch")
+        if int(z_flat.size(0)) >= count:
+            indices = torch.randperm(int(z_flat.size(0)), device=z_flat.device)[:count]
+            return z_flat[indices]
+
+        repeats = int(math.ceil(count / int(z_flat.size(0))))
+        tiled = z_flat.repeat(repeats, 1)
+        indices = torch.randperm(int(tiled.size(0)), device=z_flat.device)[:count]
+        return tiled[indices]
+
+    @torch.no_grad()
+    def _initialize_codebook_from_batch(self, z_flat: torch.Tensor):
+        samples = self._sample_batch_vectors(z_flat.detach(), self.num_embeddings)
+        samples = samples.to(device=self.embedding.weight.device, dtype=self.embedding.weight.dtype)
+        self.embedding.weight.copy_(samples)
+        self._ema_w.copy_(samples)
+        self.ema_cluster_size.fill_(1.0)
+        self._codebook_initialized.fill_(True)
+
+    @torch.no_grad()
+    def _expire_dead_codes(self, z_flat: torch.Tensor):
+        if self.dead_code_threshold <= 0.0:
+            return
+        dead_codes = self.ema_cluster_size < self.dead_code_threshold
+        num_dead = int(dead_codes.sum().item())
+        if num_dead <= 0:
+            return
+        samples = self._sample_batch_vectors(z_flat.detach(), num_dead)
+        samples = samples.to(device=self._ema_w.device, dtype=self._ema_w.dtype)
+        replacement_count = max(float(self.dead_code_threshold), 1.0)
+        self.ema_cluster_size[dead_codes] = replacement_count
+        self._ema_w[dead_codes] = samples * replacement_count
 
     def _load_from_state_dict(
         self,
@@ -149,6 +227,10 @@ class VectorQuantizerEMA(nn.Module):
             loaded = state_dict.get(key)
             if loaded is None or tuple(loaded.shape) != tuple(value.shape):
                 state_dict[key] = value
+        init_key = prefix + "_codebook_initialized"
+        loaded_init = state_dict.get(init_key)
+        if loaded_init is None or tuple(loaded_init.shape) != tuple(self._codebook_initialized.shape):
+            state_dict[init_key] = torch.ones_like(self._codebook_initialized)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -181,6 +263,8 @@ class VectorQuantizerEMA(nn.Module):
 
         z_e = z_e.permute(0, 2, 3, 1).contiguous()
         z_flat = z_e.view(-1, self.embedding_dim)
+        if self.training and self.codebook_init and not bool(self._codebook_initialized.item()):
+            self._initialize_codebook_from_batch(z_flat)
 
         distances = (
             z_flat.pow(2).sum(dim=1, keepdim=True)
@@ -207,11 +291,11 @@ class VectorQuantizerEMA(nn.Module):
                 self.ema_cluster_size.mul_(self.ema_decay).add_(
                     counts, alpha=1 - self.ema_decay
                 )
-
                 dw = (encodings.t() @ z_flat).to(self._ema_w.dtype)
                 self._ema_w.mul_(self.ema_decay).add_(
                     dw, alpha=1 - self.ema_decay
                 )
+                self._expire_dead_codes(z_flat)
 
                 n = self.ema_cluster_size.sum()
                 cluster_size = (
@@ -251,6 +335,20 @@ class DictionaryLearning(nn.Module):
         patch_reconstruction="hann",
         coef_max=None,
         bounded_omp_refine_steps=8,
+        dictionary_usage_ema_decay=0.99,
+        dictionary_usage_grad_scale=0.0,
+        dictionary_usage_grad_min=0.1,
+        dictionary_usage_grad_max=10.0,
+        variational_coeffs=False,
+        variational_coeff_refine_weight=0.0,
+        variational_coeff_target_std=0.25,
+        variational_coeff_min_std=0.01,
+        dictionary_through_decoder=False,
+        dictionary_update_mode=None,
+        dictionary_ksvd_lr=0.2,
+        dictionary_ksvd_update_every=1,
+        dictionary_ksvd_min_usage=1,
+        dictionary_ksvd_max_atoms_per_step=512,
         epsilon=1e-10,
         **legacy_kwargs,
     ):
@@ -270,9 +368,23 @@ class DictionaryLearning(nn.Module):
         legacy_kwargs.pop("lista_layers", None)
         legacy_kwargs.pop("lista_tied_weights", None)
         legacy_kwargs.pop("lista_initial_threshold", None)
-        legacy_kwargs.pop("dictionary_update_mode", None)
-        legacy_kwargs.pop("dict_ema_decay", None)
+        legacy_dictionary_update_mode = legacy_kwargs.pop("dictionary_update_mode", None)
+        if dictionary_update_mode is None:
+            dictionary_update_mode = legacy_dictionary_update_mode
+        dict_ema_decay = legacy_kwargs.pop("dict_ema_decay", None)
         legacy_kwargs.pop("dict_ema_eps", None)
+        # A3 rename (May 2026): renamed for honesty about what the term does
+        # (refinement-around-OMP, not a KL-to-prior). Refuse the old names
+        # explicitly rather than silently dropping them.
+        for old_name, new_name in (
+            ("variational_coeff_kl_weight", "variational_coeff_refine_weight"),
+            ("variational_coeff_prior_std", "variational_coeff_target_std"),
+        ):
+            if old_name in legacy_kwargs:
+                raise TypeError(
+                    f"{old_name!r} was renamed to {new_name!r} in the May 2026 "
+                    "A3 cleanup; update your configs/checkpoints."
+                )
         if legacy_kwargs:
             unknown = ", ".join(sorted(legacy_kwargs))
             raise TypeError(f"Unsupported DictionaryLearning arguments: {unknown}")
@@ -292,6 +404,81 @@ class DictionaryLearning(nn.Module):
             raise ValueError(
                 "bounded_omp_refine_steps must be >= 0, got "
                 f"{self.bounded_omp_refine_steps}"
+            )
+        self.variational_coeffs = bool(variational_coeffs)
+        # ``variational_coeff_refine_weight`` weights the refinement-around-OMP term
+        # (Gaussian-KL math, but the "prior" mean is the data-dependent OMP coefficient
+        # so it acts as an L2 pull toward OMP plus a variance shrinkage). Renamed from
+        # ``variational_coeff_kl_weight`` (May 2026, A3) to avoid implying a fixed prior.
+        self.variational_coeff_refine_weight = float(variational_coeff_refine_weight)
+        # ``variational_coeff_target_std`` is the std of the reference Gaussian in the
+        # refinement term AND the upper bound on the learned posterior std. Renamed from
+        # ``variational_coeff_prior_std`` (May 2026, A3).
+        self.variational_coeff_target_std = float(variational_coeff_target_std)
+        self.variational_coeff_min_std = float(variational_coeff_min_std)
+        # A2 switch: when True, ``forward`` skips the straight-through estimator so
+        # decoder gradients flow into the dictionary (and into coeff_variational_*).
+        # Off by default to preserve the legacy proto/VQ-style training behavior where
+        # the dictionary learns only from ``dl_latent_loss``.
+        self.dictionary_through_decoder = bool(dictionary_through_decoder)
+        if dictionary_update_mode is None:
+            dictionary_update_mode = "gradient"
+        if dictionary_update_mode not in ("gradient", "usage_ema", "online_ksvd"):
+            raise ValueError(
+                "dictionary_update_mode must be unset, 'gradient', 'usage_ema', or 'online_ksvd', "
+                f"got {dictionary_update_mode!r}"
+            )
+        self.dictionary_update_mode = str(dictionary_update_mode)
+        self.dictionary_ksvd_lr = float(dictionary_ksvd_lr)
+        if not 0.0 < self.dictionary_ksvd_lr <= 1.0:
+            raise ValueError(
+                "dictionary_ksvd_lr must be in (0, 1], got "
+                f"{self.dictionary_ksvd_lr}"
+            )
+        self.dictionary_ksvd_update_every = max(1, int(dictionary_ksvd_update_every))
+        self.dictionary_ksvd_min_usage = max(1, int(dictionary_ksvd_min_usage))
+        self.dictionary_ksvd_max_atoms_per_step = max(1, int(dictionary_ksvd_max_atoms_per_step))
+        if dict_ema_decay is not None:
+            dictionary_usage_ema_decay = dict_ema_decay
+        self.dictionary_usage_ema_decay = float(dictionary_usage_ema_decay)
+        if not 0.0 <= self.dictionary_usage_ema_decay < 1.0:
+            raise ValueError(
+                "dictionary_usage_ema_decay must be in [0, 1), got "
+                f"{self.dictionary_usage_ema_decay}"
+            )
+        self.dictionary_usage_grad_scale = float(dictionary_usage_grad_scale)
+        if self.dictionary_usage_grad_scale < 0.0:
+            raise ValueError(
+                "dictionary_usage_grad_scale must be >= 0, got "
+                f"{self.dictionary_usage_grad_scale}"
+            )
+        self.dictionary_usage_grad_min = float(dictionary_usage_grad_min)
+        self.dictionary_usage_grad_max = float(dictionary_usage_grad_max)
+        if self.dictionary_usage_grad_min <= 0.0 or self.dictionary_usage_grad_max <= 0.0:
+            raise ValueError("dictionary usage gradient clamps must be positive")
+        if self.dictionary_usage_grad_min > self.dictionary_usage_grad_max:
+            raise ValueError(
+                "dictionary_usage_grad_min cannot exceed dictionary_usage_grad_max: "
+                f"{self.dictionary_usage_grad_min} > {self.dictionary_usage_grad_max}"
+            )
+        if self.variational_coeff_refine_weight < 0.0:
+            raise ValueError(
+                "variational_coeff_refine_weight must be >= 0, got "
+                f"{self.variational_coeff_refine_weight}"
+            )
+        if self.variational_coeff_target_std <= 0.0:
+            raise ValueError(
+                "variational_coeff_target_std must be > 0, got "
+                f"{self.variational_coeff_target_std}"
+            )
+        if self.variational_coeff_min_std <= 0.0:
+            raise ValueError(
+                f"variational_coeff_min_std must be > 0, got {self.variational_coeff_min_std}"
+            )
+        if self.variational_coeff_min_std > self.variational_coeff_target_std:
+            raise ValueError(
+                "variational_coeff_min_std cannot exceed variational_coeff_target_std: "
+                f"{self.variational_coeff_min_std} > {self.variational_coeff_target_std}"
             )
         self.patch_based = bool(patch_based)
         effective_patch_size = int(patch_size) if self.patch_based else 1
@@ -322,6 +509,19 @@ class DictionaryLearning(nn.Module):
         self.dictionary = nn.Parameter(
             torch.randn(self.patch_dim, self.num_embeddings) * 0.02
         )
+        if self.dictionary_update_mode == "online_ksvd":
+            self.dictionary.requires_grad_(False)
+        if self.variational_coeffs:
+            hidden_dim = max(64, min(256, self.embedding_dim * self.patch_size))
+            self.coeff_variational_atom_emb = nn.Embedding(self.num_embeddings, hidden_dim)
+            self.coeff_variational_posterior = nn.Sequential(
+                nn.Linear(hidden_dim + 1, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
+        else:
+            self.coeff_variational_atom_emb = None
+            self.coeff_variational_posterior = None
         if self.patch_size > 1 or self.patch_stride > 1:
             hann_1d = torch.hann_window(self.patch_size, periodic=False)
             window_2d = hann_1d.unsqueeze(1) * hann_1d.unsqueeze(0)
@@ -331,10 +531,62 @@ class DictionaryLearning(nn.Module):
         else:
             window_flat = torch.ones(self.patch_dim)
         self.register_buffer("_hann_win", window_flat)
+        self.register_buffer("dictionary_usage_ema", torch.zeros(self.num_embeddings))
+        self.register_buffer("dictionary_usage_steps", torch.zeros((), dtype=torch.long))
         self.normalize_dictionary_()
         self._last_diag = {}
         self._last_dl_latent_loss = None
         self._last_e_latent_loss = None
+        self._last_coeff_refine_loss = torch.zeros(())
+        self._last_weighted_coeff_refine_loss = torch.zeros(())
+        self._last_extra_bottleneck_loss = torch.zeros(())
+        self._last_coeff_posterior_std = torch.zeros(())
+        self._last_coeff_target_std = torch.tensor(self.variational_coeff_target_std)
+        self._last_bottleneck_loss = torch.zeros(())
+        self._last_ksvd_batch = None
+        self._online_ksvd_steps = 0
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        variational_prefixes = (
+            prefix + "coeff_variational_atom_emb.",
+            prefix + "coeff_variational_posterior.",
+        )
+        if (
+            self.variational_coeffs
+            and self.coeff_variational_atom_emb is not None
+            and self.coeff_variational_posterior is not None
+        ):
+            expected_state = {
+                prefix + "coeff_variational_atom_emb.weight": self.coeff_variational_atom_emb.weight.detach().clone(),
+            }
+            for subkey, value in self.coeff_variational_posterior.state_dict().items():
+                expected_state[prefix + "coeff_variational_posterior." + subkey] = value.detach().clone()
+            for key, expected in expected_state.items():
+                loaded = state_dict.get(key)
+                if loaded is None or tuple(loaded.shape) != tuple(expected.shape):
+                    state_dict[key] = expected
+        else:
+            for key in list(state_dict.keys()):
+                if key.startswith(variational_prefixes):
+                    state_dict.pop(key, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def normalize_dictionary_(self):
         with torch.no_grad():
@@ -349,11 +601,24 @@ class DictionaryLearning(nn.Module):
             atoms = _normalize_dictionary(self.dictionary.detach(), eps=self.epsilon)
             grad = torch.nan_to_num(self.dictionary.grad)
             radial = (atoms * grad).sum(dim=0, keepdim=True)
-            self.dictionary.grad.copy_(torch.nan_to_num(grad - atoms * radial))
+            grad = grad - atoms * radial
+            if self.dictionary_usage_grad_scale > 0.0:
+                usage = self.dictionary_usage_ema.to(device=grad.device, dtype=grad.dtype)
+                active = usage > 0
+                if bool(active.any()):
+                    reference = usage[active].mean().clamp_min(float(self.epsilon))
+                    usage = usage.clamp_min(float(self.epsilon))
+                    scale = (reference / usage).pow(float(self.dictionary_usage_grad_scale))
+                    scale = scale.clamp(
+                        float(self.dictionary_usage_grad_min),
+                        float(self.dictionary_usage_grad_max),
+                    )
+                    grad = grad * scale.unsqueeze(0)
+            self.dictionary.grad.copy_(torch.nan_to_num(grad))
 
     def coherence_penalty(self, margin=0.0):
         abs_offdiag, pair_count = _dictionary_abs_offdiag_cosines(
-            self.dictionary, eps=self.epsilon, detach=False
+            self.dictionary, eps=self.epsilon, detach=False, max_atoms=4096
         )
         if pair_count <= 0:
             return torch.zeros(
@@ -362,9 +627,13 @@ class DictionaryLearning(nn.Module):
         excess = F.relu(abs_offdiag - float(max(0.0, margin)))
         return excess.square().sum() / float(pair_count)
 
-    def coherence_stats(self):
+    def coherence_stats(self, max_exact_atoms=4096, sample_atoms=1024):
+        num_atoms = int(self.dictionary.size(1))
+        max_atoms = None
+        if num_atoms > int(max_exact_atoms):
+            max_atoms = max(1, int(sample_atoms))
         abs_offdiag, pair_count = _dictionary_abs_offdiag_cosines(
-            self.dictionary, eps=self.epsilon, detach=True
+            self.dictionary, eps=self.epsilon, detach=True, max_atoms=max_atoms
         )
         if pair_count <= 0:
             zero = torch.zeros(
@@ -469,116 +738,234 @@ class DictionaryLearning(nn.Module):
         gram_support = self._support_gram(gram, support)
         return self._refine_support_coefficients_bounded(gram_support, rhs)
 
+    def _support_atoms_rhs_and_gram(self, X_t, D, support):
+        atoms = D.t()[support.to(torch.long)]
+        rhs = torch.bmm(atoms, X_t.unsqueeze(-1)).squeeze(-1)
+        gram_support = torch.bmm(atoms, atoms.transpose(1, 2))
+        return atoms, rhs, gram_support
+
+    def _solve_residual_support(self, X_t, D, support):
+        atoms, rhs, gram_support = self._support_atoms_rhs_and_gram(X_t, D, support)
+        support_size = int(support.size(1))
+        diag_eps = 1e-4
+        cholesky_eps = 1e-6
+        reg_eye = torch.eye(
+            support_size,
+            device=gram_support.device,
+            dtype=gram_support.dtype,
+        ).unsqueeze(0)
+        gram_reg = gram_support + diag_eps * reg_eye
+        init = self._solve_regularized_support_system(
+            gram_reg,
+            rhs,
+            reg_eps=cholesky_eps,
+        )
+        coeffs = self._refine_support_coefficients_bounded(
+            gram_support,
+            rhs,
+            init=init,
+        )
+        recon = torch.bmm(coeffs.unsqueeze(1), atoms).squeeze(1)
+        return coeffs, recon
+
+    def _select_residual_atom(self, residual, D, chosen):
+        """Choose the best atom per signal without materializing a full KxK Gram."""
+        _, num_atoms = D.shape
+        chunk_size = 16384
+        best_scores = residual.new_full((residual.size(0),), -1.0)
+        best_indices = torch.zeros(residual.size(0), device=residual.device, dtype=torch.long)
+        for start in range(0, int(num_atoms), chunk_size):
+            end = min(start + chunk_size, int(num_atoms))
+            scores = residual.mm(D[:, start:end]).abs()
+            scores.masked_fill_(chosen[:, start:end], -1.0)
+            values, local_indices = scores.max(dim=1)
+            update = values > best_scores
+            best_scores = torch.where(update, values, best_scores)
+            best_indices = torch.where(
+                update,
+                local_indices.to(best_indices.dtype) + int(start),
+                best_indices,
+            )
+        return best_indices
+
     def batch_omp_with_support(self, X, D):
-        """Scratch-style batched OMP that returns support indices and ordered coefficients."""
+        """Batched OMP that scales to large dictionaries and low sparsity.
+
+        The old scratch-style path formed a dense KxK dictionary Gram matrix
+        and updated correlations through it. That is fast for small K but is the
+        wrong shape for large patch dictionaries. This residual OMP path
+        recomputes D^T residual in chunks and only solves each sample's small
+        support Gram, so memory scales with signal_dim*K and batch*K rather than
+        K^2.
+        """
         self._validate_omp_inputs(X, D)
         X = torch.nan_to_num(X)
         D = torch.nan_to_num(D)
 
-        diag_eps = 1e-4
-        cholesky_eps = 1e-6
         _, batch_size = X.size()
-        device = D.device
-        dtype = D.dtype
+        device = X.device
         batch_idx = torch.arange(batch_size, device=device)
+        X_t = X.t().contiguous()
+        residual = X_t.clone()
 
-        dictionary_t = D.t()
-        gram = dictionary_t.mm(D)
-        gram_solver = gram
-        if diag_eps > 0.0:
-            gram_solver = gram + float(diag_eps) * torch.eye(
-                gram.size(0),
-                device=device,
-                dtype=dtype,
-            )
-        corr_init = dictionary_t.mm(X).t()
-        corr = corr_init.clone()
-        dense_coeffs = torch.zeros_like(corr_init)
-        use_bounded_refine = self.coef_max is not None
-        cholesky = torch.empty(batch_size, 0, 0, device=device, dtype=dtype)
         support = torch.empty(batch_size, 0, device=device, dtype=torch.long)
-        chosen = torch.zeros_like(corr_init, dtype=torch.bool)
+        chosen = torch.zeros(batch_size, int(D.size(1)), device=device, dtype=torch.bool)
+        coeffs_ordered = X.new_empty(batch_size, 0)
 
         while support.size(1) < int(self.sparsity_level):
-            scores = corr.abs().masked_fill(chosen, -1.0)
-            index = scores.argmax(dim=1)
+            index = self._select_residual_atom(residual, D, chosen)
             chosen[batch_idx, index] = True
 
-            selected = int(support.size(1))
             support = torch.cat([support, index.unsqueeze(1)], dim=1)
-            support_size = int(support.size(1))
-            if use_bounded_refine:
-                rhs = corr_init.gather(1, support)
-                gram_support = self._support_gram(gram, support)
-                # Derive the regularized sub-Gram from the already-extracted one
-                # instead of re-gathering from gram_solver.
-                reg_eye = torch.eye(
-                    support_size, device=device, dtype=dtype
-                ).unsqueeze(0)
-                gram_support_reg = gram_support + float(diag_eps) * reg_eye
-                init = self._solve_regularized_support_system(
-                    gram_support_reg,
-                    rhs,
-                    reg_eps=cholesky_eps,
-                )
-                coeffs_ordered = self._refine_support_coefficients_bounded(
-                    gram_support,
-                    rhs,
-                    init=init,
-                )
-            else:
-                diag_g = gram_solver[index, index].view(batch_size, 1, 1)
-                if selected == 0:
-                    cholesky = torch.sqrt(torch.clamp(diag_g, min=cholesky_eps))
-                else:
-                    expanded_batch_idx = batch_idx.unsqueeze(0).expand(selected, batch_size).t()
-                    gram_stack = gram_solver[
-                        support[batch_idx, :selected],
-                        index[expanded_batch_idx],
-                    ].view(batch_size, selected, 1)
-                    w = torch.linalg.solve_triangular(cholesky, gram_stack, upper=False)
-                    w_t = w.transpose(1, 2)
-                    corner = torch.sqrt(
-                        torch.clamp(
-                            diag_g - (w_t ** 2).sum(dim=2, keepdim=True),
-                            min=cholesky_eps,
-                        )
-                    )
-                    zeros = torch.zeros(batch_size, selected, 1, device=device, dtype=dtype)
-                    cholesky = torch.cat(
-                        (
-                            torch.cat((cholesky, zeros), dim=2),
-                            torch.cat((w_t, corner), dim=2),
-                        ),
-                        dim=1,
-                    )
-
-                rhs = corr_init.gather(1, support).unsqueeze(-1)
-                try:
-                    coeff_stack = torch.cholesky_solve(rhs, cholesky)
-                except RuntimeError:
-                    gram_support = torch.bmm(cholesky, cholesky.transpose(1, 2))
-                    reg_eye = torch.eye(
-                        support_size,
-                        device=device,
-                        dtype=dtype,
-                    ).expand(batch_size, -1, -1)
-                    coeff_stack = torch.linalg.solve(
-                        gram_support + cholesky_eps * reg_eye,
-                        rhs,
-                    )
-                coeff_stack = torch.nan_to_num(coeff_stack, nan=0.0, posinf=0.0, neginf=0.0)
-                coeffs_ordered = coeff_stack.squeeze(-1)
-
-            dense_coeffs[batch_idx.unsqueeze(1), support] = coeffs_ordered
-            coeffs_ordered = dense_coeffs[batch_idx.unsqueeze(1), support]
             coeffs_ordered = torch.nan_to_num(coeffs_ordered, nan=0.0, posinf=0.0, neginf=0.0)
-            gram_for_corr = gram if use_bounded_refine else gram_solver
-            beta = coeffs_ordered.unsqueeze(1).bmm(gram_for_corr[support, :]).squeeze(1)
-            corr = torch.nan_to_num(corr_init - beta, nan=0.0, posinf=0.0, neginf=0.0)
+            coeffs_ordered, recon = self._solve_residual_support(X_t, D, support)
+            residual = torch.nan_to_num(X_t - recon, nan=0.0, posinf=0.0, neginf=0.0)
 
-        coeffs_ordered = dense_coeffs[batch_idx.unsqueeze(1), support]
         return support, torch.nan_to_num(coeffs_ordered, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def update_dictionary_usage_ema_(self, support):
+        if self.dictionary_usage_ema_decay <= 0.0 and self.dictionary_usage_grad_scale <= 0.0:
+            return
+        with torch.no_grad():
+            flat = support.detach().to(torch.long).reshape(-1)
+            if flat.numel() == 0:
+                return
+            counts = torch.zeros(
+                self.num_embeddings,
+                device=flat.device,
+                dtype=self.dictionary_usage_ema.dtype,
+            )
+            counts.scatter_add_(0, flat.clamp(0, self.num_embeddings - 1), torch.ones_like(flat, dtype=counts.dtype))
+            site_count = torch.as_tensor(
+                max(flat.numel() // max(int(self.sparsity_level), 1), 1),
+                device=counts.device,
+                dtype=counts.dtype,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(site_count, op=torch.distributed.ReduceOp.SUM)
+            counts = counts / site_count.clamp_min(1.0)
+            counts = counts.to(device=self.dictionary_usage_ema.device, dtype=self.dictionary_usage_ema.dtype)
+            decay = float(self.dictionary_usage_ema_decay)
+            if int(self.dictionary_usage_steps.item()) == 0:
+                self.dictionary_usage_ema.copy_(counts)
+            else:
+                self.dictionary_usage_ema.mul_(decay).add_(counts, alpha=1.0 - decay)
+            self.dictionary_usage_steps.add_(1)
+
+    def _distributed_is_initialized(self):
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    @torch.no_grad()
+    def _all_gather_ksvd_stats(self, indices, numerator, denominator):
+        if not self._distributed_is_initialized():
+            return indices, numerator, denominator
+        gathered_indices = [torch.empty_like(indices) for _ in range(torch.distributed.get_world_size())]
+        gathered_numerators = [torch.empty_like(numerator) for _ in range(torch.distributed.get_world_size())]
+        gathered_denominators = [torch.empty_like(denominator) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(gathered_indices, indices)
+        torch.distributed.all_gather(gathered_numerators, numerator)
+        torch.distributed.all_gather(gathered_denominators, denominator)
+        return (
+            torch.cat(gathered_indices, dim=0),
+            torch.cat(gathered_numerators, dim=1),
+            torch.cat(gathered_denominators, dim=0),
+        )
+
+    @torch.no_grad()
+    def online_ksvd_update_(self):
+        """Mini-batch K-SVD-style atom update on the last sparse coding batch.
+
+        Coefficients and support are fixed. For each active atom, the update is
+        the coordinate-descent least-squares solution against the residual with
+        that atom added back, blended into the current atom and renormalized.
+        """
+        if self.dictionary_update_mode != "online_ksvd":
+            return
+        self._online_ksvd_steps += 1
+        if self._online_ksvd_steps % self.dictionary_ksvd_update_every != 0:
+            return
+        batch = self._last_ksvd_batch
+        if not batch:
+            return
+
+        signals = batch["signals"].to(device=self.dictionary.device, dtype=self.dictionary.dtype)
+        support = batch["support"].to(device=self.dictionary.device, dtype=torch.long)
+        values = batch["values"].to(device=self.dictionary.device, dtype=self.dictionary.dtype)
+        if signals.ndim != 2 or support.ndim != 2 or values.shape != support.shape:
+            return
+        if int(support.size(0)) <= 0:
+            return
+
+        dictionary_t = _normalize_dictionary(self.dictionary.detach(), eps=self.epsilon).t()
+        atoms = dictionary_t[support.clamp(0, self.num_embeddings - 1)]
+        recon = (atoms * values.unsqueeze(-1)).sum(dim=1).t().contiguous()
+        residual = torch.nan_to_num(signals - recon, nan=0.0, posinf=0.0, neginf=0.0)
+
+        flat_support = support.reshape(-1)
+        flat_values = values.reshape(-1)
+        counts = torch.bincount(
+            flat_support.clamp(0, self.num_embeddings - 1),
+            minlength=self.num_embeddings,
+        )
+        active = torch.nonzero(counts >= self.dictionary_ksvd_min_usage, as_tuple=False).flatten()
+        if active.numel() == 0:
+            return
+        active_counts = counts.index_select(0, active)
+        order = torch.argsort(active_counts, descending=True)
+        active = active.index_select(0, order[: self.dictionary_ksvd_max_atoms_per_step])
+
+        slot_to_signal = torch.arange(
+            int(support.size(0)),
+            device=support.device,
+            dtype=torch.long,
+        ).unsqueeze(1).expand_as(support).reshape(-1)
+        old_dictionary = dictionary_t.t().contiguous()
+
+        local_count = int(active.numel())
+        stat_count = self.dictionary_ksvd_max_atoms_per_step
+        indices = torch.full((stat_count,), -1, device=self.dictionary.device, dtype=torch.long)
+        numerator = torch.zeros(
+            self.patch_dim,
+            stat_count,
+            device=self.dictionary.device,
+            dtype=self.dictionary.dtype,
+        )
+        denominator = torch.zeros(stat_count, device=self.dictionary.device, dtype=self.dictionary.dtype)
+        if local_count > 0:
+            indices[:local_count] = active[:local_count]
+
+        for out_col, atom_idx in enumerate(active.tolist()):
+            mask = flat_support == int(atom_idx)
+            if not bool(mask.any()):
+                continue
+            coeff = flat_values[mask]
+            denom = coeff.square().sum()
+            if float(denom.detach().item()) <= float(self.epsilon):
+                continue
+            signal_ids = slot_to_signal[mask]
+            residual_plus = residual.index_select(1, signal_ids) + old_dictionary[:, atom_idx : atom_idx + 1] * coeff.unsqueeze(0)
+            numerator[:, out_col] = (residual_plus * coeff.unsqueeze(0)).sum(dim=1)
+            denominator[out_col] = denom
+
+        indices, numerator, denominator = self._all_gather_ksvd_stats(indices, numerator, denominator)
+        valid = (indices >= 0) & (denominator > float(self.epsilon))
+        if not bool(valid.any()):
+            return
+        valid_indices = indices[valid]
+        for atom_idx in valid_indices.unique(sorted=True).tolist():
+            mask = (indices == int(atom_idx)) & valid
+            denom = denominator[mask].sum()
+            if float(denom.detach().item()) <= float(self.epsilon):
+                continue
+            update = numerator[:, mask].sum(dim=1) / denom
+            update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
+            update = F.normalize(update, p=2, dim=0, eps=self.epsilon)
+            current = old_dictionary[:, atom_idx]
+            if torch.dot(update, current) < 0:
+                update = -update
+            blended = (1.0 - self.dictionary_ksvd_lr) * current + self.dictionary_ksvd_lr * update
+            self.dictionary[:, atom_idx].copy_(F.normalize(blended, p=2, dim=0, eps=self.epsilon))
 
     def _is_patch_based(self):
         return self.patch_based
@@ -606,14 +993,21 @@ class DictionaryLearning(nn.Module):
         )
         return patches, nph, npw, height, width
 
-    def _reconstruct_patches_center_crop(self, support, values, height, width):
-        batch_size, nph, npw, depth = support.shape
-        crop_start = max(self.patch_size - self.patch_stride, 0) // 2
+    def _sparse_atom_sum(self, support, values, *, clamp_values=False):
+        depth = int(support.shape[-1])
         dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon).t()
         support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, depth)
-        values_flat = values.to(dictionary.dtype).reshape(-1, depth)
+        values_dense = values.to(dictionary.dtype)
+        if clamp_values and self.coef_max is not None:
+            values_dense = values_dense.clamp(-self.coef_max, self.coef_max)
+        values_flat = values_dense.reshape(-1, depth)
         atoms = dictionary[support_flat]
-        recon = (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
+        return (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
+
+    def _reconstruct_patches_center_crop(self, support, values, height, width):
+        batch_size, nph, npw, _ = support.shape
+        crop_start = max(self.patch_size - self.patch_stride, 0) // 2
+        recon = self._sparse_atom_sum(support, values)
         recon = recon.view(
             batch_size * nph * npw,
             self.embedding_dim,
@@ -644,15 +1038,11 @@ class DictionaryLearning(nn.Module):
         return recon[:, :, :height, :width]
 
     def _reconstruct_patches_hann(self, support, values, height, width):
-        batch_size, nph, npw, depth = support.shape
+        batch_size, nph, npw, _ = support.shape
         center_pad = max(self.patch_size - self.patch_stride, 0) // 2
         height_padded = (nph - 1) * self.patch_stride + self.patch_size
         width_padded = (npw - 1) * self.patch_stride + self.patch_size
-        dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon).t()
-        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, depth)
-        values_flat = values.to(dictionary.dtype).reshape(-1, depth)
-        atoms = dictionary[support_flat]
-        recon = (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
+        recon = self._sparse_atom_sum(support, values)
         window = self._hann_win.to(recon.dtype)
         recon = recon * window.unsqueeze(0)
         recon = recon.view(batch_size, nph * npw, self.patch_dim).permute(0, 2, 1)
@@ -681,15 +1071,7 @@ class DictionaryLearning(nn.Module):
         """Direct patch tiling for non-overlapping patches (stride == size)."""
         B, nph, npw, D = support.shape
         C = self.embedding_dim
-
-        dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon).t()
-        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, D)
-        values_clamped = values.to(dictionary.dtype)
-        if self.coef_max is not None:
-            values_clamped = values_clamped.clamp(-self.coef_max, self.coef_max)
-        values_flat = values_clamped.reshape(-1, D)
-        atoms = dictionary[support_flat]
-        recon = (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
+        recon = self._sparse_atom_sum(support, values, clamp_values=True)
 
         recon = recon.view(B, nph, npw, C, self.patch_size, self.patch_size)
         recon = recon.permute(0, 3, 1, 4, 2, 5).contiguous()
@@ -704,13 +1086,48 @@ class DictionaryLearning(nn.Module):
         if self._is_patch_based():
             return self._reconstruct_patches_center_crop(support, values, height, width)
 
-        dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon).t()
-        support_flat = support.to(torch.long).clamp(0, self.num_embeddings - 1).reshape(-1, self.sparsity_level)
-        values_flat = values.to(dictionary.dtype).reshape(-1, self.sparsity_level)
-        atoms = dictionary[support_flat]
-        recon = (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
+        recon = self._sparse_atom_sum(support, values)
         batch_size = support.shape[0]
         return recon.view(batch_size, height, width, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
+
+    def clamp_sparse_coeffs(self, coeffs: torch.Tensor) -> torch.Tensor:
+        coeffs = torch.nan_to_num(coeffs)
+        if self.coef_max is None:
+            return coeffs
+        return coeffs.clamp(-self.coef_max, self.coef_max)
+
+    def _coeff_posterior_stats(
+        self,
+        support: torch.Tensor,
+        coeffs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.variational_coeffs:
+            raise RuntimeError("_coeff_posterior_stats requires variational_coeffs=True")
+        if self.coeff_variational_atom_emb is None or self.coeff_variational_posterior is None:
+            raise RuntimeError("variational coefficient modules were not initialized")
+        if support.shape != coeffs.shape:
+            raise ValueError(f"support and coeffs shape mismatch: {support.shape} vs {coeffs.shape}")
+
+        support_clamped = support.to(torch.long).clamp(0, self.num_embeddings - 1)
+        coeffs_base = self.clamp_sparse_coeffs(coeffs.to(torch.float32))
+        atom_emb = self.coeff_variational_atom_emb(support_clamped)
+        posterior_in = torch.cat([atom_emb, coeffs_base.unsqueeze(-1)], dim=-1)
+        posterior_raw = self.coeff_variational_posterior(posterior_in)
+
+        mean_offset = self.variational_coeff_target_std * torch.tanh(posterior_raw[..., 0])
+        posterior_mu = self.clamp_sparse_coeffs(coeffs_base + mean_offset)
+
+        std_range = max(self.variational_coeff_target_std - self.variational_coeff_min_std, 0.0)
+        posterior_std = self.variational_coeff_min_std + std_range * torch.sigmoid(posterior_raw[..., 1])
+        posterior_logvar = 2.0 * torch.log(posterior_std.clamp_min(1e-6))
+        return posterior_mu, posterior_logvar
+
+    def project_sparse_coeffs(self, support: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
+        coeffs_clamped = self.clamp_sparse_coeffs(coeffs)
+        if not self.variational_coeffs:
+            return coeffs_clamped
+        coeff_mu, _ = self._coeff_posterior_stats(support, coeffs_clamped)
+        return coeff_mu
 
     def _coeff_bin_values(
         self,
@@ -901,6 +1318,35 @@ class DictionaryLearning(nn.Module):
         return z_q
 
     def forward(self, z_e):
+        """Sparse-code ``z_e`` against the learned dictionary.
+
+        Gradient flow (important — design choice, see A2 in the May 2026 review):
+
+        * OMP support selection and (non-variational) coefficient values are
+          computed under ``no_grad``. They are not part of the autograd graph.
+        * ``dl_latent_loss = MSE(z_dl, z_e.detach())`` is the **only** training
+          signal the dictionary atoms receive in the legacy path. Pixel /
+          perceptual losses do **not** backprop into the dictionary because of
+          the straight-through estimator on the final line below.
+        * ``e_latent_loss = MSE(z_dl.detach(), z_e)`` trains the encoder to sit
+          near the dictionary span.
+        * ``z_dl = z_e + (z_dl - z_e).detach()`` is the standard VQ-VAE-style
+          straight-through estimator: the decoder consumes ``z_dl``'s value but
+          backprops into ``z_e`` (encoder), not into ``self.dictionary``.
+
+        If ``self.dictionary_through_decoder`` is True (A2 switch), the STE is
+        skipped: decoder gradients flow into the dictionary (and into the
+        ``coeff_variational_*`` modules in the variational branch), at the cost
+        of losing the direct decoder→encoder path. You will likely need to
+        raise ``commitment_cost`` to keep the encoder pinned to the dictionary
+        manifold under this setting.
+
+        The ``coeff_refine_loss`` term (when ``variational_coeffs=True``) is a
+        Gaussian KL whose reference mean is the *data-dependent* OMP
+        coefficient — it acts as a refinement-around-OMP regularizer, not a
+        KL against a fixed prior. Renamed from ``coeff_kl_loss`` (May 2026, A3)
+        for honesty.
+        """
         if z_e.dim() != 4:
             raise ValueError(
                 f"Expected input [B, C, H, W], got {tuple(z_e.shape)}"
@@ -919,23 +1365,72 @@ class DictionaryLearning(nn.Module):
             signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
         dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon)
         with torch.no_grad():
-            if self._is_patch_based():
-                support, values = self.batch_omp_with_support(signals, dictionary)
-            else:
-                support, values = self.batch_topk_with_support(signals, dictionary)
+            support, values = self.batch_omp_with_support(signals, dictionary)
         support = support.view(B, grid_h, grid_w, self.sparsity_level)
-        values = values.view(B, grid_h, grid_w, self.sparsity_level)
-        z_dl = self._reconstruct_sparse(support, values, height, width)
+        values = self.clamp_sparse_coeffs(
+            values.view(B, grid_h, grid_w, self.sparsity_level)
+        )
+        if self.training and self.dictionary_update_mode == "online_ksvd":
+            self._last_ksvd_batch = {
+                "signals": signals.detach(),
+                "support": support.detach().reshape(-1, self.sparsity_level),
+                "values": values.detach().reshape(-1, self.sparsity_level),
+            }
+        if self.training:
+            self.update_dictionary_usage_ema_(support)
+
+        coeff_refine_loss = z_e.new_zeros(())
+        weighted_coeff_refine_loss = z_e.new_zeros(())
+        coeffs_for_recon = values
+        if self.variational_coeffs:
+            coeff_mu, coeff_logvar = self._coeff_posterior_stats(support, values)
+            if self.training:
+                coeff_eps = torch.randn_like(coeff_mu)
+                coeff_std = (0.5 * coeff_logvar).exp()
+                coeffs_for_recon = self.clamp_sparse_coeffs(coeff_mu + coeff_std * coeff_eps)
+            else:
+                coeffs_for_recon = coeff_mu
+            # Gaussian-KL math, but ``values`` (the OMP coefficient) is data-dependent and
+            # detached, so this acts as a refinement-around-OMP regularizer. Renamed from
+            # ``coeff_kl_loss`` (May 2026, A3); see ``_gaussian_kl_to_fixed_mean`` docstring.
+            coeff_refine_loss = _gaussian_kl_to_fixed_mean(
+                coeff_mu,
+                coeff_logvar,
+                values,
+                target_std=self.variational_coeff_target_std,
+            )
+            weighted_coeff_refine_loss = (
+                float(self.variational_coeff_refine_weight) * coeff_refine_loss
+            )
+            self._last_coeff_posterior_std = (0.5 * coeff_logvar).exp().mean().detach()
+            self._last_coeff_target_std = torch.as_tensor(
+                self.variational_coeff_target_std,
+                device=z_e.device,
+                dtype=z_e.dtype,
+            )
+        else:
+            self._last_coeff_posterior_std = z_e.new_zeros(())
+            self._last_coeff_target_std = torch.as_tensor(
+                self.variational_coeff_target_std,
+                device=z_e.device,
+                dtype=z_e.dtype,
+            )
+
+        z_dl = self._reconstruct_sparse(support, coeffs_for_recon, height, width)
 
         dl_latent_loss = F.mse_loss(z_dl, z_e.detach())
         e_latent_loss = F.mse_loss(z_dl.detach(), z_e)
-        loss = dl_latent_loss + self.commitment_cost * e_latent_loss
+        loss = dl_latent_loss + self.commitment_cost * e_latent_loss + weighted_coeff_refine_loss
 
         self._last_dl_latent_loss = dl_latent_loss.detach()
         self._last_e_latent_loss = e_latent_loss.detach()
+        self._last_coeff_refine_loss = coeff_refine_loss.detach()
+        self._last_weighted_coeff_refine_loss = weighted_coeff_refine_loss.detach()
+        self._last_extra_bottleneck_loss = weighted_coeff_refine_loss.detach()
+        self._last_bottleneck_loss = loss.detach()
         num_sites = max(int(values.shape[0] * values.shape[1] * values.shape[2]), 1)
         dict_norms = self.dictionary.norm(dim=0).detach()
-        coeff_abs = values.abs()
+        coeff_abs = coeffs_for_recon.abs()
         coeff_abs_max = coeff_abs.max().detach()
         if self.coef_max is None:
             coeff_clip_frac = coeff_abs.new_zeros(())
@@ -951,6 +1446,9 @@ class DictionaryLearning(nn.Module):
             "dict_norm_max": dict_norms.max(),
             "dict_norm_mean": dict_norms.mean(),
             "dict_norm_min": dict_norms.min(),
+            "dict_usage_ema_max": self.dictionary_usage_ema.max().detach(),
+            "dict_usage_ema_mean": self.dictionary_usage_ema.mean().detach(),
+            "dict_usage_ema_min": self.dictionary_usage_ema.min().detach(),
             "coeff_abs_mean": (
                 coeff_abs.sum() / float(self.num_embeddings * num_sites)
             ).detach(),
@@ -958,10 +1456,14 @@ class DictionaryLearning(nn.Module):
             "coeff_clip_frac": coeff_clip_frac,
         }
 
-        z_dl = z_e + (z_dl - z_e).detach()
+        if not self.dictionary_through_decoder:
+            # Legacy VQ-style straight-through estimator: decoder loss reaches the
+            # encoder but bypasses the dictionary and (in variational mode) the
+            # coeff_variational_* networks. Disable via dictionary_through_decoder=True.
+            z_dl = z_e + (z_dl - z_e).detach()
         sparse_codes = SparseCodes(
             support=support,
-            values=values,
+            values=coeffs_for_recon,
             num_embeddings=self.num_embeddings,
         )
         return z_dl, loss, sparse_codes

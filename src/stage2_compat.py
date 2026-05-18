@@ -9,6 +9,7 @@ import torch
 
 from .checkpoint_io import build_lightning_module, extract_state_dict, load_torch_payload
 from .models.rq_ae import PatchDictionaryLearningTokenized, RQAE
+from .models.vqvae import VQVAE
 from .stage2_paths import infer_latest_stage1_checkpoint
 
 
@@ -146,6 +147,24 @@ def _infer_rq_patch_layout(
     return patch_based, patch_size, patch_stride, patch_reconstruction
 
 
+def _infer_channel_multipliers(
+    state_dict: dict,
+    *,
+    num_hiddens: int,
+    num_downsamples: int,
+) -> Optional[Tuple[int, ...]]:
+    mults = []
+    for level in range(max(0, int(num_downsamples)) + 1):
+        weight = state_dict.get(f"encoder.down.{level}.block.0.conv1.weight")
+        if weight is None:
+            return None
+        out_channels = int(weight.shape[0])
+        if num_hiddens <= 0 or out_channels % num_hiddens != 0:
+            return None
+        mults.append(out_channels // num_hiddens)
+    return tuple(mults)
+
+
 def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
     metadata = token_cache.get("meta") or token_cache.get("metadata") or {}
     dictionary_shape = tuple(state_dict["bottleneck.dictionary"].shape)
@@ -170,7 +189,18 @@ def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
     inferred_use_mid_attention = (
         "encoder.mid.attn_1.q.weight" in state_dict or "decoder.mid.attn_1.q.weight" in state_dict
     )
-    embedding_dim = int(state_dict["encoder.conv_out.weight"].shape[0])
+    pre_bottleneck_weight = state_dict.get("pre_bottleneck.weight")
+    post_bottleneck_weight = state_dict.get("post_bottleneck.weight")
+    meta_backbone_latent_channels = metadata.get("backbone_latent_channels")
+    if pre_bottleneck_weight is not None:
+        embedding_dim = int(pre_bottleneck_weight.shape[0])
+        inferred_backbone_latent_channels = int(pre_bottleneck_weight.shape[1])
+    elif post_bottleneck_weight is not None:
+        embedding_dim = int(post_bottleneck_weight.shape[1])
+        inferred_backbone_latent_channels = int(post_bottleneck_weight.shape[0])
+    else:
+        embedding_dim = int(state_dict["encoder.conv_out.weight"].shape[0])
+        inferred_backbone_latent_channels = embedding_dim
     patch_based, patch_size, patch_stride, patch_reconstruction = _infer_rq_patch_layout(
         state_dict,
         token_cache,
@@ -182,6 +212,15 @@ def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
         token_cache,
         quantized_sparse_coeffs=bool(quantize_sparse_coeffs),
     )
+    meta_channel_multipliers = metadata.get("channel_multipliers")
+    if isinstance(meta_channel_multipliers, (tuple, list)):
+        channel_multipliers = tuple(int(v) for v in meta_channel_multipliers)
+    else:
+        channel_multipliers = _infer_channel_multipliers(
+            state_dict,
+            num_hiddens=num_hiddens,
+            num_downsamples=num_downsamples,
+        )
 
     coeff_bin_centers = state_dict.get("bottleneck.coef_bin_centers")
     n_bins = int(coeff_bin_centers.shape[0]) if torch.is_tensor(coeff_bin_centers) else int(
@@ -195,8 +234,14 @@ def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
         "in_channels": int(state_dict["encoder.conv_in.weight"].shape[1]),
         "num_hiddens": num_hiddens,
         "num_downsamples": num_downsamples,
+        "channel_multipliers": channel_multipliers,
         "num_residual_layers": num_residual_layers,
         "resolution": int(metadata.get("image_size", 128)),
+        "backbone_latent_channels": int(
+            meta_backbone_latent_channels
+            if meta_backbone_latent_channels is not None
+            else inferred_backbone_latent_channels
+        ),
         "max_ch_mult": int(metadata.get("max_ch_mult", max(1, encoder_norm_channels // max(1, num_hiddens)))),
         "decoder_extra_residual_layers": int(
             metadata.get("decoder_extra_residual_layers", max(0, decoder_blocks_per_level - num_residual_layers))
@@ -222,8 +267,12 @@ def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
                 "bottleneck.coeff_variational_atom_emb.weight" in state_dict,
             )
         ),
-        "variational_coeff_kl_weight": float(metadata.get("variational_coeff_kl_weight", 0.0)),
-        "variational_coeff_prior_std": float(metadata.get("variational_coeff_prior_std", 0.25)),
+        # Renamed in May 2026 (A3). Caches written before the rename used
+        # variational_coeff_kl_weight / variational_coeff_prior_std — those will
+        # silently fall back to the defaults below; re-extract such caches against
+        # the new stage-1 code if you need accurate values.
+        "variational_coeff_refine_weight": float(metadata.get("variational_coeff_refine_weight", 0.0)),
+        "variational_coeff_target_std": float(metadata.get("variational_coeff_target_std", 0.25)),
         "variational_coeff_min_std": float(metadata.get("variational_coeff_min_std", 0.01)),
     }
 
@@ -284,6 +333,15 @@ def _coeff_codec_from_state_dict(state_dict: dict):
     return int(coeff_bin_centers.numel()), coeff_bin_centers
 
 
+def _infer_lightning_stage1_type(payload, state_dict: dict) -> str:
+    hparams = dict(payload.get("hyper_parameters", {}) or {}) if isinstance(payload, dict) else {}
+    if "sparsity_level" in hparams or any(key.startswith("bottleneck.") for key in state_dict):
+        return "laser"
+    if "decay" in hparams or any(key.startswith("vector_quantizer.") for key in state_dict):
+        return "vqvae"
+    raise RuntimeError("Could not infer stage-1 Lightning module type from checkpoint metadata.")
+
+
 def _infer_stage1_metadata_defaults(payload, cache: dict) -> dict:
     state_dict = extract_state_dict(payload)
     if not isinstance(state_dict, dict):
@@ -292,19 +350,20 @@ def _infer_stage1_metadata_defaults(payload, cache: dict) -> dict:
     inferred = {}
     if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
         hparams = dict(payload.get("hyper_parameters", {}) or {})
+        inferred["stage1_model_type"] = _infer_lightning_stage1_type(payload, state_dict)
         for key in (
             "patch_based",
             "patch_size",
             "patch_stride",
             "patch_reconstruction",
             "variational_coeffs",
-            "variational_coeff_prior_std",
+            "variational_coeff_target_std",
             "variational_coeff_min_std",
             "image_size",
         ):
             if hparams.get(key) is not None:
                 inferred[key] = hparams.get(key)
-        coeff_max = hparams.get("coeff_max")
+        coeff_max = hparams.get("coeff_max", hparams.get("coef_max"))
         if coeff_max is not None:
             inferred["coeff_max"] = float(coeff_max)
             inferred["coef_max"] = float(coeff_max)
@@ -318,7 +377,7 @@ def _infer_stage1_metadata_defaults(payload, cache: dict) -> dict:
             "patch_stride": int(rq_cfg.get("patch_stride", 4)),
             "patch_reconstruction": str(rq_cfg.get("patch_reconstruction", "center_crop")),
             "variational_coeffs": bool(rq_cfg.get("variational_coeffs", False)),
-            "variational_coeff_prior_std": float(rq_cfg.get("variational_coeff_prior_std", 0.25)),
+            "variational_coeff_target_std": float(rq_cfg.get("variational_coeff_target_std", 0.25)),
             "variational_coeff_min_std": float(rq_cfg.get("variational_coeff_min_std", 0.01)),
             "coef_max": float(rq_cfg.get("coef_max", 24.0)),
             "coeff_max": float(rq_cfg.get("coef_max", 24.0)),
@@ -473,14 +532,29 @@ def load_stage1_decoder_bundle(
     device = torch.device(device)
     image_size = meta.get("image_size")
     if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
-        from .models.laser import LASER
+        stage1_model_type = str(meta.get("stage1_model_type") or _infer_lightning_stage1_type(payload, state_dict))
+        if stage1_model_type == "laser":
+            from .models.laser import LASER
 
-        model = build_lightning_module(
-            LASER,
-            payload,
-            strict=False,
-            compute_fid=False,
-        ).eval().to(device)
+            model = build_lightning_module(
+                LASER,
+                payload,
+                strict=False,
+                compute_fid=False,
+                perceptual_weight=0.0,
+            ).eval().to(device)
+            bundle_kind = "lightning"
+        elif stage1_model_type == "vqvae":
+            model = build_lightning_module(
+                VQVAE,
+                payload,
+                strict=False,
+                compute_fid=False,
+                perceptual_weight=0.0,
+            ).eval().to(device)
+            bundle_kind = "vqvae"
+        else:
+            raise RuntimeError(f"Unsupported stage-1 Lightning module type: {stage1_model_type!r}")
         model.requires_grad_(False)
         latent_hw = meta.get("latent_hw")
         if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
@@ -488,7 +562,7 @@ def load_stage1_decoder_bundle(
         else:
             latent_hw = _infer_latent_hw_from_model(model, image_size)
         return Stage1DecodeBundle(
-            kind="lightning",
+            kind=bundle_kind,
             model=model,
             checkpoint_path=checkpoint_path,
             latent_hw=latent_hw,
@@ -535,6 +609,22 @@ def decode_stage2_tokens(
         bundle.model = bundle.model.to(device)
 
     tokens = token_grid.to(device=device, dtype=torch.long)
+    if bundle.kind == "vqvae":
+        if tokens.ndim == 4:
+            if int(tokens.shape[-1]) != 1:
+                raise ValueError(
+                    "VQ-VAE stage-2 decoding expects token grids with depth 1, "
+                    f"got shape {tuple(tokens.shape)}"
+                )
+            indices = tokens[..., 0]
+        elif tokens.ndim == 3:
+            indices = tokens
+        else:
+            raise ValueError(f"Expected VQ-VAE tokens with rank 3 or 4, got shape {tuple(tokens.shape)}")
+        h_z = int(indices.shape[1])
+        w_z = int(indices.shape[2])
+        return bundle.model.decode_from_indices(indices.reshape(indices.size(0), -1), h_z, w_z)
+
     target_hw = _resolve_decode_latent_hw(
         bundle,
         token_hw=(int(tokens.shape[1]), int(tokens.shape[2])),
@@ -563,6 +653,8 @@ def reconstruct_stage2_sparse_latent(
     device=None,
     latent_hw: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
+    if bundle.kind == "vqvae":
+        raise RuntimeError("VQ-VAE stage-2 checkpoints do not support sparse atom+coefficient latent reconstruction.")
     if device is None:
         try:
             ref_param = next(bundle.model.parameters())
@@ -613,6 +705,8 @@ def decode_stage2_outputs(
 ) -> torch.Tensor:
     if coeffs is None:
         return decode_stage2_tokens(bundle, atoms_or_tokens, device=device, latent_hw=latent_hw)
+    if bundle.kind == "vqvae":
+        raise RuntimeError("VQ-VAE stage-2 decoding does not use sparse atom+coefficient outputs.")
 
     if device is None:
         try:

@@ -1,11 +1,12 @@
-# Maintained stage-2 config
-# Usage: python train_s2.py token_cache_path=/path/to/tokens_cache.pt
+# Maintained stage-2 transformer prior config
+# Usage: python train_stage2_prior.py token_cache_path=/path/to/tokens_cache.pt
 
 # =============================================================================
 # Sparse prior training requires a token cache produced by the maintained
 # sparse-code extraction pipeline.
 # =============================================================================
 token_cache_path: null
+ckpt_path: null
 
 # =============================================================================
 # General Settings
@@ -14,7 +15,7 @@ seed: 42
 output_dir: outputs/ar
 
 # =============================================================================
-# Stage-2 Model Configuration
+# Stage-2 Transformer Configuration
 # =============================================================================
 ar:
   # Maintained training path:
@@ -31,7 +32,11 @@ ar:
   atom_vocab_size: null
   coeff_vocab_size: null
   window_sites: 0
-  n_global_spatial_tokens: 0
+  # Sparse-representation prior: row/column/depth embeddings are always used,
+  # and quantized atom/coeff streams get learned field-type embeddings.
+  # A small global prefix gives the image-level distribution a few summary
+  # tokens before raster-position generation begins.
+  n_global_spatial_tokens: 8
   autoregressive_coeffs: true
 
   # Model architecture
@@ -57,9 +62,7 @@ ar:
   coeff_loss_weight: 1.0
   coeff_depth_weighting: none
   coeff_focal_gamma: 0.0
-  # For real-valued autoregressive coefficients, prefer recon_mse for
-  # generation-focused runs. gt_atom_recon_mse reconstructs with ground-truth
-  # atom supports and can mismatch unconditional sampling.
+  # Keep the maintained stage-2 path token-prediction focused by default.
   coeff_loss_type: auto
   coeff_huber_delta: 0.5
 
@@ -68,17 +71,21 @@ ar:
   sample_coeff_mode: gaussian
 
 # =============================================================================
-# Stage-2 Training Configuration
+# Stage-2 Transformer Training And Generation Configuration
 # =============================================================================
 train_ar:
   batch_size: 256
   max_epochs: 100
   accelerator: gpu
+  num_nodes: 1
   devices: 1
   strategy: auto
   precision: 16-mixed
   gradient_clip_val: 1.0
   log_every_n_steps: 10
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+  limit_test_batches: 1.0
   val_check_interval: 0.25
   validation_split: 0.05
   test_split: 0.05
@@ -95,12 +102,20 @@ train_ar:
   sample_coeff_temperature: null
   sample_coeff_mode: gaussian
   sample_log_to_wandb: true
-  log_recon_every_n_steps: 500
+  compute_generation_fid: false
+  compute_audio_generation_metrics: false
+  generation_metric_num_samples: 0
+  # Multi-GPU post-fit test/final generation can leave ranks waiting on NCCL
+  # after training has already checkpointed. Keep DDP sweep jobs focused on
+  # training/validation; single-GPU debug runs still perform the final pass by
+  # default unless these are set explicitly.
+  run_test_after_fit: null
+  save_final_samples_after_fit: null
 
 # =============================================================================
 # Token-cache loader settings
 # Maintained stage-2 training reads dataset/image metadata from the token cache.
-# Only num_workers is used directly by train_s2.py.
+# Only num_workers is used directly by train_stage2_prior.py.
 # =============================================================================
 data:
   dataset: null
@@ -117,4 +132,9 @@ data:
 wandb:
   project: laser-ar
   name: s2
+  id: null
+  resume: allow
+  group: null
+  tags: []
+  append_timestamp: false
   save_dir: outputs/wandb

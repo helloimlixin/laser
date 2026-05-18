@@ -1,0 +1,30 @@
+defaults:
+  - laser
+  - _self_
+
+in_channels: 1
+backbone: simple
+audio_backbone: waveform
+audio_downsample_rates: [4, 4, 4]
+audio_dilation_cycle: [1, 3, 9]
+num_hiddens: 128
+num_embeddings: 1024
+embedding_dim: 64
+num_residual_blocks: 3
+num_residual_hiddens: 64
+sparsity_level: 8
+commitment_cost: 0.1
+bottleneck_loss_weight: 0.5
+dict_learning_rate: 1.0e-4
+coef_max: 8.0
+recon_mse_weight: 0.5
+recon_l1_weight: 0.5
+recon_edge_weight: 0.0
+perceptual_weight: 0.0
+compute_fid: false
+audio_energy_loss_weight: 0.0
+audio_multires_loss_weight: 0.0
+audio_waveform_l1_weight: 1.0
+audio_multires_stft_loss_weight: 1.0
+audio_multires_stft_fft_sizes: [512, 1024, 2048]
+out_tanh: true

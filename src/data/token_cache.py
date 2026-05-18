@@ -30,6 +30,7 @@ class CachedTokenDataset(Dataset):
         self,
         tokens_flat: torch.Tensor,
         coeffs_flat: Optional[torch.Tensor] = None,
+        audio_meta: Optional[dict] = None,
         *,
         shape: Optional[tuple[int, int, int]] = None,
         crop_shape: Optional[tuple[int, int, int]] = None,
@@ -49,10 +50,28 @@ class CachedTokenDataset(Dataset):
         else:
             self.coeffs_flat = None
         self.tokens_flat = tokens_flat.to(torch.long).contiguous()
+        self.audio_meta = None if audio_meta is None else dict(audio_meta)
         self.shape = None if shape is None else tuple(int(v) for v in shape)
         self.crop_shape = None if crop_shape is None else tuple(int(v) for v in crop_shape)
         self.crop_mode = str(crop_mode).strip().lower()
         self.indices = None if indices is None else [int(v) for v in indices]
+        if self.audio_meta is not None:
+            total_items = int(self.tokens_flat.size(0))
+            paths = list(self.audio_meta.get("path", []))
+            if len(paths) != total_items:
+                raise ValueError(
+                    f"audio_meta['path'] length {len(paths)} must match tokens_flat length {total_items}"
+                )
+            for key, value in self.audio_meta.items():
+                if key == "path":
+                    continue
+                if not torch.is_tensor(value):
+                    value = torch.as_tensor(value)
+                if int(value.shape[0]) != total_items:
+                    raise ValueError(
+                        f"audio_meta[{key!r}] batch dimension {int(value.shape[0])} must match tokens_flat length {total_items}"
+                    )
+                self.audio_meta[key] = value.contiguous()
 
         if self.crop_shape is not None:
             if self.shape is None:
@@ -86,10 +105,21 @@ class CachedTokenDataset(Dataset):
             return int((size - crop) // 2)
         return int(torch.randint(0, size - crop + 1, size=()).item())
 
+    def _audio_meta_item(self, real_idx: int) -> Optional[dict]:
+        if self.audio_meta is None:
+            return None
+        item = {"path": self.audio_meta["path"][real_idx]}
+        for key, value in self.audio_meta.items():
+            if key == "path":
+                continue
+            item[key] = value[real_idx]
+        return item
+
     def __getitem__(self, idx: int):
         real_idx = int(self.indices[idx]) if self.indices is not None else int(idx)
         tokens = self.tokens_flat[real_idx]
         coeffs = None if self.coeffs_flat is None else self.coeffs_flat[real_idx]
+        audio_meta = self._audio_meta_item(real_idx)
         if self.crop_shape is not None:
             full_h, full_w, full_d = self.shape
             crop_h, crop_w, _ = self.crop_shape
@@ -101,8 +131,12 @@ class CachedTokenDataset(Dataset):
                 coeffs = coeffs.view(full_h, full_w, full_d)[top : top + crop_h, left : left + crop_w, :]
                 coeffs = coeffs.reshape(-1)
         if coeffs is None:
-            return tokens
-        return tokens, coeffs
+            if audio_meta is None:
+                return tokens
+            return tokens, audio_meta
+        if audio_meta is None:
+            return tokens, coeffs
+        return tokens, coeffs, audio_meta
 
 
 class TokenCacheDataModule(pl.LightningDataModule):
@@ -163,15 +197,26 @@ class TokenCacheDataModule(pl.LightningDataModule):
         cache = load_token_cache(self.cache_path)
         tokens_flat = cache.get("tokens_flat")
         coeffs_flat = cache.get("coeffs_flat")
+        audio_meta = cache.get("audio_meta")
         if self.max_items > 0:
             tokens_flat = tokens_flat[: self.max_items]
             if coeffs_flat is not None:
                 coeffs_flat = coeffs_flat[: self.max_items]
+            if isinstance(audio_meta, dict):
+                sliced_meta = {"path": list(audio_meta.get("path", []))[: self.max_items]}
+                for key, value in audio_meta.items():
+                    if key == "path":
+                        continue
+                    tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+                    sliced_meta[key] = tensor[: self.max_items].clone()
+                audio_meta = sliced_meta
 
         self.cache = dict(cache)
         self.cache["tokens_flat"] = tokens_flat
         if coeffs_flat is not None:
             self.cache["coeffs_flat"] = coeffs_flat
+        if audio_meta is not None:
+            self.cache["audio_meta"] = audio_meta
 
         full_shape = tuple(int(v) for v in cache.get("shape"))
         self._full_token_shape = full_shape
@@ -193,6 +238,7 @@ class TokenCacheDataModule(pl.LightningDataModule):
         self.dataset = CachedTokenDataset(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
+            audio_meta=audio_meta,
             shape=full_shape,
         )
         total_items = len(self.dataset)
@@ -207,6 +253,7 @@ class TokenCacheDataModule(pl.LightningDataModule):
         self.train_dataset = CachedTokenDataset(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
+            audio_meta=audio_meta,
             shape=full_shape,
             crop_shape=crop_shape,
             crop_mode=("random" if crop_shape is not None else "full"),
@@ -216,6 +263,7 @@ class TokenCacheDataModule(pl.LightningDataModule):
             CachedTokenDataset(
                 tokens_flat=tokens_flat,
                 coeffs_flat=coeffs_flat,
+                audio_meta=audio_meta,
                 shape=full_shape,
                 crop_shape=crop_shape,
                 crop_mode=("center" if crop_shape is not None else "full"),
@@ -228,6 +276,7 @@ class TokenCacheDataModule(pl.LightningDataModule):
             CachedTokenDataset(
                 tokens_flat=tokens_flat,
                 coeffs_flat=coeffs_flat,
+                audio_meta=audio_meta,
                 shape=full_shape,
                 crop_shape=crop_shape,
                 crop_mode=("center" if crop_shape is not None else "full"),

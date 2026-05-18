@@ -1,0 +1,9 @@
+dataset: celebahq
+data_dir: ${oc.env:CELEBAHQ_DIR,${oc.env:CELEBA_HQ_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/celebahq}}
+batch_size: 8
+num_workers: 8
+image_size: 256
+seed: ${seed}
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
+augment: false

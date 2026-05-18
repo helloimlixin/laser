@@ -2,6 +2,7 @@
 type: vqvae
 in_channels: 3
 num_hiddens: 128
+num_downsamples: 2
 num_embeddings: 512
 embedding_dim: 64
 num_residual_blocks: 2
@@ -11,3 +12,12 @@ decay: 0.99
 perceptual_weight: 0.
 compute_fid: true
 fid_feature: 2048
+codebook_init: false
+dead_code_threshold: 0.0
+out_tanh: false
+
+# W&B codebook visuals:
+# - val/vq_codebook_scatter
+# - val/vq_codebook_trajectories at fit end
+enable_codebook_visuals: true
+codebook_visual_max_vectors: 1024

@@ -1,0 +1,16 @@
+dataset: vctk
+data_dir: ${oc.env:VCTK_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/vctk}
+batch_size: 8
+num_workers: 4
+image_size: 128
+seed: ${seed}
+mean: [0.5]
+std: [0.5]
+augment: true
+sample_rate: 16000
+audio_num_samples: 32768
+stft_n_fft: 1024
+stft_hop_length: 256
+stft_win_length: 1024
+stft_power: 2.0
+stft_log_offset: 1.0e-5

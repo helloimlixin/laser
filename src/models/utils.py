@@ -3,6 +3,33 @@ from torch import nn
 from tqdm.auto import tqdm
 import torch.nn.functional as F
 
+
+def fid_has_enough_samples(metric) -> bool:
+    """Return True iff the FID metric has the >=2 samples per side that .compute() requires.
+
+    torchmetrics' ``FrechetInceptionDistance.compute()`` raises a ``RuntimeError``
+    if either the real or fake feature buffer holds fewer than 2 samples. That
+    fires whenever ``compute_fid=True`` is set on an audio stage-1 run: the
+    metric is lazily allocated but never receives ``update()`` calls because
+    the audio code path skips them (rFID is meaningless for 1-channel audio
+    and the Inception backbone expects 3 channels). Guard ``.compute()`` with
+    this helper so the validation/test epoch end does not crash an otherwise
+    healthy run.
+    """
+    if metric is None:
+        return False
+    real = getattr(metric, "real_features_num_samples", None)
+    fake = getattr(metric, "fake_features_num_samples", None)
+    if real is None or fake is None:
+        # Unknown torchmetrics layout — be conservative and let .compute() raise so
+        # the caller still sees the real diagnostic instead of a silent miss.
+        return True
+    try:
+        return int(real) >= 2 and int(fake) >= 2
+    except (TypeError, ValueError):
+        return True
+
+
 def compute_accuracy(eval_model, dataloader):
     correct = 0
     total = 0

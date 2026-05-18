@@ -89,6 +89,7 @@ class SpatialDepthPriorConfig:
     coeff_prior_std: float = 0.25
     coeff_min_std: float = 0.01
     autoregressive_coeffs: bool = True
+    support_order: str = "none"
 
 
 def build_spatial_depth_prior_config(
@@ -137,7 +138,7 @@ def build_spatial_depth_prior_config(
             bottleneck_coef_max if bottleneck_coef_max is not None else coeff_max_fallback
         ),
         gaussian_coeffs=bool(getattr(bottleneck, "variational_coeffs", False)),
-        coeff_prior_std=float(getattr(bottleneck, "variational_coeff_prior_std", 0.25)),
+        coeff_prior_std=float(getattr(bottleneck, "variational_coeff_target_std", 0.25)),
         coeff_min_std=float(getattr(bottleneck, "variational_coeff_min_std", 0.01)),
         autoregressive_coeffs=bool(autoregressive_coeffs),
     )
@@ -151,6 +152,9 @@ class SpatialDepthPrior(nn.Module):
         self.real_valued_coeffs = bool(cfg.real_valued_coeffs)
         self.gaussian_coeffs = bool(self.real_valued_coeffs and cfg.gaussian_coeffs)
         self.autoregressive_coeffs = bool(cfg.autoregressive_coeffs)
+        self.support_order = str(getattr(cfg, "support_order", "none") or "none").strip().lower()
+        if self.support_order not in {"none", "atom_id"}:
+            raise ValueError(f"Unsupported sparse support_order: {self.support_order!r}")
         self.n_global_spatial_tokens = int(cfg.n_global_spatial_tokens)
         if self.n_global_spatial_tokens < 0:
             raise ValueError(
@@ -194,6 +198,14 @@ class SpatialDepthPrior(nn.Module):
             self.rollout_depth = self.output_depth
         else:
             self.rollout_depth = self.output_depth // 2
+        self.atom_steps = self.rollout_depth if (self.real_valued_coeffs or not self.autoregressive_coeffs) else (
+            (self.rollout_depth + 1) // 2
+        )
+        if self.support_order == "atom_id" and self.atom_vocab_size < self.atom_steps:
+            raise ValueError(
+                "support_order='atom_id' requires enough unique atoms for the sparse support, "
+                f"got atom_vocab_size={self.atom_vocab_size} for {self.atom_steps} atom steps"
+            )
 
         # Shared token embedding for atom IDs and output classes.
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
@@ -216,6 +228,11 @@ class SpatialDepthPrior(nn.Module):
         self.coeff_token_emb = None
         self.token_type_emb = None
         if not self.real_valued_coeffs:
+            if self.autoregressive_coeffs:
+                # Factor atom-id and coefficient-bin channels, mirroring the
+                # sparse representation paper's channel/location/value tuple
+                # decomposition while keeping our compact spatial-depth prior.
+                self.token_type_emb = nn.Embedding(2, cfg.d_model)
             coeff_bin_values = cfg.coeff_bin_values
             if coeff_bin_values is None:
                 coeff_bin_values = torch.linspace(
@@ -526,6 +543,75 @@ class SpatialDepthPrior(nn.Module):
         act_dtype = self._activation_dtype(tokens.device)
         return self.token_emb(tokens).to(dtype=act_dtype)
 
+    def _depth_type_emb(
+        self,
+        depth_indices: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.token_type_emb is None:
+            return None
+        type_ids = (depth_indices.to(torch.long) % 2).clamp(0, 1)
+        return self.token_type_emb(type_ids).to(dtype=dtype)
+
+    def _add_depth_type_embeddings(
+        self,
+        token_emb: torch.Tensor,
+        *,
+        start_depth: int = 0,
+    ) -> torch.Tensor:
+        if self.token_type_emb is None or token_emb.size(-2) <= 0:
+            return token_emb
+        depth_indices = torch.arange(
+            int(start_depth),
+            int(start_depth) + int(token_emb.size(-2)),
+            device=token_emb.device,
+        )
+        type_emb = self._depth_type_emb(depth_indices, dtype=token_emb.dtype)
+        if type_emb is None:
+            return token_emb
+        return token_emb + type_emb.view(*([1] * (token_emb.ndim - 2)), token_emb.size(-2), token_emb.size(-1))
+
+    def _is_atom_depth(self, depth_idx: int) -> bool:
+        if self.real_valued_coeffs or not self.autoregressive_coeffs:
+            return True
+        return (int(depth_idx) % 2) == 0
+
+    def _atom_slot_index(self, depth_idx: int) -> int:
+        if self.real_valued_coeffs or not self.autoregressive_coeffs:
+            return int(depth_idx)
+        return int(depth_idx) // 2
+
+    def _previous_atom_tokens(self, tokens: torch.Tensor, depth_idx: int) -> Optional[torch.Tensor]:
+        if int(depth_idx) <= 0:
+            return None
+        if self.real_valued_coeffs or not self.autoregressive_coeffs:
+            prev = tokens[..., : int(depth_idx)]
+        elif (int(depth_idx) % 2) == 0:
+            prev = tokens[..., : int(depth_idx) : 2]
+        else:
+            return None
+        return prev if prev.size(-1) > 0 else None
+
+    def _mask_atom_order_logits(
+        self,
+        logits: torch.Tensor,
+        depth_idx: int,
+        prev_atoms: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.support_order != "atom_id" or not self._is_atom_depth(depth_idx):
+            return logits
+        slot = self._atom_slot_index(depth_idx)
+        max_allowed = int(self.atom_vocab_size) - (int(self.atom_steps) - int(slot))
+        atom_ids = torch.arange(self.atom_vocab_size, device=logits.device)
+        view_shape = (1,) * (logits.ndim - 1) + (self.atom_vocab_size,)
+        invalid = atom_ids.view(view_shape) > max_allowed
+        if prev_atoms is not None and prev_atoms.numel() > 0:
+            min_allowed = prev_atoms.to(torch.long).max(dim=-1).values + 1
+            invalid = invalid | (atom_ids.view(view_shape) < min_allowed.unsqueeze(-1))
+        logits[..., : self.atom_vocab_size] = logits[..., : self.atom_vocab_size].masked_fill(invalid, float("-inf"))
+        return logits
+
     def _split_quantized_tokens(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.real_valued_coeffs:
             raise RuntimeError("_split_quantized_tokens is only valid when real_valued_coeffs=False")
@@ -591,15 +677,14 @@ class SpatialDepthPrior(nn.Module):
                     f"Expected tokens with shape {tuple(logits.shape[:3])}, got {tuple(tokens.shape)}"
                 )
             tokens = _private_long_tensor(tokens, device=logits.device)
-            if self.real_valued_coeffs or not self.autoregressive_coeffs:
-                depth_range = range(1, self.rollout_depth)
-                prev_atom_slice = lambda depth_idx: tokens[:, :, :depth_idx]
-            else:
-                depth_range = range(2, self.rollout_depth, 2)
-                prev_atom_slice = lambda depth_idx: tokens[:, :, :depth_idx:2]
-            for depth_idx in depth_range:
-                prev_atoms = prev_atom_slice(depth_idx).to(torch.long)
-                masked[:, :, depth_idx, :].scatter_(2, prev_atoms, float("-inf"))
+            for depth_idx in range(self.rollout_depth):
+                if not self._is_atom_depth(depth_idx):
+                    continue
+                prev_atoms = self._previous_atom_tokens(tokens, depth_idx)
+                if self.support_order == "atom_id":
+                    self._mask_atom_order_logits(masked[:, :, depth_idx, :], depth_idx, prev_atoms)
+                elif prev_atoms is not None:
+                    masked[:, :, depth_idx, :].scatter_(2, prev_atoms.to(torch.long), float("-inf"))
         return masked
 
     def _forward_spatial_hidden(
@@ -616,6 +701,7 @@ class SpatialDepthPrior(nn.Module):
         spatial_in[:, 0] = self.start_emb.squeeze(1)
         if T > 1:
             prev_token_emb = self._embed_tokens(tokens[:, :-1])
+            prev_token_emb = self._add_depth_type_embeddings(prev_token_emb)
             if self.real_valued_coeffs and self.autoregressive_coeffs:
                 if self.coeff_proj is None:
                     raise RuntimeError("Missing coeff_proj for autoregressive real-valued coefficient conditioning")
@@ -662,7 +748,10 @@ class SpatialDepthPrior(nn.Module):
         depth_in[:, 0] = spatial_h_flat
         if D > 1:
             prev_depth_tokens = tokens[:, :, :-1].reshape(bt, D - 1)
-            depth_in[:, 1:] = self._embed_tokens(prev_depth_tokens)
+            depth_in[:, 1:] = self._add_depth_type_embeddings(
+                self._embed_tokens(prev_depth_tokens),
+                start_depth=0,
+            )
             if self.real_valued_coeffs and self.autoregressive_coeffs:
                 if self.coeff_proj is None:
                     raise RuntimeError("Missing coeff_proj for autoregressive real-valued coefficient conditioning")
@@ -785,16 +874,13 @@ class SpatialDepthPrior(nn.Module):
         prev_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         logits = logits.masked_fill(~self._depth_token_mask[depth_idx].view(1, -1), float("-inf"))
-        prev_atoms = None
-        if prev_tokens is not None and depth_idx > 0:
-            if self.real_valued_coeffs or not self.autoregressive_coeffs:
-                prev_atoms = prev_tokens[:, :depth_idx]
-            elif (depth_idx % 2) == 0:
-                prev_atoms = prev_tokens[:, :depth_idx:2]
-        if prev_atoms is not None:
-            if prev_atoms.numel() > 0:
-                prev_atoms = _private_long_tensor(prev_atoms, device=logits.device)
-                logits.scatter_(1, prev_atoms, float("-inf"))
+        prev_atoms = None if prev_tokens is None else self._previous_atom_tokens(prev_tokens, depth_idx)
+        if prev_atoms is not None and prev_atoms.numel() > 0:
+            prev_atoms = _private_long_tensor(prev_atoms, device=logits.device)
+        if self.support_order == "atom_id":
+            logits = self._mask_atom_order_logits(logits, depth_idx, prev_atoms)
+        elif prev_atoms is not None:
+            logits.scatter_(1, prev_atoms, float("-inf"))
         return logits
 
     def _sample_from_logits(
@@ -983,6 +1069,7 @@ class SpatialDepthPrior(nn.Module):
                 x_new = self.start_emb.expand(batch_size, -1, -1).to(dtype=act_dtype)
             else:
                 prev_emb = self._embed_tokens(tokens[:, t - 1])    # [B, D, d]
+                prev_emb = self._add_depth_type_embeddings(prev_emb)
                 if self.real_valued_coeffs and self.autoregressive_coeffs:
                     if self.coeff_proj is None:
                         raise RuntimeError("Missing coeff_proj for autoregressive real-valued coefficient conditioning")
@@ -1011,6 +1098,7 @@ class SpatialDepthPrior(nn.Module):
                     step_in = h_t.unsqueeze(1)
                 else:
                     step_in = self._embed_tokens(tokens[:, t, d - 1]).unsqueeze(1)
+                    step_in = self._add_depth_type_embeddings(step_in, start_depth=d - 1)
                     if self.real_valued_coeffs and self.autoregressive_coeffs:
                         if self.coeff_proj is None:
                             raise RuntimeError("Missing coeff_proj for autoregressive real-valued coefficient conditioning")

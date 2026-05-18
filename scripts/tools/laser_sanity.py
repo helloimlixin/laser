@@ -1,0 +1,78 @@
+#!/usr/bin/env python
+"""Quick manual sanity check for the LASER model."""
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+for p in (str(ROOT), str(SRC)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import torch
+from src.models.laser import LASER
+
+print("=" * 60)
+print("LASER SANITY CHECK")
+print("=" * 60)
+
+# Create model
+print("\n1. Creating LASER model...")
+model = LASER(
+    in_channels=3,
+    num_hiddens=128,
+    num_embeddings=32,
+    embedding_dim=64,
+    sparsity_level=5,
+    num_residual_blocks=2,
+    num_residual_hiddens=32,
+    commitment_cost=0.25,
+    learning_rate=1e-4,
+    beta=0.9,
+    perceptual_weight=1.0,
+)
+print("✓ Model created successfully")
+
+# Test forward pass
+print("\n2. Testing forward pass...")
+model.eval()
+x = torch.randn(2, 3, 64, 64)
+
+with torch.no_grad():
+    recon, bottleneck_loss, sparse_codes = model(x)
+
+print(f"✓ Forward pass successful")
+print(f"   Input shape: {x.shape}")
+print(f"   Reconstruction shape: {recon.shape}")
+print(f"   Bottleneck loss: {bottleneck_loss.item():.6f}")
+print(f"   Support shape: {sparse_codes.support.shape}")
+print(f"   Values shape: {sparse_codes.values.shape}")
+print(f"   Sparsity: {(sparse_codes.values.abs() > 1e-6).float().sum(dim=-1).mean().item():.2f} atoms/pixel")
+
+# Test reconstruction quality
+print("\n3. Testing reconstruction quality...")
+mse = torch.nn.functional.mse_loss(recon, x).item()
+print(f"✓ MSE: {mse:.6f}")
+
+# Test compute_metrics
+print("\n4. Testing compute_metrics...")
+model.eval()
+model.log = lambda *args, **kwargs: None
+batch = (x,)
+loss, recon_vis, x_vis = model.compute_metrics(batch, prefix='test')
+print(f"✓ Metrics computed")
+print(f"   Total loss: {loss.item():.6f}")
+
+# Count parameters
+print("\n5. Model statistics...")
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"   Total parameters: {total_params:,}")
+print(f"   Trainable parameters: {trainable_params:,}")
+print(f"   Dictionary atoms: {model.bottleneck.num_embeddings}")
+print(f"   Atom dimension: {model.bottleneck.embedding_dim}")
+
+print("\n" + "="*60)
+print("ALL CHECKS PASSED ✓")
+print("="*60)

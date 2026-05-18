@@ -1,18 +1,33 @@
 """Lightning wrapper and factory helpers for sparse-token stage-2 priors."""
 
 import math
+import warnings
 from typing import Optional, Tuple
 
 import lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.utils
-
-from src.stage2_compat import decode_stage2_outputs, reconstruct_stage2_sparse_latent
 
 from .gpt_prior import GPTPrior, GPTPriorConfig
 from .spatial_prior import SpatialDepthPrior, SpatialDepthPriorConfig
+
+
+def _unpack_cached_batch(batch) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
+    """Normalize tensor- and tuple-based cache batches into tokens and optional coeffs."""
+    if torch.is_tensor(batch):
+        return batch, None, None
+    if not isinstance(batch, (tuple, list)) or len(batch) == 0:
+        raise ValueError("Sparse-token batches must be a tensor or a non-empty sequence.")
+    tokens = batch[0]
+    if not torch.is_tensor(tokens):
+        raise ValueError("Sparse-token batches must start with a token tensor.")
+    coeffs = None
+    for item in batch[1:]:
+        if torch.is_tensor(item):
+            coeffs = item
+            break
+    return tokens, coeffs, None
 
 
 def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
@@ -40,6 +55,7 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
             "prior_autoregressive_coeffs": bool(cfg.autoregressive_coeffs),
             "prior_coeff_prior_std": float(cfg.coeff_prior_std),
             "prior_coeff_min_std": float(cfg.coeff_min_std),
+            "prior_support_order": str(getattr(cfg, "support_order", "none") or "none"),
         }
     if isinstance(prior, GPTPrior) and isinstance(cfg, GPTPriorConfig):
         return {
@@ -218,6 +234,7 @@ def build_sparse_prior_from_cache(
     else:
         H, W, D = (int(grid_shape[0]), int(grid_shape[1]), int(grid_shape[2]))
     meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+    support_order = str(meta.get("support_order", "none") or "none")
     real_valued_coeffs = cache.get("coeffs_flat") is not None
     architecture = str(architecture).strip().lower()
     if architecture == "mingpt":
@@ -253,9 +270,10 @@ def build_sparse_prior_from_cache(
                 dropout=float(dropout),
                 coeff_max=coeff_max,
                 gaussian_coeffs=bool(meta.get("variational_coeffs", False)),
-                coeff_prior_std=float(meta.get("variational_coeff_prior_std", 0.25)),
+                coeff_prior_std=float(meta.get("variational_coeff_target_std", 0.25)),
                 coeff_min_std=float(meta.get("variational_coeff_min_std", 0.01)),
                 autoregressive_coeffs=bool(autoregressive_coeffs),
+                support_order=support_order,
             )
         )
 
@@ -288,6 +306,7 @@ def build_sparse_prior_from_cache(
                 dropout=float(dropout),
                 coeff_max=coeff_max,
                 autoregressive_coeffs=bool(autoregressive_coeffs),
+                support_order=support_order,
             )
         )
     if architecture == "gpt":
@@ -350,6 +369,7 @@ def build_sparse_prior_from_hparams(
     else:
         H, W, D = token_cache_grid_shape(cache)
     meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+    support_order = str(hparams.get("prior_support_order", meta.get("support_order", "none")) or "none")
     if real_valued_coeffs:
         atom_vocab_size = infer_sparse_atom_vocab_size(cache, atom_vocab_size=atom_vocab_size)
         total_vocab_size = int(total_vocab_size or atom_vocab_size)
@@ -387,6 +407,7 @@ def build_sparse_prior_from_hparams(
                 coeff_prior_std=float(hparams.get("prior_coeff_prior_std", 0.25)),
                 coeff_min_std=float(hparams.get("prior_coeff_min_std", 0.01)),
                 autoregressive_coeffs=bool(autoregressive_coeffs),
+                support_order=support_order,
             )
         )
 
@@ -432,8 +453,6 @@ class SparseTokenPriorModule(pl.LightningModule):
         coeff_huber_delta: float = 0.5,
         sample_coeff_temperature: Optional[float] = None,
         sample_coeff_mode: str = "gaussian",
-        stage1_decoder_bundle=None,
-        log_recon_every_n_steps: int = 500,
     ):
         super().__init__()
         self.prior = prior
@@ -454,14 +473,22 @@ class SparseTokenPriorModule(pl.LightningModule):
             raise ValueError(
                 f"sample_coeff_mode must be 'gaussian' or 'mean', got {self.sample_coeff_mode!r}"
             )
+        if (
+            self.sample_coeff_mode == "gaussian"
+            and bool(getattr(self.prior, "real_valued_coeffs", False))
+            and not bool(getattr(self.prior, "gaussian_coeffs", False))
+        ):
+            warnings.warn(
+                "sample_coeff_mode='gaussian' requires a variational/Gaussian coefficient head; "
+                "falling back to deterministic mean coefficient sampling.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.sample_coeff_mode = "mean"
         self.coeff_loss_type = self._resolve_coeff_loss_type(coeff_loss_type)
-        self._stage1_decoder_bundle = stage1_decoder_bundle
-        self.log_recon_every_n_steps = max(0, int(log_recon_every_n_steps))
-        self._last_recon_logged_step = -1
-        self._cached_val_batch = None
         self._lr_base_lrs = ()
         self._lr_total_steps = 1
-        self.save_hyperparameters(ignore=["prior", "stage1_decoder_bundle"])
+        self.save_hyperparameters(ignore=["prior"])
         self.save_hyperparameters(_prior_checkpoint_hparams(prior))
 
     def _wandb_step(self, experiment=None, *, requested_step: Optional[int] = None) -> int:
@@ -511,7 +538,7 @@ class SparseTokenPriorModule(pl.LightningModule):
             return None if text in {"", "auto"} else text
         if text in {"", "auto"}:
             return "gaussian_nll" if bool(getattr(self.prior, "gaussian_coeffs", False)) else "mse"
-        if text not in {"mse", "huber", "recon_mse", "gt_atom_recon_mse", "gaussian_nll"}:
+        if text not in {"mse", "huber", "gaussian_nll"}:
             raise ValueError(f"Unsupported coeff_loss_type: {requested!r}")
         if text == "gaussian_nll" and not bool(getattr(self.prior, "gaussian_coeffs", False)):
             raise ValueError("coeff_loss_type='gaussian_nll' requires a Gaussian coefficient head.")
@@ -527,42 +554,37 @@ class SparseTokenPriorModule(pl.LightningModule):
             return coeffs
         return coeffs.clamp(-coeff_max, coeff_max)
 
+    def _step_log_kwargs(self, prefix: str, batch_size: int) -> dict:
+        return dict(
+            on_step=(prefix == "train"),
+            on_epoch=(prefix != "train"),
+            sync_dist=True,
+            batch_size=int(batch_size),
+            prog_bar=(prefix != "test"),
+        )
+
     def _real_valued_shared_step(self, batch, prefix: str) -> torch.Tensor:
-        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        tok_flat, coeff_flat, _ = _unpack_cached_batch(batch)
+        if coeff_flat is None:
             raise ValueError("Real-valued sparse-token training expects batches of (tokens_flat, coeffs_flat).")
 
-        tok_flat = batch[0].to(self.device, dtype=torch.long, non_blocking=True)
-        coeff_flat = batch[1].to(self.device, dtype=torch.float32, non_blocking=True)
+        tok_flat = tok_flat.to(self.device, dtype=torch.long, non_blocking=True)
+        coeff_flat = coeff_flat.to(self.device, dtype=torch.float32, non_blocking=True)
         bsz = tok_flat.size(0)
         cfg = self.prior.cfg
         # Token indices are integer tensors with no gradient; a single contiguous
         # copy is sufficient for all read-only uses (CE targets, forward input,
-        # mask tokens).  Coefficient grid is float but only read, never written.
+        # mask tokens). Coefficient grid is float but only read, never written.
         tok_grid = tok_flat.view(bsz, int(cfg.H) * int(cfg.W), int(cfg.D)).clone()
         coeff_grid = coeff_flat.view(bsz, int(cfg.H) * int(cfg.W), int(cfg.D))
 
         loss_type = str(self.coeff_loss_type or "mse")
-        needs_rollout_features = loss_type in {"recon_mse", "gt_atom_recon_mse"}
-        if needs_rollout_features:
-            forward_out = self.prior(
-                tok_grid,
-                coeff_grid,
-                mask_tokens=tok_grid,
-                return_features=True,
-            )
-            if bool(getattr(self.prior, "gaussian_coeffs", False)):
-                atom_logits, coeff_pred, coeff_logvar_pred, depth_h = forward_out
-            else:
-                atom_logits, coeff_pred, depth_h = forward_out
-                coeff_logvar_pred = None
+        forward_out = self.prior(tok_grid, coeff_grid)
+        if bool(getattr(self.prior, "gaussian_coeffs", False)):
+            atom_logits, coeff_pred, coeff_logvar_pred = forward_out
         else:
-            forward_out = self.prior(tok_grid, coeff_grid)
-            if bool(getattr(self.prior, "gaussian_coeffs", False)):
-                atom_logits, coeff_pred, coeff_logvar_pred = forward_out
-            else:
-                atom_logits, coeff_pred = forward_out
-                coeff_logvar_pred = None
-            depth_h = None
+            atom_logits, coeff_pred = forward_out
+            coeff_logvar_pred = None
 
         ce_loss = F.cross_entropy(
             atom_logits.reshape(-1, int(cfg.vocab_size)),
@@ -587,57 +609,14 @@ class SparseTokenPriorModule(pl.LightningModule):
             )
             coeff_reg_loss = coeff_reg_loss.mean()
         else:
-            if self._stage1_decoder_bundle is None:
-                raise RuntimeError(
-                    f"coeff_loss_type={loss_type!r} requires a stage-1 decoder bundle for sparse latent reconstruction."
-                )
-            if loss_type == "recon_mse":
-                rollout_out = self.prior(
-                    tok_grid,
-                    coeff_grid,
-                    mask_tokens=tok_grid,
-                    return_features=True,
-                )
-                if bool(getattr(self.prior, "gaussian_coeffs", False)):
-                    rollout_atom_logits, _, _, rollout_depth_h = rollout_out
-                else:
-                    rollout_atom_logits, _, rollout_depth_h = rollout_out
-                pred_atoms = rollout_atom_logits.argmax(dim=-1)
-                pred_coeff = self._clamp_coeffs(
-                    self.prior.predict_coeffs_for_atoms(rollout_depth_h, pred_atoms)
-                )
-                atoms_for_latent = pred_atoms.view(bsz, int(cfg.H), int(cfg.W), int(cfg.D))
-            else:
-                atoms_for_latent = tok_grid.view(
-                    bsz, int(cfg.H), int(cfg.W), int(cfg.D)
-                )
-            pred_latent = reconstruct_stage2_sparse_latent(
-                self._stage1_decoder_bundle,
-                atoms_for_latent,
-                pred_coeff.view(bsz, int(cfg.H), int(cfg.W), int(cfg.D)),
-                device=self.device,
-            )
-            with torch.no_grad():
-                target_latent = reconstruct_stage2_sparse_latent(
-                    self._stage1_decoder_bundle,
-                    tok_grid.view(bsz, int(cfg.H), int(cfg.W), int(cfg.D)),
-                    target_coeff.view(bsz, int(cfg.H), int(cfg.W), int(cfg.D)),
-                    device=self.device,
-                )
-            coeff_reg_loss = F.mse_loss(pred_latent, target_latent)
+            raise RuntimeError(f"Unexpected coeff_loss_type: {loss_type!r}")
 
         loss = self.atom_loss_weight * ce_loss + self.coeff_loss_weight * coeff_reg_loss
         atom_preds = atom_logits.argmax(dim=-1)
         atom_accuracy = (atom_preds == tok_grid).float().mean()
         coeff_mae = (pred_coeff - target_coeff).abs().mean()
 
-        log_kwargs = dict(
-            on_step=(prefix == "train"),
-            on_epoch=(prefix != "train"),
-            sync_dist=True,
-            batch_size=bsz,
-            prog_bar=(prefix != "test"),
-        )
+        log_kwargs = self._step_log_kwargs(prefix, bsz)
         self.log(f"{prefix}/loss", loss, **log_kwargs)
         self.log(f"{prefix}/ce_loss", ce_loss, **log_kwargs)
         self.log(f"{prefix}/atom_accuracy", atom_accuracy, **log_kwargs)
@@ -647,10 +626,10 @@ class SparseTokenPriorModule(pl.LightningModule):
             self.log(f"{prefix}/coeff_mse_loss", coeff_reg_loss, **log_kwargs)
         elif loss_type == "gaussian_nll":
             self.log(f"{prefix}/coeff_gaussian_nll", coeff_reg_loss, **log_kwargs)
-        elif loss_type in {"recon_mse", "gt_atom_recon_mse"}:
-            self.log(f"{prefix}/recon_mse_loss", coeff_reg_loss, **log_kwargs)
-        else:
+        elif loss_type == "huber":
             self.log(f"{prefix}/coeff_huber_loss", coeff_reg_loss, **log_kwargs)
+        else:
+            raise RuntimeError(f"Unexpected coeff_loss_type: {loss_type!r}")
         return loss
 
     def configure_optimizers(self):
@@ -670,7 +649,7 @@ class SparseTokenPriorModule(pl.LightningModule):
         if getattr(self.prior, "real_valued_coeffs", False):
             return self._real_valued_shared_step(batch, prefix)
 
-        tok_flat = batch[0] if isinstance(batch, (tuple, list)) else batch
+        tok_flat, _, _ = _unpack_cached_batch(batch)
         tok_flat = tok_flat.to(self.device, dtype=torch.long, non_blocking=True)
         bsz = tok_flat.size(0)
         cfg = self.prior.cfg
@@ -692,21 +671,27 @@ class SparseTokenPriorModule(pl.LightningModule):
 
         preds = logits.argmax(dim=-1)
         accuracy = (preds == tok_grid).float().mean()
-        atom_accuracy = (preds[..., 0::2] == tok_grid[..., 0::2]).float().mean()
-        coeff_accuracy = (preds[..., 1::2] == tok_grid[..., 1::2]).float().mean()
-
-        log_kwargs = dict(
-            on_step=(prefix == "train"),
-            on_epoch=(prefix != "train"),
-            sync_dist=True,
-            batch_size=bsz,
-            prog_bar=(prefix != "test"),
+        atom_targets = tok_grid[..., 0::2]
+        atom_accuracy = (
+            (preds[..., 0::2] == atom_targets).float().mean()
+            if atom_targets.numel() > 0
+            else None
         )
+        coeff_targets = tok_grid[..., 1::2]
+        coeff_accuracy = (
+            (preds[..., 1::2] == coeff_targets).float().mean()
+            if coeff_targets.numel() > 0
+            else None
+        )
+
+        log_kwargs = self._step_log_kwargs(prefix, bsz)
         self.log(f"{prefix}/loss", loss, **log_kwargs)
         self.log(f"{prefix}/ce_loss", ce_loss, **log_kwargs)
         self.log(f"{prefix}/accuracy", accuracy, **log_kwargs)
-        self.log(f"{prefix}/atom_accuracy", atom_accuracy, **log_kwargs)
-        self.log(f"{prefix}/coeff_accuracy", coeff_accuracy, **log_kwargs)
+        if atom_accuracy is not None:
+            self.log(f"{prefix}/atom_accuracy", atom_accuracy, **log_kwargs)
+        if coeff_accuracy is not None:
+            self.log(f"{prefix}/coeff_accuracy", coeff_accuracy, **log_kwargs)
         if atom_ce_loss is not None:
             self.log(f"{prefix}/atom_ce_loss", atom_ce_loss, **log_kwargs)
         if coeff_ce_loss is not None:
@@ -717,114 +702,7 @@ class SparseTokenPriorModule(pl.LightningModule):
         return self._shared_step(batch, "train")
 
     def validation_step(self, batch, batch_idx):
-        loss = self._shared_step(batch, "val")
-        if batch_idx == 0:
-            self._cached_val_batch = batch
-        return loss
-
-    def on_validation_epoch_end(self):
-        super().on_validation_epoch_end()
-        step = self.global_step
-        if (
-            self.log_recon_every_n_steps > 0
-            and self._cached_val_batch is not None
-            and step > 0
-            and step != self._last_recon_logged_step
-            and step % self.log_recon_every_n_steps == 0
-        ):
-            self._log_recon_images(self._cached_val_batch)
-            self._last_recon_logged_step = step
-        self._cached_val_batch = None
-
-    @torch.no_grad()
-    def _log_recon_images(self, batch, max_images: int = 8):
-        """Log ground-truth vs predicted reconstruction images to W&B."""
-        if not getattr(self.trainer, "is_global_zero", False):
-            return
-        logger = getattr(self, "logger", None)
-        experiment = getattr(logger, "experiment", None) if logger else None
-        if experiment is None or not hasattr(experiment, "log"):
-            return
-        if self._stage1_decoder_bundle is None:
-            return
-
-        cfg = self.prior.cfg
-        real_valued = getattr(self.prior, "real_valued_coeffs", False)
-        H, W, D = int(cfg.H), int(cfg.W), int(cfg.D)
-
-        tok_flat = batch[0].to(self.device, dtype=torch.long, non_blocking=True)
-        bsz = min(tok_flat.size(0), max_images)
-        tok_flat = tok_flat[:bsz]
-        tok_grid = tok_flat.view(bsz, H * W, D)
-
-        if real_valued:
-            coeff_flat = batch[1].to(self.device, dtype=torch.float32, non_blocking=True)[:bsz]
-            coeff_grid = coeff_flat.view(bsz, H * W, D)
-            # Ground-truth reconstruction
-            gt_images = decode_stage2_outputs(
-                self._stage1_decoder_bundle,
-                tok_grid.view(bsz, H, W, D),
-                coeff_grid.view(bsz, H, W, D),
-                device=self.device,
-            )
-            # Predicted reconstruction: run through prior, take argmax atoms + predicted coeffs
-            out = self.prior(tok_grid, coeff_grid, mask_tokens=tok_grid, return_features=True)
-            if bool(getattr(self.prior, "gaussian_coeffs", False)):
-                atom_logits, _, _, depth_h = out
-            else:
-                atom_logits, _, depth_h = out
-            pred_atoms = atom_logits.argmax(dim=-1)
-            pred_coeffs = self._clamp_coeffs(
-                self.prior.predict_coeffs_for_atoms(depth_h, pred_atoms)
-            )
-            pred_images = decode_stage2_outputs(
-                self._stage1_decoder_bundle,
-                pred_atoms.view(bsz, H, W, D),
-                pred_coeffs.view(bsz, H, W, D),
-                device=self.device,
-            )
-        else:
-            # Quantized path: decode ground-truth tokens
-            gt_images = decode_stage2_outputs(
-                self._stage1_decoder_bundle,
-                tok_grid.view(bsz, H, W, D),
-                device=self.device,
-            )
-            # Predicted tokens via argmax
-            logits = self.prior(tok_grid)
-            pred_tokens = logits.argmax(dim=-1)
-            pred_images = decode_stage2_outputs(
-                self._stage1_decoder_bundle,
-                pred_tokens.view(bsz, H, W, D),
-                device=self.device,
-            )
-
-        gt_images = gt_images.detach().cpu().float()
-        pred_images = pred_images.detach().cpu().float()
-
-        # Normalize from [-1,1] to [0,1] for display
-        gt_disp = ((gt_images + 1.0) / 2.0).clamp(0.0, 1.0)
-        pred_disp = ((pred_images + 1.0) / 2.0).clamp(0.0, 1.0)
-
-        nrow = min(8, bsz)
-        gt_grid = torchvision.utils.make_grid(gt_disp, nrow=nrow)
-        pred_grid = torchvision.utils.make_grid(pred_disp, nrow=nrow)
-
-        gt_grid = torch.nan_to_num(gt_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        pred_grid = torch.nan_to_num(pred_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-
-        import wandb as _wandb
-        step = self._wandb_epoch_end_step(experiment)
-        experiment.log(
-            {
-                "val/recon_images": [
-                    _wandb.Image(gt_grid.permute(1, 2, 0).numpy(), caption="Ground Truth"),
-                    _wandb.Image(pred_grid.permute(1, 2, 0).numpy(), caption="Predicted"),
-                ],
-                "global_step": step,
-            },
-            step=step,
-        )
+        return self._shared_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
         return self._shared_step(batch, "test")

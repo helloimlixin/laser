@@ -1,3 +1,6 @@
+import os
+import tempfile
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,12 +9,29 @@ import torchvision
 
 from .encoder import Encoder
 from .decoder import Decoder
+from .audio_codec import AudioDecoder, AudioEncoder, canonical_int_tuple
 from .bottleneck import VectorQuantizerEMA
 from .lpips import LPIPS
+from .utils import fid_has_enough_samples
 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
-import wandb
+
+from src.audio_logging import (
+    build_audio_log_payload,
+    compute_audio_energy_matching_loss,
+    compute_audio_reconstruction_metrics,
+    compute_waveform_multires_stft_loss,
+    extract_audio_metadata_from_batch,
+    has_audio_metadata,
+)
+from src.codebook_visuals import (
+    render_codebook_scatter,
+    save_codebook_trajectory_gif,
+    select_codebook_vectors,
+)
+from src.wandb_media import log_wandb_images, log_wandb_payload, log_wandb_video
+
 
 class VQVAE(pl.LightningModule):
     def __init__(
@@ -29,6 +49,19 @@ class VQVAE(pl.LightningModule):
             beta,
             compute_fid=False,
             fid_feature=2048,
+            audio_energy_loss_weight=0.0,
+            audio_backbone="spectrogram",
+            audio_downsample_rates=(4, 4, 4),
+            audio_dilation_cycle=(1, 3, 9),
+            audio_multires_stft_loss_weight=0.0,
+            audio_multires_stft_fft_sizes=(512, 1024, 2048),
+            audio_waveform_l1_weight=0.0,
+            codebook_init=False,
+            dead_code_threshold=0.0,
+            out_tanh=False,
+            num_downsamples=2,
+            enable_codebook_visuals=False,
+            codebook_visual_max_vectors=1024,
     ):
         """Initialize VQVAE model.
 
@@ -45,6 +78,8 @@ class VQVAE(pl.LightningModule):
             beta: Beta parameter for optimizer
             compute_fid: Whether to compute FID metric
             fid_feature: Inception feature size for reconstruction FID
+            enable_codebook_visuals: whether to log VQ codebook PCA scatter/GIF visualizations
+            codebook_visual_max_vectors: max codebook entries to draw in PCA visualizations
         """
         super().__init__()
 
@@ -53,42 +88,110 @@ class VQVAE(pl.LightningModule):
         self.beta = beta
         self.decay = decay
         self.perceptual_weight = perceptual_weight
+        self.audio_energy_loss_weight = float(audio_energy_loss_weight)
+        self.audio_backbone = str(audio_backbone or "spectrogram").strip().lower()
+        if self.audio_backbone in {"2d", "image", "stft", "logmag"}:
+            self.audio_backbone = "spectrogram"
+        if self.audio_backbone in {"raw", "wav"}:
+            self.audio_backbone = "waveform"
+        if self.audio_backbone not in {"spectrogram", "waveform"}:
+            raise ValueError(
+                f"Unsupported VQVAE audio_backbone {audio_backbone!r}; expected 'spectrogram' or 'waveform'"
+            )
+        self.audio_downsample_rates = canonical_int_tuple(audio_downsample_rates, default=(4, 4, 4))
+        self.audio_dilation_cycle = canonical_int_tuple(audio_dilation_cycle, default=(1, 3, 9))
+        self.audio_multires_stft_loss_weight = float(audio_multires_stft_loss_weight)
+        self.audio_multires_stft_fft_sizes = canonical_int_tuple(
+            audio_multires_stft_fft_sizes,
+            default=(512, 1024, 2048),
+        )
+        self.audio_waveform_l1_weight = float(audio_waveform_l1_weight)
+        self.codebook_init = bool(codebook_init)
+        self.dead_code_threshold = float(dead_code_threshold)
+        self.out_tanh = bool(out_tanh)
+        self.num_downsamples = int(num_downsamples)
+        self.enable_codebook_visuals = bool(enable_codebook_visuals)
+        self.codebook_visual_max_vectors = max(1, int(codebook_visual_max_vectors))
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
+        self.in_channels = int(in_channels)
         self._viz_train = None
         self._viz_val = None
         self._viz_test = None
+        self._codebook_snapshots = []
+        self._codebook_snapshot_steps = []
+
+        self.is_waveform_audio = self.audio_backbone == "waveform" and int(in_channels) == 1
 
         # Initialize model components
-        self.encoder = Encoder(in_channels=in_channels,
-                               num_hiddens=num_hiddens,
-                               num_residual_blocks=num_residual_blocks,
-                               num_residual_hiddens=num_residual_hiddens)
-        
-        self.pre_bottleneck = nn.Conv2d(in_channels=num_hiddens,
-                                        out_channels=embedding_dim,
-                                        kernel_size=1,
-                                        stride=1)
+        if self.is_waveform_audio:
+            self.encoder = AudioEncoder(
+                in_channels=in_channels,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                downsample_rates=self.audio_downsample_rates,
+                dilation_cycle=self.audio_dilation_cycle,
+            )
+            self.pre_bottleneck = nn.Conv1d(
+                in_channels=num_hiddens,
+                out_channels=embedding_dim,
+                kernel_size=1,
+                stride=1,
+            )
+        else:
+            self.encoder = Encoder(in_channels=in_channels,
+                                   num_hiddens=num_hiddens,
+                                   num_residual_blocks=num_residual_blocks,
+                                   num_residual_hiddens=num_residual_hiddens,
+                                   num_downsamples=self.num_downsamples)
+
+            self.pre_bottleneck = nn.Conv2d(in_channels=num_hiddens,
+                                            out_channels=embedding_dim,
+                                            kernel_size=1,
+                                            stride=1)
         
         self.vector_quantizer = VectorQuantizerEMA(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             commitment_cost=commitment_cost,
             ema_decay=decay,
+            codebook_init=self.codebook_init,
+            dead_code_threshold=self.dead_code_threshold,
         )
 
-        self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
-                                         out_channels=num_hiddens,
-                                         kernel_size=3,
-                                         stride=1,
-                                         padding=1)
-        
-        self.decoder = Decoder(
-            in_channels=num_hiddens,  # Input channels for decoder matches hidden dims
-            num_hiddens=num_hiddens,
-            num_residual_blocks=num_residual_blocks,
-            num_residual_hiddens=num_residual_hiddens
-        )
+        if self.is_waveform_audio:
+            self.post_bottleneck = nn.Conv1d(
+                in_channels=embedding_dim,
+                out_channels=num_hiddens,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            )
+            self.decoder = AudioDecoder(
+                in_channels=num_hiddens,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                out_channels=in_channels,
+                upsample_rates=self.audio_downsample_rates,
+                dilation_cycle=self.audio_dilation_cycle,
+            )
+        else:
+            self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
+                                             out_channels=num_hiddens,
+                                             kernel_size=3,
+                                             stride=1,
+                                             padding=1)
+
+            self.decoder = Decoder(
+                in_channels=num_hiddens,  # Input channels for decoder matches hidden dims
+                num_hiddens=num_hiddens,
+                num_residual_blocks=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                out_channels=in_channels,
+                num_upsamples=self.num_downsamples,
+            )
 
         # Initialize LPIPS only if used
         self.lpips = LPIPS() if self.perceptual_weight > 0 else None
@@ -117,8 +220,51 @@ class VQVAE(pl.LightningModule):
         # Save hyperparameters for logging
         self.save_hyperparameters()
 
+    def _to_metric_rgb(self, x: torch.Tensor) -> torch.Tensor:
+        if int(x.size(1)) == 3:
+            return x
+        if int(x.size(1)) == 1:
+            return x.repeat(1, 3, 1, 1)
+        raise ValueError(
+            f"VQVAE metrics/logging expect 1 or 3 channels, got tensor with shape {tuple(x.shape)}"
+        )
+
     def _trainer_ref(self):
         return self.__dict__.get("_trainer", None)
+
+    def _is_log_rank_zero(self) -> bool:
+        trainer = self._trainer_ref()
+        if trainer is not None:
+            return bool(getattr(trainer, "is_global_zero", True))
+        return int(getattr(self, "global_rank", 0)) == 0
+
+    def _wandb_epoch_end_step(self) -> int:
+        return int(getattr(self, "global_step", 0) or 0) + 1
+
+    def _ddp_barrier_if_needed(self):
+        trainer = self._trainer_ref()
+        if trainer is None or getattr(trainer, "world_size", 1) <= 1:
+            return
+        strategy = getattr(trainer, "strategy", None)
+        barrier = getattr(strategy, "barrier", None)
+        if callable(barrier):
+            barrier()
+
+    def _quantize(self, z: torch.Tensor):
+        if z.ndim == 3:
+            z_q, loss, perplexity, encodings = self.vector_quantizer(z.unsqueeze(2))
+            return z_q.squeeze(2), loss, perplexity, encodings
+        return self.vector_quantizer(z)
+
+    def _apply_output_activation(self, x_recon: torch.Tensor) -> torch.Tensor:
+        if self.out_tanh:
+            return torch.tanh(x_recon)
+        return x_recon
+
+    def _encode_quantized(self, x):
+        z = self.pre_bottleneck(self.encoder(x))
+        z_q, loss, perplexity, encodings = self._quantize(z)
+        return z, z_q, loss, perplexity, encodings
 
     def encode_to_indices(self, x):
         """
@@ -127,11 +273,12 @@ class VQVAE(pl.LightningModule):
           H_z, W_z: latent spatial dims
         """
         with torch.no_grad():
-            z = self.encoder(x)
-            z = self.pre_bottleneck(z)
-            # VectorQuantizer returns (z_q, loss, perplexity, encodings)
-            _, _, _, encodings = self.vector_quantizer(z)
-            B, _, H_z, W_z = z.shape
+            z, _, _, _, encodings = self._encode_quantized(x)
+            if z.ndim == 3:
+                B, _, W_z = z.shape
+                H_z = 1
+            else:
+                B, _, H_z, W_z = z.shape
             indices = torch.argmax(encodings, dim=1).view(B, H_z * W_z)
         return indices, H_z, W_z
 
@@ -148,10 +295,14 @@ class VQVAE(pl.LightningModule):
         # Gather codebook vectors and reshape to latent feature map
         codebook = self.vector_quantizer.embedding.weight  # [K, D]
         z_q_flat = codebook[indices.view(-1)]              # [B*H_z*W_z, D]
-        z_q = z_q_flat.view(B, H_z, W_z, -1).permute(0, 3, 1, 2).contiguous()  # [B, D, H_z, W_z]
+        if self.is_waveform_audio:
+            z_q = z_q_flat.view(B, W_z, -1).permute(0, 2, 1).contiguous()
+        else:
+            z_q = z_q_flat.view(B, H_z, W_z, -1).permute(0, 3, 1, 2).contiguous()  # [B, D, H_z, W_z]
         z_q = self.post_bottleneck(z_q)
-        recon = self.decoder(z_q)
+        recon = self._apply_output_activation(self.decoder(z_q))
         return recon
+
     def encode(self, x):
         """
         Encode input to latent representation
@@ -163,9 +314,7 @@ class VQVAE(pl.LightningModule):
             z_q: Quantized latent representation
             indices: Indices of the codebook entries
         """
-        z = self.encoder(x)
-        z = self.pre_bottleneck(z)
-        z_q, quantization_loss, _, _ = self.vector_quantizer(z)
+        _, z_q, quantization_loss, _, _ = self._encode_quantized(x)
         return z_q, quantization_loss
     
     def decode(self, z_q):
@@ -180,14 +329,16 @@ class VQVAE(pl.LightningModule):
         """
         z_q = self.post_bottleneck(z_q)
         x_recon = self.decoder(z_q)
-        return x_recon
+        return self._apply_output_activation(x_recon)
 
     def forward(self, x):
-        z = self.encoder(x)
-        z = self.pre_bottleneck(z)
-        z_q, vq_loss, perplexity, _ = self.vector_quantizer(z)
-        z_q = self.post_bottleneck(z_q)
-        recon = self.decoder(z_q)
+        _, z_q, vq_loss, perplexity, _ = self._encode_quantized(x)
+        recon = self.decode(z_q)
+        if recon.shape[-1] != x.shape[-1] and recon.ndim == 3 and x.ndim == 3:
+            if recon.shape[-1] > x.shape[-1]:
+                recon = recon[..., : x.shape[-1]]
+            else:
+                recon = F.pad(recon, (0, x.shape[-1] - recon.shape[-1]))
 
         # Return as tuple instead of dict
         return recon, vq_loss, perplexity
@@ -204,6 +355,10 @@ class VQVAE(pl.LightningModule):
         """
         # Unpack the batch - ensure we get a single tensor
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        batch_size = int(x.size(0))
+        audio_meta = extract_audio_metadata_from_batch(batch)
+        is_audio = has_audio_metadata(audio_meta)
+        is_waveform_audio = is_audio and x.ndim == 3
         
         # Forward pass
         recon_raw, vq_loss, perplexity = self(x)
@@ -213,11 +368,17 @@ class VQVAE(pl.LightningModule):
 
         # Compute reconstruction loss (ensure it's a scalar)
         recon_loss = F.mse_loss(recon_raw, x).mean()
+        waveform_l1_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
+        weighted_waveform_l1_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
+        if is_waveform_audio and self.audio_waveform_l1_weight > 0:
+            waveform_l1_loss = F.l1_loss(recon_raw, x)
+            weighted_waveform_l1_loss = self.audio_waveform_l1_weight * waveform_l1_loss
+            recon_loss = recon_loss + weighted_waveform_l1_loss
 
         # Compute perceptual loss only if enabled
-        if self.perceptual_weight > 0 and self.lpips is not None:
-            x_norm = x * 2.0 - 1.0
-            x_recon_norm = recon_raw * 2.0 - 1.0
+        if (not is_waveform_audio) and self.perceptual_weight > 0 and self.lpips is not None:
+            x_norm = self._to_metric_rgb(x * 2.0 - 1.0)
+            x_recon_norm = self._to_metric_rgb(recon_raw * 2.0 - 1.0)
             perceptual_loss = self.lpips(x_recon_norm, x_norm).mean()
         else:
             perceptual_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
@@ -225,21 +386,12 @@ class VQVAE(pl.LightningModule):
         # Compute total loss
         total_loss = (1 - self.perceptual_weight) * recon_loss + vq_loss + self.perceptual_weight * perceptual_loss
 
-        # Always synchronize epoch metrics so DDP runs do not emit reduction warnings.
-        log_kwargs = dict(
-            on_step=prefix == 'train',
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
-        self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
-        self.log(f'{prefix}/vq_loss', vq_loss, **log_kwargs)
-        self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
-        self.log(f'{prefix}/perplexity', perplexity, prog_bar=True, **log_kwargs)
-
         # Add PSNR calculation on de-normalized [0,1] images for stable progression
         dm = getattr(self._trainer_ref(), "datamodule", None)
-        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+        if is_waveform_audio:
+            x_dn = None
+            recon_dn = None
+        elif dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
             mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
             std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
             x_dn = (x * std + mean).clamp(0.0, 1.0)
@@ -248,53 +400,144 @@ class VQVAE(pl.LightningModule):
             x_dn = ((x + 1.0) / 2.0).clamp(0.0, 1.0)
             recon_dn = ((recon_raw + 1.0) / 2.0).clamp(0.0, 1.0)
 
-        if prefix == 'val' and self.val_rfid is not None:
-            self.val_rfid.update(x_dn, real=True)
-            self.val_rfid.update(recon_dn, real=False)
-        elif prefix == 'test' and self.test_fid is not None:
-            self.test_fid.update(x_dn, real=True)
-            self.test_fid.update(recon_dn, real=False)
+        if not is_audio and prefix == 'val' and self.val_rfid is not None:
+            self.val_rfid.update(self._to_metric_rgb(x_dn), real=True)
+            self.val_rfid.update(self._to_metric_rgb(recon_dn), real=False)
+        elif not is_audio and prefix == 'test' and self.test_fid is not None:
+            self.test_fid.update(self._to_metric_rgb(x_dn), real=True)
+            self.test_fid.update(self._to_metric_rgb(recon_dn), real=False)
+
+        psnr = None
         ssim = None
-        if prefix == 'train':
-            psnr = self.train_psnr(recon_dn, x_dn)
-        elif prefix == 'val':
-            psnr = self.val_psnr(recon_dn, x_dn)
-            ssim = self.val_ssim(recon_dn, x_dn)
+        audio_metrics = {}
+        audio_energy_metrics = {}
+        audio_stft_metrics = {}
+        audio_energy_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
+        weighted_audio_energy_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
+        audio_stft_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
+        weighted_audio_stft_loss = torch.zeros((), device=x.device, dtype=recon_raw.dtype)
+        if is_audio:
+            audio_source = getattr(dm, "config", {"dataset": "vctk"})
+            if is_waveform_audio and self.audio_multires_stft_loss_weight > 0:
+                audio_stft_metrics = compute_waveform_multires_stft_loss(
+                    x,
+                    recon_raw,
+                    fft_sizes=self.audio_multires_stft_fft_sizes,
+                )
+                audio_stft_loss = audio_stft_metrics.get(
+                    "audio_multires_stft_loss",
+                    torch.zeros((), device=x.device, dtype=recon_raw.dtype),
+                )
+                weighted_audio_stft_loss = self.audio_multires_stft_loss_weight * audio_stft_loss
+                total_loss = total_loss + weighted_audio_stft_loss
+            audio_metrics = compute_audio_reconstruction_metrics(
+                x,
+                recon_raw,
+                audio_meta=audio_meta,
+                audio_source=audio_source,
+                compute_visqol=prefix != "train",
+            )
+            if (not is_waveform_audio) and self.audio_energy_loss_weight > 0:
+                audio_energy_metrics = compute_audio_energy_matching_loss(
+                    x,
+                    recon_raw,
+                    audio_meta=audio_meta,
+                    audio_source=audio_source,
+                )
+                audio_energy_loss = audio_energy_metrics.get(
+                    "audio_energy_loss",
+                    torch.zeros((), device=x.device, dtype=recon_raw.dtype),
+                )
         else:
-            psnr = self.test_psnr(recon_dn, x_dn)
-            ssim = self.test_ssim(recon_dn, x_dn)
-        self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
-        if ssim is not None:
-            self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
+            if prefix == 'train':
+                psnr = self.train_psnr(recon_dn, x_dn)
+            elif prefix == 'val':
+                psnr = self.val_psnr(recon_dn, x_dn)
+                ssim = self.val_ssim(recon_dn, x_dn)
+            else:
+                psnr = self.test_psnr(recon_dn, x_dn)
+                ssim = self.test_ssim(recon_dn, x_dn)
+
+        if is_audio and (not is_waveform_audio) and self.audio_energy_loss_weight > 0:
+            weighted_audio_energy_loss = self.audio_energy_loss_weight * audio_energy_loss
+            total_loss = total_loss + weighted_audio_energy_loss
+
+        # Always synchronize epoch metrics so DDP runs do not emit reduction warnings.
+        log_kwargs = dict(
+            on_step=prefix == 'train',
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
+        self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
+        if is_waveform_audio and self.audio_waveform_l1_weight > 0:
+            self.log(f'{prefix}/audio_waveform_l1_loss', waveform_l1_loss, **log_kwargs)
+            self.log(f'{prefix}/weighted_audio_waveform_l1_loss', weighted_waveform_l1_loss, **log_kwargs)
+        self.log(f'{prefix}/vq_loss', vq_loss, **log_kwargs)
+        self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
+        self.log(f'{prefix}/perplexity', perplexity, prog_bar=True, **log_kwargs)
+        if is_audio:
+            for name, value in audio_metrics.items():
+                self.log(f'{prefix}/{name}', value, prog_bar=(name == "audio_lsd"), **log_kwargs)
+            for name, value in audio_stft_metrics.items():
+                self.log(f'{prefix}/{name}', value, prog_bar=False, **log_kwargs)
+            if is_waveform_audio and self.audio_multires_stft_loss_weight > 0:
+                self.log(f'{prefix}/weighted_audio_multires_stft_loss', weighted_audio_stft_loss, **log_kwargs)
+        if is_audio and (not is_waveform_audio) and self.audio_energy_loss_weight > 0:
+            self.log(f'{prefix}/weighted_audio_energy_loss', weighted_audio_energy_loss, **log_kwargs)
+            for name, value in audio_energy_metrics.items():
+                self.log(f'{prefix}/{name}', value, prog_bar=False, **log_kwargs)
+        elif not is_audio:
+            self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
+            if ssim is not None:
+                self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
 
         return {
             'loss': total_loss,
             'recon_loss': recon_loss,
             'vq_loss': vq_loss,
             'perceptual_loss': perceptual_loss,
+            'audio_energy_loss': audio_energy_loss,
+            'audio_multires_stft_loss': audio_stft_loss,
             'perplexity': perplexity,
             'psnr': psnr,
             'ssim': ssim,
+            'audio_metrics': audio_metrics,
             'x': x_vis,
-            'x_recon': recon_vis
+            'x_recon': recon_vis,
+            'audio_meta': audio_meta,
         }
 
     def training_step(self, batch, batch_idx):
         """Perform the training step."""
         metrics = self.compute_metrics(batch, prefix='train')
-        self._viz_train = (metrics['x'], metrics['x_recon'])
+        self._viz_train = {
+            "x": metrics['x'],
+            "x_recon": metrics['x_recon'],
+            "audio_meta": metrics.get("audio_meta"),
+        }
         return metrics
 
     def on_train_epoch_end(self):
         if self._viz_train is not None:
-            x, x_recon = self._viz_train
-            self._log_images(x, x_recon, split='train')
+            self._log_images(
+                self._viz_train["x"],
+                self._viz_train["x_recon"],
+                split='train',
+                audio_meta=self._viz_train.get("audio_meta"),
+            )
+            self._ddp_barrier_if_needed()
             self._viz_train = None
 
     def validation_step(self, batch, batch_idx):
         """Perform the validation step."""
         metrics = self.compute_metrics(batch, prefix='val')
-        self._viz_val = (metrics['x'], metrics['x_recon'])
+        self._viz_val = {
+            "x": metrics['x'],
+            "x_recon": metrics['x_recon'],
+            "audio_meta": metrics.get("audio_meta"),
+        }
         return metrics
 
     def on_validation_epoch_start(self):
@@ -304,13 +547,25 @@ class VQVAE(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         if self.val_rfid is not None:
-            rfid_score = self.val_rfid.compute()
-            self.log('val/rfid', rfid_score, sync_dist=True)
+            # Skip compute() if no updates landed this epoch — audio runs with
+            # compute_fid=true allocate the metric but never call update().
+            if fid_has_enough_samples(self.val_rfid):
+                rfid_score = self.val_rfid.compute()
+                self.log('val/rfid', rfid_score, sync_dist=True)
             self.val_rfid.reset()
         if self._viz_val is not None:
-            x, x_recon = self._viz_val
-            self._log_images(x, x_recon, split='val')
+            self._log_images(
+                self._viz_val["x"],
+                self._viz_val["x_recon"],
+                split='val',
+                audio_meta=self._viz_val.get("audio_meta"),
+            )
+            self._ddp_barrier_if_needed()
             self._viz_val = None
+        if self.enable_codebook_visuals:
+            self._snapshot_codebook()
+            self._log_codebook_scatter()
+            self._ddp_barrier_if_needed()
 
     def on_test_epoch_start(self):
         """Reset test-only metrics before aggregating over the full test set."""
@@ -324,18 +579,28 @@ class VQVAE(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         """Perform the test step."""
         metrics = self.compute_metrics(batch, prefix='test')
-        self._viz_test = (metrics['x'], metrics['x_recon'])
+        self._viz_test = {
+            "x": metrics['x'],
+            "x_recon": metrics['x_recon'],
+            "audio_meta": metrics.get("audio_meta"),
+        }
         return metrics
 
     def on_test_epoch_end(self):
         """Log reconstructions and compute FID after the full test set."""
         if self._viz_test is not None:
-            x, x_recon = self._viz_test
-            self._log_images(x, x_recon, split='test')
+            self._log_images(
+                self._viz_test["x"],
+                self._viz_test["x_recon"],
+                split='test',
+                audio_meta=self._viz_test.get("audio_meta"),
+            )
+            self._ddp_barrier_if_needed()
             self._viz_test = None
         if self.test_fid is not None:
-            fid_score = self.test_fid.compute()
-            self.log('test/fid', fid_score, sync_dist=True)
+            if fid_has_enough_samples(self.test_fid):
+                fid_score = self.test_fid.compute()
+                self.log('test/fid', fid_score, sync_dist=True)
             self.test_fid.reset()
 
     def configure_optimizers(self):
@@ -357,7 +622,90 @@ class VQVAE(pl.LightningModule):
             }
         }
 
-    def _log_images(self, x, x_recon, split='train'):
+    def on_fit_start(self):
+        super().on_fit_start()
+        self._snapshot_codebook()
+
+    def _snapshot_codebook(self):
+        """Store a stable subset of VQ codebook vectors for trajectory animation."""
+        if not self.enable_codebook_visuals or not self._is_log_rank_zero():
+            return
+        with torch.no_grad():
+            vectors = self.vector_quantizer.embedding.weight.detach().cpu()
+            vectors = select_codebook_vectors(vectors, self.codebook_visual_max_vectors)
+        step = int(getattr(self, "global_step", 0) or 0)
+        if self._codebook_snapshot_steps and self._codebook_snapshot_steps[-1] == step:
+            return
+        self._codebook_snapshots.append(vectors)
+        self._codebook_snapshot_steps.append(step)
+
+    def _log_codebook_scatter(self):
+        if not self.enable_codebook_visuals or not self._is_log_rank_zero():
+            return
+        if not self._codebook_snapshots:
+            return
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return
+        image = render_codebook_scatter(
+            self._codebook_snapshots,
+            self._codebook_snapshot_steps,
+            title="VQ Codebook Vectors (PCA)",
+        )
+        if image is None:
+            return
+        step = self._wandb_epoch_end_step()
+        log_wandb_images(
+            logger,
+            "val/vq_codebook_scatter",
+            [image],
+            step=step,
+            captions=[f"vq codebook scatter step={step}"],
+        )
+
+    def _generate_codebook_animation(self):
+        if not self.enable_codebook_visuals or not self._is_log_rank_zero():
+            return
+        if len(self._codebook_snapshots) < 2:
+            return
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return
+        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+            gif_path = tmp.name
+        try:
+            saved = save_codebook_trajectory_gif(
+                self._codebook_snapshots,
+                self._codebook_snapshot_steps,
+                gif_path,
+                title="VQ Codebook Vector Trajectories (PCA)",
+                fps=2,
+            )
+            if saved is None:
+                return
+            step = self._wandb_epoch_end_step()
+            log_wandb_video(
+                logger,
+                "val/vq_codebook_trajectories",
+                [str(saved)],
+                step=step,
+                captions=[f"vq codebook trajectories step={step}"],
+                formats=["gif"],
+            )
+        finally:
+            try:
+                os.unlink(gif_path)
+            except OSError:
+                pass
+
+    def on_fit_end(self):
+        if self.enable_codebook_visuals:
+            self._snapshot_codebook()
+            self._log_codebook_scatter()
+            self._generate_codebook_animation()
+            self._ddp_barrier_if_needed()
+
+    def _log_images(self, x, x_recon, split='train', audio_meta=None):
         """
         Log images to Weights & Biases.
 
@@ -372,10 +720,29 @@ class VQVAE(pl.LightningModule):
         # Take first 16 images
         x = x[:32]
         x_recon = x_recon[:32]
+        dm = getattr(self._trainer_ref(), "datamodule", None)
+        logger = getattr(self, "logger", None)
+        step = int(self.global_step)
+        if audio_meta is not None and x.ndim == 3 and dm is not None and hasattr(dm, "config"):
+            payload = {
+                f"{split}/reconstruction_error": F.mse_loss(x_recon, x).item(),
+            }
+            payload.update(
+                build_audio_log_payload(
+                    x,
+                    x_recon,
+                    audio_meta=audio_meta,
+                    audio_source=dm.config,
+                    split=split,
+                    max_items=4,
+                    artifact_dir=getattr(self.logger, "save_dir", None) or getattr(self._trainer_ref(), "default_root_dir", None),
+                )
+            )
+            log_wandb_payload(logger, payload, step=step)
+            return
 
         # Create grids with smaller size
         # De-normalize using datamodule config if available; otherwise assume [-1,1] → [0,1]
-        dm = getattr(self._trainer_ref(), "datamodule", None)
         if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
             mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
             std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
@@ -386,6 +753,8 @@ class VQVAE(pl.LightningModule):
             x_recon_disp = (x_recon + 1.0) / 2.0
         x_disp = x_disp.clamp(0.0, 1.0)
         x_recon_disp = x_recon_disp.clamp(0.0, 1.0)
+        x_disp = self._to_metric_rgb(x_disp)
+        x_recon_disp = self._to_metric_rgb(x_recon_disp)
         x_grid = torchvision.utils.make_grid(x_disp, nrow=8, normalize=False)
         x_recon_grid = torchvision.utils.make_grid(x_recon_disp, nrow=8, normalize=False)
 
@@ -398,14 +767,29 @@ class VQVAE(pl.LightningModule):
         x_recon_grid = x_recon_grid.cpu().numpy().transpose(1, 2, 0)
 
         # Log to wandb using the experiment attribute
-        self.logger.experiment.log({
-            f"{split}/images": [
-                wandb.Image(x_grid, caption="Original"),
-                wandb.Image(x_recon_grid, caption="Reconstructed")
-            ],
+        log_wandb_images(
+            logger,
+            f"{split}/images",
+            [x_grid, x_recon_grid],
+            step=step,
+            captions=["Original", "Reconstructed"],
+        )
+        payload = {
             f"{split}/reconstruction_error": F.mse_loss(x_recon, x).item(),
-            "global_step": self.global_step
-        })
+        }
+        if audio_meta is not None and dm is not None and hasattr(dm, "config"):
+            payload.update(
+                build_audio_log_payload(
+                    x,
+                    x_recon,
+                    audio_meta=audio_meta,
+                    audio_source=dm.config,
+                    split=split,
+                    max_items=4,
+                    artifact_dir=getattr(self.logger, "save_dir", None) or getattr(self._trainer_ref(), "default_root_dir", None),
+                )
+            )
+        log_wandb_payload(logger, payload, step=step)
 
 
 # test the VQVAE model

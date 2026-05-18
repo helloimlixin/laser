@@ -1,3 +1,4 @@
+import ast
 import math
 from contextlib import nullcontext
 from typing import Optional, Tuple
@@ -171,6 +172,25 @@ def Normalize(in_channels):
     return nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
 
 
+def _canonical_channel_multipliers(values):
+    if values is None:
+        return None
+    if isinstance(values, str):
+        raw = values.strip()
+        if not raw or raw.lower() in {"none", "null"}:
+            return None
+        if raw[0] in "[(":
+            values = ast.literal_eval(raw)
+        else:
+            values = [part for part in raw.split(",") if part.strip()]
+    mults = tuple(int(v) for v in values)
+    if not mults:
+        raise ValueError("channel_multipliers must contain at least one level")
+    if any(mult <= 0 for mult in mults):
+        raise ValueError(f"channel_multipliers must be positive, got {mults}")
+    return mults
+
+
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
@@ -268,10 +288,32 @@ class AttnBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """RQ-VAE encoder with ResNet blocks, optional attention, and progressive downsampling."""
-    def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, double_z=False, use_mid_attention=True, **ignore_kwargs):
+    """
+    KakaoBrain RQ-VAE encoder port with two explicit local extensions:
+    - `double_z` can still be disabled for deterministic autoencoder use.
+    - `use_mid_attention` can disable the middle attention block when needed.
+
+    Source structure:
+    https://github.com/kakaobrain/rq-vae-transformer/blob/main/rqvae/models/rqvae/modules.py
+    """
+
+    def __init__(
+        self,
+        *,
+        ch,
+        out_ch,
+        ch_mult=(1, 2, 4, 8),
+        num_res_blocks,
+        attn_resolutions,
+        dropout=0.0,
+        resamp_with_conv=True,
+        in_channels,
+        resolution,
+        z_channels,
+        double_z=True,
+        use_mid_attention=True,
+        **ignore_kwargs,
+    ):
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -292,8 +334,14 @@ class Encoder(nn.Module):
             block_in = ch * in_ch_mult[i_level]
             block_out = ch * ch_mult[i_level]
             for i_block in range(self.num_res_blocks):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out,
-                                         temb_channels=self.temb_ch, dropout=dropout))
+                block.append(
+                    ResnetBlock(
+                        in_channels=block_in,
+                        out_channels=block_out,
+                        temb_channels=self.temb_ch,
+                        dropout=dropout,
+                    )
+                )
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(AttnBlock(block_in))
@@ -306,26 +354,41 @@ class Encoder(nn.Module):
             self.down.append(down)
 
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in,
-                                       temb_channels=self.temb_ch, dropout=dropout)
+        self.mid.block_1 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.temb_ch,
+            dropout=dropout,
+        )
         self.mid.attn_1 = AttnBlock(block_in) if self.use_mid_attention else nn.Identity()
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in,
-                                       temb_channels=self.temb_ch, dropout=dropout)
+        self.mid.block_2 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.temb_ch,
+            dropout=dropout,
+        )
 
         self.norm_out = Normalize(block_in)
-        self.conv_out = nn.Conv2d(block_in, 2 * z_channels if double_z else z_channels,
-                                  kernel_size=3, stride=1, padding=1)
+        self.conv_out = nn.Conv2d(
+            block_in,
+            2 * z_channels if double_z else z_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
 
     def forward(self, x):
         temb = None
-        h = self.conv_in(x)
+        hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](h, temb)
+                h = self.down[i_level].block[i_block](hs[-1], temb)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
+                hs.append(h)
             if i_level != self.num_resolutions - 1:
-                h = self.down[i_level].downsample(h)
+                hs.append(self.down[i_level].downsample(hs[-1]))
+        h = hs[-1]
         h = self.mid.block_1(h, temb)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
@@ -336,10 +399,33 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """RQ-VAE decoder with ResNet blocks, optional attention, and progressive upsampling."""
-    def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, give_pre_end=False, use_mid_attention=True, extra_res_blocks=1, **ignorekwargs):
+    """
+    KakaoBrain RQ-VAE decoder port with two explicit local extensions:
+    - `extra_res_blocks=1` matches upstream `num_res_blocks + 1`.
+    - `use_mid_attention` can disable the middle attention block when needed.
+
+    Source structure:
+    https://github.com/kakaobrain/rq-vae-transformer/blob/main/rqvae/models/rqvae/modules.py
+    """
+
+    def __init__(
+        self,
+        *,
+        ch,
+        out_ch,
+        ch_mult=(1, 2, 4, 8),
+        num_res_blocks,
+        attn_resolutions,
+        dropout=0.0,
+        resamp_with_conv=True,
+        in_channels,
+        resolution,
+        z_channels,
+        give_pre_end=False,
+        use_mid_attention=True,
+        extra_res_blocks=1,
+        **ignorekwargs,
+    ):
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -358,11 +444,19 @@ class Decoder(nn.Module):
         self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in,
-                                       temb_channels=self.temb_ch, dropout=dropout)
+        self.mid.block_1 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.temb_ch,
+            dropout=dropout,
+        )
         self.mid.attn_1 = AttnBlock(block_in) if self.use_mid_attention else nn.Identity()
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in,
-                                       temb_channels=self.temb_ch, dropout=dropout)
+        self.mid.block_2 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.temb_ch,
+            dropout=dropout,
+        )
         self.blocks_per_level = max(1, self.num_res_blocks + self.extra_res_blocks)
 
         self.up = nn.ModuleList()
@@ -371,8 +465,14 @@ class Decoder(nn.Module):
             attn = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
             for i_block in range(self.blocks_per_level):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out,
-                                         temb_channels=self.temb_ch, dropout=dropout))
+                block.append(
+                    ResnetBlock(
+                        in_channels=block_in,
+                        out_channels=block_out,
+                        temb_channels=self.temb_ch,
+                        dropout=dropout,
+                    )
+                )
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(AttnBlock(block_in))
@@ -1601,6 +1701,7 @@ class LASER(nn.Module):
         resolution: int = 128,
         attn_resolutions: tuple = (),
         dropout: float = 0.0,
+        channel_multipliers=None,
         max_ch_mult: int = 2,
         decoder_extra_residual_layers: int = 1,
         use_mid_attention: bool = True,
@@ -1625,6 +1726,7 @@ class LASER(nn.Module):
     ):
         super().__init__()
         self.out_tanh = bool(out_tanh)
+        self.channel_multipliers = _canonical_channel_multipliers(channel_multipliers)
         self.max_ch_mult = int(max_ch_mult)
         self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.use_mid_attention = bool(use_mid_attention)
@@ -1640,7 +1742,10 @@ class LASER(nn.Module):
         # len(ch_mult) - 1 equals the number of spatial downsampling steps.
         # Cap multipliers to keep the max width bounded without changing the
         # number of encoder or decoder stages.
-        ch_mult = tuple(min(2 ** i, self.max_ch_mult) for i in range(num_downsamples + 1))
+        if self.channel_multipliers is None:
+            ch_mult = tuple(min(2 ** i, self.max_ch_mult) for i in range(num_downsamples + 1))
+        else:
+            ch_mult = self.channel_multipliers
 
         enc_dec_kwargs = dict(
             ch=num_hiddens,
@@ -1654,6 +1759,7 @@ class LASER(nn.Module):
             in_channels=in_channels,
             resolution=resolution,
             z_channels=embedding_dim,
+            double_z=False,
         )
         dec_kwargs = dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
         self.encoder = Encoder(**enc_dec_kwargs)

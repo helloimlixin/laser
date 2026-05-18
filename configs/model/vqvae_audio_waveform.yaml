@@ -1,0 +1,24 @@
+defaults:
+  - vqvae
+  - _self_
+
+in_channels: 1
+audio_backbone: waveform
+audio_downsample_rates: [4, 4, 4]
+audio_dilation_cycle: [1, 3, 9]
+num_hiddens: 128
+num_embeddings: 1024
+embedding_dim: 64
+num_residual_blocks: 3
+num_residual_hiddens: 64
+commitment_cost: 0.25
+decay: 0.95
+perceptual_weight: 0.0
+compute_fid: false
+audio_energy_loss_weight: 0.0
+audio_waveform_l1_weight: 1.0
+audio_multires_stft_loss_weight: 1.0
+audio_multires_stft_fft_sizes: [512, 1024, 2048]
+codebook_init: true
+dead_code_threshold: 1.0
+out_tanh: true
