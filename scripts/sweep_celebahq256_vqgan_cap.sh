@@ -53,6 +53,9 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 
 # -- Stage 1 defaults -------------------------------------------------------
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-20}"
+# Optional random crop size for stage-1 TRAINING (val/test stay at full IMAGE_SIZE).
+# Cuts activation memory so big U-Net backbones fit; 'null' trains at full size.
+STAGE1_CROP="${STAGE1_CROP:-null}"
 STAGE1_LR="${STAGE1_LR:-1.5e-4}"
 DICT_LR="${DICT_LR:-2.5e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
@@ -234,6 +237,7 @@ python train_stage1_autoencoder.py \\
   data.dataset=$DATASET \\
   data.data_dir="$DATA_DIR" \\
   data.image_size=$IMAGE_SIZE \\
+  data.train_crop_size=$STAGE1_CROP \\
   data.batch_size=$BATCH_SIZE \\
   data.num_workers=$NUM_WORKERS \\
   train.learning_rate=$STAGE1_LR \\

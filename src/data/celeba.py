@@ -106,10 +106,16 @@ class PackedRGBImageDataset(Dataset):
         std: Tuple[float, float, float],
         random_horizontal_flip: bool = False,
         indices: Optional[List[int]] = None,
+        crop_size: Optional[int] = None,
     ):
         self.root = Path(root)
         self.image_size = int(image_size)
         self.random_horizontal_flip = bool(random_horizontal_flip)
+        # Optional random square crop applied per-sample (training augmentation).
+        # None / >= image_size keeps the full image (used for val/test).
+        self.crop_size = (
+            int(crop_size) if crop_size is not None and int(crop_size) < self.image_size else None
+        )
         self.packed_path = _packed_celeba_file(self.root, self.image_size)
         if not self.packed_path.exists():
             raise FileNotFoundError(f"Packed dataset not found: {self.packed_path}")
@@ -139,6 +145,11 @@ class PackedRGBImageDataset(Dataset):
         if self.indices is not None:
             idx = int(self.indices[idx])
         image = torch.from_numpy(np.array(self.images[idx], copy=True)).permute(2, 0, 1).float().div_(255.0)
+        if self.crop_size is not None:
+            cs = self.crop_size
+            top = int(torch.randint(0, self.image_size - cs + 1, (1,)).item())
+            left = int(torch.randint(0, self.image_size - cs + 1, (1,)).item())
+            image = image[:, top:top + cs, left:left + cs]
         if self.random_horizontal_flip and torch.rand((), dtype=torch.float32).item() < 0.5:
             image = torch.flip(image, dims=[2])
         image = (image - self.mean) / self.std
@@ -255,14 +266,21 @@ class CelebADataModule(pl.LightningDataModule):
             mean = tuple(float(x) for x in self.config.mean)
             std = tuple(float(x) for x in self.config.std)
 
-            def _make_packed(indices, flip):
+            train_crop = getattr(self.config, "train_crop_size", None)
+            if isinstance(train_crop, (list, tuple)):
+                train_crop = int(train_crop[0])
+
+            def _make_packed(indices, flip, crop_size=None):
                 return PackedRGBImageDataset(
                     data_dir, packed_image_size,
                     mean=mean, std=std,
                     random_horizontal_flip=flip, indices=indices,
+                    crop_size=crop_size,
                 )
 
-            self.train_dataset = _make_packed(train_idx, flip=augment)
+            # Train on moderate random crops to cut activation memory; val/test
+            # use the full image so reconstruction metrics reflect full resolution.
+            self.train_dataset = _make_packed(train_idx, flip=augment, crop_size=train_crop)
             self.val_dataset = _make_packed(val_idx, flip=False)
             self.test_dataset = _make_packed(test_idx, flip=False)
             return
