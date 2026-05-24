@@ -169,7 +169,7 @@ echo "========================================"
 echo "TOKEN EXTRACTION (quantized: bins=$coeff_bins, uniform)"
 echo "========================================"
 
-python extract_token_cache.py \\
+python cache.py \\
   --stage1-checkpoint "\$STAGE1_CKPT" \\
   --output-path "\$TOKEN_CACHE" \\
   --dataset "$DATASET" \\
@@ -187,7 +187,7 @@ echo "========================================"
 echo "STAGE 2: AR Prior ($case_name, bins=$coeff_bins, d=$d_model)"
 echo "========================================"
 
-python train_ar.py \\
+python train_stage2_prior.py \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\

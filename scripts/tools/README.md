@@ -7,7 +7,7 @@ Maintained launch entrypoints:
 
 Utilities in this directory:
 - `smoke_e2e.py`
-- `build_token_cache.py`
+- `cache.py`
 - `compute_rfid.py`
 - `extract_sparse_codes.py`
 - `kmeans_quantize_sparse_codes.py`

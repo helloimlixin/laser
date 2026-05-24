@@ -6,7 +6,7 @@ source "$ROOT_DIR/scripts/p4g.sh"
 
 p4g_mkdirs
 
-python3 train.py \
+python3 train_stage1_autoencoder.py \
   model=laser \
   data=celeba \
   seed=42 \
@@ -58,18 +58,18 @@ if [[ -z "$S1_CKPT" ]]; then
 fi
 p4g_write_ref "$(p4g_s1_ckpt_ref)" "$S1_CKPT"
 
-python3 build_token_cache.py \
-  --stage1_checkpoint "$S1_CKPT" \
+python3 cache.py \
+  --stage1-checkpoint "$S1_CKPT" \
   --dataset celeba \
-  --data_dir "$DATA_DIR" \
+  --data-dir "$DATA_DIR" \
   --split train \
-  --image_size "$IMG" \
-  --batch_size 16 \
-  --num_workers 8 \
+  --image-size "$IMG" \
+  --batch-size 16 \
+  --num-workers 8 \
   --device cuda \
-  --coeff_vocab_size "$BINS" \
-  --coeff_max "$CMAX" \
-  --output "$(p4g_cache_pt)"
+  --coeff-bins "$BINS" \
+  --coeff-max "$CMAX" \
+  --output-path "$(p4g_cache_pt)"
 
 p4g_write_ref "$(p4g_cache_ref)" "$(p4g_cache_pt)"
 echo "stage1_checkpoint=$S1_CKPT"

@@ -1,11 +1,6 @@
 import argparse
 from pathlib import Path
-import sys
 
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from compute_rfid import build_data_args, infer_config_path, infer_model_type
 

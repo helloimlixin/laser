@@ -11,7 +11,7 @@ CACHE_PT="$(p4g_read_ref "$(p4g_cache_ref)")"
 
 mkdir -p "$(p4g_s2_out "$WIN" "$GST")"
 
-python3 train_s2.py \
+python3 train_stage2_prior.py \
   seed=42 \
   output_dir="$(p4g_s2_out "$WIN" "$GST")" \
   token_cache_path="$CACHE_PT" \

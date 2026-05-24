@@ -9,9 +9,9 @@
 #   - Removed coef_max by default (bounded OMP was a source of instability)
 #
 # Each SLURM job runs the three-stage Lightning pipeline:
-#   1. train.py               - stage-1 autoencoder
-#   2. extract_token_cache.py - sparse-token extraction
-#   3. train_ar.py            - stage-2 autoregressive prior
+#   1. train_stage1_autoencoder.py               - stage-1 autoencoder
+#   2. cache.py - sparse-token extraction
+#   3. train_stage2_prior.py            - stage-2 autoregressive prior
 #
 # Usage:
 #   ./scripts/sweep_patch_quant_v2.sh                             # CelebA 128
@@ -209,7 +209,7 @@ echo "STAGE 1: Autoencoder Training"
 echo "  run=$run_name  patch=$patch_based  quantize=$quantize"
 echo "========================================"
 
-python train.py \\
+python train_stage1_autoencoder.py \\
   seed=42 \\
   output_dir="\$STAGE1_DIR" \\
   model=laser \\
@@ -273,14 +273,14 @@ if [[ "$quantize" == "true" ]]; then
 else
   EXTRACT_ARGS+=(--coeff-bins 0)
 fi
-python extract_token_cache.py "\${EXTRACT_ARGS[@]}"
+python cache.py "\${EXTRACT_ARGS[@]}"
 
 echo ""
 echo "========================================"
 echo "STAGE 2: Autoregressive Prior Training"
 echo "========================================"
 
-python train_ar.py \\
+python train_stage2_prior.py \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\

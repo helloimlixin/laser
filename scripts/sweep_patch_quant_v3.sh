@@ -218,7 +218,7 @@ echo "STAGE 1: Autoencoder Training"
 echo "  run=$run_name  patch=$patch_based  K=$num_embeddings  k=$sparsity"
 echo "========================================"
 
-python train.py \\
+python train_stage1_autoencoder.py \\
   seed=42 \\
   output_dir="\$STAGE1_DIR" \\
   model=laser \\
@@ -282,14 +282,14 @@ if [[ "$quantize" == "true" ]]; then
 else
   EXTRACT_ARGS+=(--coeff-bins 0)
 fi
-python extract_token_cache.py "\${EXTRACT_ARGS[@]}"
+python cache.py "\${EXTRACT_ARGS[@]}"
 
 echo ""
 echo "========================================"
 echo "STAGE 2: Autoregressive Prior Training"
 echo "========================================"
 
-python train_ar.py \\
+python train_stage2_prior.py \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\

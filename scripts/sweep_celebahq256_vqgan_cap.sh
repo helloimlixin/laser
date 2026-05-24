@@ -211,7 +211,7 @@ echo "  hiddens=$num_hiddens  res_blocks=$num_res_blocks  res_hiddens=$num_res_h
 echo "  recon=$patch_recon  image_size=${IMAGE_SIZE}  batch_size=$BATCH_SIZE  lr=$STAGE1_LR"
 echo "========================================"
 
-python train.py \\
+python train_stage1_autoencoder.py \\
   seed=42 \\
   output_dir="\$STAGE1_DIR" \\
   model=laser \\
@@ -262,7 +262,7 @@ echo "========================================"
 echo "TOKEN EXTRACTION (bins=$COEFF_BINS, coef_max=$coef_max)"
 echo "========================================"
 
-python extract_token_cache.py \\
+python cache.py \\
   --stage1-checkpoint "\$STAGE1_CKPT" \\
   --output-path "\$TOKEN_CACHE" \\
   --dataset "$DATASET" \\
@@ -280,7 +280,7 @@ echo "========================================"
 echo "STAGE 2: AR Prior (${AR_N_LAYERS}L, d=$AR_D_MODEL, ${STAGE2_EPOCHS}ep)"
 echo "========================================"
 
-python train_ar.py \\
+python train_stage2_prior.py \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\
@@ -334,6 +334,8 @@ RUNNER_EOF
     --error="$run_dir/${run_name}_%j.err"
     --requeue
   )
+  # Optional node feature constraint, e.g. CONSTRAINT=ampere (A100) or adalovelace (L40S).
+  [[ -n "${CONSTRAINT:-}" ]] && SBATCH_ARGS+=(--constraint="$CONSTRAINT")
 
   sbatch "${SBATCH_ARGS[@]}" --wrap='#!/bin/bash
 set -euo pipefail

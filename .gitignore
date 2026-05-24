@@ -187,3 +187,6 @@ tests/artifacts/
 Data/
 .ruff_cache/
 .vscode/
+
+# Local experiment artifacts (run outputs, checkpoints, logs) — never tracked
+runs/

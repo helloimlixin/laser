@@ -3,7 +3,6 @@ Encoder/Decoder tests with visualization.
 Artifacts go to: tests/artifacts/codec/{encoder,decoder}/{random,celeba,imagenet,ffhq}/
 """
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -15,13 +14,13 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from tqdm import tqdm
 
 # Add src to path
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from src.models.encoder import Encoder
 from src.models.decoder import Decoder
 from src.checkpoint_io import load_lightning_module
+
+# Repo root, used to locate datasets and checkpoints below.
+ROOT = Path(__file__).resolve().parents[1]
 
 # Output dirs
 OUT = Path(__file__).resolve().parent / "artifacts" / "codec"

@@ -183,7 +183,7 @@ echo "========================================"
 echo "TOKEN EXTRACTION (quantized: bins=$coeff_bins, $coeff_quantization)"
 echo "========================================"
 
-python extract_token_cache.py \\
+python cache.py \\
   --stage1-checkpoint "\$STAGE1_CKPT" \\
   --output-path "\$TOKEN_CACHE" \\
   --dataset "$DATASET" \\
@@ -203,7 +203,7 @@ echo "STAGE 2: Autoregressive Prior Training"
 echo "  $run_name  bins=$coeff_bins  quant=$coeff_quantization  d=$d_model"
 echo "========================================"
 
-python train_ar.py \\
+python train_stage2_prior.py \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\

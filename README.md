@@ -54,7 +54,7 @@ pip install -r requirements.txt
 │   │   ├── lpips.py
 │   └── visualizations/     # Visualization utilities
 ├── tests/                  # Unit tests
-├── train.py                # Main training script
+├── train_stage1_autoencoder.py                # Main training script
 └── test.py                 # Testing script
 ```
 
@@ -64,16 +64,16 @@ pip install -r requirements.txt
 
 ```bash
 # Train LASER with OMP sparse coding
-python train.py model=laser data=cifar10
+python train_stage1_autoencoder.py model=laser data=cifar10
 
 # Train LASER on CelebA
-python train.py model=laser data=celeba
+python train_stage1_autoencoder.py model=laser data=celeba
 
 # Train VQ-VAE baseline
-python train.py model=vqvae data=cifar10
+python train_stage1_autoencoder.py model=vqvae data=cifar10
 
 # Override config parameters
-python train.py model=laser data=celeba train.max_epochs=50 model.sparsity_level=16
+python train_stage1_autoencoder.py model=laser data=celeba train.max_epochs=50 model.sparsity_level=16
 ```
 
 ### Testing
@@ -100,20 +100,20 @@ Run a tiny end-to-end CelebA smoke test that:
 - generates a small sample sheet
 
 ```bash
-python scripts/smoke_e2e.py
+python scripts/tools/smoke_e2e.py
 ```
 
 Useful overrides:
 
 ```bash
 # Use a specific CelebA directory
-python scripts/smoke_e2e.py --data-dir /path/to/celeba
+python scripts/tools/smoke_e2e.py --data-dir /path/to/celeba
 
 # Rebuild outputs from scratch
-python scripts/smoke_e2e.py --clean
+python scripts/tools/smoke_e2e.py --clean
 
 # Compare against the non-patch bottleneck
-python scripts/smoke_e2e.py --no-patch-based
+python scripts/tools/smoke_e2e.py --no-patch-based
 ```
 
 The generated samples are still a smoke-test artifact, but the defaults now give stage-2 a bit more signal. In practice the most useful outputs are usually `stage1_recon_preview.png`, `token_cache_decode_preview.png`, and then `samples.png` in that order.
@@ -135,7 +135,7 @@ This is the maintained one-command pipeline for a quick end-to-end sanity run:
 - generates samples
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 scripts/smoke_e2e.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/tools/smoke_e2e.py \
   --clean \
   --device auto \
   --train-accelerator gpu \
@@ -184,10 +184,10 @@ Interpretation:
 
 #### Full-Dataset Stage 1
 
-For the real full dataset, prefer the maintained entrypoints directly instead of `scripts/smoke_e2e.py`.
+For the real full dataset, prefer the maintained entrypoints directly instead of `scripts/tools/smoke_e2e.py`.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 train_stage1_autoencoder.py \
   model=laser \
   data=celeba \
   data.data_dir=/home/xl598/Projects/data/celeba \
@@ -217,7 +217,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 train.py \
 #### Full-Dataset Token Cache Extraction
 
 ```bash
-python3 extract_token_cache.py \
+python3 cache.py \
   --dataset celeba \
   --data-dir /home/xl598/Projects/data/celeba \
   --split train \
@@ -232,7 +232,7 @@ python3 extract_token_cache.py \
 #### Full-Dataset Stage 2
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train_s2.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 train_stage2_prior.py \
   output_dir=outputs/ar \
   token_cache_path=null \
   data.num_workers=8 \
@@ -257,7 +257,7 @@ The maintained stage-2 path reads dataset and image metadata from the token cach
 #### Generation
 
 ```bash
-python3 sample_s2.py \
+python3 sample.py \
   --dev auto \
   -n 16 \
   -b 8
@@ -267,9 +267,6 @@ This will infer the latest maintained:
 - stage-1 checkpoint
 - stage-2 checkpoint
 - token cache
-
-`train_ar.py`, `sample_ar.py`, and `generate_ar.py` remain available as compatibility wrappers.
-`gen_s2.py` is the short compatibility sampler that still writes `samples.pt`.
 
 #### Local 2-GPU P4 Launcher
 
@@ -308,22 +305,22 @@ All configuration is managed through Hydra. Adjust the YAML files under `configs
 
 ```bash
 # Override specific parameters
-python train.py model=laser data=celeba train.max_epochs=100 model.sparsity_level=8
+python train_stage1_autoencoder.py model=laser data=celeba train.max_epochs=100 model.sparsity_level=8
 
 # Tune sparse coding capacity
-python train.py model=laser model.sparsity_level=10 model.num_embeddings=1024
+python train_stage1_autoencoder.py model=laser model.sparsity_level=10 model.num_embeddings=1024
 
 # Switch to the legacy simple backbone
-python train.py model=laser model.backbone=simple
+python train_stage1_autoencoder.py model=laser model.backbone=simple
 ```
 
 ## LASER: Maintained Model Architecture
 
 This section describes the maintained `src/` training and sampling path:
 
-- stage 1: [train.py](train.py)
-- token extraction: [extract_token_cache.py](extract_token_cache.py)
-- stage 2: [train_s2.py](train_s2.py)
+- stage 1: [train_stage1_autoencoder.py](train_stage1_autoencoder.py)
+- token extraction: [cache.py](cache.py)
+- stage 2: [train_stage2_prior.py](train_stage2_prior.py)
 
 Older exploratory code under `scratch/` may use different defaults. The section below is the authoritative description of the current maintained model.
 
@@ -524,7 +521,7 @@ That metadata is important because patch-based token grids and latent grids are 
 
 ### Stage 2: Sparse-Token Priors
 
-The maintained stage-2 training path is [train_s2.py](train_s2.py). It trains a transformer prior over the cached sparse representation instead of over pixels.
+The maintained stage-2 training path is [train_stage2_prior.py](train_stage2_prior.py). It trains a transformer prior over the cached sparse representation instead of over pixels.
 
 The default config in [configs/config_ar.yaml](configs/config_ar.yaml) uses:
 
@@ -593,7 +590,7 @@ Tradeoff:
 - [src/models/laser.py](src/models/laser.py): stage-1 LightningModule, training losses, logging, and backbone selection
 - [src/models/rq_ae.py](src/models/rq_ae.py): VQGAN/DDPM-style encoder and decoder reused by the maintained LASER path
 - [src/models/bottleneck.py](src/models/bottleneck.py): sparse dictionary bottleneck, patch extraction, OMP, coefficient quantization, and latent reconstruction
-- [extract_token_cache.py](extract_token_cache.py): stage-1 to stage-2 interface and cache metadata emission
+- [cache.py](cache.py): stage-1 to stage-2 interface and cache metadata emission
 - [src/models/spatial_prior.py](src/models/spatial_prior.py): default spatial-depth stage-2 prior
 - [src/models/mingpt_prior.py](src/models/mingpt_prior.py): flat quantized GPT prior
 - [src/stage2_compat.py](src/stage2_compat.py): stage-1 bundle loading and stage-2 decode compatibility helpers
@@ -1166,7 +1163,7 @@ transforms = [
 
 6. **Early Stopping**:
 ```python
-# In train.py
+# In train_stage1_autoencoder.py
 from lightning.pytorch.callbacks import EarlyStopping
 early_stop = EarlyStopping(
     monitor='val/loss',
@@ -1244,7 +1241,7 @@ python scripts/kmeans_quantize_sparse_codes.py \
 After generating the token files, launch AR/ImageGPT training with:
 
 ```bash
-python train_s2.py \
+python train_stage2_prior.py \
   token_cache_path=outputs/ar_tokens/celeba/tokens_cache.pt \
   data.dataset=celeba
 ```
