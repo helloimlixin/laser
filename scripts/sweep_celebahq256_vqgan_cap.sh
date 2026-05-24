@@ -334,6 +334,8 @@ RUNNER_EOF
     --error="$run_dir/${run_name}_%j.err"
     --requeue
   )
+  # Optional node feature constraint, e.g. CONSTRAINT=ampere (A100) or adalovelace (L40S).
+  [[ -n "${CONSTRAINT:-}" ]] && SBATCH_ARGS+=(--constraint="$CONSTRAINT")
 
   sbatch "${SBATCH_ARGS[@]}" --wrap='#!/bin/bash
 set -euo pipefail
