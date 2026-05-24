@@ -9,20 +9,20 @@ S1_CKPT="$(pg_read_ref "$(pg_s1_ckpt_ref)")"
 
 mkdir -p "$(pg_s2_out "$BIN")" "$RUN_ROOT/cache"
 
-python3 build_token_cache.py \
-  --stage1_checkpoint "$S1_CKPT" \
+python3 cache.py \
+  --stage1-checkpoint "$S1_CKPT" \
   --dataset celeba \
-  --data_dir "$DATA_DIR" \
+  --data-dir "$DATA_DIR" \
   --split train \
-  --image_size "$IMG" \
-  --batch_size 16 \
-  --num_workers 8 \
+  --image-size "$IMG" \
+  --batch-size 16 \
+  --num-workers 8 \
   --device cuda \
-  --coeff_vocab_size "$BIN" \
-  --coeff_max "$CMAX" \
-  --output "$(pg_cache_pt "$BIN")"
+  --coeff-bins "$BIN" \
+  --coeff-max "$CMAX" \
+  --output-path "$(pg_cache_pt "$BIN")"
 
-python3 train_s2.py \
+python3 train_stage2_prior.py \
   seed=42 \
   output_dir="$(pg_s2_out "$BIN")" \
   token_cache_path="$(pg_cache_pt "$BIN")" \

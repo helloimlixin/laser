@@ -29,7 +29,13 @@ def _bundle_patch_layout(bundle: Stage1DecodeBundle) -> tuple[bool, int]:
     if bottleneck is not None:
         patch_based = getattr(bottleneck, "patch_based", None)
         if patch_based is None:
-            patch_based = isinstance(bottleneck, PatchDictionaryLearningTokenized)
+            # When the patch flag is not exposed, infer it the same way the
+            # reconstruct path does: a patch bundle carries a ``patch_size``
+            # (RQ patch bottlenecks set it; non-patch ones leave it unset).
+            patch_based = (
+                isinstance(bottleneck, PatchDictionaryLearningTokenized)
+                or getattr(bottleneck, "patch_size", None) is not None
+            )
         patch_stride = int(getattr(bottleneck, "patch_stride", 1) or 1)
         return bool(patch_based), max(1, patch_stride)
 

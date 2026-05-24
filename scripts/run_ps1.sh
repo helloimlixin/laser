@@ -6,7 +6,7 @@ source "$ROOT_DIR/scripts/pg.sh"
 
 pg_mkdirs
 
-python3 train.py \
+python3 train_stage1_autoencoder.py \
   model=laser \
   data=celeba \
   seed=42 \

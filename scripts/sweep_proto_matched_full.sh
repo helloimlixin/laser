@@ -140,7 +140,7 @@ echo "STAGE 1: Autoencoder (coef_max=$COEF_MAX)"
 echo "  $run_name  patch=$patch_based  K=$num_embeddings  k=$sparsity"
 echo "========================================"
 
-python train.py \\
+python train_stage1_autoencoder.py \\
   seed=42 \\
   output_dir="\$STAGE1_DIR" \\
   model=laser \\
@@ -187,7 +187,7 @@ echo "========================================"
 echo "TOKEN EXTRACTION (bins=$COEFF_BINS, coef_max=$COEF_MAX)"
 echo "========================================"
 
-python extract_token_cache.py \\
+python cache.py \\
   --stage1-checkpoint "\$STAGE1_CKPT" \\
   --output-path "\$TOKEN_CACHE" \\
   --dataset "$DATASET" \\
@@ -205,7 +205,7 @@ echo "========================================"
 echo "STAGE 2: Proto-matched AR (12L, 100ep, temp=$SAMPLE_TEMP)"
 echo "========================================"
 
-python train_ar.py \\
+python train_stage2_prior.py \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\

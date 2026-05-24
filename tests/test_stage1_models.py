@@ -17,12 +17,15 @@ def test_laser_forward_and_sparse_token_decode():
     torch.manual_seed(0)
     model = LASER(
         in_channels=3,
-        num_hiddens=16,
+        num_hiddens=32,
         num_embeddings=16,
         embedding_dim=4,
         sparsity_level=2,
         num_residual_blocks=1,
         num_residual_hiddens=8,
+        resolution=16,
+        num_downsamples=1,
+        max_ch_mult=1,
         commitment_cost=0.25,
         learning_rate=1e-3,
         beta=0.9,
@@ -95,62 +98,24 @@ def test_vqvae_forward_and_index_decode():
     assert len(model._codebook_snapshots) == 1
 
 
-def test_laser_simple_backbone_matches_vqvae_encoder_decoder_depth():
-    torch.manual_seed(0)
-    common = dict(
-        in_channels=3,
-        num_hiddens=16,
-        num_embeddings=16,
-        embedding_dim=4,
-        num_residual_blocks=1,
-        num_residual_hiddens=8,
-        commitment_cost=0.25,
-        learning_rate=1e-3,
-        beta=0.9,
-        compute_fid=False,
-        num_downsamples=4,
-    )
-    laser = LASER(
-        **common,
-        sparsity_level=2,
-        perceptual_weight=0.0,
-        backbone="simple",
-        log_images_every_n_steps=0,
-    )
-    vqvae = VQVAE(
-        **common,
-        decay=0.99,
-        perceptual_weight=0.0,
-    )
-    laser.eval()
-    vqvae.eval()
-    x = torch.randn(2, 3, 32, 32)
-
-    assert type(laser.encoder) is type(vqvae.encoder)
-    assert type(laser.decoder) is type(vqvae.decoder)
-    assert laser.encoder.num_downsamples == vqvae.encoder.num_downsamples == 4
-    assert laser.decoder.num_upsamples == vqvae.decoder.num_upsamples == 4
-    assert laser.pre_bottleneck(laser.encoder(x)).shape[-2:] == (2, 2)
-    assert vqvae.pre_bottleneck(vqvae.encoder(x)).shape[-2:] == (2, 2)
-
-
 def test_laser_nonoverlap_patch_tokens_have_expected_grid_and_depth():
     torch.manual_seed(0)
     model = LASER(
         in_channels=3,
-        num_hiddens=16,
+        num_hiddens=32,
         num_embeddings=32,
         embedding_dim=4,
         sparsity_level=2,
         num_residual_blocks=1,
         num_residual_hiddens=8,
+        resolution=32,
+        num_downsamples=2,
+        max_ch_mult=1,
         commitment_cost=0.25,
         learning_rate=1e-3,
         beta=0.9,
         perceptual_weight=0.0,
         compute_fid=False,
-        backbone="simple",
-        num_downsamples=2,
         patch_based=True,
         patch_size=2,
         patch_stride=2,

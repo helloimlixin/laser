@@ -1,14 +1,5 @@
-import sys
-from pathlib import Path
-
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-for path_str in (str(ROOT), str(SRC)):
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
 
 from src.models.bottleneck import (
     DictionaryLearning,

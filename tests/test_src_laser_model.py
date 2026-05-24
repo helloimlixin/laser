@@ -1,13 +1,7 @@
 import inspect
-import sys
-from pathlib import Path
 
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from src.models import laser as laser_module
 
@@ -25,12 +19,16 @@ class _DummyLPIPS(torch.nn.Module):
 def _build_model(**overrides):
     params = {
         "in_channels": 3,
-        "num_hiddens": 16,
+        "num_hiddens": 32,
         "num_embeddings": 8,
         "embedding_dim": 4,
         "sparsity_level": 1,
         "num_residual_blocks": 1,
         "num_residual_hiddens": 8,
+        # Attention U-Net backbone params (tiny config for 16x16 test inputs).
+        "resolution": 16,
+        "num_downsamples": 1,
+        "max_ch_mult": 1,
         "commitment_cost": 0.25,
         "learning_rate": 1e-3,
         "beta": 0.9,
@@ -74,71 +72,46 @@ def test_validation_visual_cache_respects_flag():
 
 
 def test_validation_step_skips_duplicate_recon_grid_for_cached_latent_visuals():
-    model = _build_model(enable_val_latent_visuals=True, log_images_every_n_steps=1)
-    trainer_stub = type("TrainerStub", (), {"is_global_zero": True})()
-    model.__dict__["_trainer"] = trainer_stub
-    batch = torch.randn(4, 3, 16, 16)
-    calls = []
+    # With latent visuals enabled, validation_step skips the simple recon grid
+    # (the richer grid is logged at validation epoch end instead). With them
+    # disabled, validation_step logs the grid once at batch 0.
+    def _run(enable):
+        model = _build_model(enable_val_latent_visuals=enable, log_images_every_n_steps=1)
+        model.__dict__["_trainer"] = type("TrainerStub", (), {"is_global_zero": True})()
+        batch = torch.randn(4, 3, 16, 16)
+        calls = []
+        model.compute_metrics = lambda batch, prefix="val": (
+            torch.tensor(0.0),
+            batch if isinstance(batch, torch.Tensor) else batch[0],
+            batch if isinstance(batch, torch.Tensor) else batch[0],
+        )
+        model.log_images = lambda *args, **kwargs: calls.append(kwargs.get("prefix", "val"))
+        model.validation_step(batch, 0)
+        model.validation_step(batch, 1)
+        return calls
 
-    model.compute_metrics = lambda batch, prefix="val": (
-        torch.tensor(0.0),
-        batch if isinstance(batch, torch.Tensor) else batch[0],
-        batch if isinstance(batch, torch.Tensor) else batch[0],
-    )
-    model.log_images = lambda *args, **kwargs: calls.append(kwargs.get("prefix", "val"))
-
-    model.validation_step(batch, 0)
-    model.validation_step(batch, 1)
-
-    assert calls == ["val"]
+    assert _run(enable=True) == []        # skipped for epoch-end latent visuals
+    assert _run(enable=False) == ["val"]  # logged once at batch 0
 
 
-def test_log_images_uses_global_step_for_wandb_log():
+def test_log_images_uses_global_step_for_wandb_log(recording_wandb_trainer):
     model = _build_model(log_images_every_n_steps=1)
-    calls = []
-
-    class _Experiment:
-        def log(self, payload, **kwargs):
-            calls.append((payload, kwargs))
-
-    trainer_stub = type(
-        "TrainerStub",
-        (),
-        {
-            "is_global_zero": True,
-            "global_step": 7,
-            "datamodule": None,
-            "logger": type("LoggerStub", (), {"experiment": _Experiment()})(),
-        },
-    )()
+    trainer_stub, calls = recording_wandb_trainer(global_step=7)
     model.__dict__["_trainer"] = trainer_stub
 
     x = torch.rand(2, 3, 8, 8)
     recon = torch.rand(2, 3, 8, 8)
     model.log_images(x, recon, prefix="train")
 
-    assert len(calls) == 1
-    assert calls[0][1]["step"] == 7
+    # The wandb_media helpers fold the step into the payload as
+    # "trainer/global_step" (rather than an experiment.log(step=...) kwarg).
+    assert calls, "log_images should emit at least one wandb log"
+    assert all(payload["trainer/global_step"] == 7 for payload, _ in calls)
 
 
-def test_log_images_is_idempotent_per_prefix_and_step():
+def test_log_images_is_idempotent_per_prefix_and_step(recording_wandb_trainer):
     model = _build_model(log_images_every_n_steps=1)
-    calls = []
-
-    class _Experiment:
-        def log(self, payload, **kwargs):
-            calls.append((payload, kwargs))
-
-    trainer_stub = type(
-        "TrainerStub",
-        (),
-        {
-            "is_global_zero": True,
-            "global_step": 11,
-            "datamodule": None,
-            "logger": type("LoggerStub", (), {"experiment": _Experiment()})(),
-        },
-    )()
+    trainer_stub, calls = recording_wandb_trainer(global_step=11)
     model.__dict__["_trainer"] = trainer_stub
 
     x = torch.rand(2, 3, 8, 8)
@@ -147,8 +120,12 @@ def test_log_images_is_idempotent_per_prefix_and_step():
     model.log_images(x, recon, prefix="train")
     model.log_images(x, recon, prefix="val")
 
-    assert len(calls) == 2
-    assert [call[0]["global_step"] for call in calls] == [11, 11]
+    # The same (prefix, step) logs its media exactly once: the repeated "train"
+    # call is deduplicated by _claim_media_log, so each grid key appears once.
+    image_keys = [key for payload, _ in calls for key in payload if key.endswith("/images")]
+    assert image_keys.count("train/images") == 1
+    assert image_keys.count("val/images") == 1
+    assert all(payload["trainer/global_step"] == 11 for payload, _ in calls)
 
 
 def test_train_psnr_is_logged_to_progress_bar():

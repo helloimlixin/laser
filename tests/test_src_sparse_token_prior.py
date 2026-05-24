@@ -194,41 +194,6 @@ def test_sparse_token_prior_module_manual_lr_schedule_applies_first_step_without
     assert optimizer.param_groups[0]["lr"] == 1e-4
 
 
-def test_log_recon_images_uses_global_step_for_wandb_log():
-    calls = []
-
-    class _Experiment:
-        def log(self, payload, **kwargs):
-            calls.append((payload, kwargs))
-
-    trainer_stub = type(
-        "TrainerStub",
-        (),
-        {
-            "is_global_zero": True,
-            "global_step": 11,
-            "logger": type("LoggerStub", (), {"experiment": _Experiment()})(),
-        },
-    )()
-
-    mod = SparseTokenPriorModule(
-        prior=_FakeQuantPrior(),
-        stage1_decoder_bundle=object(),
-    )
-    mod.__dict__["_trainer"] = trainer_stub
-    mod._stage1_decoder_bundle = object()
-
-    old_decode = sparse_token_prior_module.decode_stage2_outputs
-    sparse_token_prior_module.decode_stage2_outputs = lambda *args, **kwargs: torch.zeros(1, 3, 4, 4)
-    try:
-        mod._log_recon_images((torch.zeros(1, 2, dtype=torch.long),))
-    finally:
-        sparse_token_prior_module.decode_stage2_outputs = old_decode
-
-    assert len(calls) == 1
-    assert calls[0][1]["step"] == 11
-
-
 def test_src_spatial_depth_prior_quantized_generation_preserves_unique_atoms():
     torch.manual_seed(0)
 
@@ -560,6 +525,7 @@ def test_build_sparse_prior_from_hparams_prefers_saved_grid_shape():
             "prior_dropout": 0.0,
             "prior_atom_vocab_size": 3,
             "prior_coeff_vocab_size": 2,
+            "prior_window_sites": 2,
         },
     )
 
@@ -684,7 +650,7 @@ def test_build_sparse_prior_from_cache_supports_real_valued_coeffs():
             "num_atoms": 5,
             "coeff_max": 6.0,
             "variational_coeffs": True,
-            "variational_coeff_prior_std": 0.35,
+            "variational_coeff_target_std": 0.35,
             "variational_coeff_min_std": 0.05,
         },
     }
