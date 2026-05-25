@@ -160,26 +160,8 @@ def train(cfg: DictConfig):
         print(f"Bypass Bottleneck: {bool(getattr(cfg.model, 'bypass_bottleneck', False))}")
         print(f"Coefficient Bound: {getattr(cfg.model, 'coef_max', None)}")
         print(
-            "Bounded OMP Refine Steps: "
-            f"{getattr(cfg.model, 'bounded_omp_refine_steps', 8)}"
-        )
-        print(f"Variational Coefficients: {bool(getattr(cfg.model, 'variational_coeffs', False))}")
-        if bool(getattr(cfg.model, 'variational_coeffs', False)):
-            print(
-                "Variational Coeff Refine Weight: "
-                f"{float(getattr(cfg.model, 'variational_coeff_refine_weight', 0.0))}"
-            )
-            print(
-                "Variational Coeff Target Std: "
-                f"{float(getattr(cfg.model, 'variational_coeff_target_std', 0.25))}"
-            )
-            print(
-                "Variational Coeff Min Std: "
-                f"{float(getattr(cfg.model, 'variational_coeff_min_std', 0.01))}"
-            )
-        print(
-            "Dictionary Through Decoder: "
-            f"{bool(getattr(cfg.model, 'dictionary_through_decoder', False))}"
+            "OMP Residual Tolerance: "
+            f"{getattr(cfg.model, 'omp_residual_tolerance', None)}"
         )
         if str(getattr(cfg.model, 'backbone', 'simple')).strip().lower() != "simple":
             print(f"Downsamples: {getattr(cfg.model, 'num_downsamples', 2)}")

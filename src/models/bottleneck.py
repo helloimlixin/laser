@@ -4,16 +4,12 @@ The concrete classes live in focused modules; this module re-exports them so
 existing ``from src.models.bottleneck import ...`` imports keep working:
 
 - :mod:`src.models.quantizers` — :class:`VectorQuantizer`, :class:`VectorQuantizerEMA`
-- :mod:`src.models.dictionary_learning` — :class:`DictionaryLearning`, :class:`SparseCodes`
+- :mod:`src.models.dictionary` — :class:`DictionaryLearning`
+- :mod:`src.models.bottleneck_utils` — :class:`SparseCodes` and math helpers
 """
 
-from .dictionary_learning import (
-    DictionaryLearning,
-    SparseCodes,
-    _dictionary_abs_offdiag_cosines,
-    _gaussian_kl_to_fixed_mean,
-    _normalize_dictionary,
-)
+from .bottleneck_utils import SparseCodes, _normalize_dictionary
+from .dictionary import DictionaryLearning
 from .quantizers import VectorQuantizer, VectorQuantizerEMA
 
 __all__ = [

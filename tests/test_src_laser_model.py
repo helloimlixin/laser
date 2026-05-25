@@ -34,7 +34,6 @@ def _build_model(**overrides):
         "beta": 0.9,
         "perceptual_weight": 0.0,
         "compute_fid": False,
-        "coherence_weight": 0.0,
         "log_images_every_n_steps": 0,
         "diag_log_interval": 0,
     }
@@ -187,36 +186,6 @@ def test_logged_sparsity_uses_fixed_support_budget_not_thresholded_coeffs():
     assert float(logged["train/effective_sparsity"]) == 0.0625
 
 
-def test_sparsity_reg_weight_does_not_change_optimized_loss():
-    batch = torch.randn(2, 3, 16, 16)
-    sparse_codes = laser_module.SparseCodes(
-        support=torch.tensor(
-            [
-                [[[0, 1]]],
-                [[[2, 3]]],
-            ],
-            dtype=torch.long,
-        ),
-        values=torch.tensor(
-            [
-                [[[1.0, 0.5]]],
-                [[[0.25, 0.125]]],
-            ],
-            dtype=torch.float32,
-        ),
-        num_embeddings=8,
-    )
-    base = _build_model(num_embeddings=8, sparsity_level=2, sparsity_reg_weight=0.0)
-    heavy = _build_model(num_embeddings=8, sparsity_level=2, sparsity_reg_weight=100.0)
-    base.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
-    heavy.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
-    base.log = lambda *args, **kwargs: None
-    heavy.log = lambda *args, **kwargs: None
-
-    loss_base, _, _ = base.compute_metrics(batch, prefix="train")
-    loss_heavy, _, _ = heavy.compute_metrics(batch, prefix="train")
-
-    assert torch.isclose(loss_base, loss_heavy)
 
 
 def test_dictionary_is_always_in_optimizer_with_optional_lr_override():

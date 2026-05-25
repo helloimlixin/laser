@@ -78,69 +78,21 @@ commitment_cost: 0.25
 # matched f4 profile.
 dict_learning_rate: 2.5e-4
 
-# Optional hard bound on sparse coefficients for downstream quantization.
-# null keeps the previous unconstrained least-squares updates.
+# Optional hard bound on sparse coefficients (e.g. for quantization).
+# null leaves OMP coefficients unconstrained.
 coef_max: null
-bounded_omp_refine_steps: 8
 
-# EMA-like dictionary usage tracking. The dictionary remains a DDP-synchronized
-# parameter, while per-atom usage counts smooth the dictionary gradient so a few
-# frequent atoms do not dominate large overcomplete patch dictionaries.
-dictionary_usage_ema_decay: 0.99
-dictionary_usage_grad_scale: 0.0
-dictionary_usage_grad_min: 0.1
-dictionary_usage_grad_max: 10.0
+# Relative residual tolerance for OMP early termination. If set, OMP stops
+# picking atoms for a latent site once ||residual||^2 / ||signal||^2 <= this.
+# null preserves fixed sparsity_level iterations.
+omp_residual_tolerance: null
 
-# Optional variational posterior over continuous sparse coefficients.
-# This keeps the support depth fixed while giving stage 2 a Gaussian
-# coefficient target when caches are extracted with coeff_bins=0.
-#
-# Note (May 2026, A3): the historical "KL" term here is a Gaussian KL whose
-# reference mean is the data-dependent OMP coefficient, so it acts as an L2
-# refinement-around-OMP regularizer rather than a KL to a fixed prior. Keys
-# were renamed for honesty: variational_coeff_kl_weight ->
-# variational_coeff_refine_weight, variational_coeff_prior_std ->
-# variational_coeff_target_std. Old configs/checkpoints will raise a
-# TypeError directing you here.
-variational_coeffs: false
-variational_coeff_refine_weight: 0.0
-variational_coeff_target_std: 0.25
-variational_coeff_min_std: 0.01
-
-# A2 switch (May 2026): when true, skip the straight-through estimator inside
-# the bottleneck so decoder gradients flow into the dictionary atoms (and the
-# coeff_variational_* networks in variational mode). Off by default — current
-# training matches the legacy proto/VQ-style behavior where the dictionary
-# learns only from dl_latent_loss. Turning this on usually requires raising
-# commitment_cost so the encoder stays pinned to the dictionary manifold.
-dictionary_through_decoder: false
-
-# Dictionary atom update.
-# `gradient` uses the standard Adam path. `online_ksvd` removes the dictionary
-# from Adam and applies a mini-batch K-SVD-style least-squares atom update on
-# the fixed OMP supports after each training step.
-dictionary_update_mode: gradient
-dictionary_ksvd_lr: 0.2
-dictionary_ksvd_update_every: 1
-dictionary_ksvd_min_usage: 1
-dictionary_ksvd_max_atoms_per_step: 512
-
-# Latent patch sparse coding.
-# Keep this disabled for the RQ-AE encoder/decoder stack while reconstruction
-# quality is being validated. The sparse bottleneck operates per 16x16 latent
-# site instead of extracting/stitching latent patches.
+# Latent patch sparse coding. Disabled by default — sparse bottleneck operates
+# per latent site rather than extracting/stitching latent patches.
 patch_based: false
 patch_size: 2
 patch_stride: 2
 patch_reconstruction: tile
-
-# L1 regularization weight on sparse coefficients
-# Typical range: 0.0-0.1
-# 0.0 = no regularization
-# 0.01 = mild regularization (recommended)
-# 0.05-0.1 = strong regularization (max sparsity)
-# Increase this if the sparse codes are still too dense.
-sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regularization
 
 # Perceptual loss weight (LPIPS)
 # Keep disabled while validating reconstruction capacity. The scratch reference
@@ -176,8 +128,3 @@ enable_val_latent_visuals: true
 # Large dictionaries are sampled for PCA scatter/GIF logging to keep W&B media
 # and end-of-fit rendering manageable.
 codebook_visual_max_vectors: 1024
-
-# Optional dictionary coherence penalty.
-# Proto.py keeps this disabled by default and relies on normalized atoms plus
-# projected gradients for the main dictionary-learning behavior.
-coherence_weight: 0.0

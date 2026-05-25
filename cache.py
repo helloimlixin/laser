@@ -469,17 +469,6 @@ def _token_cache_meta(
         "embedding_dim": int(model.bottleneck.embedding_dim),
         "latent_hw": (int(latent_hw[0]), int(latent_hw[1])),
         "coef_max": float(args.coeff_max),
-        "variational_coeffs": bool(getattr(model.bottleneck, "variational_coeffs", False)),
-        # Renamed in May 2026 (A3); see src/models/bottleneck.py docstring.
-        "variational_coeff_refine_weight": float(
-            getattr(model.bottleneck, "variational_coeff_refine_weight", 0.0)
-        ),
-        "variational_coeff_target_std": float(
-            getattr(model.bottleneck, "variational_coeff_target_std", 0.25)
-        ),
-        "variational_coeff_min_std": float(
-            getattr(model.bottleneck, "variational_coeff_min_std", 0.01)
-        ),
         "backbone": backbone,
         "num_downsamples": int(getattr(model, "num_downsamples", getattr(model.hparams, "num_downsamples", 2))),
         "attn_resolutions": attn_resolutions,
