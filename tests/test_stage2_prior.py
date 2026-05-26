@@ -1,5 +1,7 @@
 """Core stage-2 behavior: cached sparse tokens build, train, and generate."""
 
+from types import SimpleNamespace
+
 import torch
 
 from src.models.sparse_token_prior import (
@@ -7,6 +9,7 @@ from src.models.sparse_token_prior import (
     build_sparse_prior_from_cache,
     infer_sparse_vocab_sizes,
 )
+from src.stage2_preview import _build_sparse_visuals, _sparse_generation_stats
 
 
 def _quantized_cache():
@@ -55,6 +58,46 @@ def _real_valued_cache():
             "variational_coeffs": False,
         },
     }
+
+
+def test_stage2_preview_writes_sparse_visual_maps(tmp_path):
+    batch = SimpleNamespace(
+        imgs=torch.randn(2, 3, 8, 8),
+        atoms=torch.arange(2 * 3 * 4 * 2).view(2, 3, 4, 2) % 8,
+        coeffs=torch.randn(2, 3, 4, 2),
+        toks=None,
+    )
+    cache = {"meta": {"num_atoms": 8}}
+
+    paths = _build_sparse_visuals(batch, cache, tmp_path, stem="preview")
+    stats = _sparse_generation_stats(batch, cache)
+
+    assert {"atom_id_maps", "coeff_value_maps", "coeff_abs_maps"} <= set(paths)
+    assert all(path.exists() and path.stat().st_size > 0 for path in paths.values())
+    assert int(stats["generation/unique_atoms"]) == 8
+    assert "generation/coeff_abs_mean" in stats
+
+
+def test_stage2_preview_writes_quantized_coeff_bin_maps(tmp_path):
+    toks = torch.tensor(
+        [
+            [
+                [[0, 8, 1, 9], [2, 10, 3, 11]],
+                [[4, 12, 5, 13], [6, 14, 7, 15]],
+            ]
+        ],
+        dtype=torch.long,
+    )
+    batch = SimpleNamespace(imgs=torch.randn(1, 3, 8, 8), toks=toks, atoms=None, coeffs=None)
+    cache = {"meta": {"num_atoms": 8}}
+
+    paths = _build_sparse_visuals(batch, cache, tmp_path, stem="quantized")
+    stats = _sparse_generation_stats(batch, cache)
+
+    assert {"atom_id_maps", "coeff_bin_maps"} <= set(paths)
+    assert all(path.exists() and path.stat().st_size > 0 for path in paths.values())
+    assert stats["generation/coeff_bin_min"] == 0.0
+    assert stats["generation/coeff_bin_max"] == 7.0
 
 
 def test_sparse_prior_builds_trains_and_generates_quantized_tokens():

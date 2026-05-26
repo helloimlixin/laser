@@ -42,15 +42,16 @@ class DictionaryLearning(nn.Module):
         self.epsilon = float(epsilon)
         self.dict_learning_rate = dict_learning_rate
         # When True, decoder gradients flow into the dictionary atoms via the
-        # OMP-linear-combo path (no STE bypass). Useful to break bottleneck collapse
-        # since atoms then get shaped by reconstruction quality, not just MSE-to-z_e.
+        # OMP-linear-combo path while retaining an identity gradient to the
+        # encoder. Useful to break bottleneck collapse since atoms then get
+        # shaped by reconstruction quality, not just MSE-to-z_e.
         self.dictionary_through_decoder = bool(dictionary_through_decoder)
         self.coef_max = None if coef_max is None else float(coef_max)
         if self.coef_max is not None:
             if not math.isfinite(self.coef_max) or self.coef_max <= 0.0:
                 raise ValueError(f"coef_max must be finite and > 0, got {self.coef_max}")
         # Relative residual tolerance for OMP early termination. If set, OMP stops
-        # picking atoms for a sample once ||residual||^2 / ||signal||^2 <= tolerance.
+        # picking atoms per sample once ||residual||^2 / ||signal||^2 <= tolerance.
         # Unused slots in support/coeffs stay at 0. None preserves fixed-k behavior.
         self.omp_residual_tolerance = (
             None if omp_residual_tolerance is None else float(omp_residual_tolerance)
@@ -165,124 +166,124 @@ class DictionaryLearning(nn.Module):
                 f"sparsity_level ({int(self.sparsity_level)}) must be <= num_atoms ({int(D.size(1))})"
             )
 
-    def _solve_residual_support(self, X_t, D, support):
-        """Least-squares solve for the active support, returning (coeffs, recon).
-
-        Uses very light regularization (``self.epsilon``) to match the original
-        OMP behavior. Stronger regularization biases coefficients toward zero and
-        causes the reconstruction to collapse toward the data mean.
-        """
-        atoms = D.t()[support.to(torch.long)]
-        rhs = torch.bmm(atoms, X_t.unsqueeze(-1)).squeeze(-1)
-        gram_support = torch.bmm(atoms, atoms.transpose(1, 2))
-        support_size = int(support.size(1))
-        reg_eye = torch.eye(
-            support_size,
-            device=gram_support.device,
-            dtype=gram_support.dtype,
-        ).unsqueeze(0)
-        gram_reg = gram_support + float(self.epsilon) * reg_eye
-        try:
-            coeffs = torch.linalg.solve(gram_reg, rhs.unsqueeze(-1)).squeeze(-1)
-        except RuntimeError:
-            diag = gram_reg.diagonal(dim1=-2, dim2=-1).clamp_min(self.epsilon)
-            coeffs = rhs / diag
-        coeffs = torch.nan_to_num(coeffs, nan=0.0, posinf=0.0, neginf=0.0)
-        if self.coef_max is not None:
-            coeffs = coeffs.clamp(-self.coef_max, self.coef_max)
-        recon = torch.bmm(coeffs.unsqueeze(1), atoms).squeeze(1)
-        return coeffs, recon
-
-    def _select_residual_atom(self, residual, D, chosen):
-        """Choose the best atom per signal without materializing a full KxK Gram."""
-        _, num_atoms = D.shape
-        chunk_size = 16384
-        best_scores = residual.new_full((residual.size(0),), -1.0)
-        best_indices = torch.zeros(residual.size(0), device=residual.device, dtype=torch.long)
-        for start in range(0, int(num_atoms), chunk_size):
-            end = min(start + chunk_size, int(num_atoms))
-            scores = residual.mm(D[:, start:end]).abs()
-            scores.masked_fill_(chosen[:, start:end], -1.0)
-            values, local_indices = scores.max(dim=1)
-            update = values > best_scores
-            best_scores = torch.where(update, values, best_scores)
-            best_indices = torch.where(
-                update,
-                local_indices.to(best_indices.dtype) + int(start),
-                best_indices,
-            )
-        return best_indices
-
     def batch_omp_with_support(self, X, D):
-        """Batched OMP that scales to large dictionaries and low sparsity.
+        """Batch-OMP (Rubinstein-Zibulevsky-Elad 2008) with incremental Cholesky.
 
-        The old scratch-style path formed a dense KxK dictionary Gram matrix
-        and updated correlations through it. That is fast for small K but is the
-        wrong shape for large patch dictionaries. This residual OMP path
-        recomputes D^T residual in chunks and only solves each sample's small
-        support Gram, so memory scales with signal_dim*K and batch*K rather than
-        K^2.
+        Port of sparse-vqvae's ``Batch_OMP``
+        (https://github.com/amzn/sparse-vqvae/blob/main/utils/pyomp.py).
+
+        Precomputes ``G = D^T D`` and ``h_bar = D^T X`` once, then iteratively
+        picks atoms and updates the Cholesky factor of ``G[I, I]`` incrementally.
+        With ``omp_residual_tolerance=None``, always runs ``sparsity_level``
+        selections. Otherwise each sample stops once its squared residual norm
+        falls below ``omp_residual_tolerance * ||x||^2`` while other samples in
+        the batch can keep selecting atoms.
+
+        Args:
+            X: ``[patch_dim, batch]`` signals.
+            D: ``[patch_dim, num_atoms]`` dictionary (unit-norm columns).
+
+        Returns:
+            ``(support, coeffs_ordered)``, both ``[batch, sparsity_level]``.
         """
         self._validate_omp_inputs(X, D)
         X = torch.nan_to_num(X)
         D = torch.nan_to_num(D)
 
-        _, batch_size = X.size()
+        _, batch_size = X.shape
+        num_atoms = int(D.size(1))
         device = X.device
-        batch_idx = torch.arange(batch_size, device=device)
-        X_t = X.t().contiguous()
-        residual = X_t.clone()
-
+        dtype = X.dtype
         sparsity = int(self.sparsity_level)
+        fixed_sparsity = self.omp_residual_tolerance is None
+        tolerance = 0.0 if fixed_sparsity else float(self.omp_residual_tolerance)
+
+        # Precompute Gram and initial correlations.
+        G = D.t() @ D  # [num_atoms, num_atoms]
+        h_bar = (D.t() @ X).t().contiguous()  # [batch_size, num_atoms]
+        h = h_bar.clone()
+
+        # eps tracks the per-sample residual squared L2 norm so the eps/delta
+        # updates stay in consistent units (the upstream sparse-vqvae mixes
+        # ``||x||`` and ``||recon||^2`` which makes eps go negative for any
+        # signal with ``||x||>1``).
+        x_norm_sq = (X * X).sum(dim=0)  # [batch_size]
+        eps = x_norm_sq.clone()
+        tolerance_sq = None if fixed_sparsity else x_norm_sq * tolerance
+
+        # Outputs.
         support = torch.zeros(batch_size, sparsity, device=device, dtype=torch.long)
-        chosen = torch.zeros(batch_size, int(D.size(1)), device=device, dtype=torch.bool)
-        coeffs_ordered = torch.zeros(batch_size, sparsity, device=device, dtype=X.dtype)
+        coeffs_ordered = torch.zeros(batch_size, sparsity, device=device, dtype=dtype)
+        sparse_code = torch.zeros(batch_size, num_atoms, device=device, dtype=dtype)
+        I_logic = torch.zeros(batch_size, num_atoms, device=device, dtype=torch.bool)
+        L = torch.ones(batch_size, 1, 1, device=device, dtype=dtype)
+        batch_idx = torch.arange(batch_size, device=device)
 
-        tolerance = self.omp_residual_tolerance
-        if tolerance is not None:
-            signal_norm_sq = (X_t * X_t).sum(dim=1).clamp_min(float(self.epsilon))
-            target_residual_sq = float(tolerance) * signal_norm_sq
-            final_support = torch.zeros_like(support)
-            final_coeffs = torch.zeros_like(coeffs_ordered)
-            done = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        else:
-            target_residual_sq = None
-            final_support = None
-            final_coeffs = None
-            done = None
+        k = 0
+        while k < sparsity:
+            if fixed_sparsity:
+                active = torch.ones(batch_size, device=device, dtype=torch.bool)
+            else:
+                active = eps > tolerance_sq
+                if not bool(active.any().item()):
+                    break
 
-        for step in range(sparsity):
-            index = self._select_residual_atom(residual, D, chosen)
-            chosen[batch_idx, index] = True
+            # argmax |h| over not-yet-picked atoms. Multiplicative masking can
+            # reselect an already-picked atom when all remaining correlations
+            # are zero, so use -inf-style masking instead.
+            masked_corr = h.abs().masked_fill(I_logic, torch.finfo(dtype).min)
+            index = masked_corr.argmax(dim=1)
+            index = torch.where(active, index, torch.zeros_like(index))
+            I_logic[batch_idx[active], index[active]] = True
 
-            support[:, step] = index
-            curr_support = support[:, :step + 1]
-
-            curr_coeffs, recon = self._solve_residual_support(X_t, D, curr_support)
-            coeffs_ordered[:, :step + 1] = torch.nan_to_num(curr_coeffs, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # In-place update of residual
-            residual.copy_(X_t - recon)
-            torch.nan_to_num_(residual, nan=0.0, posinf=0.0, neginf=0.0)
-
-            if target_residual_sq is not None:
-                res_norm_sq = (residual * residual).sum(dim=1)
-                just_done = (~done) & (res_norm_sq <= target_residual_sq)
-                mask_step = just_done.unsqueeze(1).expand(-1, step + 1)
-                final_support[:, :step + 1] = torch.where(
-                    mask_step, support[:, :step + 1], final_support[:, :step + 1]
+            if k > 0:
+                # G_cross[b, i] = G[support[b, i], index[b]] for i = 0..k-1.
+                I_prev = support[:, :k]
+                idx_b = index.unsqueeze(1).expand(batch_size, k)
+                G_cross = G[I_prev, idx_b].view(batch_size, k, 1)
+                w = torch.linalg.solve_triangular(L, G_cross, upper=False)
+                w_corner = torch.sqrt(
+                    (1.0 - (w * w).sum(dim=(1, 2), keepdim=False)).clamp_min(self.epsilon)
                 )
-                final_coeffs[:, :step + 1] = torch.where(
-                    mask_step, coeffs_ordered[:, :step + 1], final_coeffs[:, :step + 1]
+                # L_new = [[L, 0], [w^T, w_corner]]
+                k_zeros = w.new_zeros(batch_size, k, 1)
+                L = torch.cat(
+                    (
+                        torch.cat((L, k_zeros), dim=2),
+                        torch.cat((w.transpose(1, 2), w_corner.view(batch_size, 1, 1)), dim=2),
+                    ),
+                    dim=1,
                 )
-                done = done | just_done
 
-        if target_residual_sq is not None:
-            remaining = ~done
-            mask_all = remaining.unsqueeze(1).expand_as(final_support)
-            final_support = torch.where(mask_all, support, final_support)
-            final_coeffs = torch.where(mask_all, coeffs_ordered, final_coeffs)
-            return final_support, final_coeffs
+            support[active, k] = index[active]
+
+            # Solve L L^T x_I = h_bar[I].
+            I_curr = support[:, : k + 1]
+            x_stack = torch.zeros(batch_size, k + 1, device=device, dtype=dtype)
+            h_stack = h_bar[active].gather(1, I_curr[active]).unsqueeze(-1)
+            x_active = torch.cholesky_solve(h_stack, L[active]).squeeze(-1)
+            if self.coef_max is not None:
+                x_active = x_active.clamp(-self.coef_max, self.coef_max)
+            x_stack[active] = x_active
+
+            next_sparse_code = torch.zeros_like(sparse_code)
+            next_sparse_code.scatter_(1, I_curr, x_stack)
+            sparse_code[active] = next_sparse_code[active]
+            coeffs_ordered[active, : k + 1] = x_active
+
+            # beta = sparse_code @ G; h = h_bar - beta.
+            beta = sparse_code @ G
+            h = h_bar - beta
+
+            # Track the actual residual norm. The simpler
+            # ``||X||^2 - ||D alpha||^2`` expression is only valid for the
+            # unconstrained orthogonal projection; coefficient clipping breaks
+            # that identity.
+            recon_norm_sq = (sparse_code * beta).sum(dim=1)
+            cross = (sparse_code * h_bar).sum(dim=1)
+            eps = (x_norm_sq - 2.0 * cross + recon_norm_sq).clamp_min(0.0)
+
+            k += 1
 
         return support, coeffs_ordered
 
@@ -358,8 +359,9 @@ class DictionaryLearning(nn.Module):
     def _is_patch_based(self):
         return self.patch_based
 
-    def _extract_patches(self, z_e):
-        _, _, height, width = z_e.shape
+    def _patch_grid_geometry(self, height: int, width: int):
+        height = int(height)
+        width = int(width)
         center_pad = max(self.patch_size - self.patch_stride, 0) // 2
         nph = math.ceil(height / self.patch_stride)
         npw = math.ceil(width / self.patch_stride)
@@ -369,6 +371,20 @@ class DictionaryLearning(nn.Module):
         pad_left = center_pad
         pad_bottom = height_padded - height - center_pad
         pad_right = width_padded - width - center_pad
+        return nph, npw, height_padded, width_padded, pad_top, pad_left, pad_bottom, pad_right
+
+    def _extract_patches(self, z_e):
+        _, _, height, width = z_e.shape
+        (
+            nph,
+            npw,
+            _height_padded,
+            _width_padded,
+            pad_top,
+            pad_left,
+            pad_bottom,
+            pad_right,
+        ) = self._patch_grid_geometry(height, width)
         pad_mode = "reflect"
         if pad_left >= width or pad_right >= width or pad_top >= height or pad_bottom >= height:
             pad_mode = "replicate"
@@ -396,15 +412,43 @@ class DictionaryLearning(nn.Module):
         return (atoms * values_flat.unsqueeze(-1)).sum(dim=1)
 
     def _reconstruct_patches_tile(self, support, values, height, width):
-        """Direct patch tiling for non-overlapping patches (stride == size)."""
-        B, nph, npw, D = support.shape
+        """Fold-and-average patches; equivalent to tiling when patches do not overlap."""
+        B, nph, npw, _depth = support.shape
         C = self.embedding_dim
         recon = self._sparse_atom_sum(support, values, clamp_values=True)
 
-        recon = recon.view(B, nph, npw, C, self.patch_size, self.patch_size)
-        recon = recon.permute(0, 3, 1, 4, 2, 5).contiguous()
-        recon = recon.view(B, C, nph * self.patch_size, npw * self.patch_size)
-        return recon[:, :, :height, :width]
+        (
+            expected_nph,
+            expected_npw,
+            height_padded,
+            width_padded,
+            pad_top,
+            pad_left,
+            _pad_bottom,
+            _pad_right,
+        ) = self._patch_grid_geometry(height, width)
+        if nph != expected_nph or npw != expected_npw:
+            raise ValueError(
+                "Patch token grid does not match latent shape: "
+                f"got {(nph, npw)}, expected {(expected_nph, expected_npw)} for latent {(height, width)}"
+            )
+
+        recon = recon.view(B, nph * npw, self.patch_dim).transpose(1, 2).contiguous()
+        recon = F.fold(
+            recon,
+            output_size=(height_padded, width_padded),
+            kernel_size=self.patch_size,
+            stride=self.patch_stride,
+        )
+        weights = recon.new_ones(B, C * self.patch_size * self.patch_size, nph * npw)
+        weights = F.fold(
+            weights,
+            output_size=(height_padded, width_padded),
+            kernel_size=self.patch_size,
+            stride=self.patch_stride,
+        ).clamp_min(self.epsilon)
+        recon = recon / weights
+        return recon[:, :, pad_top: pad_top + height, pad_left: pad_left + width]
 
     def _reconstruct_sparse(self, support, values, height, width):
         if self._is_patch_based():
@@ -666,7 +710,9 @@ class DictionaryLearning(nn.Module):
         self._last_bottleneck_loss = loss.detach()
         self._update_diagnostics(values)
 
-        if not self.dictionary_through_decoder:
+        if self.dictionary_through_decoder:
+            z_dl = z_dl + (z_e - z_e.detach())
+        else:
             z_dl = z_e + (z_dl - z_e).detach()
         sparse_codes = SparseCodes(
             support=support,
@@ -700,5 +746,3 @@ class DictionaryLearning(nn.Module):
             "coeff_abs_max": coeff_abs_max,
             "coeff_clip_frac": coeff_clip_frac,
         }
-
-

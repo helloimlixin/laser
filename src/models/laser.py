@@ -184,7 +184,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             patch_based: whether to use latent patch sparse coding instead of per-site coding
             patch_size: latent patch size used for sparse coding
             patch_stride: latent patch stride used for sparse coding
-            patch_reconstruction: patch stitching rule, one of 'center_crop', 'hann', or 'tile'
+            patch_reconstruction: patch stitching rule; DictionaryLearning currently supports 'tile'
             coef_max: optional hard bound applied to sparse coefficients
             omp_residual_tolerance: relative ||residual||^2/||signal||^2 below which OMP stops
                 early per latent site (None = run full sparsity_level iterations)

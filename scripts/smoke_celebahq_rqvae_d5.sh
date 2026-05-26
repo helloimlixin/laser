@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Smoke run: CelebA-HQ 256x256, RQ-VAE-style backbone, 5 downsamples.
+# Smoke run: CelebA-HQ 256x256, RQ-VAE-style backbone.
 # Stage 1: 5 epochs autoencoder with random crop.
-# Stage 2: 100 epochs sparse-token prior on cached tokens.
+# Stage 2: 50 epochs sparse-token prior on cached tokens.
 set -euo pipefail
 
 cd /home/xl598/Projects/laser
@@ -12,26 +12,32 @@ PYTHON_BIN="${PYTHON_BIN:-/home/xl598/anaconda3/envs/laser/bin/python}"
 DATA_DIR="${DATA_DIR:-/home/xl598/Projects/data/celeba_hq}"
 
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
-STAGE2_EPOCHS="${STAGE2_EPOCHS:-100}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-50}"
 MAX_ITEMS="${MAX_ITEMS:-8192}"
 
-# Match RQ-VAE FFHQ256 recipe: train at native 256, no random crop.
+# Train: random-crop 128 out of full 256 (data augmentation + 4x faster per iter).
+# Val: full 256 (no crop on eval transform), so reconstruction quality is reported
+# against the original resolution.
 IMAGE_SIZE_PRE="${IMAGE_SIZE_PRE:-256}"
-IMAGE_SIZE="${IMAGE_SIZE:-256}"
+IMAGE_SIZE="${IMAGE_SIZE:-128}"
 
-# Adjusted for the deeper RQ-VAE-style backbone at 256x256:
-# - smaller per-GPU batch to fit num_downsamples=5 in 20GB
-# - LR matched to RQ-VAE's 4e-5 (yours was 2.5e-4 -> too high for this depth)
+# Cache + stage 2 use full 256 (no random crop). The encoder is convolutional so
+# it handles 256 just fine despite being trained at 128 crops; latent grid simply
+# becomes 32x32 instead of 16x16 and the per-image token sequence grows 4x.
+STAGE2_IMAGE_SIZE="${STAGE2_IMAGE_SIZE:-256}"
+
+# 4x batch size now that input is 4x smaller spatially. LR scaled 2x with batch
+# (linear-scaling rule, conservative since LPIPS+OMP can destabilize).
 STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-4}"
-STAGE1_LR="${STAGE1_LR:-4e-5}"
-STAGE1_DICT_LR="${STAGE1_DICT_LR:-4e-5}"
+STAGE1_LR="${STAGE1_LR:-1e-4}"
+STAGE1_DICT_LR="${STAGE1_DICT_LR:-1e-4}"
 
 # Bottleneck: "dictionary" (OMP) or "rq" (kakaobrain residual quantization).
 BOTTLENECK_TYPE="${BOTTLENECK_TYPE:-dictionary}"
 
 # OMP-only knobs (ignored when BOTTLENECK_TYPE=rq).
 OMP_RESIDUAL_TOLERANCE="${OMP_RESIDUAL_TOLERANCE:-null}"
-DEAD_ATOM_REVIVAL_STEPS="${DEAD_ATOM_REVIVAL_STEPS:-null}"
+DEAD_ATOM_REVIVAL_STEPS="${DEAD_ATOM_REVIVAL_STEPS:-100}"
 DICTIONARY_THROUGH_DECODER="${DICTIONARY_THROUGH_DECODER:-false}"
 DATA_INIT_FROM_FIRST_BATCH="${DATA_INIT_FROM_FIRST_BATCH:-false}"
 
@@ -46,6 +52,9 @@ SPARSITY_LEVEL="${SPARSITY_LEVEL:-8}"
 
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-4}"
 STAGE2_LR="${STAGE2_LR:-5e-4}"
+STAGE2_SAMPLE_EVERY_N_EPOCHS="${STAGE2_SAMPLE_EVERY_N_EPOCHS:-1}"
+STAGE2_SAMPLE_NUM_IMAGES="${STAGE2_SAMPLE_NUM_IMAGES:-8}"
+STAGE2_SAMPLE_TOP_K="${STAGE2_SAMPLE_TOP_K:-128}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -63,10 +72,12 @@ mkdir -p "${RUN_ROOT}/logs" "${STAGE1_DIR}" "${STAGE2_DIR}"
 echo "[$(date --iso-8601=seconds)] smoke run start" | tee -a "${LOG}"
 echo "RUN_ROOT=${RUN_ROOT}" | tee -a "${LOG}"
 echo "STAGE1_EPOCHS=${STAGE1_EPOCHS}  STAGE2_EPOCHS=${STAGE2_EPOCHS}  MAX_ITEMS=${MAX_ITEMS}" | tee -a "${LOG}"
-echo "IMAGE_SIZE_PRE=${IMAGE_SIZE_PRE} -> IMAGE_SIZE=${IMAGE_SIZE} (random crop)" | tee -a "${LOG}"
+echo "IMAGE_SIZE_PRE=${IMAGE_SIZE_PRE} -> IMAGE_SIZE=${IMAGE_SIZE} (train random crop)" | tee -a "${LOG}"
+echo "STAGE2_IMAGE_SIZE=${STAGE2_IMAGE_SIZE} (cache + stage 2)" | tee -a "${LOG}"
 echo "STAGE1_BATCH_SIZE=${STAGE1_BATCH_SIZE}  STAGE1_LR=${STAGE1_LR}  STAGE1_DICT_LR=${STAGE1_DICT_LR}" | tee -a "${LOG}"
 echo "BOTTLENECK_TYPE=${BOTTLENECK_TYPE}  OMP_RESIDUAL_TOLERANCE=${OMP_RESIDUAL_TOLERANCE}  RQ_CODE_DEPTH=${RQ_CODE_DEPTH}" | tee -a "${LOG}"
 echo "STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  STAGE2_LR=${STAGE2_LR}" | tee -a "${LOG}"
+echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPLE_NUM_IMAGES=${STAGE2_SAMPLE_NUM_IMAGES}  STAGE2_SAMPLE_TOP_K=${STAGE2_SAMPLE_TOP_K}" | tee -a "${LOG}"
 
 # Stage 1: autoencoder. RQ-VAE-style backbone (vqgan), 5 downsamples,
 # channel multipliers [1,1,2,2,4,4] (len = num_downsamples + 1).
@@ -91,17 +102,17 @@ echo "STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  STAGE2_LR=${STAGE2_LR}" | tee -a "
   checkpoint.save_top_k=1 \
   model.backbone=vqgan \
   model.num_hiddens=128 \
-  model.num_downsamples=3 \
-  "model.channel_multipliers=[1,2,2,4]" \
+  model.num_downsamples=4 \
+  "model.channel_multipliers=[1,2,4,4,4]" \
   model.max_ch_mult=4 \
-  model.embedding_dim=4 \
+  model.embedding_dim=32 \
   model.num_embeddings=8192 \
   model.sparsity_level="${SPARSITY_LEVEL}" \
-  model.num_residual_blocks=2 \
-  model.num_residual_hiddens=64 \
+  model.num_residual_blocks=3 \
+  model.num_residual_hiddens=128 \
   model.patch_based=true \
-  model.patch_size=8 \
-  model.patch_stride=8 \
+  model.patch_size=4 \
+  model.patch_stride=4 \
   model.patch_reconstruction=tile \
   model.use_mid_attention=true \
   "model.attn_resolutions=[]" \
@@ -118,7 +129,7 @@ echo "STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  STAGE2_LR=${STAGE2_LR}" | tee -a "
   model.perceptual_weight=1.0 \
   model.compute_fid=false \
   model.log_images_every_n_steps=200 \
-  wandb.name="smoke_celebahq_rqvae_d5_stage1_${STAMP}" \
+  wandb.name="s1_${STAMP}" \
   wandb.project=laser \
   2>&1 | tee -a "${LOG}"
 
@@ -136,7 +147,7 @@ echo "[$(date --iso-8601=seconds)] stage1 checkpoint: ${CKPT}" | tee -a "${LOG}"
   --output-path "${CACHE}" \
   --dataset celebahq \
   --data-dir "${DATA_DIR}" \
-  --image-size "${IMAGE_SIZE}" \
+  --image-size "${STAGE2_IMAGE_SIZE}" \
   --batch-size 8 \
   --num-workers 4 \
   --seed 42 \
@@ -153,18 +164,24 @@ echo "[$(date --iso-8601=seconds)] stage1 checkpoint: ${CKPT}" | tee -a "${LOG}"
   token_cache_path="${CACHE}" \
   data.dataset=celebahq \
   data.data_dir="${DATA_DIR}" \
-  data.image_size="${IMAGE_SIZE}" \
+  data.image_size="${STAGE2_IMAGE_SIZE}" \
   data.num_workers=4 \
   ar.type=sparse_spatial_depth \
-  train.accelerator=gpu \
-  train.devices=2 \
-  train.strategy=ddp \
-  train.precision=32 \
-  train.max_epochs="${STAGE2_EPOCHS}" \
-  train.learning_rate="${STAGE2_LR}" \
-  train.log_every_n_steps=20 \
-  data.batch_size="${STAGE2_BATCH_SIZE}" \
-  wandb.name="smoke_celebahq_rqvae_d5_stage2_${STAMP}" \
+  ar.learning_rate="${STAGE2_LR}" \
+  train_ar.accelerator=gpu \
+  train_ar.devices=2 \
+  train_ar.strategy=ddp \
+  train_ar.precision=32 \
+  train_ar.max_epochs="${STAGE2_EPOCHS}" \
+  train_ar.log_every_n_steps=20 \
+  train_ar.batch_size="${STAGE2_BATCH_SIZE}" \
+  train_ar.sample_every_n_epochs="${STAGE2_SAMPLE_EVERY_N_EPOCHS}" \
+  train_ar.sample_num_images="${STAGE2_SAMPLE_NUM_IMAGES}" \
+  train_ar.sample_top_k="${STAGE2_SAMPLE_TOP_K}" \
+  train_ar.sample_log_to_wandb=true \
+  train_ar.generation_metric_num_samples=0 \
+  train_ar.save_final_samples_after_fit=false \
+  wandb.name="s2_${STAMP}" \
   wandb.project=laser \
   2>&1 | tee -a "${LOG}"
 

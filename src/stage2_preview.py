@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Optional
 
 import lightning as pl
+import numpy as np
 import torch
+from PIL import Image
 
 from src.audio_logging import (
     audio_config_from_source,
@@ -78,6 +81,273 @@ def _sample_for_preview(
 
 def _is_waveform_samples(samples: torch.Tensor) -> bool:
     return torch.is_tensor(samples) and samples.ndim == 3 and int(samples.size(1)) == 1
+
+
+def _grid_uint8(images: list[np.ndarray], *, nrow: int) -> np.ndarray:
+    if not images:
+        raise ValueError("images must be non-empty")
+    nrow = max(1, int(nrow))
+    height, width, channels = images[0].shape
+    rows = int(math.ceil(len(images) / float(nrow)))
+    grid = np.full((rows * height, nrow * width, channels), 255, dtype=np.uint8)
+    for idx, image in enumerate(images):
+        row = idx // nrow
+        col = idx % nrow
+        grid[row * height: (row + 1) * height, col * width: (col + 1) * width] = image
+    return grid
+
+
+def _colorize_scalar_maps(
+    maps: torch.Tensor,
+    *,
+    cmap_name: str,
+    per_map: bool,
+    value_min: Optional[float] = None,
+    value_max: Optional[float] = None,
+) -> list[np.ndarray]:
+    maps = torch.nan_to_num(maps.detach().cpu().to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        import matplotlib
+
+        cmap = matplotlib.colormaps.get_cmap(cmap_name)
+    except Exception:
+        cmap = None
+
+    out: list[np.ndarray] = []
+    if maps.numel() == 0:
+        return out
+    if not per_map:
+        global_min = float(maps.min().item()) if value_min is None else float(value_min)
+        global_max = float(maps.max().item()) if value_max is None else float(value_max)
+    for scalar_map in maps:
+        if per_map:
+            lo = float(scalar_map.min().item()) if value_min is None else float(value_min)
+            hi = float(scalar_map.max().item()) if value_max is None else float(value_max)
+        else:
+            lo, hi = global_min, global_max
+        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+            norm = torch.zeros_like(scalar_map)
+        else:
+            norm = ((scalar_map - lo) / (hi - lo)).clamp(0.0, 1.0)
+        arr = norm.numpy()
+        if cmap is not None:
+            rgb = (cmap(arr)[..., :3] * 255.0).round().astype(np.uint8)
+        else:
+            gray = (arr * 255.0).round().astype(np.uint8)
+            rgb = np.stack([gray, gray, gray], axis=-1)
+        out.append(rgb)
+    return out
+
+
+def _save_scalar_map_grid(
+    values: torch.Tensor,
+    out_dir: Path,
+    *,
+    stem: str,
+    max_items: int,
+    max_depths: int,
+    cmap_name: str,
+    per_map: bool,
+    value_min: Optional[float] = None,
+    value_max: Optional[float] = None,
+) -> Optional[Path]:
+    if not torch.is_tensor(values) or values.ndim != 4:
+        return None
+    B, H, W, D = values.shape
+    if B <= 0 or H <= 0 or W <= 0 or D <= 0:
+        return None
+    keep_b = min(int(max_items), int(B))
+    keep_d = min(int(max_depths), int(D))
+    maps = (
+        values[:keep_b, :, :, :keep_d]
+        .permute(0, 3, 1, 2)
+        .reshape(keep_b * keep_d, H, W)
+    )
+    colored = _colorize_scalar_maps(
+        maps,
+        cmap_name=cmap_name,
+        per_map=per_map,
+        value_min=value_min,
+        value_max=value_max,
+    )
+    if not colored:
+        return None
+    max_side = max(int(colored[0].shape[0]), int(colored[0].shape[1]))
+    scale = max(1, int(math.ceil(96.0 / float(max(1, max_side)))))
+    if scale > 1:
+        resampling = getattr(getattr(Image, "Resampling", Image), "NEAREST", Image.NEAREST)
+        colored = [
+            np.asarray(
+                Image.fromarray(image).resize(
+                    (int(image.shape[1]) * scale, int(image.shape[0]) * scale),
+                    resampling,
+                )
+            )
+            for image in colored
+        ]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{stem}.png"
+    Image.fromarray(_grid_uint8(colored, nrow=keep_d)).save(path)
+    return path
+
+
+def _sparse_visual_tensors(
+    batch,
+    cache: Optional[dict],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    atoms = getattr(batch, "atoms", None)
+    coeffs = getattr(batch, "coeffs", None)
+    coeff_bins = None
+    if atoms is not None:
+        return atoms, coeffs, coeff_bins
+
+    tokens = getattr(batch, "toks", None)
+    if tokens is None:
+        return None, None, None
+    tokens = tokens.detach()
+    if tokens.ndim != 4:
+        return None, None, None
+    if int(tokens.size(-1)) >= 2 and int(tokens.size(-1)) % 2 == 0:
+        atoms = tokens[..., 0::2]
+        meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+        atom_vocab = int(meta.get("num_atoms") or meta.get("atom_vocab_size") or 0)
+        coeff_bins = tokens[..., 1::2]
+        if atom_vocab > 0:
+            coeff_bins = coeff_bins - atom_vocab
+        return atoms, None, coeff_bins
+    return tokens, None, None
+
+
+def _build_sparse_visuals(batch, cache: Optional[dict], out_dir: Path, *, stem: str) -> dict[str, Path]:
+    atoms, coeffs, coeff_bins = _sparse_visual_tensors(batch, cache)
+    paths: dict[str, Path] = {}
+    meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+    atom_vocab = int(meta.get("num_atoms") or meta.get("atom_vocab_size") or 0)
+    if atoms is not None:
+        path = _save_scalar_map_grid(
+            atoms,
+            out_dir,
+            stem=f"{stem}_atom_ids",
+            max_items=4,
+            max_depths=8,
+            cmap_name="turbo",
+            per_map=False,
+            value_min=0.0,
+            value_max=float(max(atom_vocab - 1, 1)) if atom_vocab > 0 else None,
+        )
+        if path is not None:
+            paths["atom_id_maps"] = path
+    if coeffs is not None:
+        path = _save_scalar_map_grid(
+            coeffs,
+            out_dir,
+            stem=f"{stem}_coeff_values",
+            max_items=4,
+            max_depths=8,
+            cmap_name="coolwarm",
+            per_map=True,
+        )
+        if path is not None:
+            paths["coeff_value_maps"] = path
+        path = _save_scalar_map_grid(
+            coeffs.abs(),
+            out_dir,
+            stem=f"{stem}_coeff_abs",
+            max_items=4,
+            max_depths=8,
+            cmap_name="magma",
+            per_map=True,
+        )
+        if path is not None:
+            paths["coeff_abs_maps"] = path
+    if coeff_bins is not None:
+        path = _save_scalar_map_grid(
+            coeff_bins,
+            out_dir,
+            stem=f"{stem}_coeff_bins",
+            max_items=4,
+            max_depths=8,
+            cmap_name="viridis",
+            per_map=False,
+        )
+        if path is not None:
+            paths["coeff_bin_maps"] = path
+    return paths
+
+
+def _sparse_generation_stats(batch, cache: Optional[dict]) -> dict[str, object]:
+    atoms, coeffs, coeff_bins = _sparse_visual_tensors(batch, cache)
+    stats: dict[str, object] = {}
+    if atoms is not None:
+        atoms_flat = atoms.detach().cpu().to(torch.float32).reshape(-1)
+        if atoms_flat.numel() == 0:
+            return stats
+        stats["generation/atom_id_min"] = float(atoms_flat.min().item())
+        stats["generation/atom_id_max"] = float(atoms_flat.max().item())
+        unique_atoms = int(torch.unique(atoms_flat.to(torch.long)).numel())
+        stats["generation/unique_atoms"] = unique_atoms
+        meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+        atom_vocab = int(meta.get("num_atoms") or meta.get("atom_vocab_size") or 0)
+        if atom_vocab > 0:
+            stats["generation/unique_atom_frac"] = float(unique_atoms) / float(atom_vocab)
+        try:
+            import wandb
+
+            stats["generation/atom_id_hist"] = wandb.Histogram(atoms_flat.numpy())
+        except Exception:
+            pass
+    if coeffs is not None:
+        coeffs_flat = torch.nan_to_num(coeffs.detach().cpu().to(torch.float32).reshape(-1))
+        if coeffs_flat.numel() > 0:
+            stats["generation/coeff_mean"] = float(coeffs_flat.mean().item())
+            stats["generation/coeff_std"] = float(coeffs_flat.std(unbiased=False).item())
+            stats["generation/coeff_abs_mean"] = float(coeffs_flat.abs().mean().item())
+            stats["generation/coeff_abs_max"] = float(coeffs_flat.abs().max().item())
+            try:
+                import wandb
+
+                stats["generation/coeff_hist"] = wandb.Histogram(coeffs_flat.numpy())
+            except Exception:
+                pass
+    if coeff_bins is not None:
+        bins_flat = coeff_bins.detach().cpu().to(torch.float32).reshape(-1)
+        if bins_flat.numel() > 0:
+            stats["generation/coeff_bin_min"] = float(bins_flat.min().item())
+            stats["generation/coeff_bin_max"] = float(bins_flat.max().item())
+            try:
+                import wandb
+
+                stats["generation/coeff_bin_hist"] = wandb.Histogram(bins_flat.numpy())
+            except Exception:
+                pass
+    return stats
+
+
+def _load_image_for_wandb(path: Path):
+    try:
+        with Image.open(path) as img:
+            return np.asarray(img.convert("RGB"))
+    except Exception:
+        return str(path)
+
+
+def _log_sparse_visuals(logger, visual_paths: dict[str, Path], *, step: int, caption: str) -> None:
+    for name, path in visual_paths.items():
+        image = _load_image_for_wandb(path)
+        log_wandb_images(
+            logger,
+            f"generation/{name}",
+            [image],
+            step=step,
+            captions=[caption],
+        )
+        log_wandb_images(
+            logger,
+            f"s2/{name}",
+            [image],
+            step=step,
+            captions=[caption],
+        )
 
 
 def _save_waveform_samples(samples: torch.Tensor, out_dir, *, stem: str, sample_rate: int) -> Path:
@@ -179,28 +449,19 @@ class Stage2SamplePreviewCallback(pl.Callback):
         if epoch is not None:
             bits.append(f"epoch={epoch}")
         cap = " ".join(bits)
-        image_item = str(direct)
         log_images = direct.is_file() and direct.suffix.lower() in {".png", ".jpg", ".jpeg"}
         if log_images:
-            try:
-                from PIL import Image
-                import numpy as np
-
-                with Image.open(direct) as img:
-                    image_item = np.asarray(img.convert("RGB"))
-            except Exception:
-                image_item = str(direct)
             log_wandb_images(
                 logger,
                 "generation/samples",
-                [image_item],
+                [_load_image_for_wandb(direct)],
                 step=step,
                 captions=[cap],
             )
             log_wandb_images(
                 logger,
                 "s2/samples",
-                [image_item],
+                [_load_image_for_wandb(direct)],
                 step=step,
                 captions=[cap],
             )
@@ -221,6 +482,7 @@ class Stage2SamplePreviewCallback(pl.Callback):
                     artifact_dir=self.out_dir,
                 )
             )
+            payload.update(_sparse_generation_stats(batch, self._cache))
         log_wandb_payload(logger, payload, step=step)
 
     @torch.no_grad()
@@ -262,6 +524,16 @@ class Stage2SamplePreviewCallback(pl.Callback):
             direct = _save_waveform_samples(batch.imgs, self.out_dir, stem=stem, sample_rate=sample_rate)
         else:
             direct = save_grid(batch.imgs, self.out_dir, stem=stem)
+            visual_paths = _build_sparse_visuals(batch, self._cache, self.out_dir, stem=stem)
+            if self.use_wandb and trainer.is_global_zero:
+                logger = getattr(trainer, "logger", None)
+                log_step = int(step) + 1 if epoch is not None else int(step)
+                cap = (
+                    f"step={int(step)}"
+                    if epoch is None
+                    else f"step={log_step} epoch={int(epoch)}"
+                )
+                _log_sparse_visuals(logger, visual_paths, step=log_step, caption=cap)
         self._log(trainer, step=step, epoch=epoch, direct=direct, batch=batch)
         if epoch is None:
             print(f"Saved s2 samples at step {step}: {direct}")
@@ -350,6 +622,14 @@ def save_final_generation_preview(
         direct = _save_waveform_samples(batch.imgs, saver.out_dir, stem=stem, sample_rate=sample_rate)
     else:
         direct = save_grid(batch.imgs, saver.out_dir, stem=stem)
+        visual_paths = _build_sparse_visuals(batch, saver._cache, saver.out_dir, stem=stem)
+        if use_wandb:
+            _log_sparse_visuals(
+                getattr(trainer, "logger", None),
+                visual_paths,
+                step=step,
+                caption=f"step={step}",
+            )
     saver._log(trainer, step=step, epoch=None, direct=direct, batch=batch)
     if return_batch:
         return direct, batch, saver._cache

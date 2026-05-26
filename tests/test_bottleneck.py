@@ -102,6 +102,39 @@ def test_batch_omp_with_coef_max_hard_bounds_coefficients():
     assert float(values.abs().max()) <= 1.0 + 1e-6
 
 
+def test_batch_omp_fixed_sparsity_does_not_reselect_atoms_on_zero_ties():
+    dl = DictionaryLearning(
+        num_embeddings=3,
+        embedding_dim=3,
+        sparsity_level=3,
+    )
+    dictionary = torch.eye(3)
+    signals = torch.tensor([[1.0], [0.0], [0.0]], dtype=torch.float32)
+
+    support, values = dl.batch_omp_with_support(signals, dictionary)
+
+    assert support.tolist() == [[0, 1, 2]]
+    assert torch.allclose(values, torch.tensor([[1.0, 0.0, 0.0]]), atol=1e-6)
+
+
+def test_batch_omp_residual_tolerance_stops_per_sample():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=2,
+        omp_residual_tolerance=1e-8,
+    )
+    dictionary = torch.eye(2)
+    signals = torch.tensor([[1.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
+
+    support, values = dl.batch_omp_with_support(signals, dictionary)
+
+    assert support[0, 0].item() == 0
+    assert torch.allclose(values[0], torch.tensor([1.0, 0.0]), atol=1e-6)
+    assert support[1].tolist() == [0, 1]
+    assert torch.allclose(values[1], torch.tensor([1.0, 1.0]), atol=1e-6)
+
+
 def test_dictionary_learning_forward_hard_bounds_patch_coefficients():
     dl = DictionaryLearning(
         num_embeddings=4,
@@ -131,6 +164,26 @@ def test_dictionary_learning_forward_hard_bounds_patch_coefficients():
     assert float(dl._last_diag["coeff_clip_frac"]) > 0.0
 
 
+def test_patch_dictionary_learning_overlap_reconstructs_exact_latent():
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=1,
+        sparsity_level=4,
+        patch_based=True,
+        patch_size=2,
+        patch_stride=1,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(torch.eye(4))
+    z = torch.arange(1, 10, dtype=torch.float32).view(1, 1, 3, 3)
+
+    z_out, loss, sparse_codes = dl(z)
+
+    assert torch.isfinite(loss)
+    assert sparse_codes.support.shape == (1, 3, 3, 4)
+    assert torch.allclose(z_out, z, atol=1e-5)
+
+
 def test_patch_dictionary_learning_preserves_latent_shape():
     torch.manual_seed(0)
     dl = DictionaryLearning(
@@ -151,6 +204,25 @@ def test_patch_dictionary_learning_preserves_latent_shape():
     assert sparse_codes.values.shape == sparse_codes.support.shape
     (z_out.mean() + loss).backward()
     assert dl.dictionary.grad is not None
+
+
+def test_dictionary_through_decoder_keeps_encoder_gradient_path():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=8,
+        embedding_dim=4,
+        sparsity_level=2,
+        dictionary_through_decoder=True,
+    )
+    z = torch.randn(1, 4, 2, 2, requires_grad=True)
+
+    z_out, _loss, _sparse_codes = dl(z)
+    z_out.sum().backward()
+
+    assert z.grad is not None
+    assert float(z.grad.abs().sum()) > 0.0
+    assert dl.dictionary.grad is not None
+    assert float(dl.dictionary.grad.abs().sum()) > 0.0
 
 
 def test_patch_toggle_disables_patch_dictionary_learning_even_with_patch_params():
@@ -220,5 +292,4 @@ def test_dictionary_learning_sparse_codes_to_tokens_quantizes_support_and_values
     assert tokens.shape == (1, 1, 1, 4)
     assert tokens.tolist() == [[[[1, 4, 3, 8]]]]
     assert torch.allclose(coeff_q, torch.tensor([[[[-2.0, 2.0]]]]))
-
 

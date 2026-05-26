@@ -260,7 +260,7 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "patch_based": _cfg_get(model_cfg, "patch_based", True),
         "patch_size": _cfg_get(model_cfg, "patch_size", 4),
         "patch_stride": _cfg_get(model_cfg, "patch_stride", 2),
-        "patch_reconstruction": _cfg_get(model_cfg, "patch_reconstruction", "hann"),
+        "patch_reconstruction": _cfg_get(model_cfg, "patch_reconstruction", "tile"),
         "coef_max": _cfg_get(model_cfg, "coef_max", None),
         "omp_residual_tolerance": _cfg_get(model_cfg, "omp_residual_tolerance", None),
         "dead_atom_revival_steps": _cfg_get(model_cfg, "dead_atom_revival_steps", None),
