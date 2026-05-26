@@ -238,6 +238,8 @@ def _build_sparse_visuals(batch, cache: Optional[dict], out_dir: Path, *, stem: 
         if path is not None:
             paths["atom_id_maps"] = path
     if coeffs is not None:
+        coeff_abs = torch.nan_to_num(coeffs.detach().cpu().to(torch.float32).abs())
+        coeff_limit_value = float(coeff_abs.max().item()) if coeff_abs.numel() > 0 else 0.0
         path = _save_scalar_map_grid(
             coeffs,
             out_dir,
@@ -245,7 +247,9 @@ def _build_sparse_visuals(batch, cache: Optional[dict], out_dir: Path, *, stem: 
             max_items=4,
             max_depths=8,
             cmap_name="coolwarm",
-            per_map=True,
+            per_map=False,
+            value_min=-coeff_limit_value,
+            value_max=coeff_limit_value,
         )
         if path is not None:
             paths["coeff_value_maps"] = path
@@ -261,6 +265,10 @@ def _build_sparse_visuals(batch, cache: Optional[dict], out_dir: Path, *, stem: 
         if path is not None:
             paths["coeff_abs_maps"] = path
     if coeff_bins is not None:
+        coeff_vocab = int(meta.get("n_bins") or meta.get("coeff_vocab_size") or 0)
+        coeff_bin_values = meta.get("coeff_bin_values")
+        if coeff_vocab <= 0 and coeff_bin_values is not None:
+            coeff_vocab = int(torch.as_tensor(coeff_bin_values).numel())
         path = _save_scalar_map_grid(
             coeff_bins,
             out_dir,
@@ -269,6 +277,8 @@ def _build_sparse_visuals(batch, cache: Optional[dict], out_dir: Path, *, stem: 
             max_depths=8,
             cmap_name="viridis",
             per_map=False,
+            value_min=0.0 if coeff_vocab > 0 else None,
+            value_max=float(max(coeff_vocab - 1, 1)) if coeff_vocab > 0 else None,
         )
         if path is not None:
             paths["coeff_bin_maps"] = path

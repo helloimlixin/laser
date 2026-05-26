@@ -85,6 +85,21 @@ def test_dictionary_learning_normalizes_and_projects_dictionary():
     )
 
 
+def test_dictionary_data_sampling_jitters_short_batches_instead_of_duplicates():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(num_embeddings=8, embedding_dim=4, sparsity_level=2)
+    signals = torch.eye(4, 2)
+
+    atoms = dl._sample_atoms_from_signals(signals, dl.num_embeddings)
+
+    assert atoms.shape == (4, 8)
+    assert torch.isfinite(atoms).all()
+    assert torch.allclose(atoms.norm(dim=0), torch.ones(8), atol=1e-5)
+    cosine = atoms.t() @ atoms
+    off_diag = cosine - torch.eye(8)
+    assert float(off_diag.abs().max()) < 0.9999
+
+
 def test_batch_omp_with_coef_max_hard_bounds_coefficients():
     dl = DictionaryLearning(
         num_embeddings=2,
@@ -292,4 +307,3 @@ def test_dictionary_learning_sparse_codes_to_tokens_quantizes_support_and_values
     assert tokens.shape == (1, 1, 1, 4)
     assert tokens.tolist() == [[[[1, 4, 3, 8]]]]
     assert torch.allclose(coeff_q, torch.tensor([[[[-2.0, 2.0]]]]))
-

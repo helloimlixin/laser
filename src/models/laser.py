@@ -1215,6 +1215,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.log(f'{prefix}/dict_norm_mean', diag.get("dict_norm_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/coeff_abs_max', diag.get("coeff_abs_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/coeff_abs_mean', diag.get("coeff_abs_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
+            self.log(f'{prefix}/coeff_clip_frac', diag.get("coeff_clip_frac", torch.tensor(0.0, device=x.device)), **log_kwargs)
         if ssim is not None:
             self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/sparsity', sparsity, **log_kwargs)
@@ -1268,6 +1269,11 @@ class LASER(VisualsMixin, pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """Training step."""
         loss, recon, x = self.compute_metrics(batch, prefix='train')
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite train/loss at global_step={int(getattr(self, 'global_step', 0))} "
+                f"batch_idx={int(batch_idx)}"
+            )
         audio_meta = extract_audio_metadata_from_batch(batch)
 
         # Log images periodically

@@ -319,6 +319,8 @@ def _extract_cache(
                 # support: [B, H, W, D] atom ids, values: [B, H, W, D] coeffs
                 flat_atoms = support.view(support.size(0), -1).to(torch.int32).cpu()
                 flat_coeffs = values.view(values.size(0), -1).to(torch.float32).cpu()
+                if not torch.isfinite(flat_coeffs).all():
+                    raise RuntimeError("Sparse coefficient cache contains non-finite values")
                 all_tokens.append(flat_atoms)
                 all_coeffs.append(flat_coeffs)
                 current_shape = (int(support.shape[1]), int(support.shape[2]), int(support.shape[3]))
@@ -680,6 +682,14 @@ def main():
         payload["audio_meta"] = cache_result["audio_meta"]
     if "coeffs_flat" in cache_result:
         payload["coeffs_flat"] = cache_result["coeffs_flat"]
+        coeffs_flat = payload["coeffs_flat"]
+        if not torch.isfinite(coeffs_flat).all():
+            raise RuntimeError("Refusing to save sparse token cache with non-finite coefficients")
+        coeff_abs_max = float(coeffs_flat.abs().max().item()) if coeffs_flat.numel() > 0 else 0.0
+        if coeff_abs_max <= 1e-12:
+            raise RuntimeError(
+                "Refusing to save degenerate sparse token cache: all coefficients are zero"
+            )
         print(f"Real-valued cache: storing atoms + coefficients (no quantization)")
 
     output_path = Path(args.output_path).expanduser().resolve()

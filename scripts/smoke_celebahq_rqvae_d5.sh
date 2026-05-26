@@ -22,8 +22,9 @@ IMAGE_SIZE_PRE="${IMAGE_SIZE_PRE:-256}"
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 
 # Cache + stage 2 use full 256 (no random crop). The encoder is convolutional so
-# it handles 256 just fine despite being trained at 128 crops; latent grid simply
-# becomes 32x32 instead of 16x16 and the per-image token sequence grows 4x.
+# it handles 256 despite being trained at 128 crops. With 4 downsamples and 8x8
+# non-overlapping latent patches, train crops have a 1x1 patch grid and full
+# images have a 2x2 patch grid.
 STAGE2_IMAGE_SIZE="${STAGE2_IMAGE_SIZE:-256}"
 
 # 4x batch size now that input is 4x smaller spatially. LR scaled 2x with batch
@@ -31,6 +32,17 @@ STAGE2_IMAGE_SIZE="${STAGE2_IMAGE_SIZE:-256}"
 STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-4}"
 STAGE1_LR="${STAGE1_LR:-1e-4}"
 STAGE1_DICT_LR="${STAGE1_DICT_LR:-1e-4}"
+STAGE1_RECON_L1_WEIGHT="${STAGE1_RECON_L1_WEIGHT:-0.5}"
+STAGE1_RECON_EDGE_WEIGHT="${STAGE1_RECON_EDGE_WEIGHT:-0.05}"
+STAGE1_PERCEPTUAL_WEIGHT="${STAGE1_PERCEPTUAL_WEIGHT:-1.0}"
+STAGE1_PERCEPTUAL_START_STEP="${STAGE1_PERCEPTUAL_START_STEP:-1000}"
+STAGE1_PERCEPTUAL_WARMUP_STEPS="${STAGE1_PERCEPTUAL_WARMUP_STEPS:-2000}"
+STAGE1_NUM_HIDDENS="${STAGE1_NUM_HIDDENS:-160}"
+STAGE1_NUM_RES_BLOCKS="${STAGE1_NUM_RES_BLOCKS:-4}"
+STAGE1_NUM_RES_HIDDENS="${STAGE1_NUM_RES_HIDDENS:-160}"
+STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS="${STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS:-2}"
+STAGE1_ATTN_RESOLUTIONS="${STAGE1_ATTN_RESOLUTIONS:-[16,32]}"
+STAGE1_DIAG_LOG_INTERVAL="${STAGE1_DIAG_LOG_INTERVAL:-20}"
 
 # Bottleneck: "dictionary" (OMP) or "rq" (kakaobrain residual quantization).
 BOTTLENECK_TYPE="${BOTTLENECK_TYPE:-dictionary}"
@@ -38,8 +50,8 @@ BOTTLENECK_TYPE="${BOTTLENECK_TYPE:-dictionary}"
 # OMP-only knobs (ignored when BOTTLENECK_TYPE=rq).
 OMP_RESIDUAL_TOLERANCE="${OMP_RESIDUAL_TOLERANCE:-null}"
 DEAD_ATOM_REVIVAL_STEPS="${DEAD_ATOM_REVIVAL_STEPS:-100}"
-DICTIONARY_THROUGH_DECODER="${DICTIONARY_THROUGH_DECODER:-false}"
-DATA_INIT_FROM_FIRST_BATCH="${DATA_INIT_FROM_FIRST_BATCH:-false}"
+DICTIONARY_THROUGH_DECODER="${DICTIONARY_THROUGH_DECODER:-true}"
+DATA_INIT_FROM_FIRST_BATCH="${DATA_INIT_FROM_FIRST_BATCH:-true}"
 
 # RQ-only knobs (ignored when BOTTLENECK_TYPE=dictionary).
 RQ_CODE_DEPTH="${RQ_CODE_DEPTH:-4}"
@@ -47,11 +59,23 @@ RQ_SHARED_CODEBOOK="${RQ_SHARED_CODEBOOK:-true}"
 RQ_DECAY="${RQ_DECAY:-0.99}"
 RQ_RESTART_UNUSED_CODES="${RQ_RESTART_UNUSED_CODES:-true}"
 
-# Bottleneck sparsity (OMP: atoms per latent site; RQ: ignored, depth controls it).
-SPARSITY_LEVEL="${SPARSITY_LEVEL:-8}"
+# Bottleneck capacity. This trial uses large non-overlapping latent patches:
+# a 128 crop has one 8x8 latent patch, while full 256 cache/stage-2 examples
+# have a 2x2 token grid. Coefficients are quantized for a plain GPT prior.
+BOTTLENECK_NUM_EMBEDDINGS="${BOTTLENECK_NUM_EMBEDDINGS:-8192}"
+BOTTLENECK_EMBEDDING_DIM="${BOTTLENECK_EMBEDDING_DIM:-32}"
+PATCH_SIZE="${PATCH_SIZE:-8}"
+PATCH_STRIDE="${PATCH_STRIDE:-8}"
+SPARSITY_LEVEL="${SPARSITY_LEVEL:-4}"
+BOTTLENECK_COEF_MAX="${BOTTLENECK_COEF_MAX:-4.0}"
 
-STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-4}"
+STAGE2_AR_TYPE="${STAGE2_AR_TYPE:-gpt}"
+STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-256}"
 STAGE2_LR="${STAGE2_LR:-5e-4}"
+STAGE2_COEFF_BINS="${STAGE2_COEFF_BINS:-256}"
+STAGE2_COEFF_MAX="${STAGE2_COEFF_MAX:-auto}"
+STAGE2_COEFF_QUANTIZATION="${STAGE2_COEFF_QUANTIZATION:-uniform}"
+STAGE2_COEFF_MU="${STAGE2_COEFF_MU:-0.0}"
 STAGE2_SAMPLE_EVERY_N_EPOCHS="${STAGE2_SAMPLE_EVERY_N_EPOCHS:-1}"
 STAGE2_SAMPLE_NUM_IMAGES="${STAGE2_SAMPLE_NUM_IMAGES:-8}"
 STAGE2_SAMPLE_TOP_K="${STAGE2_SAMPLE_TOP_K:-128}"
@@ -75,12 +99,16 @@ echo "STAGE1_EPOCHS=${STAGE1_EPOCHS}  STAGE2_EPOCHS=${STAGE2_EPOCHS}  MAX_ITEMS=
 echo "IMAGE_SIZE_PRE=${IMAGE_SIZE_PRE} -> IMAGE_SIZE=${IMAGE_SIZE} (train random crop)" | tee -a "${LOG}"
 echo "STAGE2_IMAGE_SIZE=${STAGE2_IMAGE_SIZE} (cache + stage 2)" | tee -a "${LOG}"
 echo "STAGE1_BATCH_SIZE=${STAGE1_BATCH_SIZE}  STAGE1_LR=${STAGE1_LR}  STAGE1_DICT_LR=${STAGE1_DICT_LR}" | tee -a "${LOG}"
+echo "STAGE1_RECON_L1_WEIGHT=${STAGE1_RECON_L1_WEIGHT}  STAGE1_RECON_EDGE_WEIGHT=${STAGE1_RECON_EDGE_WEIGHT}  STAGE1_PERCEPTUAL=${STAGE1_PERCEPTUAL_WEIGHT}@${STAGE1_PERCEPTUAL_START_STEP}+${STAGE1_PERCEPTUAL_WARMUP_STEPS}" | tee -a "${LOG}"
+echo "STAGE1_NUM_HIDDENS=${STAGE1_NUM_HIDDENS}  STAGE1_NUM_RES_BLOCKS=${STAGE1_NUM_RES_BLOCKS}  STAGE1_NUM_RES_HIDDENS=${STAGE1_NUM_RES_HIDDENS}" | tee -a "${LOG}"
+echo "STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS=${STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS}  STAGE1_ATTN_RESOLUTIONS=${STAGE1_ATTN_RESOLUTIONS}  STAGE1_DIAG_LOG_INTERVAL=${STAGE1_DIAG_LOG_INTERVAL}" | tee -a "${LOG}"
 echo "BOTTLENECK_TYPE=${BOTTLENECK_TYPE}  OMP_RESIDUAL_TOLERANCE=${OMP_RESIDUAL_TOLERANCE}  RQ_CODE_DEPTH=${RQ_CODE_DEPTH}" | tee -a "${LOG}"
-echo "STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  STAGE2_LR=${STAGE2_LR}" | tee -a "${LOG}"
+echo "BOTTLENECK_NUM_EMBEDDINGS=${BOTTLENECK_NUM_EMBEDDINGS}  BOTTLENECK_EMBEDDING_DIM=${BOTTLENECK_EMBEDDING_DIM}  PATCH=${PATCH_SIZE}/${PATCH_STRIDE}  SPARSITY_LEVEL=${SPARSITY_LEVEL}  BOTTLENECK_COEF_MAX=${BOTTLENECK_COEF_MAX}" | tee -a "${LOG}"
+echo "STAGE2_AR_TYPE=${STAGE2_AR_TYPE}  STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  STAGE2_LR=${STAGE2_LR}" | tee -a "${LOG}"
+echo "STAGE2_COEFF_BINS=${STAGE2_COEFF_BINS}  STAGE2_COEFF_MAX=${STAGE2_COEFF_MAX}  STAGE2_COEFF_QUANTIZATION=${STAGE2_COEFF_QUANTIZATION}  STAGE2_COEFF_MU=${STAGE2_COEFF_MU}" | tee -a "${LOG}"
 echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPLE_NUM_IMAGES=${STAGE2_SAMPLE_NUM_IMAGES}  STAGE2_SAMPLE_TOP_K=${STAGE2_SAMPLE_TOP_K}" | tee -a "${LOG}"
 
-# Stage 1: autoencoder. RQ-VAE-style backbone (vqgan), 5 downsamples,
-# channel multipliers [1,1,2,2,4,4] (len = num_downsamples + 1).
+# Stage 1: autoencoder. VQGAN-style backbone with four downsampling stages.
 "${PYTHON_BIN}" train_stage1_autoencoder.py \
   output_dir="${STAGE1_DIR}" \
   hydra.run.dir="${STAGE1_DIR}/hydra" \
@@ -101,21 +129,24 @@ echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPL
   train.log_every_n_steps=20 \
   checkpoint.save_top_k=1 \
   model.backbone=vqgan \
-  model.num_hiddens=128 \
+  model.num_hiddens="${STAGE1_NUM_HIDDENS}" \
   model.num_downsamples=4 \
   "model.channel_multipliers=[1,2,4,4,4]" \
   model.max_ch_mult=4 \
-  model.embedding_dim=32 \
-  model.num_embeddings=8192 \
+  model.embedding_dim="${BOTTLENECK_EMBEDDING_DIM}" \
+  model.num_embeddings="${BOTTLENECK_NUM_EMBEDDINGS}" \
   model.sparsity_level="${SPARSITY_LEVEL}" \
-  model.num_residual_blocks=3 \
-  model.num_residual_hiddens=128 \
+  model.coef_max="${BOTTLENECK_COEF_MAX}" \
+  model.num_residual_blocks="${STAGE1_NUM_RES_BLOCKS}" \
+  model.num_residual_hiddens="${STAGE1_NUM_RES_HIDDENS}" \
+  model.decoder_extra_residual_layers="${STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS}" \
+  model.diag_log_interval="${STAGE1_DIAG_LOG_INTERVAL}" \
   model.patch_based=true \
-  model.patch_size=4 \
-  model.patch_stride=4 \
+  model.patch_size="${PATCH_SIZE}" \
+  model.patch_stride="${PATCH_STRIDE}" \
   model.patch_reconstruction=tile \
   model.use_mid_attention=true \
-  "model.attn_resolutions=[]" \
+  "model.attn_resolutions=${STAGE1_ATTN_RESOLUTIONS}" \
   +model.bottleneck_type="${BOTTLENECK_TYPE}" \
   +model.dictionary_through_decoder="${DICTIONARY_THROUGH_DECODER}" \
   +model.omp_residual_tolerance="${OMP_RESIDUAL_TOLERANCE}" \
@@ -126,7 +157,11 @@ echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPL
   +model.rq_decay="${RQ_DECAY}" \
   +model.rq_restart_unused_codes="${RQ_RESTART_UNUSED_CODES}" \
   model.dict_learning_rate="${STAGE1_DICT_LR}" \
-  model.perceptual_weight=1.0 \
+  model.recon_l1_weight="${STAGE1_RECON_L1_WEIGHT}" \
+  model.recon_edge_weight="${STAGE1_RECON_EDGE_WEIGHT}" \
+  model.perceptual_weight="${STAGE1_PERCEPTUAL_WEIGHT}" \
+  model.perceptual_start_step="${STAGE1_PERCEPTUAL_START_STEP}" \
+  model.perceptual_warmup_steps="${STAGE1_PERCEPTUAL_WARMUP_STEPS}" \
   model.compute_fid=false \
   model.log_images_every_n_steps=200 \
   wandb.name="s1_${STAMP}" \
@@ -153,8 +188,10 @@ echo "[$(date --iso-8601=seconds)] stage1 checkpoint: ${CKPT}" | tee -a "${LOG}"
   --seed 42 \
   --max-items "${MAX_ITEMS}" \
   --model-type laser \
-  --coeff-bins 0 \
-  --coeff-max 16.0 \
+  --coeff-bins "${STAGE2_COEFF_BINS}" \
+  --coeff-max "${STAGE2_COEFF_MAX}" \
+  --coeff-quantization "${STAGE2_COEFF_QUANTIZATION}" \
+  --coeff-mu "${STAGE2_COEFF_MU}" \
   --device auto \
   2>&1 | tee -a "${LOG}"
 
@@ -166,7 +203,7 @@ echo "[$(date --iso-8601=seconds)] stage1 checkpoint: ${CKPT}" | tee -a "${LOG}"
   data.data_dir="${DATA_DIR}" \
   data.image_size="${STAGE2_IMAGE_SIZE}" \
   data.num_workers=4 \
-  ar.type=sparse_spatial_depth \
+  ar.type="${STAGE2_AR_TYPE}" \
   ar.learning_rate="${STAGE2_LR}" \
   train_ar.accelerator=gpu \
   train_ar.devices=2 \

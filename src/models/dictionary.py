@@ -291,18 +291,17 @@ class DictionaryLearning(nn.Module):
     def _init_dictionary_from_signals_(self, signals: torch.Tensor):
         """Replace random init with normalized samples from current-batch latents.
 
-        ``signals`` is ``[patch_dim, N]``. Samples N random columns (with replacement
-        if N < num_embeddings, broadcast from rank 0 for DDP determinism), L2-normalizes,
-        and copies into the dictionary parameter. Run exactly once, gated by
-        ``_data_initialized``.
+        ``signals`` is ``[patch_dim, N]``. In DDP, gather rank-local signal
+        columns before sampling so the first batch uses the full global batch.
+        When there are still fewer valid signals than atoms, fill the shortfall
+        with jittered real signal directions instead of exact duplicates;
+        duplicate atoms make OMP's Cholesky system singular and can produce
+        enormous coefficients on the first step.
         """
-        N = int(signals.shape[1])
-        if N <= 0:
-            return
+        signals_for_sampling = self._distributed_concat_signals_for_sampling(signals)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
-                idx = torch.randint(0, N, (self.num_embeddings,), device=signals.device)
-                sampled = signals[:, idx]
+                sampled = self._sample_atoms_from_signals(signals_for_sampling, self.num_embeddings)
             else:
                 sampled = torch.empty(
                     self.patch_dim, self.num_embeddings,
@@ -310,11 +309,75 @@ class DictionaryLearning(nn.Module):
                 )
             torch.distributed.broadcast(sampled, src=0)
         else:
-            idx = torch.randint(0, N, (self.num_embeddings,), device=signals.device)
-            sampled = signals[:, idx]
-        sampled = F.normalize(sampled, p=2, dim=0, eps=self.epsilon)
+            sampled = self._sample_atoms_from_signals(signals_for_sampling, self.num_embeddings)
         self.dictionary.data.copy_(sampled.to(dtype=self.dictionary.dtype))
         self._data_initialized.fill_(True)
+
+    def _distributed_concat_signals_for_sampling(self, signals: torch.Tensor) -> torch.Tensor:
+        signals = torch.nan_to_num(signals.detach())
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return signals
+
+        world_size = torch.distributed.get_world_size()
+        local_cols = torch.tensor([signals.shape[1]], device=signals.device, dtype=torch.long)
+        gathered_cols = [torch.zeros_like(local_cols) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_cols, local_cols)
+        col_counts = [int(cols.item()) for cols in gathered_cols]
+        max_cols = max(col_counts) if col_counts else 0
+        if max_cols <= 0:
+            return signals[:, :0]
+
+        padded = signals.new_zeros(self.patch_dim, max_cols)
+        if signals.shape[1] > 0:
+            padded[:, : signals.shape[1]] = signals
+        gathered = [torch.empty_like(padded) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, padded)
+        chunks = [
+            chunk[:, :num_cols]
+            for chunk, num_cols in zip(gathered, col_counts)
+            if num_cols > 0
+        ]
+        if not chunks:
+            return signals[:, :0]
+        return torch.cat(chunks, dim=1)
+
+    def _sample_atoms_from_signals(self, signals: torch.Tensor, count: int) -> torch.Tensor:
+        count = int(count)
+        if count <= 0:
+            return torch.empty(self.patch_dim, 0, device=signals.device, dtype=signals.dtype)
+        signals = torch.nan_to_num(signals.detach())
+        signal_norms = signals.norm(dim=0)
+        valid = torch.isfinite(signal_norms) & (signal_norms > self.epsilon)
+        signals = F.normalize(signals[:, valid], p=2, dim=0, eps=self.epsilon)
+        num_valid = int(signals.shape[1])
+
+        if num_valid >= count:
+            idx = torch.randperm(num_valid, device=signals.device)[:count]
+            sampled = signals[:, idx]
+        else:
+            sampled = torch.empty(
+                self.patch_dim,
+                count,
+                device=signals.device,
+                dtype=signals.dtype,
+            )
+            if num_valid > 0:
+                idx = torch.randperm(num_valid, device=signals.device)
+                sampled[:, :num_valid] = signals[:, idx]
+                remaining = count - num_valid
+                if remaining > 0:
+                    base_idx = torch.randint(num_valid, (remaining,), device=signals.device)
+                    base = signals[:, base_idx]
+                    noise = F.normalize(
+                        torch.randn_like(base),
+                        p=2,
+                        dim=0,
+                        eps=self.epsilon,
+                    )
+                    sampled[:, num_valid:] = base + 0.25 * noise
+            else:
+                sampled.normal_()
+        return F.normalize(sampled, p=2, dim=0, eps=self.epsilon)
 
     @torch.no_grad()
     def _track_atom_usage_and_revive_(self, support: torch.Tensor, signals: torch.Tensor):
@@ -339,20 +402,18 @@ class DictionaryLearning(nn.Module):
         num_dead = int(dead_mask.sum().item())
         if num_dead <= 0:
             return
-        N = int(signals.shape[1])
+        signals_for_sampling = self._distributed_concat_signals_for_sampling(signals)
+        N = int(signals_for_sampling.shape[1])
         if N <= 0:
             return
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
-                idx = torch.randint(0, N, (num_dead,), device=signals.device)
-                sampled = signals[:, idx]
+                sampled = self._sample_atoms_from_signals(signals_for_sampling, num_dead)
             else:
                 sampled = torch.empty(self.patch_dim, num_dead, device=signals.device, dtype=signals.dtype)
             torch.distributed.broadcast(sampled, src=0)
         else:
-            idx = torch.randint(0, N, (num_dead,), device=signals.device)
-            sampled = signals[:, idx]
-        sampled = F.normalize(sampled, p=2, dim=0, eps=self.epsilon)
+            sampled = self._sample_atoms_from_signals(signals_for_sampling, num_dead)
         self.dictionary.data[:, dead_mask] = sampled.to(dtype=self.dictionary.dtype)
         self._steps_since_use[dead_mask] = 0
 
