@@ -55,6 +55,22 @@ def test_train_lpips_uses_full_batch(monkeypatch):
     assert model.lpips.batch_sizes == [4]
 
 
+def test_lpips_range_uses_datamodule_normalization_stats():
+    model = _build_model()
+    cfg = type("Cfg", (), {"mean": (0.25, 0.5, 0.75), "std": (0.25, 0.5, 0.125)})()
+    datamodule = type("DataModule", (), {"config": cfg})()
+    model.__dict__["_trainer"] = type("TrainerStub", (), {"datamodule": datamodule})()
+
+    unit = torch.tensor([[[[0.0, 1.0]], [[0.25, 0.75]], [[0.5, 1.0]]]])
+    mean = torch.tensor(cfg.mean).view(1, 3, 1, 1)
+    std = torch.tensor(cfg.std).view(1, 3, 1, 1)
+    normalized = (unit - mean) / std
+
+    lpips_input = model._image_to_lpips_range(normalized)
+
+    assert torch.allclose(lpips_input, unit * 2.0 - 1.0)
+
+
 def test_validation_visual_cache_respects_flag():
     batch = torch.randn(4, 3, 16, 16)
     disabled = _build_model(enable_val_latent_visuals=False)

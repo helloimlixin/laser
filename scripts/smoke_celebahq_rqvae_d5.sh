@@ -15,25 +15,27 @@ STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-50}"
 MAX_ITEMS="${MAX_ITEMS:-8192}"
 
-# Train: random-crop 128 out of full 256 (data augmentation + 4x faster per iter).
+# Train: random-crop 128 out of full 256. With four downsamples and 4x4
+# latent patches, a crop gives a small 2x2 token grid instead of compressing
+# an entire face crop into one patch.
 # Val: full 256 (no crop on eval transform), so reconstruction quality is reported
 # against the original resolution.
 IMAGE_SIZE_PRE="${IMAGE_SIZE_PRE:-256}"
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 
 # Cache + stage 2 use full 256 (no random crop). The encoder is convolutional so
-# it handles 256 despite being trained at 128 crops. With 4 downsamples and 8x8
-# non-overlapping latent patches, train crops have a 1x1 patch grid and full
-# images have a 2x2 patch grid.
+# it handles 256 despite being trained at 128 crops. Full images have a 4x4
+# patch grid with the default patch geometry below.
 STAGE2_IMAGE_SIZE="${STAGE2_IMAGE_SIZE:-256}"
 
-# 4x batch size now that input is 4x smaller spatially. LR scaled 2x with batch
-# (linear-scaling rule, conservative since LPIPS+OMP can destabilize).
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-4}"
+# Width-160 fits comfortably at batch 4. Batch 5 is the larger-batch probe that
+# still keeps the crop geometry valid for the 4x4 latent patch defaults.
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-5}"
 STAGE1_LR="${STAGE1_LR:-1e-4}"
 STAGE1_DICT_LR="${STAGE1_DICT_LR:-1e-4}"
 STAGE1_RECON_L1_WEIGHT="${STAGE1_RECON_L1_WEIGHT:-0.5}"
 STAGE1_RECON_EDGE_WEIGHT="${STAGE1_RECON_EDGE_WEIGHT:-0.05}"
+STAGE1_RECON_MSE_WEIGHT="${STAGE1_RECON_MSE_WEIGHT:-0.25}"
 STAGE1_PERCEPTUAL_WEIGHT="${STAGE1_PERCEPTUAL_WEIGHT:-1.0}"
 STAGE1_PERCEPTUAL_START_STEP="${STAGE1_PERCEPTUAL_START_STEP:-1000}"
 STAGE1_PERCEPTUAL_WARMUP_STEPS="${STAGE1_PERCEPTUAL_WARMUP_STEPS:-2000}"
@@ -46,6 +48,8 @@ STAGE1_DIAG_LOG_INTERVAL="${STAGE1_DIAG_LOG_INTERVAL:-20}"
 
 # Bottleneck: "dictionary" (OMP) or "rq" (kakaobrain residual quantization).
 BOTTLENECK_TYPE="${BOTTLENECK_TYPE:-dictionary}"
+BOTTLENECK_LOSS_WEIGHT="${BOTTLENECK_LOSS_WEIGHT:-0.25}"
+BOTTLENECK_COMMITMENT_COST="${BOTTLENECK_COMMITMENT_COST:-0.05}"
 
 # OMP-only knobs (ignored when BOTTLENECK_TYPE=rq).
 OMP_RESIDUAL_TOLERANCE="${OMP_RESIDUAL_TOLERANCE:-null}"
@@ -59,15 +63,15 @@ RQ_SHARED_CODEBOOK="${RQ_SHARED_CODEBOOK:-true}"
 RQ_DECAY="${RQ_DECAY:-0.99}"
 RQ_RESTART_UNUSED_CODES="${RQ_RESTART_UNUSED_CODES:-true}"
 
-# Bottleneck capacity. This trial uses large non-overlapping latent patches:
-# a 128 crop has one 8x8 latent patch, while full 256 cache/stage-2 examples
-# have a 2x2 token grid. Coefficients are quantized for a plain GPT prior.
+# Bottleneck capacity. The defaults use non-overlapping 4x4 latent patches:
+# a 128 crop has a 2x2 patch grid, while full 256 cache/stage-2 examples
+# have a 4x4 token grid. Coefficients are quantized for a plain GPT prior.
 BOTTLENECK_NUM_EMBEDDINGS="${BOTTLENECK_NUM_EMBEDDINGS:-8192}"
-BOTTLENECK_EMBEDDING_DIM="${BOTTLENECK_EMBEDDING_DIM:-32}"
-PATCH_SIZE="${PATCH_SIZE:-8}"
-PATCH_STRIDE="${PATCH_STRIDE:-8}"
-SPARSITY_LEVEL="${SPARSITY_LEVEL:-4}"
-BOTTLENECK_COEF_MAX="${BOTTLENECK_COEF_MAX:-4.0}"
+BOTTLENECK_EMBEDDING_DIM="${BOTTLENECK_EMBEDDING_DIM:-64}"
+PATCH_SIZE="${PATCH_SIZE:-4}"
+PATCH_STRIDE="${PATCH_STRIDE:-4}"
+SPARSITY_LEVEL="${SPARSITY_LEVEL:-8}"
+BOTTLENECK_COEF_MAX="${BOTTLENECK_COEF_MAX:-16.0}"
 
 STAGE2_AR_TYPE="${STAGE2_AR_TYPE:-gpt}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-256}"
@@ -99,10 +103,10 @@ echo "STAGE1_EPOCHS=${STAGE1_EPOCHS}  STAGE2_EPOCHS=${STAGE2_EPOCHS}  MAX_ITEMS=
 echo "IMAGE_SIZE_PRE=${IMAGE_SIZE_PRE} -> IMAGE_SIZE=${IMAGE_SIZE} (train random crop)" | tee -a "${LOG}"
 echo "STAGE2_IMAGE_SIZE=${STAGE2_IMAGE_SIZE} (cache + stage 2)" | tee -a "${LOG}"
 echo "STAGE1_BATCH_SIZE=${STAGE1_BATCH_SIZE}  STAGE1_LR=${STAGE1_LR}  STAGE1_DICT_LR=${STAGE1_DICT_LR}" | tee -a "${LOG}"
-echo "STAGE1_RECON_L1_WEIGHT=${STAGE1_RECON_L1_WEIGHT}  STAGE1_RECON_EDGE_WEIGHT=${STAGE1_RECON_EDGE_WEIGHT}  STAGE1_PERCEPTUAL=${STAGE1_PERCEPTUAL_WEIGHT}@${STAGE1_PERCEPTUAL_START_STEP}+${STAGE1_PERCEPTUAL_WARMUP_STEPS}" | tee -a "${LOG}"
+echo "STAGE1_RECON_MSE_WEIGHT=${STAGE1_RECON_MSE_WEIGHT}  STAGE1_RECON_L1_WEIGHT=${STAGE1_RECON_L1_WEIGHT}  STAGE1_RECON_EDGE_WEIGHT=${STAGE1_RECON_EDGE_WEIGHT}  STAGE1_PERCEPTUAL=${STAGE1_PERCEPTUAL_WEIGHT}@${STAGE1_PERCEPTUAL_START_STEP}+${STAGE1_PERCEPTUAL_WARMUP_STEPS}" | tee -a "${LOG}"
 echo "STAGE1_NUM_HIDDENS=${STAGE1_NUM_HIDDENS}  STAGE1_NUM_RES_BLOCKS=${STAGE1_NUM_RES_BLOCKS}  STAGE1_NUM_RES_HIDDENS=${STAGE1_NUM_RES_HIDDENS}" | tee -a "${LOG}"
 echo "STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS=${STAGE1_DECODER_EXTRA_RESIDUAL_LAYERS}  STAGE1_ATTN_RESOLUTIONS=${STAGE1_ATTN_RESOLUTIONS}  STAGE1_DIAG_LOG_INTERVAL=${STAGE1_DIAG_LOG_INTERVAL}" | tee -a "${LOG}"
-echo "BOTTLENECK_TYPE=${BOTTLENECK_TYPE}  OMP_RESIDUAL_TOLERANCE=${OMP_RESIDUAL_TOLERANCE}  RQ_CODE_DEPTH=${RQ_CODE_DEPTH}" | tee -a "${LOG}"
+echo "BOTTLENECK_TYPE=${BOTTLENECK_TYPE}  BOTTLENECK_LOSS_WEIGHT=${BOTTLENECK_LOSS_WEIGHT}  BOTTLENECK_COMMITMENT_COST=${BOTTLENECK_COMMITMENT_COST}  OMP_RESIDUAL_TOLERANCE=${OMP_RESIDUAL_TOLERANCE}  RQ_CODE_DEPTH=${RQ_CODE_DEPTH}" | tee -a "${LOG}"
 echo "BOTTLENECK_NUM_EMBEDDINGS=${BOTTLENECK_NUM_EMBEDDINGS}  BOTTLENECK_EMBEDDING_DIM=${BOTTLENECK_EMBEDDING_DIM}  PATCH=${PATCH_SIZE}/${PATCH_STRIDE}  SPARSITY_LEVEL=${SPARSITY_LEVEL}  BOTTLENECK_COEF_MAX=${BOTTLENECK_COEF_MAX}" | tee -a "${LOG}"
 echo "STAGE2_AR_TYPE=${STAGE2_AR_TYPE}  STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  STAGE2_LR=${STAGE2_LR}" | tee -a "${LOG}"
 echo "STAGE2_COEFF_BINS=${STAGE2_COEFF_BINS}  STAGE2_COEFF_MAX=${STAGE2_COEFF_MAX}  STAGE2_COEFF_QUANTIZATION=${STAGE2_COEFF_QUANTIZATION}  STAGE2_COEFF_MU=${STAGE2_COEFF_MU}" | tee -a "${LOG}"
@@ -133,9 +137,12 @@ echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPL
   model.num_downsamples=4 \
   "model.channel_multipliers=[1,2,4,4,4]" \
   model.max_ch_mult=4 \
+  model.out_tanh=true \
   model.embedding_dim="${BOTTLENECK_EMBEDDING_DIM}" \
   model.num_embeddings="${BOTTLENECK_NUM_EMBEDDINGS}" \
   model.sparsity_level="${SPARSITY_LEVEL}" \
+  model.bottleneck_loss_weight="${BOTTLENECK_LOSS_WEIGHT}" \
+  model.commitment_cost="${BOTTLENECK_COMMITMENT_COST}" \
   model.coef_max="${BOTTLENECK_COEF_MAX}" \
   model.num_residual_blocks="${STAGE1_NUM_RES_BLOCKS}" \
   model.num_residual_hiddens="${STAGE1_NUM_RES_HIDDENS}" \
@@ -157,6 +164,7 @@ echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPL
   +model.rq_decay="${RQ_DECAY}" \
   +model.rq_restart_unused_codes="${RQ_RESTART_UNUSED_CODES}" \
   model.dict_learning_rate="${STAGE1_DICT_LR}" \
+  model.recon_mse_weight="${STAGE1_RECON_MSE_WEIGHT}" \
   model.recon_l1_weight="${STAGE1_RECON_L1_WEIGHT}" \
   model.recon_edge_weight="${STAGE1_RECON_EDGE_WEIGHT}" \
   model.perceptual_weight="${STAGE1_PERCEPTUAL_WEIGHT}" \

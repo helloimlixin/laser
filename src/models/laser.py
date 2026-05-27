@@ -756,6 +756,24 @@ class LASER(VisualsMixin, pl.LightningModule):
             return torch.tanh(x_recon)
         return x_recon
 
+    def _image_to_unit_range(self, x: torch.Tensor, *, clamp: bool = True) -> torch.Tensor:
+        """Map normalized image tensors to [0, 1] using the active datamodule stats."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        dm = getattr(self._trainer_ref(), "datamodule", None)
+        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+            stat_shape = (1, -1, 1) if x.ndim == 3 else (1, -1, 1, 1)
+            mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(*stat_shape)
+            std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(*stat_shape)
+            x = x * std + mean
+        else:
+            x = (x + 1.0) / 2.0
+        if clamp:
+            x = x.clamp(0.0, 1.0)
+        return x
+
+    def _image_to_lpips_range(self, x: torch.Tensor) -> torch.Tensor:
+        return self._image_to_unit_range(x, clamp=True).mul(2.0).sub(1.0)
+
     def _effective_perceptual_weight(self, prefix: str) -> float:
         if prefix != "train" or self.perceptual_weight <= 0:
             return 0.0
@@ -1053,7 +1071,10 @@ class LASER(VisualsMixin, pl.LightningModule):
         # Perceptual loss - only compute during training for quality
         perceptual_weight = self._effective_perceptual_weight(prefix)
         if self.lpips is not None and perceptual_weight > 0:
-            perceptual_loss = self.lpips(recon_raw, x).mean()
+            perceptual_loss = self.lpips(
+                self._image_to_lpips_range(recon_raw),
+                self._image_to_lpips_range(x),
+            ).mean()
         else:
             perceptual_loss = recon_raw.new_zeros(())
 
@@ -1063,19 +1084,9 @@ class LASER(VisualsMixin, pl.LightningModule):
             + perceptual_weight * perceptual_loss
         )
         
-        # Compute PSNR on de-normalized tensors if mean/std available; otherwise assume [-1,1].
-        dm = getattr(self._trainer_ref(), "datamodule", None)
-        x_clean = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
-        recon_clean = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
-        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
-            stat_shape = (1, -1, 1) if x_clean.ndim == 3 else (1, -1, 1, 1)
-            mean = torch.tensor(dm.config.mean, device=x_clean.device, dtype=x_clean.dtype).view(*stat_shape)
-            std = torch.tensor(dm.config.std, device=x_clean.device, dtype=x_clean.dtype).view(*stat_shape)
-            x_dn = (x_clean * std + mean).clamp(0.0, 1.0)
-            recon_dn = (recon_clean * std + mean).clamp(0.0, 1.0)
-        else:
-            x_dn = (x_clean + 1.0) / 2.0
-            recon_dn = (recon_clean + 1.0) / 2.0
+        # Compute PSNR/SSIM/rFID on de-normalized image tensors.
+        x_dn = self._image_to_unit_range(x.detach(), clamp=True)
+        recon_dn = self._image_to_unit_range(recon_raw.detach(), clamp=True)
 
         if not is_audio and prefix == 'val' and self.val_rfid is not None:
             self.val_rfid.update(x_dn, real=True)
