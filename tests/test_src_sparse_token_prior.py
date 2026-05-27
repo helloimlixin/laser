@@ -191,7 +191,34 @@ def test_sparse_token_prior_module_manual_lr_schedule_applies_first_step_without
     optimizer = mod.configure_optimizers()
     mod._apply_scheduled_lrs(optimizer, step=0)
 
+    assert mod._lr_total_steps == 100
     assert optimizer.param_groups[0]["lr"] == 1e-4
+
+
+def test_sparse_token_prior_lr_schedule_does_not_force_lightning_step_estimate_property():
+    mod = SparseTokenPriorModule(
+        prior=_FakeQuantPrior(),
+        learning_rate=1e-3,
+        warmup_steps=10,
+        min_lr_ratio=0.01,
+    )
+
+    class TrainerStub:
+        max_steps = -1
+        max_epochs = 100
+        num_training_batches = float("inf")
+
+        @property
+        def estimated_stepping_batches(self):
+            raise AssertionError("estimated_stepping_batches should not be forced")
+
+    mod.__dict__["_trainer"] = TrainerStub()
+
+    optimizer = mod.configure_optimizers()
+    mod._apply_scheduled_lrs(optimizer, step=0)
+
+    assert mod._lr_total_steps == 1
+    assert optimizer.param_groups[0]["lr"] == 1e-5
 
 
 def test_src_spatial_depth_prior_quantized_generation_preserves_unique_atoms():

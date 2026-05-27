@@ -7,8 +7,7 @@ import torch.nn.functional as F
 import lightning as pl
 import torchvision
 
-from .encoder import Encoder
-from .decoder import Decoder
+from .unet import Encoder, Decoder
 from .audio_codec import AudioDecoder, AudioEncoder, canonical_int_tuple
 from .bottleneck import VectorQuantizerEMA
 from .lpips import LPIPS
@@ -60,6 +59,14 @@ class VQVAE(pl.LightningModule):
             dead_code_threshold=0.0,
             out_tanh=False,
             num_downsamples=2,
+            resolution=None,
+            channel_multipliers=None,
+            backbone_latent_channels=None,
+            max_ch_mult=2,
+            attn_resolutions=(),
+            dropout=0.0,
+            use_mid_attention=True,
+            decoder_extra_residual_layers=1,
             enable_codebook_visuals=False,
             codebook_visual_max_vectors=1024,
     ):
@@ -110,6 +117,19 @@ class VQVAE(pl.LightningModule):
         self.dead_code_threshold = float(dead_code_threshold)
         self.out_tanh = bool(out_tanh)
         self.num_downsamples = int(num_downsamples)
+        # Attention U-Net (VQGAN/DDPM-style) backbone params, shared with LASER.
+        self.resolution = None if resolution is None else int(resolution)
+        self.channel_multipliers = (
+            None if channel_multipliers is None else tuple(int(m) for m in channel_multipliers)
+        )
+        self.backbone_latent_channels = (
+            None if backbone_latent_channels is None else int(backbone_latent_channels)
+        )
+        self.max_ch_mult = int(max_ch_mult)
+        self.attn_resolutions = tuple(int(a) for a in attn_resolutions) if attn_resolutions else ()
+        self.dropout = float(dropout)
+        self.use_mid_attention = bool(use_mid_attention)
+        self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.enable_codebook_visuals = bool(enable_codebook_visuals)
         self.codebook_visual_max_vectors = max(1, int(codebook_visual_max_vectors))
         self.compute_fid = compute_fid
@@ -122,6 +142,34 @@ class VQVAE(pl.LightningModule):
         self._codebook_snapshot_steps = []
 
         self.is_waveform_audio = self.audio_backbone == "waveform" and int(in_channels) == 1
+
+        enc_dec_kwargs = None
+        if not self.is_waveform_audio:
+            # Attention U-Net backbone (same as LASER); waveform audio uses AudioEncoder.
+            if self.resolution is None or self.resolution <= 0:
+                raise ValueError("resolution must be a positive integer for the U-Net backbone")
+            if self.channel_multipliers is None:
+                self.channel_multipliers = tuple(
+                    min(2 ** i, self.max_ch_mult) for i in range(self.num_downsamples + 1)
+                )
+            else:
+                self.num_downsamples = len(self.channel_multipliers) - 1
+            if self.backbone_latent_channels is None:
+                self.backbone_latent_channels = int(embedding_dim)
+            enc_dec_kwargs = dict(
+                ch=num_hiddens,
+                out_ch=in_channels,
+                ch_mult=self.channel_multipliers,
+                num_res_blocks=num_residual_blocks,
+                attn_resolutions=self.attn_resolutions,
+                dropout=self.dropout,
+                resamp_with_conv=True,
+                in_channels=in_channels,
+                resolution=self.resolution,
+                z_channels=self.backbone_latent_channels,
+                double_z=False,
+                use_mid_attention=self.use_mid_attention,
+            )
 
         # Initialize model components
         if self.is_waveform_audio:
@@ -140,16 +188,16 @@ class VQVAE(pl.LightningModule):
                 stride=1,
             )
         else:
-            self.encoder = Encoder(in_channels=in_channels,
-                                   num_hiddens=num_hiddens,
-                                   num_residual_blocks=num_residual_blocks,
-                                   num_residual_hiddens=num_residual_hiddens,
-                                   num_downsamples=self.num_downsamples)
-
-            self.pre_bottleneck = nn.Conv2d(in_channels=num_hiddens,
-                                            out_channels=embedding_dim,
-                                            kernel_size=1,
-                                            stride=1)
+            self.encoder = Encoder(**enc_dec_kwargs)
+            if self.backbone_latent_channels == int(embedding_dim):
+                self.pre_bottleneck = nn.Identity()
+            else:
+                self.pre_bottleneck = nn.Conv2d(
+                    in_channels=self.backbone_latent_channels,
+                    out_channels=embedding_dim,
+                    kernel_size=1,
+                    stride=1,
+                )
         
         self.vector_quantizer = VectorQuantizerEMA(
             num_embeddings=num_embeddings,
@@ -178,19 +226,17 @@ class VQVAE(pl.LightningModule):
                 dilation_cycle=self.audio_dilation_cycle,
             )
         else:
-            self.post_bottleneck = nn.Conv2d(in_channels=embedding_dim,
-                                             out_channels=num_hiddens,
-                                             kernel_size=3,
-                                             stride=1,
-                                             padding=1)
-
+            if self.backbone_latent_channels == int(embedding_dim):
+                self.post_bottleneck = nn.Identity()
+            else:
+                self.post_bottleneck = nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=self.backbone_latent_channels,
+                    kernel_size=1,
+                    stride=1,
+                )
             self.decoder = Decoder(
-                in_channels=num_hiddens,  # Input channels for decoder matches hidden dims
-                num_hiddens=num_hiddens,
-                num_residual_blocks=num_residual_blocks,
-                num_residual_hiddens=num_residual_hiddens,
-                out_channels=in_channels,
-                num_upsamples=self.num_downsamples,
+                **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
             )
 
         # Initialize LPIPS only if used

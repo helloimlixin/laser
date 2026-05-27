@@ -355,6 +355,12 @@ def train(cfg: DictConfig):
     )
     max_steps = int(getattr(cfg.train, "max_steps", -1) or -1)
     trainer_plugins = [LightningEnvironment()] if num_devices > 1 and strat_lower.startswith("ddp") else None
+    # Lightning forbids Trainer-level gradient clipping under manual optimization
+    # (the adversarial path). The model clips internally via grad_clip_val there.
+    uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
+    trainer_grad_clip = None if uses_manual_opt else cfg.train.gradient_clip_val
+    if uses_manual_opt:
+        print("Manual optimization active (adversarial); gradient clipping applied inside the model.")
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,
         max_steps=max_steps,
@@ -366,7 +372,7 @@ def train(cfg: DictConfig):
         logger=wandb_logger,
         callbacks=callbacks,
         precision=cfg.train.precision,
-        gradient_clip_val=cfg.train.gradient_clip_val,
+        gradient_clip_val=trainer_grad_clip,
         log_every_n_steps=cfg.train.log_every_n_steps,
         val_check_interval=val_check_interval,
         limit_train_batches=getattr(cfg.train, "limit_train_batches", 1.0),

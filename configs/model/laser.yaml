@@ -149,6 +149,34 @@ perceptual_weight: 0.0
 perceptual_start_step: 0
 perceptual_warmup_steps: 0
 
+# --- PatchGAN adversarial loss (VQGAN-style) ---
+# The reconstruction-only objective (MSE/L1/edge/LPIPS) regresses toward the
+# conditional mean and produces over-smoothed images. A PatchGAN critic with a
+# hinge loss rewards plausible high-frequency texture WITHOUT changing the
+# latent/token budget. Default 0.0 keeps the discriminator off and preserves the
+# legacy single-optimizer (automatic optimization) training path exactly.
+# Set >0 (e.g. 0.8) to enable; this switches stage-1 to manual optimization.
+adversarial_weight: 0.0
+# Autoencoder warmup (in training batches) before the critic starts. Below this
+# step training is pure reconstruction so the critic does not fight an untrained
+# decoder. Tie roughly to perceptual_start_step.
+disc_start_step: 0
+# PatchGAN depth / width and normalization. 'group' or spectral norm are safer
+# than 'batch' for small per-GPU batches and DDP.
+disc_num_layers: 3
+disc_channels: 64
+disc_norm: batch
+disc_spectral: false
+# Critic objective: 'hinge' (default) or 'vanilla' (BCE/softplus).
+disc_loss: hinge
+# Optional separate LR for the critic (null -> use the autoencoder learning_rate).
+disc_learning_rate: null
+# VQGAN adaptive weight: balances recon vs adversarial gradients at the decoder
+# output layer so the GAN term neither vanishes nor dominates.
+use_adaptive_disc_weight: true
+disc_factor: 1.0
+disc_weight_max: 10000.0
+
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99
 # 0.9 = standard default

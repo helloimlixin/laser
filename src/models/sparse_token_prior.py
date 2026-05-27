@@ -636,8 +636,42 @@ class SparseTokenPriorModule(pl.LightningModule):
         optimizer_cls = torch.optim.AdamW if self.weight_decay > 0 else torch.optim.Adam
         optimizer = optimizer_cls(self.prior.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         trainer = getattr(self, "_trainer", None)
-        estimated_steps = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
-        self._lr_total_steps = max(1, int(estimated_steps or 1))
+        total_steps = None
+        if trainer is not None:
+            for value in (getattr(trainer, "max_steps", None),):
+                try:
+                    if value is not None and int(value) > 0:
+                        total_steps = int(value)
+                        break
+                except (TypeError, ValueError):
+                    pass
+            if total_steps is None:
+                try:
+                    max_epochs_raw = float(getattr(trainer, "max_epochs", 0) or 0)
+                    num_batches_raw = float(getattr(trainer, "num_training_batches", 0) or 0)
+                    if (
+                        math.isfinite(max_epochs_raw)
+                        and math.isfinite(num_batches_raw)
+                        and max_epochs_raw > 0
+                        and num_batches_raw > 0
+                    ):
+                        total_steps = int(max_epochs_raw) * int(num_batches_raw)
+                except (TypeError, ValueError):
+                    total_steps = None
+            if total_steps is None:
+                descriptor = getattr(type(trainer), "estimated_stepping_batches", None)
+                if isinstance(descriptor, property):
+                    trainer_state = getattr(trainer, "__dict__", {})
+                    estimated_steps = (
+                        trainer_state.get("estimated_stepping_batches") if isinstance(trainer_state, dict) else None
+                    )
+                else:
+                    estimated_steps = getattr(trainer, "estimated_stepping_batches", None)
+                try:
+                    total_steps = int(estimated_steps)
+                except (TypeError, ValueError):
+                    total_steps = None
+        self._lr_total_steps = max(1, int(total_steps or 1))
         self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
         return optimizer
 

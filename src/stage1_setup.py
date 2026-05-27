@@ -289,6 +289,21 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "bypass_bottleneck": bool(_cfg_get(model_cfg, "bypass_bottleneck", False)),
         "warmup_steps": int(_cfg_get(train_cfg, "warmup_steps", 0)),
         "min_lr_ratio": float(_cfg_get(train_cfg, "min_lr_ratio", 0.01)),
+        # PatchGAN adversarial loss (default off -> single-optimizer path).
+        "adversarial_weight": float(_cfg_get(model_cfg, "adversarial_weight", 0.0)),
+        "disc_start_step": int(_cfg_get(model_cfg, "disc_start_step", 0)),
+        "disc_num_layers": int(_cfg_get(model_cfg, "disc_num_layers", 3)),
+        "disc_channels": int(_cfg_get(model_cfg, "disc_channels", 64)),
+        "disc_norm": str(_cfg_get(model_cfg, "disc_norm", "batch")),
+        "disc_spectral": bool(_cfg_get(model_cfg, "disc_spectral", False)),
+        "disc_loss": str(_cfg_get(model_cfg, "disc_loss", "hinge")),
+        "disc_learning_rate": _cfg_get(model_cfg, "disc_learning_rate", None),
+        "use_adaptive_disc_weight": bool(_cfg_get(model_cfg, "use_adaptive_disc_weight", True)),
+        "disc_factor": float(_cfg_get(model_cfg, "disc_factor", 1.0)),
+        "disc_weight_max": float(_cfg_get(model_cfg, "disc_weight_max", 10000.0)),
+        # Trainer-level clipping is incompatible with manual optimization, so the
+        # adversarial path applies this internally instead.
+        "grad_clip_val": float(_cfg_get(train_cfg, "gradient_clip_val", 0.0) or 0.0),
     }
 
 

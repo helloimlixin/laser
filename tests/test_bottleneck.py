@@ -206,6 +206,30 @@ def test_patch_dictionary_learning_preserves_latent_shape():
     assert dl.dictionary.grad is not None
 
 
+def test_patch_dictionary_learning_keeps_sparse_solve_finite_for_half_inputs():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=16,
+        embedding_dim=4,
+        sparsity_level=4,
+        patch_based=True,
+        patch_size=2,
+        patch_stride=2,
+        coef_max=8.0,
+    )
+    z = torch.randn(2, 4, 4, 4, dtype=torch.float16, requires_grad=True)
+
+    z_out, loss, sparse_codes = dl(z)
+
+    assert z_out.dtype == z.dtype
+    assert sparse_codes.values.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert torch.isfinite(z_out.float()).all()
+    (z_out.float().mean() + loss).backward()
+    assert dl.dictionary.grad is not None
+    assert torch.isfinite(dl.dictionary.grad).all()
+
+
 def test_patch_dictionary_learning_hann_reconstructs_exact_signal_with_full_identity_dictionary():
     torch.manual_seed(0)
     dl = DictionaryLearning(

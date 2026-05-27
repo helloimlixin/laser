@@ -1,6 +1,7 @@
 """Dictionary-learning bottleneck: OMP sparse coding over a learned dictionary."""
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -70,6 +71,13 @@ def _dictionary_abs_offdiag_cosines(
     gram = atoms.t() @ atoms
     gram = gram - torch.diag_embed(torch.diagonal(gram))
     return gram.abs(), int(gram.size(0) * max(gram.size(0) - 1, 0))
+
+
+def _disable_autocast_for(tensor: torch.Tensor):
+    device_type = tensor.device.type
+    if device_type in {"cpu", "cuda", "xpu", "mps"}:
+        return torch.autocast(device_type=device_type, enabled=False)
+    return nullcontext()
 
 
 class DictionaryLearning(nn.Module):
@@ -1111,70 +1119,75 @@ class DictionaryLearning(nn.Module):
                 f"Expected channel dim {self.embedding_dim} but received {C}"
             )
 
-        if self._is_patch_based():
-            patches, grid_h, grid_w, height, width = self._extract_patches(z_e)
-            signals = patches.permute(0, 2, 1).contiguous().view(-1, self.patch_dim).t()
-        else:
-            grid_h, grid_w, height, width = H, W, H, W
-            signals = z_e.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
-        dictionary = _normalize_dictionary(self.dictionary, eps=self.epsilon)
-        with torch.no_grad():
-            support, values = self.batch_omp_with_support(signals, dictionary)
-        support = support.view(B, grid_h, grid_w, self.sparsity_level)
-        values = self.clamp_sparse_coeffs(
-            values.view(B, grid_h, grid_w, self.sparsity_level)
-        )
-        if self.training and self.dictionary_update_mode == "online_ksvd":
-            self._last_ksvd_batch = {
-                "signals": signals.detach(),
-                "support": support.detach().reshape(-1, self.sparsity_level),
-                "values": values.detach().reshape(-1, self.sparsity_level),
-            }
-        if self.training:
-            self.update_dictionary_usage_ema_(support)
-
-        coeff_refine_loss = z_e.new_zeros(())
-        weighted_coeff_refine_loss = z_e.new_zeros(())
-        coeffs_for_recon = values
-        if self.variational_coeffs:
-            coeff_mu, coeff_logvar = self._coeff_posterior_stats(support, values)
-            if self.training:
-                coeff_eps = torch.randn_like(coeff_mu)
-                coeff_std = (0.5 * coeff_logvar).exp()
-                coeffs_for_recon = self.clamp_sparse_coeffs(coeff_mu + coeff_std * coeff_eps)
+        # OMP support selection and least-squares coefficient solves are fragile in
+        # FP16. Keep this bottleneck math in FP32 under AMP, then cast only the
+        # returned latent value back to the encoder dtype.
+        with _disable_autocast_for(z_e):
+            z_e_work = torch.nan_to_num(z_e.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            if self._is_patch_based():
+                patches, grid_h, grid_w, height, width = self._extract_patches(z_e_work)
+                signals = patches.permute(0, 2, 1).contiguous().view(-1, self.patch_dim).t()
             else:
-                coeffs_for_recon = coeff_mu
-            # Gaussian-KL math, but ``values`` (the OMP coefficient) is data-dependent and
-            # detached, so this acts as a refinement-around-OMP regularizer. Renamed from
-            # ``coeff_kl_loss`` (May 2026, A3); see ``_gaussian_kl_to_fixed_mean`` docstring.
-            coeff_refine_loss = _gaussian_kl_to_fixed_mean(
-                coeff_mu,
-                coeff_logvar,
-                values,
-                target_std=self.variational_coeff_target_std,
-            )
-            weighted_coeff_refine_loss = (
-                float(self.variational_coeff_refine_weight) * coeff_refine_loss
-            )
-            self._last_coeff_posterior_std = (0.5 * coeff_logvar).exp().mean().detach()
-            self._last_coeff_target_std = torch.as_tensor(
-                self.variational_coeff_target_std,
-                device=z_e.device,
-                dtype=z_e.dtype,
-            )
-        else:
-            self._last_coeff_posterior_std = z_e.new_zeros(())
-            self._last_coeff_target_std = torch.as_tensor(
-                self.variational_coeff_target_std,
-                device=z_e.device,
-                dtype=z_e.dtype,
-            )
+                grid_h, grid_w, height, width = H, W, H, W
+                signals = z_e_work.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
+            dictionary = _normalize_dictionary(self.dictionary.float(), eps=max(float(self.epsilon), 1e-8))
+            with torch.no_grad():
+                support, values = self.batch_omp_with_support(signals, dictionary)
+            support = support.view(B, grid_h, grid_w, self.sparsity_level)
+            values = self.clamp_sparse_coeffs(
+                values.view(B, grid_h, grid_w, self.sparsity_level)
+            ).float()
+            if self.training and self.dictionary_update_mode == "online_ksvd":
+                self._last_ksvd_batch = {
+                    "signals": signals.detach(),
+                    "support": support.detach().reshape(-1, self.sparsity_level),
+                    "values": values.detach().reshape(-1, self.sparsity_level),
+                }
+            if self.training:
+                self.update_dictionary_usage_ema_(support)
 
-        z_dl = self._reconstruct_sparse(support, coeffs_for_recon, height, width)
+            coeff_refine_loss = z_e_work.new_zeros(())
+            weighted_coeff_refine_loss = z_e_work.new_zeros(())
+            coeffs_for_recon = values
+            if self.variational_coeffs:
+                coeff_mu, coeff_logvar = self._coeff_posterior_stats(support, values)
+                if self.training:
+                    coeff_eps = torch.randn_like(coeff_mu)
+                    coeff_std = (0.5 * coeff_logvar).exp()
+                    coeffs_for_recon = self.clamp_sparse_coeffs(coeff_mu + coeff_std * coeff_eps)
+                else:
+                    coeffs_for_recon = coeff_mu
+                # Gaussian-KL math, but ``values`` (the OMP coefficient) is data-dependent and
+                # detached, so this acts as a refinement-around-OMP regularizer. Renamed from
+                # ``coeff_kl_loss`` (May 2026, A3); see ``_gaussian_kl_to_fixed_mean`` docstring.
+                coeff_refine_loss = _gaussian_kl_to_fixed_mean(
+                    coeff_mu,
+                    coeff_logvar,
+                    values,
+                    target_std=self.variational_coeff_target_std,
+                )
+                weighted_coeff_refine_loss = (
+                    float(self.variational_coeff_refine_weight) * coeff_refine_loss
+                )
+                self._last_coeff_posterior_std = (0.5 * coeff_logvar).exp().mean().detach()
+                self._last_coeff_target_std = torch.as_tensor(
+                    self.variational_coeff_target_std,
+                    device=z_e.device,
+                    dtype=torch.float32,
+                )
+            else:
+                self._last_coeff_posterior_std = z_e_work.new_zeros(())
+                self._last_coeff_target_std = torch.as_tensor(
+                    self.variational_coeff_target_std,
+                    device=z_e.device,
+                    dtype=torch.float32,
+                )
 
-        dl_latent_loss = F.mse_loss(z_dl, z_e.detach())
-        e_latent_loss = F.mse_loss(z_dl.detach(), z_e)
-        loss = dl_latent_loss + self.commitment_cost * e_latent_loss + weighted_coeff_refine_loss
+            z_dl = self._reconstruct_sparse(support, coeffs_for_recon, height, width).float()
+
+            dl_latent_loss = F.mse_loss(z_dl, z_e_work.detach())
+            e_latent_loss = F.mse_loss(z_dl.detach(), z_e_work)
+            loss = dl_latent_loss + self.commitment_cost * e_latent_loss + weighted_coeff_refine_loss
 
         self._last_dl_latent_loss = dl_latent_loss.detach()
         self._last_e_latent_loss = e_latent_loss.detach()
@@ -1214,7 +1227,10 @@ class DictionaryLearning(nn.Module):
             # Legacy VQ-style straight-through estimator: decoder loss reaches the
             # encoder but bypasses the dictionary and (in variational mode) the
             # coeff_variational_* networks. Disable via dictionary_through_decoder=True.
-            z_dl = z_e + (z_dl - z_e).detach()
+            z_dl_value = z_dl.to(dtype=z_e.dtype)
+            z_dl = z_e + (z_dl_value - z_e).detach()
+        else:
+            z_dl = z_dl.to(dtype=z_e.dtype)
         sparse_codes = SparseCodes(
             support=support,
             values=coeffs_for_recon,
