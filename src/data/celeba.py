@@ -105,17 +105,24 @@ class PackedRGBImageDataset(Dataset):
         mean: Tuple[float, float, float],
         std: Tuple[float, float, float],
         random_horizontal_flip: bool = False,
+        random_crop_size: Optional[Tuple[int, int]] = None,
         indices: Optional[List[int]] = None,
         crop_size: Optional[int] = None,
     ):
         self.root = Path(root)
         self.image_size = int(image_size)
         self.random_horizontal_flip = bool(random_horizontal_flip)
-        # Optional random square crop applied per-sample (training augmentation).
-        # None / >= image_size keeps the full image (used for val/test).
-        self.crop_size = (
-            int(crop_size) if crop_size is not None and int(crop_size) < self.image_size else None
-        )
+        if random_crop_size is None and crop_size is not None:
+            crop = int(crop_size)
+            random_crop_size = (crop, crop)
+        if random_crop_size is not None:
+            crop_h, crop_w = (int(random_crop_size[0]), int(random_crop_size[1]))
+            random_crop_size = (
+                (crop_h, crop_w)
+                if crop_h < self.image_size or crop_w < self.image_size
+                else None
+            )
+        self.random_crop_size = random_crop_size
         self.packed_path = _packed_celeba_file(self.root, self.image_size)
         if not self.packed_path.exists():
             raise FileNotFoundError(f"Packed dataset not found: {self.packed_path}")
@@ -145,11 +152,22 @@ class PackedRGBImageDataset(Dataset):
         if self.indices is not None:
             idx = int(self.indices[idx])
         image = torch.from_numpy(np.array(self.images[idx], copy=True)).permute(2, 0, 1).float().div_(255.0)
-        if self.crop_size is not None:
-            cs = self.crop_size
-            top = int(torch.randint(0, self.image_size - cs + 1, (1,)).item())
-            left = int(torch.randint(0, self.image_size - cs + 1, (1,)).item())
-            image = image[:, top:top + cs, left:left + cs]
+        if self.random_crop_size is not None:
+            crop_h, crop_w = self.random_crop_size
+            _, height, width = image.shape
+            if crop_h > height or crop_w > width:
+                raise ValueError(
+                    f"random_crop_size={(crop_h, crop_w)} cannot exceed packed image size {(height, width)}"
+                )
+            if crop_h < height:
+                top = int(torch.randint(0, height - crop_h + 1, (), dtype=torch.long).item())
+            else:
+                top = 0
+            if crop_w < width:
+                left = int(torch.randint(0, width - crop_w + 1, (), dtype=torch.long).item())
+            else:
+                left = 0
+            image = image[:, top: top + crop_h, left: left + crop_w]
         if self.random_horizontal_flip and torch.rand((), dtype=torch.float32).item() < 0.5:
             image = torch.flip(image, dims=[2])
         image = (image - self.mean) / self.std
@@ -176,6 +194,29 @@ class CelebADataModule(pl.LightningDataModule):
         if len(image_size) == 2 and int(image_size[0]) == int(image_size[1]):
             return int(image_size[0])
         return None
+
+    @staticmethod
+    def _as_hw(value) -> Tuple[int, int]:
+        if isinstance(value, int):
+            return int(value), int(value)
+        return int(value[0]), int(value[1])
+
+    def _resize_to(self) -> Tuple[int, int]:
+        return self._as_hw(self.config.image_size)
+
+    def _train_crop_to(self) -> Optional[Tuple[int, int]]:
+        crop_size = getattr(self.config, "train_crop_size", None)
+        if crop_size is None:
+            return None
+        if isinstance(crop_size, int) and int(crop_size) <= 0:
+            return None
+        crop_to = self._as_hw(crop_size)
+        if crop_to[0] <= 0 or crop_to[1] <= 0:
+            return None
+        resize_to = self._resize_to()
+        if crop_to[0] > resize_to[0] or crop_to[1] > resize_to[1]:
+            raise ValueError(f"train_crop_size={crop_to} cannot exceed image_size={resize_to}")
+        return crop_to
 
     def _resolve_data_dir(self) -> str:
         """Resolve a directory that contains raw CelebA images or a packed npy file."""
@@ -236,11 +277,8 @@ class CelebADataModule(pl.LightningDataModule):
 
         # Transforms: center-crop if the images are 178x218, then resize to configured size.
         # Use Normalize with config mean/std.
-        image_size = self.config.image_size
-        if isinstance(image_size, int):
-            resize_to: Tuple[int, int] = (image_size, image_size)
-        else:
-            resize_to = tuple(image_size)  # type: ignore[arg-type]
+        resize_to = self._resize_to()
+        train_crop = self._train_crop_to()
 
         packed_image_size = self._packed_image_size()
         packed_path = (
@@ -266,26 +304,23 @@ class CelebADataModule(pl.LightningDataModule):
             mean = tuple(float(x) for x in self.config.mean)
             std = tuple(float(x) for x in self.config.std)
 
-            train_crop = getattr(self.config, "train_crop_size", None)
-            if isinstance(train_crop, (list, tuple)):
-                train_crop = int(train_crop[0])
-
             def _make_packed(indices, flip, crop_size=None):
                 return PackedRGBImageDataset(
                     data_dir, packed_image_size,
                     mean=mean, std=std,
-                    random_horizontal_flip=flip, indices=indices,
-                    crop_size=crop_size,
+                    random_horizontal_flip=flip,
+                    random_crop_size=crop_size,
+                    indices=indices,
                 )
 
-            # Train on moderate random crops to cut activation memory; val/test
-            # use the full image so reconstruction metrics reflect full resolution.
             self.train_dataset = _make_packed(train_idx, flip=augment, crop_size=train_crop)
-            self.val_dataset = _make_packed(val_idx, flip=False)
-            self.test_dataset = _make_packed(test_idx, flip=False)
+            self.val_dataset = _make_packed(val_idx, flip=False, crop_size=None)
+            self.test_dataset = _make_packed(test_idx, flip=False, crop_size=None)
             return
 
         train_ops = [transforms.Resize(resize_to)]
+        if train_crop is not None and train_crop != resize_to:
+            train_ops.append(transforms.RandomCrop(train_crop))
         if augment:
             train_ops.append(transforms.RandomHorizontalFlip())
         train_ops.extend([

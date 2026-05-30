@@ -114,6 +114,8 @@ variational_coeff_min_std: 0.01
 # learns only from dl_latent_loss. Turning this on usually requires raising
 # commitment_cost so the encoder stays pinned to the dictionary manifold.
 dictionary_through_decoder: false
+data_init_from_first_batch: false
+dead_atom_revival_steps: 0
 
 # Dictionary atom update.
 # `gradient` uses the standard Adam path. `online_ksvd` removes the dictionary

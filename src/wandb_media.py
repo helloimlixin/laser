@@ -39,13 +39,9 @@ def log_wandb_images(
     if caption_list is not None and len(caption_list) != len(image_list):
         raise ValueError(f"Expected {len(image_list)} captions for {key}, found {len(caption_list)}")
 
-    if hasattr(logger, "log_image"):
-        kwargs = {}
-        if caption_list is not None:
-            kwargs["caption"] = caption_list
-        logger.log_image(str(key), image_list, step=step, **kwargs)
-        return
-
+    # Go straight to wandb.experiment.log to avoid Lightning's WandbLogger creating
+    # a panel-per-list-element under the same key. A single log call with one payload
+    # produces exactly one W&B card per key, regardless of list length.
     import wandb
 
     payload = {

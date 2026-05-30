@@ -147,7 +147,6 @@ class VisualsMixin:
             log_wandb_payload(logger, payload, step=step)
             return
         
-        # Create image grids
         # De-normalize using datamodule config if available; otherwise assume [-1,1] → [0,1]
         if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
             mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
@@ -159,24 +158,22 @@ class VisualsMixin:
             recon_disp = (recon + 1.0) / 2.0
         x_disp = x_disp.clamp(0.0, 1.0)
         recon_disp = recon_disp.clamp(0.0, 1.0)
-        x_grid = torchvision.utils.make_grid(x_disp, nrow=min(8, max_images), normalize=False)
-        recon_grid = torchvision.utils.make_grid(recon_disp, nrow=min(8, max_images), normalize=False)
-        
-        # Sanitize NaN/Inf and clamp to [0,1] before converting to numpy
-        x_grid = torch.nan_to_num(x_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        recon_grid = torch.nan_to_num(recon_grid, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        
-        # Convert to display-friendly arrays. W&B accepts 2D grayscale arrays,
-        # which keeps single-channel spectrogram logging simple and explicit.
-        x_grid = self._wandb_display_array(x_grid)
-        recon_grid = self._wandb_display_array(recon_grid)
-        
+        # Stack originals on top of reconstructions per-item (channels last), then a single grid.
+        # Logging one image (not a list of two) avoids Lightning's WandbLogger creating a panel
+        # per list element under the same key.
+        stacked = torch.cat([x_disp, recon_disp], dim=2)  # [B, C, 2*H, W]
+        combined = torchvision.utils.make_grid(
+            stacked, nrow=min(8, max_images), normalize=False
+        )
+        combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        combined = self._wandb_display_array(combined)
+
         log_wandb_images(
             logger,
             f"{prefix}/images",
-            [x_grid, recon_grid],
+            [combined],
             step=step,
-            captions=["Original", "Reconstructed"],
+            captions=["Originals (top) / Reconstructions (bottom)"],
         )
         payload = {
             f"{prefix}/reconstruction_error": F.mse_loss(recon, x).item(),

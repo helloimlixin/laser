@@ -112,6 +112,14 @@ class LASER(VisualsMixin, pl.LightningModule):
             perceptual_weight=1.0,
             perceptual_start_step=0,
             perceptual_warmup_steps=0,
+            adversarial_weight=0.0,
+            adversarial_start_step=0,
+            adversarial_warmup_steps=0,
+            discriminator_learning_rate=None,
+            discriminator_beta1=0.5,
+            discriminator_beta2=0.9,
+            discriminator_channels=64,
+            discriminator_layers=3,
             compute_fid=False,
             fid_feature=2048,
             log_images_every_n_steps=100,
@@ -124,6 +132,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             patch_stride=2,
             patch_reconstruction="tile",
             coef_max=None,
+            omp_residual_tolerance=None,
             bounded_omp_refine_steps=8,
             dictionary_usage_ema_decay=0.99,
             dictionary_usage_grad_scale=0.0,
@@ -134,10 +143,17 @@ class LASER(VisualsMixin, pl.LightningModule):
             variational_coeff_target_std=0.25,
             variational_coeff_min_std=0.01,
             dictionary_through_decoder=False,
+            data_init_from_first_batch=False,
+            dead_atom_revival_steps=0,
             dictionary_ksvd_lr=0.2,
             dictionary_ksvd_update_every=1,
             dictionary_ksvd_min_usage=1,
             dictionary_ksvd_max_atoms_per_step=512,
+            bottleneck_type="dictionary",
+            rq_code_depth=4,
+            rq_shared_codebook=True,
+            rq_decay=0.99,
+            rq_restart_unused_codes=True,
             sparsity_reg_weight=0.01,
             coherence_weight=0.0,
             audio_energy_loss_weight=0.0,
@@ -153,7 +169,6 @@ class LASER(VisualsMixin, pl.LightningModule):
             bypass_bottleneck=False,
             warmup_steps=0,
             min_lr_ratio=0.01,
-            adversarial_weight=0.0,
             disc_start_step=0,
             disc_num_layers=3,
             disc_channels=64,
@@ -200,6 +215,14 @@ class LASER(VisualsMixin, pl.LightningModule):
             perceptual_weight: Weight for perceptual loss
             perceptual_start_step: Global step before which LPIPS is disabled
             perceptual_warmup_steps: Linear LPIPS ramp length after perceptual_start_step
+            adversarial_weight: Weight for PatchGAN generator loss. Disabled at 0.
+            adversarial_start_step: Global step before which adversarial loss is disabled
+            adversarial_warmup_steps: Linear adversarial weight ramp length after start
+            discriminator_learning_rate: Optional discriminator LR; defaults to learning_rate
+            discriminator_beta1: Discriminator Adam beta1
+            discriminator_beta2: Discriminator Adam beta2
+            discriminator_channels: Base discriminator channel count
+            discriminator_layers: Number of strided discriminator blocks
             compute_fid: Whether to compute FID
             fid_feature: Inception feature size for reconstruction FID
             log_images_every_n_steps: image logging cadence; 0 disables image logging
@@ -210,30 +233,10 @@ class LASER(VisualsMixin, pl.LightningModule):
             patch_based: whether to use latent patch sparse coding instead of per-site coding
             patch_size: latent patch size used for sparse coding
             patch_stride: latent patch stride used for sparse coding
-            patch_reconstruction: patch stitching rule, one of 'center_crop', 'hann', or 'tile'
-            coef_max: optional hard bound applied to sparse coefficients during support refinement
-            bounded_omp_refine_steps: projected refinement steps for bounded OMP coefficient updates
-            dictionary_usage_ema_decay: decay for distributed EMA atom usage counts
-            dictionary_usage_grad_scale: exponent for usage-aware dictionary gradient scaling;
-                0 disables it, 0.5 is a conservative EMA-like setting
-            dictionary_usage_grad_min: lower clamp for usage-aware dictionary gradient scaling
-            dictionary_usage_grad_max: upper clamp for usage-aware dictionary gradient scaling
-            variational_coeffs: whether to sample sparse coefficients from a learned posterior
-            variational_coeff_refine_weight: weight for the refinement-around-OMP loss on
-                the coefficient posterior (Gaussian-KL math against a data-dependent
-                reference; renamed from variational_coeff_kl_weight in May 2026)
-            variational_coeff_target_std: std of the reference Gaussian in the refinement
-                term and upper bound on the learned posterior std (renamed from
-                variational_coeff_prior_std in May 2026)
-            variational_coeff_min_std: minimum std allowed in the learned posterior
-            dictionary_through_decoder: when True, skip the straight-through estimator in
-                the bottleneck so decoder gradients flow into the dictionary atoms (and,
-                in variational mode, the coeff_variational_* networks). Off by default to
-                preserve the legacy VQ-style training behavior where the dictionary
-                learns only from dl_latent_loss. If you enable this, consider raising
-                commitment_cost to keep the encoder pinned to the dictionary manifold.
-            sparsity_reg_weight: legacy diagnostic weight for sparse coefficient magnitude
-            coherence_weight: weight for dictionary coherence regularization
+            patch_reconstruction: patch stitching rule; DictionaryLearning currently supports 'tile'
+            coef_max: optional hard bound applied to sparse coefficients
+            omp_residual_tolerance: relative ||residual||^2/||signal||^2 below which OMP stops
+                early per latent site (None = run full sparsity_level iterations)
             audio_energy_loss_weight: weight for audio magnitude-energy matching
             audio_multires_loss_weight: weight for audio multi-resolution spectrogram matching
             audio_multires_scales: pooling scales for the multi-resolution audio loss
@@ -266,40 +269,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         """
         super(LASER, self).__init__()
 
-        legacy_coherence = kwargs.pop("orthogonality_weight", None)
-        kwargs.pop("perceptual_batch_size", None)
-        kwargs.pop("use_online_learning", None)
-        kwargs.pop("use_backprop_only", None)
-        kwargs.pop("sparse_solver", None)
-        kwargs.pop("fast_omp", None)
-        kwargs.pop("omp_diag_eps", None)
-        kwargs.pop("omp_cholesky_eps", None)
-        kwargs.pop("sparse_coding_scheme", None)
-        kwargs.pop("lista_steps", None)
-        kwargs.pop("lista_step_size_init", None)
-        kwargs.pop("lista_threshold_init", None)
-        kwargs.pop("lista_layers", None)
-        kwargs.pop("lista_tied_weights", None)
-        kwargs.pop("lista_initial_threshold", None)
-        kwargs.pop("dictionary_update_mode", None)
-        kwargs.pop("dict_ema_decay", None)
-        kwargs.pop("dict_ema_eps", None)
-        kwargs.pop("patch_flatten_order", None)
-        kwargs.pop("per_pixel_sparse_coding", None)
-        if legacy_coherence is not None and float(coherence_weight) == 0.0:
-            coherence_weight = float(legacy_coherence)
-        # A3 rename (May 2026): refuse the old variational-coefficient names explicitly
-        # rather than letting them fall into the generic "unknown" bucket — they map to
-        # the new names but with different semantics worth flagging.
-        for old_name, new_name in (
-            ("variational_coeff_kl_weight", "variational_coeff_refine_weight"),
-            ("variational_coeff_prior_std", "variational_coeff_target_std"),
-        ):
-            if old_name in kwargs:
-                raise TypeError(
-                    f"{old_name!r} was renamed to {new_name!r} in the May 2026 "
-                    "A3 cleanup; update configs/checkpoints. See LASER docstring."
-                )
+        dictionary_update_mode = kwargs.pop("dictionary_update_mode", None)
         if kwargs:
             unknown = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported LASER arguments: {unknown}")
@@ -307,8 +277,18 @@ class LASER(VisualsMixin, pl.LightningModule):
         in_channels = int(in_channels)
         if in_channels != 3 and float(perceptual_weight) > 0.0:
             perceptual_weight = 0.0
+        if in_channels != 3 and float(adversarial_weight) > 0.0:
+            adversarial_weight = 0.0
         if in_channels != 3 and bool(compute_fid):
             compute_fid = False
+        if disc_start_step == 0 and int(adversarial_start_step or 0) > 0:
+            disc_start_step = adversarial_start_step
+        if disc_learning_rate is None and discriminator_learning_rate is not None:
+            disc_learning_rate = discriminator_learning_rate
+        if int(disc_channels) == 64 and int(discriminator_channels) != 64:
+            disc_channels = discriminator_channels
+        if int(disc_num_layers) == 3 and int(discriminator_layers) != 3:
+            disc_num_layers = discriminator_layers
 
         # Store parameters
         self.learning_rate = learning_rate
@@ -316,15 +296,28 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.perceptual_weight = perceptual_weight
         self.perceptual_start_step = max(int(perceptual_start_step), 0)
         self.perceptual_warmup_steps = max(int(perceptual_warmup_steps), 0)
+        self.adversarial_weight = float(adversarial_weight)
+        self.adversarial_start_step = max(int(adversarial_start_step), 0)
+        self.adversarial_warmup_steps = max(int(adversarial_warmup_steps), 0)
+        self.discriminator_learning_rate = (
+            float(discriminator_learning_rate)
+            if discriminator_learning_rate is not None
+            else float(learning_rate)
+        )
+        self.discriminator_beta1 = float(discriminator_beta1)
+        self.discriminator_beta2 = float(discriminator_beta2)
+        self.discriminator_channels = int(discriminator_channels)
+        self.discriminator_layers = int(discriminator_layers)
+        self.automatic_optimization = True
         self.log_images_every_n_steps = max(int(log_images_every_n_steps), 0)
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
-        self.sparsity_reg_weight = sparsity_reg_weight
         self.bottleneck_loss_weight = bottleneck_loss_weight
+        self.sparsity_reg_weight = float(sparsity_reg_weight)
+        self.coherence_weight = float(coherence_weight)
         self.recon_mse_weight = float(recon_mse_weight)
         self.recon_l1_weight = float(recon_l1_weight)
         self.recon_edge_weight = float(recon_edge_weight)
-        self.coherence_weight = coherence_weight
         self.audio_energy_loss_weight = float(audio_energy_loss_weight)
         self.audio_multires_loss_weight = float(audio_multires_loss_weight)
         self.audio_multires_scales = tuple(
@@ -493,33 +486,54 @@ class LASER(VisualsMixin, pl.LightningModule):
                 **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
             )
 
-        # Initialize Dictionary Learning bottleneck
-        self.bottleneck = DictionaryLearning(
-            num_embeddings=num_embeddings,
-            embedding_dim=embedding_dim,
-            sparsity_level=sparsity_level,
-            commitment_cost=commitment_cost,
-            dict_learning_rate=dict_learning_rate,
-            patch_based=patch_based,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patch_reconstruction=patch_reconstruction,
-            coef_max=coef_max,
-            bounded_omp_refine_steps=bounded_omp_refine_steps,
-            dictionary_usage_ema_decay=dictionary_usage_ema_decay,
-            dictionary_usage_grad_scale=dictionary_usage_grad_scale,
-            dictionary_usage_grad_min=dictionary_usage_grad_min,
-            dictionary_usage_grad_max=dictionary_usage_grad_max,
-            variational_coeffs=variational_coeffs,
-            variational_coeff_refine_weight=variational_coeff_refine_weight,
-            variational_coeff_target_std=variational_coeff_target_std,
-            variational_coeff_min_std=variational_coeff_min_std,
-            dictionary_through_decoder=dictionary_through_decoder,
-            dictionary_ksvd_lr=dictionary_ksvd_lr,
-            dictionary_ksvd_update_every=dictionary_ksvd_update_every,
-            dictionary_ksvd_min_usage=dictionary_ksvd_min_usage,
-            dictionary_ksvd_max_atoms_per_step=dictionary_ksvd_max_atoms_per_step,
-        )
+        # Bottleneck: OMP dictionary learning, or kakaobrain-style residual quantization.
+        bottleneck_type = str(bottleneck_type).strip().lower()
+        if bottleneck_type == "dictionary":
+            self.bottleneck = DictionaryLearning(
+                num_embeddings=num_embeddings,
+                embedding_dim=embedding_dim,
+                sparsity_level=sparsity_level,
+                commitment_cost=commitment_cost,
+                dict_learning_rate=dict_learning_rate,
+                patch_based=patch_based,
+                patch_size=patch_size,
+                patch_stride=patch_stride,
+                patch_reconstruction=patch_reconstruction,
+                coef_max=coef_max,
+                bounded_omp_refine_steps=bounded_omp_refine_steps,
+                dictionary_usage_ema_decay=dictionary_usage_ema_decay,
+                dictionary_usage_grad_scale=dictionary_usage_grad_scale,
+                dictionary_usage_grad_min=dictionary_usage_grad_min,
+                dictionary_usage_grad_max=dictionary_usage_grad_max,
+                variational_coeffs=variational_coeffs,
+                variational_coeff_refine_weight=variational_coeff_refine_weight,
+                variational_coeff_target_std=variational_coeff_target_std,
+                variational_coeff_min_std=variational_coeff_min_std,
+                dictionary_through_decoder=dictionary_through_decoder,
+                data_init_from_first_batch=data_init_from_first_batch,
+                dead_atom_revival_steps=dead_atom_revival_steps,
+                dictionary_update_mode=dictionary_update_mode,
+                dictionary_ksvd_lr=dictionary_ksvd_lr,
+                dictionary_ksvd_update_every=dictionary_ksvd_update_every,
+                dictionary_ksvd_min_usage=dictionary_ksvd_min_usage,
+                dictionary_ksvd_max_atoms_per_step=dictionary_ksvd_max_atoms_per_step,
+            )
+        elif bottleneck_type == "rq":
+            from .rq_bottleneck import RQBottleneck
+            self.bottleneck = RQBottleneck(
+                num_embeddings=num_embeddings,
+                embedding_dim=embedding_dim,
+                code_depth=rq_code_depth,
+                shared_codebook=rq_shared_codebook,
+                decay=rq_decay,
+                restart_unused_codes=rq_restart_unused_codes,
+                commitment_cost=commitment_cost,
+            )
+        else:
+            raise ValueError(
+                f"bottleneck_type must be 'dictionary' or 'rq', got {bottleneck_type!r}"
+            )
+        self.bottleneck_type = bottleneck_type
         if self.bypass_bottleneck:
             self.bottleneck.requires_grad_(False)
 
@@ -529,7 +543,6 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.lpips.eval()
             for p in self.lpips.parameters():
                 p.requires_grad = False
-
         # PatchGAN adversarial critic. Built only when explicitly requested via
         # adversarial_weight>0; a 2D PatchGAN cannot run on raw 1D waveforms, so
         # it is disabled (with a warning) for the waveform audio backbone. When
@@ -665,6 +678,12 @@ class LASER(VisualsMixin, pl.LightningModule):
         return self.__dict__.get("_trainer", None)
 
     def _is_log_rank_zero(self):
+        # Most reliable check first: ask torch.distributed directly. Both DDP
+        # ranks have the same `is_global_zero` problem when Lightning's hook
+        # hasn't attached the trainer yet, and ``self.global_rank`` can be 0 on
+        # both ranks before that point.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
         trainer = self._trainer_ref()
         if trainer is not None:
             flag = getattr(trainer, "is_global_zero", None)
@@ -850,7 +869,6 @@ class LASER(VisualsMixin, pl.LightningModule):
         self._apply_scheduled_lrs(optimizer, step=int(getattr(self, "global_step", 0)))
         optimizer.step(closure=optimizer_closure)
         if not self.bypass_bottleneck:
-            self.bottleneck.online_ksvd_update_()
             self.bottleneck.normalize_dictionary_()
 
     def _empty_sparse_codes_like(self, z_e: torch.Tensor) -> SparseCodes:
@@ -919,6 +937,24 @@ class LASER(VisualsMixin, pl.LightningModule):
             return torch.tanh(x_recon)
         return x_recon
 
+    def _image_to_unit_range(self, x: torch.Tensor, *, clamp: bool = True) -> torch.Tensor:
+        """Map normalized image tensors to [0, 1] using the active datamodule stats."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        dm = getattr(self._trainer_ref(), "datamodule", None)
+        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
+            stat_shape = (1, -1, 1) if x.ndim == 3 else (1, -1, 1, 1)
+            mean = torch.tensor(dm.config.mean, device=x.device, dtype=x.dtype).view(*stat_shape)
+            std = torch.tensor(dm.config.std, device=x.device, dtype=x.dtype).view(*stat_shape)
+            x = x * std + mean
+        else:
+            x = (x + 1.0) / 2.0
+        if clamp:
+            x = x.clamp(0.0, 1.0)
+        return x
+
+    def _image_to_lpips_range(self, x: torch.Tensor) -> torch.Tensor:
+        return self._image_to_unit_range(x, clamp=True).mul(2.0).sub(1.0)
+
     def _effective_perceptual_weight(self, prefix: str) -> float:
         if prefix != "train" or self.perceptual_weight <= 0:
             return 0.0
@@ -929,6 +965,52 @@ class LASER(VisualsMixin, pl.LightningModule):
             return float(self.perceptual_weight)
         progress = (step - self.perceptual_start_step) / float(max(1, self.perceptual_warmup_steps))
         return float(self.perceptual_weight) * max(0.0, min(1.0, progress))
+
+    def _effective_adversarial_weight(self, prefix: str) -> float:
+        if prefix != "train" or self.adversarial_weight <= 0 or self.discriminator is None:
+            return 0.0
+        step = int(getattr(self, "global_step", 0))
+        if step < self.adversarial_start_step:
+            return 0.0
+        if self.adversarial_warmup_steps <= 0:
+            return float(self.adversarial_weight)
+        progress = (step - self.adversarial_start_step) / float(max(1, self.adversarial_warmup_steps))
+        return float(self.adversarial_weight) * max(0.0, min(1.0, progress))
+
+    def _adversarial_generator_loss(self, recon: torch.Tensor) -> torch.Tensor:
+        if self.discriminator is None:
+            return recon.new_zeros(())
+        return -self.discriminator(recon).mean()
+
+    def _discriminator_hinge_loss(self, real: torch.Tensor, fake: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.discriminator is None:
+            zero = real.new_zeros(())
+            return zero, zero, zero
+        real_logits = self.discriminator(real.detach())
+        fake_logits = self.discriminator(fake.detach())
+        real_loss = F.relu(1.0 - real_logits).mean()
+        fake_loss = F.relu(1.0 + fake_logits).mean()
+        return 0.5 * (real_loss + fake_loss), real_logits.mean(), fake_logits.mean()
+
+    def _set_discriminator_requires_grad(self, enabled: bool) -> None:
+        if self.discriminator is None:
+            return
+        for param in self.discriminator.parameters():
+            param.requires_grad_(enabled)
+
+    @staticmethod
+    def _raw_optimizer(optimizer):
+        return getattr(optimizer, "optimizer", optimizer)
+
+    def _clip_manual_optimizer(self, optimizer) -> None:
+        trainer = self._trainer_ref()
+        clip_val = float(getattr(trainer, "gradient_clip_val", 0.0) or 0.0)
+        if clip_val > 0.0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=clip_val,
+                gradient_clip_algorithm="norm",
+            )
 
     @torch.no_grad()
     def encode_to_tokens(
@@ -1096,9 +1178,6 @@ class LASER(VisualsMixin, pl.LightningModule):
         )
         return float(sparse_codes.num_embeddings * num_sites)
 
-    def _dense_coeff_abs_mean(self, sparse_codes: SparseCodes):
-        return sparse_codes.values.abs().sum() / self._sparse_coeff_denominator(sparse_codes)
-
     def _support_fraction(self, sparse_codes: SparseCodes):
         return sparse_codes.support.numel() / self._sparse_coeff_denominator(sparse_codes)
 
@@ -1205,7 +1284,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         d_fn = hinge_d_loss if self.disc_loss == "hinge" else vanilla_d_loss
         return d_fn(logits_real, logits_fake), logits_real, logits_fake
 
-    def compute_metrics(self, batch, prefix='train'):
+    def compute_metrics(self, batch, prefix='train', *, include_adversarial: bool = True, return_raw: bool = False):
         """Compute metrics for a batch."""
         # Get input
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
@@ -1230,7 +1309,6 @@ class LASER(VisualsMixin, pl.LightningModule):
             + self.recon_l1_weight * recon_l1_loss
             + self.recon_edge_weight * recon_edge_loss
         )
-        sparsity_loss = self._dense_coeff_abs_mean(sparse_codes)
         input_mean = input_std = recon_mean = recon_std = None
         if should_log_distribution_metrics:
             input_mean = x.mean()
@@ -1242,40 +1320,25 @@ class LASER(VisualsMixin, pl.LightningModule):
         # Perceptual loss - only compute during training for quality
         perceptual_weight = self._effective_perceptual_weight(prefix)
         if self.lpips is not None and perceptual_weight > 0:
-            perceptual_loss = self.lpips(recon_raw, x).mean()
+            perceptual_loss = self.lpips(
+                self._image_to_lpips_range(recon_raw),
+                self._image_to_lpips_range(x),
+            ).mean()
         else:
             perceptual_loss = recon_raw.new_zeros(())
+        adversarial_weight = 0.0
+        adversarial_generator_loss = recon_raw.new_zeros(())
 
-        # Proto-style dictionary learning uses a normalized dictionary plus an
-        # optional coherence penalty rather than a dense orthogonality target.
-        if self.coherence_weight > 0 and not self.bypass_bottleneck:
-            coherence_loss = self.bottleneck.coherence_penalty()
-        else:
-            coherence_loss = recon_raw.new_zeros(())
-
-        # Total loss
-        # Sparse codes are inferred outside autograd, so sparsity_loss is a
-        # diagnostic scalar rather than an optimization term.
         total_loss = (
-            recon_loss +
-            self.bottleneck_loss_weight * bottleneck_loss +
-            perceptual_weight * perceptual_loss +
-            self.coherence_weight * coherence_loss
+            recon_loss
+            + self.bottleneck_loss_weight * bottleneck_loss
+            + perceptual_weight * perceptual_loss
+            + adversarial_weight * adversarial_generator_loss
         )
         
-        # Compute PSNR on de-normalized tensors if mean/std available; otherwise assume [-1,1].
-        dm = getattr(self._trainer_ref(), "datamodule", None)
-        x_clean = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
-        recon_clean = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
-        if dm is not None and hasattr(dm, "config") and hasattr(dm.config, "mean") and hasattr(dm.config, "std"):
-            stat_shape = (1, -1, 1) if x_clean.ndim == 3 else (1, -1, 1, 1)
-            mean = torch.tensor(dm.config.mean, device=x_clean.device, dtype=x_clean.dtype).view(*stat_shape)
-            std = torch.tensor(dm.config.std, device=x_clean.device, dtype=x_clean.dtype).view(*stat_shape)
-            x_dn = (x_clean * std + mean).clamp(0.0, 1.0)
-            recon_dn = (recon_clean * std + mean).clamp(0.0, 1.0)
-        else:
-            x_dn = (x_clean + 1.0) / 2.0
-            recon_dn = (recon_clean + 1.0) / 2.0
+        # Compute PSNR/SSIM/rFID on de-normalized image tensors.
+        x_dn = self._image_to_unit_range(x.detach(), clamp=True)
+        recon_dn = self._image_to_unit_range(recon_raw.detach(), clamp=True)
 
         if not is_audio and prefix == 'val' and self.val_rfid is not None:
             self.val_rfid.update(x_dn, real=True)
@@ -1373,7 +1436,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         # monitoring without touching the loss.
         adv_g_loss = recon_raw.new_zeros(())
         disc_weight = recon_raw.new_zeros(())
-        if self._adversarial_enabled and not is_audio and self.discriminator is not None:
+        if include_adversarial and self._adversarial_enabled and not is_audio and self.discriminator is not None:
             step = int(self._manual_train_step)
             active = step >= self.disc_start_step
             if prefix == 'train' and active and recon_raw.requires_grad:
@@ -1415,9 +1478,17 @@ class LASER(VisualsMixin, pl.LightningModule):
             recon_raw.new_tensor(float(perceptual_weight)),
             **log_kwargs,
         )
-        self.log(f'{prefix}/sparsity_loss', sparsity_loss, **log_kwargs)
-        self.log(f'{prefix}/weighted_sparsity_loss', self.sparsity_reg_weight * sparsity_loss, **log_kwargs)
-        self.log(f'{prefix}/coherence_loss', coherence_loss, **log_kwargs)
+        self.log(f'{prefix}/adversarial_generator_loss', adversarial_generator_loss, **log_kwargs)
+        self.log(
+            f'{prefix}/weighted_adversarial_generator_loss',
+            adversarial_weight * adversarial_generator_loss,
+            **log_kwargs,
+        )
+        self.log(
+            f'{prefix}/adversarial_weight_effective',
+            recon_raw.new_tensor(float(adversarial_weight)),
+            **log_kwargs,
+        )
         if psnr is not None:
             self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
         if is_audio:
@@ -1449,15 +1520,9 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.log(f'{prefix}/dict_norm_max', diag.get("dict_norm_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/dict_norm_min', diag.get("dict_norm_min", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/dict_norm_mean', diag.get("dict_norm_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
-            self.log(f'{prefix}/dict_usage_ema_max', diag.get("dict_usage_ema_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
-            self.log(f'{prefix}/dict_usage_ema_min', diag.get("dict_usage_ema_min", torch.tensor(0.0, device=x.device)), **log_kwargs)
-            self.log(f'{prefix}/dict_usage_ema_mean', diag.get("dict_usage_ema_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/coeff_abs_max', diag.get("coeff_abs_max", torch.tensor(0.0, device=x.device)), **log_kwargs)
             self.log(f'{prefix}/coeff_abs_mean', diag.get("coeff_abs_mean", torch.tensor(0.0, device=x.device)), **log_kwargs)
-            coherence_max, coherence_mean_abs, coherence_rms = self.bottleneck.coherence_stats()
-            self.log(f'{prefix}/dict_coherence', coherence_max, **log_kwargs)
-            self.log(f'{prefix}/dict_coherence_mean_abs', coherence_mean_abs, **log_kwargs)
-            self.log(f'{prefix}/dict_coherence_rms', coherence_rms, **log_kwargs)
+            self.log(f'{prefix}/coeff_clip_frac', diag.get("coeff_clip_frac", torch.tensor(0.0, device=x.device)), **log_kwargs)
         if ssim is not None:
             self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/sparsity', sparsity, **log_kwargs)
@@ -1494,7 +1559,10 @@ class LASER(VisualsMixin, pl.LightningModule):
             x_abs_max = torch.nan_to_num(x).abs().max()
             recon_abs_max = torch.nan_to_num(recon_raw).abs().max()
             coeff_abs_max = torch.nan_to_num(sparse_codes.values).abs().max()
-            coeff_abs_mean = self._dense_coeff_abs_mean(sparse_codes)
+            coeff_abs_mean = (
+                torch.nan_to_num(sparse_codes.values).abs().sum()
+                / self._sparse_coeff_denominator(sparse_codes)
+            )
             nan_frac = (~torch.isfinite(recon_raw)).float().mean()
             diag_kwargs = dict(on_step=True, on_epoch=False, sync_dist=False, prog_bar=False)
             self.log('train/diag/input_abs_max', x_abs_max, **diag_kwargs)
@@ -1503,6 +1571,8 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.log('train/diag/coeff_abs_mean', coeff_abs_mean, **diag_kwargs)
             self.log('train/diag/recon_nan_frac', nan_frac, **diag_kwargs)
         
+        if return_raw:
+            return total_loss, recon_vis, x_vis, recon_raw, x
         return total_loss, recon_vis, x_vis
 
     def training_step(self, batch, batch_idx):
@@ -1517,6 +1587,11 @@ class LASER(VisualsMixin, pl.LightningModule):
         """
         if not self._adversarial_enabled:
             loss, recon, x = self.compute_metrics(batch, prefix='train')
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite train/loss at global_step={int(getattr(self, 'global_step', 0))} "
+                    f"batch_idx={int(batch_idx)}"
+                )
             audio_meta = extract_audio_metadata_from_batch(batch)
             if self._should_log_images(batch_idx, prefix='train'):
                 self.log_images(x, recon, prefix='train', audio_meta=audio_meta)
@@ -1534,6 +1609,11 @@ class LASER(VisualsMixin, pl.LightningModule):
         self._apply_scheduled_lrs(opt_ae, step=step, base_lrs=self._lr_base_lrs)
         self._adv_cache = None
         loss, recon, x = self.compute_metrics(batch, prefix='train')
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite train/loss at global_step={int(getattr(self, 'global_step', 0))} "
+                f"batch_idx={int(batch_idx)}"
+            )
         opt_ae.zero_grad(set_to_none=True)
         self.manual_backward(loss)
         # Mirror on_before_optimizer_step (skipped in manual mode): project the

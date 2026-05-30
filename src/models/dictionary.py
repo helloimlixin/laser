@@ -2,12 +2,13 @@
 
 import math
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .bottleneck_utils import SparseCodes, _normalize_dictionary
 
 
 def _gaussian_kl_to_fixed_mean(
@@ -33,20 +34,6 @@ def _gaussian_kl_to_fixed_mean(
     sq_mean = (mu - target_mean).square()
     kl = 0.5 * ((var + sq_mean) / target_var - 1.0 + math.log(target_var) - logvar)
     return kl.mean()
-
-
-@dataclass
-class SparseCodes:
-    support: torch.Tensor
-    values: torch.Tensor
-    num_embeddings: int
-
-
-def _normalize_dictionary(
-    dictionary: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return F.normalize(torch.nan_to_num(dictionary), p=2, dim=0, eps=eps)
 
 
 def _dictionary_abs_offdiag_cosines(
@@ -105,6 +92,8 @@ class DictionaryLearning(nn.Module):
         variational_coeff_target_std=0.25,
         variational_coeff_min_std=0.01,
         dictionary_through_decoder=False,
+        data_init_from_first_batch=False,
+        dead_atom_revival_steps=0,
         dictionary_update_mode=None,
         dictionary_ksvd_lr=0.2,
         dictionary_ksvd_update_every=1,
@@ -182,6 +171,8 @@ class DictionaryLearning(nn.Module):
         # Off by default to preserve the legacy proto/VQ-style training behavior where
         # the dictionary learns only from ``dl_latent_loss``.
         self.dictionary_through_decoder = bool(dictionary_through_decoder)
+        self.data_init_from_first_batch = bool(data_init_from_first_batch)
+        self.dead_atom_revival_steps = max(0, int(dead_atom_revival_steps or 0))
         if dictionary_update_mode is None:
             dictionary_update_mode = "gradient"
         if dictionary_update_mode not in ("gradient", "usage_ema", "online_ksvd"):
@@ -292,6 +283,7 @@ class DictionaryLearning(nn.Module):
         self.register_buffer("_hann_win", window_flat)
         self.register_buffer("dictionary_usage_ema", torch.zeros(self.num_embeddings))
         self.register_buffer("dictionary_usage_steps", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_data_initialized", torch.tensor(False, dtype=torch.bool))
         self.normalize_dictionary_()
         self._last_diag = {}
         self._last_dl_latent_loss = None
@@ -614,6 +606,102 @@ class DictionaryLearning(nn.Module):
 
     def _distributed_is_initialized(self):
         return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    @torch.no_grad()
+    def _broadcast_dictionary_(self):
+        if self._distributed_is_initialized():
+            torch.distributed.broadcast(self.dictionary.data, src=0)
+
+    @torch.no_grad()
+    def _all_gather_signal_columns(self, signals, *, max_local_columns=2048):
+        """Gather a bounded set of latent signal columns across DDP ranks."""
+        if signals.ndim != 2 or signals.numel() == 0:
+            return signals
+        local = signals.detach()
+        if int(local.size(1)) > int(max_local_columns):
+            idx = torch.linspace(
+                0,
+                int(local.size(1)) - 1,
+                steps=int(max_local_columns),
+                device=local.device,
+            ).round().to(torch.long)
+            local = local.index_select(1, idx)
+        if not self._distributed_is_initialized():
+            return local
+
+        count = torch.tensor([int(local.size(1))], device=local.device, dtype=torch.long)
+        counts = [torch.zeros_like(count) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(counts, count)
+        counts = torch.cat(counts, dim=0)
+        max_count = int(counts.max().item())
+        if max_count <= 0:
+            return local[:, :0]
+        if int(local.size(1)) < max_count:
+            pad = local.new_zeros((int(local.size(0)), max_count - int(local.size(1))))
+            local = torch.cat([local, pad], dim=1)
+
+        gathered = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(gathered, local.contiguous())
+        parts = [part[:, : int(n.item())] for part, n in zip(gathered, counts)]
+        return torch.cat(parts, dim=1) if parts else local[:, :0]
+
+    @torch.no_grad()
+    def _signal_atoms(self, signals, count):
+        if int(count) <= 0 or signals.ndim != 2 or signals.numel() == 0:
+            return None
+        signals = torch.nan_to_num(
+            signals.detach().to(device=self.dictionary.device, dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid = signals.norm(dim=0) > max(float(self.epsilon), 1e-8)
+        if not bool(valid.any()):
+            return None
+        signals = signals[:, valid]
+        num_signals = int(signals.size(1))
+        if num_signals >= int(count):
+            idx = torch.linspace(
+                0,
+                num_signals - 1,
+                steps=int(count),
+                device=signals.device,
+            ).round().to(torch.long)
+        else:
+            idx = torch.arange(int(count), device=signals.device, dtype=torch.long) % num_signals
+        atoms = signals.index_select(1, idx)
+        return _normalize_dictionary(atoms.to(dtype=self.dictionary.dtype), eps=self.epsilon)
+
+    @torch.no_grad()
+    def _maybe_data_initialize_dictionary_(self, signals):
+        if not self.training or not self.data_init_from_first_batch:
+            return
+        if bool(self._data_initialized.item()):
+            return
+        atoms = self._signal_atoms(self._all_gather_signal_columns(signals), self.num_embeddings)
+        if atoms is not None:
+            self.dictionary.copy_(atoms)
+            self.normalize_dictionary_()
+        self._data_initialized.fill_(True)
+        self._broadcast_dictionary_()
+
+    @torch.no_grad()
+    def _maybe_revive_dead_atoms_(self, signals):
+        if not self.training or self.dead_atom_revival_steps <= 0:
+            return
+        usage_steps = int(self.dictionary_usage_steps.item())
+        if usage_steps <= 0 or usage_steps % int(self.dead_atom_revival_steps) != 0:
+            return
+        usage = self.dictionary_usage_ema.to(device=self.dictionary.device)
+        dead = torch.nonzero(usage <= 0, as_tuple=False).flatten()
+        if int(dead.numel()) <= 0:
+            return
+        atoms = self._signal_atoms(self._all_gather_signal_columns(signals), int(dead.numel()))
+        if atoms is None:
+            return
+        self.dictionary[:, dead].copy_(atoms.to(dtype=self.dictionary.dtype))
+        self.normalize_dictionary_()
+        self._broadcast_dictionary_()
 
     @torch.no_grad()
     def _all_gather_ksvd_stats(self, indices, numerator, denominator):
@@ -1096,12 +1184,10 @@ class DictionaryLearning(nn.Module):
           straight-through estimator: the decoder consumes ``z_dl``'s value but
           backprops into ``z_e`` (encoder), not into ``self.dictionary``.
 
-        If ``self.dictionary_through_decoder`` is True (A2 switch), the STE is
-        skipped: decoder gradients flow into the dictionary (and into the
-        ``coeff_variational_*`` modules in the variational branch), at the cost
-        of losing the direct decoder→encoder path. You will likely need to
-        raise ``commitment_cost`` to keep the encoder pinned to the dictionary
-        manifold under this setting.
+        If ``self.dictionary_through_decoder`` is True (A2 switch), a zero-valued
+        dictionary-gradient term is added to the STE. Decoder gradients then flow
+        into both ``z_e`` and the dictionary atoms (and into the
+        ``coeff_variational_*`` modules in the variational branch).
 
         The ``coeff_refine_loss`` term (when ``variational_coeffs=True``) is a
         Gaussian KL whose reference mean is the *data-dependent* OMP
@@ -1130,6 +1216,8 @@ class DictionaryLearning(nn.Module):
             else:
                 grid_h, grid_w, height, width = H, W, H, W
                 signals = z_e_work.permute(0, 2, 3, 1).contiguous().view(-1, C).t()
+            self._maybe_data_initialize_dictionary_(signals)
+            self._maybe_revive_dead_atoms_(signals)
             dictionary = _normalize_dictionary(self.dictionary.float(), eps=max(float(self.epsilon), 1e-8))
             with torch.no_grad():
                 support, values = self.batch_omp_with_support(signals, dictionary)
@@ -1219,6 +1307,7 @@ class DictionaryLearning(nn.Module):
             "coeff_abs_mean": (
                 coeff_abs.sum() / float(self.num_embeddings * num_sites)
             ).detach(),
+            "coeff_active_abs_mean": coeff_abs.mean().detach(),
             "coeff_abs_max": coeff_abs_max,
             "coeff_clip_frac": coeff_clip_frac,
         }
@@ -1226,11 +1315,14 @@ class DictionaryLearning(nn.Module):
         if not self.dictionary_through_decoder:
             # Legacy VQ-style straight-through estimator: decoder loss reaches the
             # encoder but bypasses the dictionary and (in variational mode) the
-            # coeff_variational_* networks. Disable via dictionary_through_decoder=True.
+            # coeff_variational_* networks.
             z_dl_value = z_dl.to(dtype=z_e.dtype)
             z_dl = z_e + (z_dl_value - z_e).detach()
         else:
-            z_dl = z_dl.to(dtype=z_e.dtype)
+            # Preserve the STE encoder path and add a zero-valued dictionary path
+            # so decoder losses train both encoder and dictionary.
+            z_dl_value = z_dl.to(dtype=z_e.dtype)
+            z_dl = z_e + (z_dl_value - z_e).detach() + (z_dl_value - z_dl_value.detach())
         sparse_codes = SparseCodes(
             support=support,
             values=coeffs_for_recon,

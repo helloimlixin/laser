@@ -319,6 +319,8 @@ def _extract_cache(
                 # support: [B, H, W, D] atom ids, values: [B, H, W, D] coeffs
                 flat_atoms = support.view(support.size(0), -1).to(torch.int32).cpu()
                 flat_coeffs = values.view(values.size(0), -1).to(torch.float32).cpu()
+                if not torch.isfinite(flat_coeffs).all():
+                    raise RuntimeError("Sparse coefficient cache contains non-finite values")
                 all_tokens.append(flat_atoms)
                 all_coeffs.append(flat_coeffs)
                 current_shape = (int(support.shape[1]), int(support.shape[2]), int(support.shape[3]))
@@ -469,17 +471,6 @@ def _token_cache_meta(
         "embedding_dim": int(model.bottleneck.embedding_dim),
         "latent_hw": (int(latent_hw[0]), int(latent_hw[1])),
         "coef_max": float(args.coeff_max),
-        "variational_coeffs": bool(getattr(model.bottleneck, "variational_coeffs", False)),
-        # Renamed in May 2026 (A3); see src/models/bottleneck.py docstring.
-        "variational_coeff_refine_weight": float(
-            getattr(model.bottleneck, "variational_coeff_refine_weight", 0.0)
-        ),
-        "variational_coeff_target_std": float(
-            getattr(model.bottleneck, "variational_coeff_target_std", 0.25)
-        ),
-        "variational_coeff_min_std": float(
-            getattr(model.bottleneck, "variational_coeff_min_std", 0.01)
-        ),
         "backbone": backbone,
         "num_downsamples": int(getattr(model, "num_downsamples", getattr(model.hparams, "num_downsamples", 2))),
         "attn_resolutions": attn_resolutions,
@@ -691,6 +682,14 @@ def main():
         payload["audio_meta"] = cache_result["audio_meta"]
     if "coeffs_flat" in cache_result:
         payload["coeffs_flat"] = cache_result["coeffs_flat"]
+        coeffs_flat = payload["coeffs_flat"]
+        if not torch.isfinite(coeffs_flat).all():
+            raise RuntimeError("Refusing to save sparse token cache with non-finite coefficients")
+        coeff_abs_max = float(coeffs_flat.abs().max().item()) if coeffs_flat.numel() > 0 else 0.0
+        if coeff_abs_max <= 1e-12:
+            raise RuntimeError(
+                "Refusing to save degenerate sparse token cache: all coefficients are zero"
+            )
         print(f"Real-valued cache: storing atoms + coefficients (no quantization)")
 
     output_path = Path(args.output_path).expanduser().resolve()

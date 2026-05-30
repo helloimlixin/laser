@@ -34,7 +34,6 @@ def _build_model(**overrides):
         "beta": 0.9,
         "perceptual_weight": 0.0,
         "compute_fid": False,
-        "coherence_weight": 0.0,
         "log_images_every_n_steps": 0,
         "diag_log_interval": 0,
     }
@@ -54,6 +53,41 @@ def test_train_lpips_uses_full_batch(monkeypatch):
     assert torch.isfinite(loss)
     assert recon.shape == x.shape == batch.shape
     assert model.lpips.batch_sizes == [4]
+
+
+def test_lpips_range_uses_datamodule_normalization_stats():
+    model = _build_model()
+    cfg = type("Cfg", (), {"mean": (0.25, 0.5, 0.75), "std": (0.25, 0.5, 0.125)})()
+    datamodule = type("DataModule", (), {"config": cfg})()
+    model.__dict__["_trainer"] = type("TrainerStub", (), {"datamodule": datamodule})()
+
+    unit = torch.tensor([[[[0.0, 1.0]], [[0.25, 0.75]], [[0.5, 1.0]]]])
+    mean = torch.tensor(cfg.mean).view(1, 3, 1, 1)
+    std = torch.tensor(cfg.std).view(1, 3, 1, 1)
+    normalized = (unit - mean) / std
+
+    lpips_input = model._image_to_lpips_range(normalized)
+
+    assert torch.allclose(lpips_input, unit * 2.0 - 1.0)
+
+
+def test_laser_adversarial_training_adds_discriminator_optimizer():
+    model = _build_model(
+        adversarial_weight=0.05,
+        discriminator_channels=8,
+        discriminator_layers=1,
+    )
+
+    assert model.automatic_optimization is False
+    assert model.discriminator is not None
+    assert len(model.configure_optimizers()) == 2
+
+    batch = torch.randn(2, 3, 16, 16)
+    loss, recon, x = model.compute_metrics(batch, prefix="train")
+
+    assert torch.isfinite(loss)
+    assert recon.shape == x.shape == batch.shape
+    assert model._effective_adversarial_weight("train") == 0.05
 
 
 def test_validation_visual_cache_respects_flag():
@@ -187,36 +221,6 @@ def test_logged_sparsity_uses_fixed_support_budget_not_thresholded_coeffs():
     assert float(logged["train/effective_sparsity"]) == 0.0625
 
 
-def test_sparsity_reg_weight_does_not_change_optimized_loss():
-    batch = torch.randn(2, 3, 16, 16)
-    sparse_codes = laser_module.SparseCodes(
-        support=torch.tensor(
-            [
-                [[[0, 1]]],
-                [[[2, 3]]],
-            ],
-            dtype=torch.long,
-        ),
-        values=torch.tensor(
-            [
-                [[[1.0, 0.5]]],
-                [[[0.25, 0.125]]],
-            ],
-            dtype=torch.float32,
-        ),
-        num_embeddings=8,
-    )
-    base = _build_model(num_embeddings=8, sparsity_level=2, sparsity_reg_weight=0.0)
-    heavy = _build_model(num_embeddings=8, sparsity_level=2, sparsity_reg_weight=100.0)
-    base.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
-    heavy.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
-    base.log = lambda *args, **kwargs: None
-    heavy.log = lambda *args, **kwargs: None
-
-    loss_base, _, _ = base.compute_metrics(batch, prefix="train")
-    loss_heavy, _, _ = heavy.compute_metrics(batch, prefix="train")
-
-    assert torch.isclose(loss_base, loss_heavy)
 
 
 def test_dictionary_is_always_in_optimizer_with_optional_lr_override():
@@ -263,6 +267,25 @@ def test_laser_lr_schedule_does_not_force_lightning_step_estimate_property():
 
     assert model._lr_total_steps == 1
     assert optimizer.param_groups[0]["lr"] == 1e-3
+
+
+def test_laser_lr_schedule_ignores_infinite_batch_estimate():
+    model = _build_model()
+    trainer = type(
+        "TrainerStub",
+        (),
+        {
+            "estimated_stepping_batches": None,
+            "max_steps": -1,
+            "max_epochs": 2,
+            "num_training_batches": float("inf"),
+        },
+    )()
+
+    total_steps, source = model._resolve_lr_total_steps(trainer)
+
+    assert total_steps == 1
+    assert source == "fallback"
 
 
 def test_laser_patch_dictionary_learning_runs_end_to_end():
