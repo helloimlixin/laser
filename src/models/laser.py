@@ -75,6 +75,36 @@ def _canonical_channel_multipliers(values) -> Optional[Tuple[int, ...]]:
         raise ValueError(f"channel_multipliers must be positive, got {mults}")
     return mults
 
+
+class PatchDiscriminator(nn.Module):
+    """Small PatchGAN discriminator for image-space adversarial reconstruction."""
+
+    def __init__(self, in_channels: int = 3, base_channels: int = 64, num_layers: int = 3):
+        super().__init__()
+        base_channels = max(8, int(base_channels))
+        num_layers = max(1, int(num_layers))
+        layers: list[nn.Module] = [
+            nn.Conv2d(int(in_channels), base_channels, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        ]
+        channels = base_channels
+        for idx in range(1, num_layers):
+            next_channels = min(base_channels * (2 ** idx), 512)
+            layers.extend(
+                [
+                    nn.Conv2d(channels, next_channels, kernel_size=4, stride=2, padding=1, bias=False),
+                    nn.GroupNorm(num_groups=1, num_channels=next_channels),
+                    nn.LeakyReLU(0.2, inplace=True),
+                ]
+            )
+            channels = next_channels
+        layers.append(nn.Conv2d(channels, 1, kernel_size=3, stride=1, padding=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class LASER(VisualsMixin, pl.LightningModule):
     def __init__(
             self,
@@ -105,6 +135,14 @@ class LASER(VisualsMixin, pl.LightningModule):
             perceptual_weight=1.0,
             perceptual_start_step=0,
             perceptual_warmup_steps=0,
+            adversarial_weight=0.0,
+            adversarial_start_step=0,
+            adversarial_warmup_steps=0,
+            discriminator_learning_rate=None,
+            discriminator_beta1=0.5,
+            discriminator_beta2=0.9,
+            discriminator_channels=64,
+            discriminator_layers=3,
             compute_fid=False,
             fid_feature=2048,
             log_images_every_n_steps=100,
@@ -174,6 +212,14 @@ class LASER(VisualsMixin, pl.LightningModule):
             perceptual_weight: Weight for perceptual loss
             perceptual_start_step: Global step before which LPIPS is disabled
             perceptual_warmup_steps: Linear LPIPS ramp length after perceptual_start_step
+            adversarial_weight: Weight for PatchGAN generator loss. Disabled at 0.
+            adversarial_start_step: Global step before which adversarial loss is disabled
+            adversarial_warmup_steps: Linear adversarial weight ramp length after start
+            discriminator_learning_rate: Optional discriminator LR; defaults to learning_rate
+            discriminator_beta1: Discriminator Adam beta1
+            discriminator_beta2: Discriminator Adam beta2
+            discriminator_channels: Base discriminator channel count
+            discriminator_layers: Number of strided discriminator blocks
             compute_fid: Whether to compute FID
             fid_feature: Inception feature size for reconstruction FID
             log_images_every_n_steps: image logging cadence; 0 disables image logging
@@ -209,6 +255,8 @@ class LASER(VisualsMixin, pl.LightningModule):
         in_channels = int(in_channels)
         if in_channels != 3 and float(perceptual_weight) > 0.0:
             perceptual_weight = 0.0
+        if in_channels != 3 and float(adversarial_weight) > 0.0:
+            adversarial_weight = 0.0
         if in_channels != 3 and bool(compute_fid):
             compute_fid = False
 
@@ -218,6 +266,19 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.perceptual_weight = perceptual_weight
         self.perceptual_start_step = max(int(perceptual_start_step), 0)
         self.perceptual_warmup_steps = max(int(perceptual_warmup_steps), 0)
+        self.adversarial_weight = float(adversarial_weight)
+        self.adversarial_start_step = max(int(adversarial_start_step), 0)
+        self.adversarial_warmup_steps = max(int(adversarial_warmup_steps), 0)
+        self.discriminator_learning_rate = (
+            float(discriminator_learning_rate)
+            if discriminator_learning_rate is not None
+            else float(learning_rate)
+        )
+        self.discriminator_beta1 = float(discriminator_beta1)
+        self.discriminator_beta2 = float(discriminator_beta2)
+        self.discriminator_channels = int(discriminator_channels)
+        self.discriminator_layers = int(discriminator_layers)
+        self.automatic_optimization = not (self.adversarial_weight > 0.0)
         self.log_images_every_n_steps = max(int(log_images_every_n_steps), 0)
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
@@ -419,6 +480,15 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.lpips.eval()
             for p in self.lpips.parameters():
                 p.requires_grad = False
+        self.discriminator = (
+            PatchDiscriminator(
+                in_channels=in_channels,
+                base_channels=self.discriminator_channels,
+                num_layers=self.discriminator_layers,
+            )
+            if self.adversarial_weight > 0.0
+            else None
+        )
 
         # Separate metrics per split to avoid state leakage across train/val/test
         self.train_psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -603,7 +673,13 @@ class LASER(VisualsMixin, pl.LightningModule):
         num_train_batches = getattr(trainer, "num_training_batches", None)
         if max_epochs is not None and num_train_batches is not None:
             try:
-                product = int(max_epochs) * int(num_train_batches)
+                max_epochs_f = float(max_epochs)
+                num_train_batches_f = float(num_train_batches)
+                product = (
+                    int(max_epochs_f) * int(num_train_batches_f)
+                    if math.isfinite(max_epochs_f) and math.isfinite(num_train_batches_f)
+                    else None
+                )
             except (TypeError, ValueError):
                 product = None
             candidates.append(("max_epochs*num_training_batches", product))
@@ -784,6 +860,52 @@ class LASER(VisualsMixin, pl.LightningModule):
             return float(self.perceptual_weight)
         progress = (step - self.perceptual_start_step) / float(max(1, self.perceptual_warmup_steps))
         return float(self.perceptual_weight) * max(0.0, min(1.0, progress))
+
+    def _effective_adversarial_weight(self, prefix: str) -> float:
+        if prefix != "train" or self.adversarial_weight <= 0 or self.discriminator is None:
+            return 0.0
+        step = int(getattr(self, "global_step", 0))
+        if step < self.adversarial_start_step:
+            return 0.0
+        if self.adversarial_warmup_steps <= 0:
+            return float(self.adversarial_weight)
+        progress = (step - self.adversarial_start_step) / float(max(1, self.adversarial_warmup_steps))
+        return float(self.adversarial_weight) * max(0.0, min(1.0, progress))
+
+    def _adversarial_generator_loss(self, recon: torch.Tensor) -> torch.Tensor:
+        if self.discriminator is None:
+            return recon.new_zeros(())
+        return -self.discriminator(recon).mean()
+
+    def _discriminator_hinge_loss(self, real: torch.Tensor, fake: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.discriminator is None:
+            zero = real.new_zeros(())
+            return zero, zero, zero
+        real_logits = self.discriminator(real.detach())
+        fake_logits = self.discriminator(fake.detach())
+        real_loss = F.relu(1.0 - real_logits).mean()
+        fake_loss = F.relu(1.0 + fake_logits).mean()
+        return 0.5 * (real_loss + fake_loss), real_logits.mean(), fake_logits.mean()
+
+    def _set_discriminator_requires_grad(self, enabled: bool) -> None:
+        if self.discriminator is None:
+            return
+        for param in self.discriminator.parameters():
+            param.requires_grad_(enabled)
+
+    @staticmethod
+    def _raw_optimizer(optimizer):
+        return getattr(optimizer, "optimizer", optimizer)
+
+    def _clip_manual_optimizer(self, optimizer) -> None:
+        trainer = self._trainer_ref()
+        clip_val = float(getattr(trainer, "gradient_clip_val", 0.0) or 0.0)
+        if clip_val > 0.0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=clip_val,
+                gradient_clip_algorithm="norm",
+            )
 
     @torch.no_grad()
     def encode_to_tokens(
@@ -1035,7 +1157,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             "audio_multires_profile_loss": profile_loss,
         }
 
-    def compute_metrics(self, batch, prefix='train'):
+    def compute_metrics(self, batch, prefix='train', *, include_adversarial: bool = True, return_raw: bool = False):
         """Compute metrics for a batch."""
         # Get input
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
@@ -1077,11 +1199,17 @@ class LASER(VisualsMixin, pl.LightningModule):
             ).mean()
         else:
             perceptual_loss = recon_raw.new_zeros(())
+        adversarial_weight = self._effective_adversarial_weight(prefix) if include_adversarial else 0.0
+        if adversarial_weight > 0.0 and not is_audio and not is_waveform_audio:
+            adversarial_generator_loss = self._adversarial_generator_loss(recon_raw)
+        else:
+            adversarial_generator_loss = recon_raw.new_zeros(())
 
         total_loss = (
             recon_loss
             + self.bottleneck_loss_weight * bottleneck_loss
             + perceptual_weight * perceptual_loss
+            + adversarial_weight * adversarial_generator_loss
         )
         
         # Compute PSNR/SSIM/rFID on de-normalized image tensors.
@@ -1193,6 +1321,17 @@ class LASER(VisualsMixin, pl.LightningModule):
             recon_raw.new_tensor(float(perceptual_weight)),
             **log_kwargs,
         )
+        self.log(f'{prefix}/adversarial_generator_loss', adversarial_generator_loss, **log_kwargs)
+        self.log(
+            f'{prefix}/weighted_adversarial_generator_loss',
+            adversarial_weight * adversarial_generator_loss,
+            **log_kwargs,
+        )
+        self.log(
+            f'{prefix}/adversarial_weight_effective',
+            recon_raw.new_tensor(float(adversarial_weight)),
+            **log_kwargs,
+        )
         if psnr is not None:
             self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
         if is_audio:
@@ -1275,10 +1414,15 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.log('train/diag/coeff_abs_mean', coeff_abs_mean, **diag_kwargs)
             self.log('train/diag/recon_nan_frac', nan_frac, **diag_kwargs)
         
+        if return_raw:
+            return total_loss, recon_vis, x_vis, recon_raw, x
         return total_loss, recon_vis, x_vis
 
     def training_step(self, batch, batch_idx):
         """Training step."""
+        if not self.automatic_optimization:
+            return self._adversarial_training_step(batch, batch_idx)
+
         loss, recon, x = self.compute_metrics(batch, prefix='train')
         if not torch.isfinite(loss):
             raise FloatingPointError(
@@ -1293,6 +1437,65 @@ class LASER(VisualsMixin, pl.LightningModule):
             self._ddp_barrier_if_needed()
 
         return loss
+
+    def _adversarial_training_step(self, batch, batch_idx):
+        optimizers = self.optimizers()
+        if not isinstance(optimizers, (list, tuple)) or len(optimizers) != 2:
+            raise RuntimeError("Adversarial LASER training expects autoencoder and discriminator optimizers.")
+        opt_ae, opt_disc = optimizers
+
+        self._set_discriminator_requires_grad(False)
+        loss, recon_vis, x_vis, recon_raw, x_raw = self.compute_metrics(
+            batch,
+            prefix='train',
+            include_adversarial=True,
+            return_raw=True,
+        )
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite train/loss at global_step={int(getattr(self, 'global_step', 0))} "
+                f"batch_idx={int(batch_idx)}"
+            )
+
+        opt_ae.zero_grad()
+        self.manual_backward(loss)
+        if not self.bypass_bottleneck:
+            self.bottleneck.project_dictionary_gradient_()
+        self._clip_manual_optimizer(self._raw_optimizer(opt_ae))
+        self._apply_scheduled_lrs(self._raw_optimizer(opt_ae), step=int(getattr(self, "global_step", 0)))
+        opt_ae.step()
+        if not self.bypass_bottleneck:
+            self.bottleneck.normalize_dictionary_()
+
+        self._set_discriminator_requires_grad(True)
+        adv_weight = self._effective_adversarial_weight('train')
+        if adv_weight > 0.0:
+            disc_loss, real_score, fake_score = self._discriminator_hinge_loss(x_raw, recon_raw)
+            if not torch.isfinite(disc_loss):
+                raise FloatingPointError(
+                    f"Non-finite train/discriminator_loss at global_step={int(getattr(self, 'global_step', 0))} "
+                    f"batch_idx={int(batch_idx)}"
+                )
+            opt_disc.zero_grad()
+            self.manual_backward(disc_loss)
+            self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
+            opt_disc.step()
+            disc_log_kwargs = dict(
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+                batch_size=int(x_raw.size(0)),
+            )
+            self.log('train/discriminator_loss', disc_loss, **disc_log_kwargs)
+            self.log('train/discriminator_real_score', real_score, **disc_log_kwargs)
+            self.log('train/discriminator_fake_score', fake_score, **disc_log_kwargs)
+
+        audio_meta = extract_audio_metadata_from_batch(batch)
+        if self._should_log_images(batch_idx, prefix='train'):
+            self.log_images(x_vis, recon_vis, prefix='train', audio_meta=audio_meta)
+            self._ddp_barrier_if_needed()
+
+        return loss.detach()
 
     def validation_step(self, batch, batch_idx):
         """Validation step."""
@@ -1369,6 +1572,13 @@ class LASER(VisualsMixin, pl.LightningModule):
         self._lr_total_steps = total_steps
         self._lr_total_steps_source = source
         self._lr_base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
+        if self.discriminator is not None:
+            discriminator_optimizer = torch.optim.Adam(
+                self.discriminator.parameters(),
+                lr=self.discriminator_learning_rate,
+                betas=(self.discriminator_beta1, self.discriminator_beta2),
+            )
+            return [optimizer, discriminator_optimizer]
         return optimizer
     
     def _maybe_store_val_batch(self, batch):

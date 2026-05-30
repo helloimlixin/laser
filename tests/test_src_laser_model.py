@@ -71,6 +71,25 @@ def test_lpips_range_uses_datamodule_normalization_stats():
     assert torch.allclose(lpips_input, unit * 2.0 - 1.0)
 
 
+def test_laser_adversarial_training_adds_discriminator_optimizer():
+    model = _build_model(
+        adversarial_weight=0.05,
+        discriminator_channels=8,
+        discriminator_layers=1,
+    )
+
+    assert model.automatic_optimization is False
+    assert model.discriminator is not None
+    assert len(model.configure_optimizers()) == 2
+
+    batch = torch.randn(2, 3, 16, 16)
+    loss, recon, x = model.compute_metrics(batch, prefix="train")
+
+    assert torch.isfinite(loss)
+    assert recon.shape == x.shape == batch.shape
+    assert model._effective_adversarial_weight("train") == 0.05
+
+
 def test_validation_visual_cache_respects_flag():
     batch = torch.randn(4, 3, 16, 16)
     disabled = _build_model(enable_val_latent_visuals=False)
@@ -226,6 +245,25 @@ def test_laser_manual_lr_schedule_applies_first_step_without_scheduler():
     model._apply_scheduled_lrs(optimizer, step=0)
 
     assert optimizer.param_groups[0]["lr"] == 1e-5
+
+
+def test_laser_lr_schedule_ignores_infinite_batch_estimate():
+    model = _build_model()
+    trainer = type(
+        "TrainerStub",
+        (),
+        {
+            "estimated_stepping_batches": None,
+            "max_steps": -1,
+            "max_epochs": 2,
+            "num_training_batches": float("inf"),
+        },
+    )()
+
+    total_steps, source = model._resolve_lr_total_steps(trainer)
+
+    assert total_steps == 1
+    assert source == "fallback"
 
 
 def test_laser_patch_dictionary_learning_runs_end_to_end():

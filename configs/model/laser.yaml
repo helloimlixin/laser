@@ -101,6 +101,17 @@ perceptual_weight: 0.0
 perceptual_start_step: 0
 perceptual_warmup_steps: 0
 
+# Optional image-space PatchGAN adversarial loss. Disabled by default because
+# it switches stage-1 LASER to manual optimization with a discriminator.
+adversarial_weight: 0.0
+adversarial_start_step: 0
+adversarial_warmup_steps: 0
+discriminator_learning_rate: null
+discriminator_beta1: 0.5
+discriminator_beta2: 0.9
+discriminator_channels: 64
+discriminator_layers: 3
+
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99
 # 0.9 = standard default
