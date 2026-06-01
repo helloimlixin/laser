@@ -869,6 +869,12 @@ class LASER(VisualsMixin, pl.LightningModule):
         self._apply_scheduled_lrs(optimizer, step=int(getattr(self, "global_step", 0)))
         optimizer.step(closure=optimizer_closure)
         if not self.bypass_bottleneck:
+            # K-SVD atom update (no-op unless dictionary_update_mode == "online_ksvd";
+            # the dictionary is requires_grad=False in that mode, so this is its ONLY
+            # update path on the automatic-optimization route). Mirror the manual path
+            # in _adversarial_training_step, which already calls this. Without it,
+            # online_ksvd freezes the dictionary at its data-init for non-adversarial runs.
+            self.bottleneck.online_ksvd_update_()
             self.bottleneck.normalize_dictionary_()
 
     def _empty_sparse_codes_like(self, z_e: torch.Tensor) -> SparseCodes:
