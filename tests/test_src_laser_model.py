@@ -90,6 +90,25 @@ def test_laser_adversarial_training_adds_discriminator_optimizer():
     assert model._effective_adversarial_weight("train") == 0.05
 
 
+def test_manual_optimizer_clipping_uses_model_side_clip_value():
+    model = _build_model(
+        adversarial_weight=0.05,
+        discriminator_channels=8,
+        discriminator_layers=1,
+    )
+    param = next(model.parameters())
+    for model_param in model.parameters():
+        model_param.grad = None
+    param.grad = torch.full_like(param, 10.0)
+    optimizer = torch.optim.Adam([param], lr=1e-3)
+    model.manual_gradient_clip_val = 0.75
+    model.__dict__["_trainer"] = type("TrainerStub", (), {"gradient_clip_val": 0.0})()
+
+    model._clip_manual_optimizer(optimizer)
+
+    assert param.grad.norm() <= 0.7501
+
+
 def test_validation_visual_cache_respects_flag():
     batch = torch.randn(4, 3, 16, 16)
     disabled = _build_model(enable_val_latent_visuals=False)

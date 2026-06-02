@@ -31,6 +31,11 @@ class DictionaryLearning(nn.Module):
         dead_atom_revival_steps=None,
         dictionary_through_decoder=False,
         data_init_from_first_batch=False,
+        online_ksvd_enabled=False,
+        online_ksvd_max_samples=512,
+        online_ksvd_max_atoms=256,
+        online_ksvd_blend=0.25,
+        online_ksvd_min_coeff=1e-8,
         epsilon=1e-10,
     ):
         super().__init__()
@@ -106,6 +111,35 @@ class DictionaryLearning(nn.Module):
         # training batch's encoder output. Sidesteps OMP's chicken-and-egg cold start
         # (random atoms produce random OMP picks → no meaningful gradient signal).
         self.data_init_from_first_batch = bool(data_init_from_first_batch)
+        self.online_ksvd_enabled = bool(online_ksvd_enabled)
+        self.online_ksvd_max_samples = int(online_ksvd_max_samples)
+        if self.online_ksvd_max_samples < 1:
+            raise ValueError(
+                "online_ksvd_max_samples must be >= 1, got "
+                f"{self.online_ksvd_max_samples}"
+            )
+        self.online_ksvd_max_atoms = int(online_ksvd_max_atoms)
+        if self.online_ksvd_max_atoms < 1:
+            raise ValueError(
+                "online_ksvd_max_atoms must be >= 1, got "
+                f"{self.online_ksvd_max_atoms}"
+            )
+        self.online_ksvd_blend = float(online_ksvd_blend)
+        if (
+            not math.isfinite(self.online_ksvd_blend)
+            or self.online_ksvd_blend <= 0.0
+            or self.online_ksvd_blend > 1.0
+        ):
+            raise ValueError(
+                "online_ksvd_blend must be in (0, 1], got "
+                f"{self.online_ksvd_blend}"
+            )
+        self.online_ksvd_min_coeff = float(online_ksvd_min_coeff)
+        if not math.isfinite(self.online_ksvd_min_coeff) or self.online_ksvd_min_coeff < 0.0:
+            raise ValueError(
+                "online_ksvd_min_coeff must be finite and >= 0, got "
+                f"{self.online_ksvd_min_coeff}"
+            )
         self.register_buffer(
             "_data_initialized",
             torch.zeros((), dtype=torch.bool),
@@ -116,6 +150,8 @@ class DictionaryLearning(nn.Module):
         self._last_dl_latent_loss = None
         self._last_e_latent_loss = None
         self._last_bottleneck_loss = torch.zeros(())
+        self._last_online_ksvd_batch = None
+        self._last_online_ksvd_stats = {}
 
     def normalize_dictionary_(self):
         with torch.no_grad():
@@ -341,6 +377,35 @@ class DictionaryLearning(nn.Module):
             return signals[:, :0]
         return torch.cat(chunks, dim=1)
 
+    def _distributed_concat_rows_for_sampling(self, rows: torch.Tensor) -> torch.Tensor:
+        rows = rows.detach()
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return rows
+
+        world_size = torch.distributed.get_world_size()
+        local_rows = torch.tensor([rows.shape[0]], device=rows.device, dtype=torch.long)
+        gathered_rows = [torch.zeros_like(local_rows) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_rows, local_rows)
+        row_counts = [int(count.item()) for count in gathered_rows]
+        max_rows = max(row_counts) if row_counts else 0
+        if max_rows <= 0:
+            return rows[:0]
+
+        padded_shape = (max_rows, *rows.shape[1:])
+        padded = rows.new_zeros(padded_shape)
+        if rows.shape[0] > 0:
+            padded[: rows.shape[0]] = rows
+        gathered = [torch.empty_like(padded) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, padded)
+        chunks = [
+            chunk[:num_rows]
+            for chunk, num_rows in zip(gathered, row_counts)
+            if num_rows > 0
+        ]
+        if not chunks:
+            return rows[:0]
+        return torch.cat(chunks, dim=0)
+
     def _sample_atoms_from_signals(self, signals: torch.Tensor, count: int) -> torch.Tensor:
         count = int(count)
         if count <= 0:
@@ -416,6 +481,172 @@ class DictionaryLearning(nn.Module):
             sampled = self._sample_atoms_from_signals(signals_for_sampling, num_dead)
         self.dictionary.data[:, dead_mask] = sampled.to(dtype=self.dictionary.dtype)
         self._steps_since_use[dead_mask] = 0
+
+    def _store_online_ksvd_batch(
+        self,
+        signals: torch.Tensor,
+        support: torch.Tensor,
+        values: torch.Tensor,
+    ):
+        if not self.online_ksvd_enabled:
+            return
+        self._last_online_ksvd_batch = (
+            torch.nan_to_num(signals.detach()).to(dtype=torch.float32),
+            support.detach().to(torch.long).reshape(-1, self.sparsity_level),
+            torch.nan_to_num(values.detach()).to(dtype=torch.float32).reshape(-1, self.sparsity_level),
+        )
+
+    @torch.no_grad()
+    def online_ksvd_refresh_(self, signals=None, support=None, values=None):
+        """Run one small online dictionary refresh from sparse-coded signals.
+
+        This is a K-SVD-style atom update with fixed sparse supports. For each
+        used atom we minimize the current residual over the latest mini-batch
+        and blend the normalized atom update into the trainable dictionary. In
+        DDP, rank 0 performs the update from gathered batch data and broadcasts
+        the refreshed dictionary plus scalar diagnostics to all ranks.
+        """
+        if signals is None or support is None or values is None:
+            batch = self._last_online_ksvd_batch
+            if batch is None:
+                return {}
+            signals, support, values = batch
+
+        signals = torch.nan_to_num(signals.detach()).to(
+            device=self.dictionary.device,
+            dtype=torch.float32,
+        )
+        support = support.detach().to(device=self.dictionary.device, dtype=torch.long)
+        values = torch.nan_to_num(values.detach()).to(
+            device=self.dictionary.device,
+            dtype=torch.float32,
+        )
+        support = support.reshape(-1, self.sparsity_level)
+        values = values.reshape(-1, self.sparsity_level)
+
+        if signals.ndim != 2 or int(signals.size(0)) != self.patch_dim:
+            raise ValueError(
+                "online_ksvd_refresh_ expected signals [patch_dim, N], got "
+                f"{tuple(signals.shape)}"
+            )
+        if int(support.size(0)) != int(signals.size(1)) or support.shape != values.shape:
+            raise ValueError(
+                "online_ksvd_refresh_ expected support/values [N, sparsity], got "
+                f"signals={tuple(signals.shape)} support={tuple(support.shape)} "
+                f"values={tuple(values.shape)}"
+            )
+
+        signals = self._distributed_concat_signals_for_sampling(signals)
+        support = self._distributed_concat_rows_for_sampling(support)
+        values = self._distributed_concat_rows_for_sampling(values)
+
+        stats_tensor = torch.zeros(5, device=self.dictionary.device, dtype=torch.float32)
+        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        should_update = (not is_distributed) or torch.distributed.get_rank() == 0
+        if should_update:
+            stats = self._online_ksvd_refresh_local_(signals, support, values)
+            stats_tensor[0] = float(stats.get("applied", 0.0))
+            stats_tensor[1] = float(stats.get("atoms_updated", 0.0))
+            stats_tensor[2] = float(stats.get("relative_atom_delta", 0.0))
+            stats_tensor[3] = float(stats.get("mse_before", 0.0))
+            stats_tensor[4] = float(stats.get("mse_after", 0.0))
+
+        if is_distributed:
+            torch.distributed.broadcast(self.dictionary.data, src=0)
+            torch.distributed.broadcast(stats_tensor, src=0)
+
+        self._last_online_ksvd_batch = None
+        self._last_online_ksvd_stats = {
+            "applied": stats_tensor[0].detach(),
+            "atoms_updated": stats_tensor[1].detach(),
+            "relative_atom_delta": stats_tensor[2].detach(),
+            "mse_before": stats_tensor[3].detach(),
+            "mse_after": stats_tensor[4].detach(),
+        }
+        return self._last_online_ksvd_stats
+
+    @torch.no_grad()
+    def _online_ksvd_refresh_local_(
+        self,
+        signals: torch.Tensor,
+        support: torch.Tensor,
+        values: torch.Tensor,
+    ) -> dict:
+        num_signals = int(signals.size(1))
+        if num_signals <= 0:
+            return {"applied": 0.0}
+        if num_signals > self.online_ksvd_max_samples:
+            idx = torch.randperm(num_signals, device=signals.device)[: self.online_ksvd_max_samples]
+            signals = signals[:, idx]
+            support = support[idx]
+            values = values[idx]
+            num_signals = int(signals.size(1))
+
+        support = support.clamp(0, self.num_embeddings - 1)
+        values = self.clamp_sparse_coeffs(values)
+        code = signals.new_zeros(self.num_embeddings, num_signals)
+        sample_idx = torch.arange(num_signals, device=signals.device).unsqueeze(1)
+        code[support.t(), sample_idx.expand_as(support).t()] = values.t()
+
+        dictionary = _normalize_dictionary(
+            self.dictionary.detach().to(dtype=torch.float32),
+            eps=self.epsilon,
+        )
+        recon = dictionary @ code
+        mse_before = (signals - recon).square().mean()
+        used_atoms = torch.nonzero(code.abs().amax(dim=1) > self.online_ksvd_min_coeff).flatten()
+        if int(used_atoms.numel()) <= 0:
+            return {
+                "applied": 0.0,
+                "atoms_updated": 0.0,
+                "relative_atom_delta": 0.0,
+                "mse_before": float(mse_before.item()),
+                "mse_after": float(mse_before.item()),
+            }
+        if int(used_atoms.numel()) > self.online_ksvd_max_atoms:
+            usage = code[used_atoms].abs().sum(dim=1)
+            top = torch.topk(usage, k=self.online_ksvd_max_atoms, largest=True).indices
+            used_atoms = used_atoms[top]
+
+        old_dictionary = dictionary.clone()
+        atoms_updated = 0
+        blend = float(self.online_ksvd_blend)
+        for atom_idx in used_atoms.tolist():
+            coeff = code[atom_idx]
+            omega = coeff.abs() > self.online_ksvd_min_coeff
+            if int(omega.sum().item()) <= 0:
+                continue
+            coeff_omega = coeff[omega]
+            old_atom = dictionary[:, atom_idx].clone()
+            residual = signals[:, omega] - recon[:, omega] + old_atom.unsqueeze(1) * coeff_omega.unsqueeze(0)
+            denom = coeff_omega.square().sum().clamp_min(self.epsilon)
+            candidate = residual @ coeff_omega / denom
+            candidate_norm = candidate.norm()
+            if not torch.isfinite(candidate_norm) or float(candidate_norm.item()) <= self.epsilon:
+                continue
+            candidate = candidate / candidate_norm.clamp_min(self.epsilon)
+            new_atom = F.normalize(
+                old_atom * (1.0 - blend) + candidate * blend,
+                p=2,
+                dim=0,
+                eps=self.epsilon,
+            )
+            dictionary[:, atom_idx] = new_atom
+            recon[:, omega] += (new_atom - old_atom).unsqueeze(1) * coeff_omega.unsqueeze(0)
+            atoms_updated += 1
+
+        if atoms_updated > 0:
+            self.dictionary.data.copy_(dictionary.to(dtype=self.dictionary.dtype))
+            self.normalize_dictionary_()
+        mse_after = (signals - (_normalize_dictionary(self.dictionary.detach().to(dtype=torch.float32), eps=self.epsilon) @ code)).square().mean()
+        relative_delta = (dictionary - old_dictionary).norm() / old_dictionary.norm().clamp_min(self.epsilon)
+        return {
+            "applied": 1.0,
+            "atoms_updated": float(atoms_updated),
+            "relative_atom_delta": float(relative_delta.item()),
+            "mse_before": float(mse_before.item()),
+            "mse_after": float(mse_after.item()),
+        }
 
     def _is_patch_based(self):
         return self.patch_based
@@ -757,6 +988,7 @@ class DictionaryLearning(nn.Module):
         )
         if self.training and self.dead_atom_revival_steps is not None:
             self._track_atom_usage_and_revive_(support, signals)
+        self._store_online_ksvd_batch(signals, support, values)
 
         z_dl = self._reconstruct_sparse(support, values, height, width)
 

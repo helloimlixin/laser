@@ -260,6 +260,15 @@ def train(cfg: DictConfig):
         )
     
     model = build_stage1_model(cfg.model, cfg.train, cfg.data)
+    trainer_gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 0.0) or 0.0)
+    uses_manual_optimization = not bool(getattr(model, "automatic_optimization", True))
+    if uses_manual_optimization:
+        model.manual_gradient_clip_val = trainer_gradient_clip_val
+        trainer_gradient_clip_val = 0.0
+        print(
+            "Manual optimization detected; disabling Lightning Trainer gradient "
+            f"clipping and using model-side clipping value {model.manual_gradient_clip_val}."
+        )
 
     if ckpt_path:
         # Older checkpoints may contain metric module state such as
@@ -335,6 +344,13 @@ def train(cfg: DictConfig):
     if num_devices <= 1 and strat_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
         strategy_cfg = "auto"
         strat_lower = "auto"
+    if uses_manual_optimization and strat_lower == "ddp":
+        strategy_cfg = "ddp_find_unused_parameters_true"
+        strat_lower = str(strategy_cfg).lower()
+        print(
+            "Manual optimization detected; using "
+            "ddp_find_unused_parameters_true so discriminator-only parameters are allowed."
+        )
     val_check_interval = resolve_val_check_interval(
         datamodule, getattr(cfg.train, "val_check_interval", 1.0)
     )
@@ -351,7 +367,7 @@ def train(cfg: DictConfig):
         logger=wandb_logger,
         callbacks=callbacks,
         precision=cfg.train.precision,
-        gradient_clip_val=cfg.train.gradient_clip_val,
+        gradient_clip_val=trainer_gradient_clip_val,
         log_every_n_steps=cfg.train.log_every_n_steps,
         val_check_interval=val_check_interval,
         limit_train_batches=getattr(cfg.train, "limit_train_batches", 1.0),

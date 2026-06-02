@@ -94,6 +94,15 @@ patch_size: 2
 patch_stride: 2
 patch_reconstruction: tile
 
+# Optional online K-SVD-style dictionary refresh. Disabled by default.
+online_ksvd_enabled: false
+online_ksvd_start_step: 0
+online_ksvd_interval_steps: 0
+online_ksvd_stop_step: null
+online_ksvd_max_samples: 512
+online_ksvd_max_atoms: 256
+online_ksvd_blend: 0.25
+
 # Perceptual loss weight (LPIPS)
 # Keep disabled while validating reconstruction capacity. The scratch reference
 # trains stage 1 with MSE reconstruction only.

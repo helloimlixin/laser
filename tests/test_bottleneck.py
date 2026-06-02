@@ -100,6 +100,38 @@ def test_dictionary_data_sampling_jitters_short_batches_instead_of_duplicates():
     assert float(off_diag.abs().max()) < 0.9999
 
 
+def test_online_ksvd_refresh_reduces_batch_reconstruction_error():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=1,
+        online_ksvd_enabled=True,
+        online_ksvd_blend=1.0,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(
+            torch.tensor(
+                [
+                    [0.8, 0.2],
+                    [0.6, 0.98],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        dl.normalize_dictionary_()
+    signals = torch.eye(2)
+    support = torch.tensor([[0], [1]], dtype=torch.long)
+    values = torch.ones(2, 1)
+
+    before = (signals - dl.dictionary.detach() @ torch.eye(2)).square().mean()
+    stats = dl.online_ksvd_refresh_(signals, support, values)
+    after = (signals - dl.dictionary.detach() @ torch.eye(2)).square().mean()
+
+    assert int(stats["atoms_updated"].item()) == 2
+    assert after < before
+    assert torch.allclose(dl.dictionary.norm(dim=0), torch.ones(2), atol=1e-6)
+
+
 def test_batch_omp_with_coef_max_hard_bounds_coefficients():
     dl = DictionaryLearning(
         num_embeddings=2,
