@@ -260,6 +260,15 @@ def train(cfg: DictConfig):
         )
     
     model = build_stage1_model(cfg.model, cfg.train, cfg.data)
+    trainer_gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 0.0) or 0.0)
+    uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
+    if uses_manual_opt:
+        model.manual_gradient_clip_val = trainer_gradient_clip_val
+        trainer_gradient_clip_val = 0.0
+        print(
+            "Manual optimization active (adversarial); applying gradient clipping "
+            f"inside the model with value {model.manual_gradient_clip_val}."
+        )
 
     if ckpt_path:
         # Older checkpoints may contain metric module state such as
@@ -335,17 +344,18 @@ def train(cfg: DictConfig):
     if num_devices <= 1 and strat_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
         strategy_cfg = "auto"
         strat_lower = "auto"
+    if uses_manual_opt and strat_lower == "ddp":
+        strategy_cfg = "ddp_find_unused_parameters_true"
+        strat_lower = str(strategy_cfg).lower()
+        print(
+            "Manual optimization active (adversarial); using "
+            "ddp_find_unused_parameters_true so discriminator-only parameters are allowed."
+        )
     val_check_interval = resolve_val_check_interval(
         datamodule, getattr(cfg.train, "val_check_interval", 1.0)
     )
     max_steps = int(getattr(cfg.train, "max_steps", -1) or -1)
     trainer_plugins = [LightningEnvironment()] if num_devices > 1 and strat_lower.startswith("ddp") else None
-    # Lightning forbids Trainer-level gradient clipping under manual optimization
-    # (the adversarial path). The model clips internally via grad_clip_val there.
-    uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
-    trainer_grad_clip = None if uses_manual_opt else cfg.train.gradient_clip_val
-    if uses_manual_opt:
-        print("Manual optimization active (adversarial); gradient clipping applied inside the model.")
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,
         max_steps=max_steps,
@@ -357,7 +367,7 @@ def train(cfg: DictConfig):
         logger=wandb_logger,
         callbacks=callbacks,
         precision=cfg.train.precision,
-        gradient_clip_val=trainer_grad_clip,
+        gradient_clip_val=trainer_gradient_clip_val,
         log_every_n_steps=cfg.train.log_every_n_steps,
         val_check_interval=val_check_interval,
         limit_train_batches=getattr(cfg.train, "limit_train_batches", 1.0),

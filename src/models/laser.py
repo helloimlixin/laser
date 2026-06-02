@@ -149,6 +149,13 @@ class LASER(VisualsMixin, pl.LightningModule):
             dictionary_ksvd_update_every=1,
             dictionary_ksvd_min_usage=1,
             dictionary_ksvd_max_atoms_per_step=512,
+            online_ksvd_enabled=False,
+            online_ksvd_start_step=0,
+            online_ksvd_interval_steps=0,
+            online_ksvd_stop_step=None,
+            online_ksvd_max_samples=512,
+            online_ksvd_max_atoms=256,
+            online_ksvd_blend=0.25,
             bottleneck_type="dictionary",
             rq_code_depth=4,
             rq_shared_codebook=True,
@@ -309,6 +316,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.discriminator_channels = int(discriminator_channels)
         self.discriminator_layers = int(discriminator_layers)
         self.automatic_optimization = True
+        self.manual_gradient_clip_val = None
         self.log_images_every_n_steps = max(int(log_images_every_n_steps), 0)
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
@@ -349,6 +357,12 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.codebook_visual_max_vectors = max(1, int(codebook_visual_max_vectors))
         self.warmup_steps = max(int(warmup_steps), 0)
         self.min_lr_ratio = float(min_lr_ratio)
+        self.online_ksvd_enabled = bool(online_ksvd_enabled)
+        self.online_ksvd_start_step = max(int(online_ksvd_start_step), 0)
+        self.online_ksvd_interval_steps = max(int(online_ksvd_interval_steps), 0)
+        self.online_ksvd_stop_step = (
+            None if online_ksvd_stop_step is None else max(int(online_ksvd_stop_step), 0)
+        )
         self.adversarial_weight = float(adversarial_weight)
         self.disc_start_step = max(int(disc_start_step), 0)
         self.disc_num_layers = max(int(disc_num_layers), 1)
@@ -367,6 +381,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         # In manual optimization Lightning refuses Trainer-level gradient
         # clipping, so the adversarial path applies it itself with this value.
         self.grad_clip_val = float(grad_clip_val or 0.0)
+        self.manual_gradient_clip_val = self.grad_clip_val
         self.backbone = _canonical_backbone(backbone)
         self.resolution = None if resolution is None else int(resolution)
         self.num_downsamples = int(num_downsamples)
@@ -517,6 +532,10 @@ class LASER(VisualsMixin, pl.LightningModule):
                 dictionary_ksvd_update_every=dictionary_ksvd_update_every,
                 dictionary_ksvd_min_usage=dictionary_ksvd_min_usage,
                 dictionary_ksvd_max_atoms_per_step=dictionary_ksvd_max_atoms_per_step,
+                online_ksvd_enabled=online_ksvd_enabled,
+                online_ksvd_max_samples=online_ksvd_max_samples,
+                online_ksvd_max_atoms=online_ksvd_max_atoms,
+                online_ksvd_blend=online_ksvd_blend,
             )
         elif bottleneck_type == "rq":
             from .rq_bottleneck import RQBottleneck
@@ -866,7 +885,8 @@ class LASER(VisualsMixin, pl.LightningModule):
         # Renormalize after the step: Lightning runs zero_grad (and on_before_zero_grad)
         # after forward but before backward inside the optimizer closure, so in-place
         # dictionary updates there break autograd for the current batch.
-        self._apply_scheduled_lrs(optimizer, step=int(getattr(self, "global_step", 0)))
+        step = int(getattr(self, "global_step", 0))
+        self._apply_scheduled_lrs(optimizer, step=step)
         optimizer.step(closure=optimizer_closure)
         if not self.bypass_bottleneck:
             # K-SVD atom update (no-op unless dictionary_update_mode == "online_ksvd";
@@ -876,6 +896,35 @@ class LASER(VisualsMixin, pl.LightningModule):
             # online_ksvd freezes the dictionary at its data-init for non-adversarial runs.
             self.bottleneck.online_ksvd_update_()
             self.bottleneck.normalize_dictionary_()
+            self._maybe_online_ksvd_refresh(step=step)
+
+    def _maybe_online_ksvd_refresh(self, *, step: int):
+        if (
+            self.bypass_bottleneck
+            or self.bottleneck_type != "dictionary"
+            or not self.online_ksvd_enabled
+            or self.online_ksvd_interval_steps <= 0
+            or not getattr(self.bottleneck, "online_ksvd_enabled", False)
+        ):
+            return
+        step = int(step)
+        if step < self.online_ksvd_start_step:
+            return
+        if self.online_ksvd_stop_step is not None and step > self.online_ksvd_stop_step:
+            return
+        if step % self.online_ksvd_interval_steps != 0:
+            return
+
+        stats = self.bottleneck.online_ksvd_refresh_()
+        if not stats:
+            return
+        log_kwargs = dict(on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+        for name, value in stats.items():
+            if torch.is_tensor(value):
+                metric = value.to(device=self.device, dtype=torch.float32)
+            else:
+                metric = torch.tensor(float(value), device=self.device)
+            self.log(f"train/online_ksvd_{name}", metric, **log_kwargs)
 
     def _empty_sparse_codes_like(self, z_e: torch.Tensor) -> SparseCodes:
         batch_size, _, height, width = z_e.shape
@@ -1010,13 +1059,19 @@ class LASER(VisualsMixin, pl.LightningModule):
 
     def _clip_manual_optimizer(self, optimizer) -> None:
         trainer = self._trainer_ref()
-        clip_val = float(getattr(trainer, "gradient_clip_val", 0.0) or 0.0)
+        clip_val = getattr(self, "manual_gradient_clip_val", None)
+        if clip_val is None:
+            clip_val = getattr(trainer, "gradient_clip_val", 0.0)
+        clip_val = float(clip_val or 0.0)
         if clip_val > 0.0:
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=clip_val,
-                gradient_clip_algorithm="norm",
-            )
+            params = [
+                param
+                for group in optimizer.param_groups
+                for param in group["params"]
+                if param.grad is not None
+            ]
+            if params:
+                torch.nn.utils.clip_grad_norm_(params, max_norm=clip_val, norm_type=2.0)
 
     @torch.no_grad()
     def encode_to_tokens(
@@ -1626,15 +1681,13 @@ class LASER(VisualsMixin, pl.LightningModule):
         # dictionary gradient before stepping only the autoencoder optimizer.
         if not self.bypass_bottleneck:
             self.bottleneck.project_dictionary_gradient_()
-        if self.grad_clip_val > 0:
-            self.clip_gradients(
-                opt_ae, gradient_clip_val=self.grad_clip_val, gradient_clip_algorithm="norm"
-            )
+        self._clip_manual_optimizer(self._raw_optimizer(opt_ae))
         opt_ae.step()
         # Mirror the automatic optimizer_step post-update dictionary maintenance.
         if not self.bypass_bottleneck:
             self.bottleneck.online_ksvd_update_()
             self.bottleneck.normalize_dictionary_()
+            self._maybe_online_ksvd_refresh(step=step)
 
         # --- Discriminator update (reuses the cached forward) ---
         if self._adv_cache is not None and step >= self.disc_start_step:
@@ -1647,10 +1700,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             d_loss = factor * d_loss
             opt_disc.zero_grad(set_to_none=True)
             self.manual_backward(d_loss)
-            if self.grad_clip_val > 0:
-                self.clip_gradients(
-                    opt_disc, gradient_clip_val=self.grad_clip_val, gradient_clip_algorithm="norm"
-                )
+            self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
             opt_disc.step()
             d_log = dict(on_step=True, on_epoch=False, sync_dist=True, batch_size=int(x.size(0)))
             self.log('train/disc_loss', d_loss, prog_bar=True, **d_log)
