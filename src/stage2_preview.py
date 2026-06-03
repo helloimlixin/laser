@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import lightning as pl
 import numpy as np
@@ -22,6 +23,95 @@ from src.stage2_compat import (
     load_stage1_decoder_bundle as load_s1,
 )
 from src.wandb_media import log_wandb_images, log_wandb_payload
+
+
+def _format_variant_number(value: float) -> str:
+    return f"{float(value):.3g}".replace("-", "m").replace(".", "p")
+
+
+def _sanitize_sample_variant_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.=-]+", "_", str(name).strip())
+    return cleaned.strip("_") or "sample"
+
+
+def _parse_variant_float(value) -> float:
+    return float(str(value).replace("p", "."))
+
+
+def _sample_variant_from_spec(spec, *, fallback_ctemp, fallback_cmode) -> dict[str, object]:
+    if isinstance(spec, Mapping):
+        temp = spec.get("temperature", spec.get("temp", spec.get("t")))
+        top_k = spec.get("top_k", spec.get("topk", spec.get("k")))
+        if temp is None or top_k is None:
+            raise ValueError(f"Sample variant mappings need temperature/temp and top_k/topk fields: {spec!r}")
+        ctemp = spec.get("coeff_temperature", spec.get("ctemp", fallback_ctemp))
+        cmode = spec.get("coeff_mode", spec.get("cmode", fallback_cmode))
+        name = spec.get("name")
+    else:
+        raw = str(spec).strip()
+        match_temp = re.search(r"(?:temperature|temp|t)[_=\-]?([0-9]+(?:[p.][0-9]+)?)", raw, re.I)
+        match_top_k = re.search(r"(?:top[_\-]?k|topk|k)[_=\-]?([0-9]+)", raw, re.I)
+        if match_temp is None or match_top_k is None:
+            raise ValueError(
+                "Sample variant strings must look like 't0p60_k32' or "
+                f"'temp0.60_topk32', got {raw!r}"
+            )
+        temp = _parse_variant_float(match_temp.group(1))
+        top_k = int(match_top_k.group(1))
+        ctemp = fallback_ctemp
+        cmode = fallback_cmode
+        name = raw
+
+    temp_f = float(temp)
+    top_k_i = int(top_k)
+    if name is None or str(name).strip() == "":
+        name = f"t{_format_variant_number(temp_f)}_k{top_k_i}"
+    return {
+        "name": _sanitize_sample_variant_name(str(name)),
+        "temp": temp_f,
+        "top_k": top_k_i,
+        "ctemp": None if ctemp is None else float(ctemp),
+        "cmode": None if cmode is None else str(cmode).strip().lower(),
+    }
+
+
+def _resolve_sample_variants(
+    specs,
+    *,
+    temp: float,
+    top_k: int,
+    ctemp,
+    cmode,
+) -> list[dict[str, object]]:
+    if specs is None or specs == "":
+        return [
+            {
+                "name": "",
+                "temp": float(temp),
+                "top_k": int(top_k),
+                "ctemp": None if ctemp is None else float(ctemp),
+                "cmode": None if cmode is None else str(cmode).strip().lower(),
+            }
+        ]
+    if isinstance(specs, str):
+        raw_specs = [item.strip() for item in specs.split(",") if item.strip()]
+    elif isinstance(specs, Mapping):
+        raw_specs = [specs]
+    else:
+        raw_specs = list(specs)
+    variants = [
+        _sample_variant_from_spec(item, fallback_ctemp=ctemp, fallback_cmode=cmode)
+        for item in raw_specs
+    ]
+    if not variants:
+        raise ValueError("sample_variants was provided but no valid variants were found")
+    seen: set[str] = set()
+    for variant in variants:
+        name = str(variant["name"])
+        if name in seen:
+            raise ValueError(f"Duplicate sample variant name: {name}")
+        seen.add(name)
+    return variants
 
 
 def _prior_token_shape(mod: pl.LightningModule, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -341,19 +431,27 @@ def _load_image_for_wandb(path: Path):
         return str(path)
 
 
-def _log_sparse_visuals(logger, visual_paths: dict[str, Path], *, step: int, caption: str) -> None:
+def _log_sparse_visuals(
+    logger,
+    visual_paths: dict[str, Path],
+    *,
+    step: int,
+    caption: str,
+    variant_name: str = "",
+) -> None:
+    suffix = f"/{variant_name}" if variant_name else ""
     for name, path in visual_paths.items():
         image = _load_image_for_wandb(path)
         log_wandb_images(
             logger,
-            f"generation/{name}",
+            f"generation/{name}{suffix}",
             [image],
             step=step,
             captions=[caption],
         )
         log_wandb_images(
             logger,
-            f"s2/{name}",
+            f"s2/{name}{suffix}",
             [image],
             step=step,
             captions=[caption],
@@ -393,6 +491,7 @@ class Stage2SamplePreviewCallback(pl.Callback):
         top_k: int = 0,
         ctemp=None,
         cmode: Optional[str] = None,
+        sample_variants=None,
         s1_root: str = "outputs",
         use_wandb: bool = False,
     ):
@@ -406,6 +505,13 @@ class Stage2SamplePreviewCallback(pl.Callback):
         self.top_k = int(top_k)
         self.ctemp = None if ctemp is None else float(ctemp)
         self.cmode = None if cmode is None else str(cmode).strip().lower()
+        self.sample_variants = _resolve_sample_variants(
+            sample_variants,
+            temp=self.temp,
+            top_k=self.top_k,
+            ctemp=self.ctemp,
+            cmode=self.cmode,
+        )
         self.s1_root = str(s1_root)
         self.use_wandb = bool(use_wandb)
         self._last_step = -1
@@ -445,7 +551,16 @@ class Stage2SamplePreviewCallback(pl.Callback):
         else:
             self._s1.model = self._s1.model.to(dev)
 
-    def _log(self, trainer: pl.Trainer, *, step: int, epoch: Optional[int], direct: Path, batch=None):
+    def _log(
+        self,
+        trainer: pl.Trainer,
+        *,
+        step: int,
+        epoch: Optional[int],
+        direct: Path,
+        batch=None,
+        variant_name: str = "",
+    ):
         if not self.use_wandb:
             return
         logger = getattr(trainer, "logger", None)
@@ -458,19 +573,22 @@ class Stage2SamplePreviewCallback(pl.Callback):
         bits = [f"step={step}"]
         if epoch is not None:
             bits.append(f"epoch={epoch}")
+        if variant_name:
+            bits.append(f"variant={variant_name}")
         cap = " ".join(bits)
         log_images = direct.is_file() and direct.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        suffix = f"/{variant_name}" if variant_name else ""
         if log_images:
             log_wandb_images(
                 logger,
-                "generation/samples",
+                f"generation/samples{suffix}",
                 [_load_image_for_wandb(direct)],
                 step=step,
                 captions=[cap],
             )
             log_wandb_images(
                 logger,
-                "s2/samples",
+                f"s2/samples{suffix}",
                 [_load_image_for_wandb(direct)],
                 step=step,
                 captions=[cap],
@@ -510,45 +628,70 @@ class Stage2SamplePreviewCallback(pl.Callback):
         full_shape = tuple(int(v) for v in self._shape)
         was_training = bool(mod.training)
         mod.eval()
+        stem = f"s{step:07d}" if epoch is None else f"e{epoch:03d}_s{step:07d}"
+        saved_paths: list[Path] = []
         try:
-            batch = _sample_for_preview(
-                mod,
-                self._s1,
-                prior_shape=shape,
-                full_shape=full_shape,
-                n=self.n,
-                temp=self.temp,
-                top_k=self.top_k,
-                ctemp=self.ctemp,
-                cmode=self.cmode,
-                dev=dev,
-            )
+            for variant in self.sample_variants:
+                variant_name = str(variant["name"])
+                variant_stem = f"{stem}_{variant_name}" if variant_name else stem
+                batch = _sample_for_preview(
+                    mod,
+                    self._s1,
+                    prior_shape=shape,
+                    full_shape=full_shape,
+                    n=self.n,
+                    temp=float(variant["temp"]),
+                    top_k=int(variant["top_k"]),
+                    ctemp=variant["ctemp"],
+                    cmode=variant["cmode"],
+                    dev=dev,
+                )
+                if _is_waveform_samples(batch.imgs):
+                    cache_meta = self._cache.get("meta", {}) if isinstance(self._cache, dict) else {}
+                    sample_rate = int(audio_config_from_source(cache_meta)["sample_rate"])
+                    direct = _save_waveform_samples(
+                        batch.imgs,
+                        self.out_dir,
+                        stem=variant_stem,
+                        sample_rate=sample_rate,
+                    )
+                else:
+                    direct = save_grid(batch.imgs, self.out_dir, stem=variant_stem)
+                    visual_paths = _build_sparse_visuals(batch, self._cache, self.out_dir, stem=variant_stem)
+                    if self.use_wandb and trainer.is_global_zero:
+                        logger = getattr(trainer, "logger", None)
+                        log_step = int(step) + 1 if epoch is not None else int(step)
+                        cap = (
+                            f"step={int(step)}"
+                            if epoch is None
+                            else f"step={log_step} epoch={int(epoch)}"
+                        )
+                        if variant_name:
+                            cap = f"{cap} variant={variant_name}"
+                        _log_sparse_visuals(
+                            logger,
+                            visual_paths,
+                            step=log_step,
+                            caption=cap,
+                            variant_name=variant_name,
+                        )
+                self._log(
+                    trainer,
+                    step=step,
+                    epoch=epoch,
+                    direct=direct,
+                    batch=batch,
+                    variant_name=variant_name,
+                )
+                saved_paths.append(direct)
         finally:
             if was_training:
                 mod.train()
-
-        stem = f"s{step:07d}" if epoch is None else f"e{epoch:03d}_s{step:07d}"
-        if _is_waveform_samples(batch.imgs):
-            cache_meta = self._cache.get("meta", {}) if isinstance(self._cache, dict) else {}
-            sample_rate = int(audio_config_from_source(cache_meta)["sample_rate"])
-            direct = _save_waveform_samples(batch.imgs, self.out_dir, stem=stem, sample_rate=sample_rate)
-        else:
-            direct = save_grid(batch.imgs, self.out_dir, stem=stem)
-            visual_paths = _build_sparse_visuals(batch, self._cache, self.out_dir, stem=stem)
-            if self.use_wandb and trainer.is_global_zero:
-                logger = getattr(trainer, "logger", None)
-                log_step = int(step) + 1 if epoch is not None else int(step)
-                cap = (
-                    f"step={int(step)}"
-                    if epoch is None
-                    else f"step={log_step} epoch={int(epoch)}"
-                )
-                _log_sparse_visuals(logger, visual_paths, step=log_step, caption=cap)
-        self._log(trainer, step=step, epoch=epoch, direct=direct, batch=batch)
+        joined = ", ".join(str(path) for path in saved_paths)
         if epoch is None:
-            print(f"Saved s2 samples at step {step}: {direct}")
+            print(f"Saved s2 samples at step {step}: {joined}")
         else:
-            print(f"Saved s2 samples at epoch {epoch}, step {step}: {direct}")
+            print(f"Saved s2 samples at epoch {epoch}, step {step}: {joined}")
 
     def on_train_batch_end(self, trainer, mod, outputs, batch, batch_idx):
         if self.step_every <= 0:

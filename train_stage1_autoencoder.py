@@ -193,6 +193,8 @@ def train(cfg: DictConfig):
     print(f"Adversarial Weight: {float(getattr(cfg.model, 'adversarial_weight', 0.0))}")
     print(f"Adversarial Start Step: {int(getattr(cfg.model, 'adversarial_start_step', 0))}")
     print(f"Adversarial Warmup Steps: {int(getattr(cfg.model, 'adversarial_warmup_steps', 0))}")
+    print(f"Adversarial Start Recon MSE: {getattr(cfg.model, 'adversarial_start_recon_mse', None)}")
+    print(f"Adversarial Quality EMA Decay: {float(getattr(cfg.model, 'adversarial_quality_ema_decay', 0.99))}")
     print(f"Beta: {cfg.train.beta}")
     print(f"Max Epochs: {cfg.train.max_epochs}")
     print(f"Max Steps: {getattr(cfg.train, 'max_steps', -1)}")

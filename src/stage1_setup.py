@@ -253,6 +253,8 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "adversarial_weight": float(_cfg_get(model_cfg, "adversarial_weight", 0.0)),
         "adversarial_start_step": int(_cfg_get(model_cfg, "adversarial_start_step", 0)),
         "adversarial_warmup_steps": int(_cfg_get(model_cfg, "adversarial_warmup_steps", 0)),
+        "adversarial_start_recon_mse": _cfg_get(model_cfg, "adversarial_start_recon_mse", None),
+        "adversarial_quality_ema_decay": float(_cfg_get(model_cfg, "adversarial_quality_ema_decay", 0.99)),
         "discriminator_learning_rate": _cfg_get(model_cfg, "discriminator_learning_rate", None),
         "discriminator_beta1": float(_cfg_get(model_cfg, "discriminator_beta1", 0.5)),
         "discriminator_beta2": float(_cfg_get(model_cfg, "discriminator_beta2", 0.9)),

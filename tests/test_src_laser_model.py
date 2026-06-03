@@ -90,6 +90,37 @@ def test_laser_adversarial_training_adds_discriminator_optimizer():
     assert model._effective_adversarial_weight("train") == 0.05
 
 
+def test_laser_adversarial_quality_gate_waits_for_reconstruction_mse():
+    model = _build_model(
+        adversarial_weight=0.05,
+        adversarial_start_recon_mse=0.01,
+        adversarial_quality_ema_decay=0.0,
+        discriminator_channels=8,
+        discriminator_layers=1,
+    )
+    batch = torch.zeros(2, 3, 16, 16)
+    sparse_codes = laser_module.SparseCodes(
+        support=torch.zeros(2, 1, 1, 1, dtype=torch.long),
+        values=torch.ones(2, 1, 1, 1),
+        num_embeddings=model.hparams.num_embeddings,
+    )
+
+    assert model._effective_adversarial_weight("train") == 0.0
+    model.forward = lambda x: (x + 0.2, x.new_zeros(()), sparse_codes)
+    loss, recon, target = model.compute_metrics(batch, prefix="train")
+
+    assert torch.isfinite(loss)
+    assert recon.shape == target.shape == batch.shape
+    assert model._effective_adversarial_weight("train") == 0.0
+
+    model.forward = lambda x: (x, x.new_zeros(()), sparse_codes)
+    loss, recon, target = model.compute_metrics(batch, prefix="train")
+
+    assert torch.isfinite(loss)
+    assert recon.shape == target.shape == batch.shape
+    assert model._effective_adversarial_weight("train") == 0.05
+
+
 def test_manual_optimizer_clipping_uses_model_side_clip_value():
     model = _build_model(
         adversarial_weight=0.05,

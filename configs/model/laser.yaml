@@ -115,6 +115,11 @@ perceptual_warmup_steps: 0
 adversarial_weight: 0.0
 adversarial_start_step: 0
 adversarial_warmup_steps: 0
+# Optional quality gate for adversarial training. When set, PatchGAN generator
+# and discriminator updates stay disabled until the train reconstruction-MSE
+# EMA is <= this threshold.
+adversarial_start_recon_mse: null
+adversarial_quality_ema_decay: 0.99
 discriminator_learning_rate: null
 discriminator_beta1: 0.5
 discriminator_beta2: 0.9
