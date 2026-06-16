@@ -33,7 +33,7 @@ from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, Ri
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.plugins.environments import LightningEnvironment
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from src.data.token_cache import TokenCacheDataModule
 from src.models.sparse_token_prior import (
@@ -73,6 +73,14 @@ STAGE2_MODE = "stage2_transformer_generation"
 
 def _default_stage2_run_name() -> str:
     return "stage2-transformer"
+
+
+def _optional_container(value):
+    if value is None:
+        return None
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
 
 
 def arch_name(raw) -> str:
@@ -338,6 +346,7 @@ def main(cfg: DictConfig):
     step_every = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
     epoch_every = int(getattr(cfg.train_ar, "sample_every_n_epochs", 0) or 0)
     sample_out_dir = os.path.join(cfg.output_dir, "samples", f"s2_{stamp}")
+    sample_variants = _optional_container(getattr(cfg.train_ar, "sample_variants", None))
     if step_every > 0 or epoch_every > 0:
         cbs.append(
             Stage2SamplePreviewCallback(
@@ -350,6 +359,7 @@ def main(cfg: DictConfig):
                 top_k=int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
                 ctemp=getattr(cfg.train_ar, "sample_coeff_temperature", cfg.ar.sample_coeff_temperature),
                 cmode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
+                sample_variants=sample_variants,
                 s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
                 use_wandb=bool(getattr(cfg.train_ar, "sample_log_to_wandb", False)),
             )

@@ -178,6 +178,16 @@ audio_mel_n_mels: 80
 use_adaptive_disc_weight: true
 disc_factor: 1.0
 disc_weight_max: 10000.0
+# Optional quality gate for adversarial training. When set, PatchGAN generator
+# and discriminator updates stay disabled until the train reconstruction-MSE
+# EMA is <= this threshold.
+adversarial_start_recon_mse: null
+adversarial_quality_ema_decay: 0.99
+discriminator_learning_rate: null
+discriminator_beta1: 0.5
+discriminator_beta2: 0.9
+discriminator_channels: 64
+discriminator_layers: 3
 
 # Beta1 parameter for Adam/AdamW optimizer
 # Typical range: 0.5-0.99

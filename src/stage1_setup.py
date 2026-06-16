@@ -268,6 +268,8 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "audio_disc_num_scales": int(_cfg_get(model_cfg, "audio_disc_num_scales", 3)),
         "audio_disc_max_channels": int(_cfg_get(model_cfg, "audio_disc_max_channels", 512)),
         "audio_disc_stft_fft_sizes": tuple(_cfg_get(model_cfg, "audio_disc_stft_fft_sizes", ())),
+        "adversarial_start_recon_mse": _cfg_get(model_cfg, "adversarial_start_recon_mse", None),
+        "adversarial_quality_ema_decay": float(_cfg_get(model_cfg, "adversarial_quality_ema_decay", 0.99)),
         "discriminator_learning_rate": _cfg_get(model_cfg, "discriminator_learning_rate", None),
         "discriminator_beta1": float(_cfg_get(model_cfg, "discriminator_beta1", 0.5)),
         "discriminator_beta2": float(_cfg_get(model_cfg, "discriminator_beta2", 0.9)),
