@@ -1,0 +1,11 @@
+dataset: imagenet
+data_dir: ${oc.env:IMAGENET_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/imagenet}
+batch_size: 8
+eval_batch_size: null
+num_workers: 8
+image_size: 256
+train_crop_size: null
+seed: ${seed}
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
+augment: true

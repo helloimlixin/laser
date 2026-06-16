@@ -134,3 +134,13 @@ def test_adaptive_weight_is_nonnegative_and_detached():
     w = model._adaptive_disc_weight(recon_loss, g_loss)
     assert w.item() >= 0.0
     assert not w.requires_grad
+
+
+def test_logit_mean_accepts_multiscale_audio_outputs():
+    logits = [
+        torch.full((2, 1, 8), 1.0),
+        torch.full((2, 1, 4, 3), 3.0),
+    ]
+    reduced = LASER._logits_mean(logits)
+    assert reduced.shape == ()
+    assert reduced.item() == torch.tensor(2.0).item()

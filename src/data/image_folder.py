@@ -10,7 +10,7 @@ from src.data.celeba import FlatImageDataset
 from src.data.config import DataConfig
 
 
-PAPER_IMAGE_FOLDER_DATASETS = {"ffhq", "lsun_bedroom", "lsun_church", "lsun_cat"}
+PAPER_IMAGE_FOLDER_DATASETS = {"ffhq", "imagenet", "lsun_bedroom", "lsun_church", "lsun_cat"}
 
 
 def normalize_image_folder_dataset_name(name: str) -> str:
@@ -121,6 +121,13 @@ class ImageFolderDataModule(pl.LightningDataModule):
                 return candidate
         return None
 
+    @staticmethod
+    def _class_to_idx(root: Path) -> Optional[dict[str, int]]:
+        class_names = sorted(path.name for path in root.iterdir() if path.is_dir())
+        if not class_names:
+            return None
+        return {name: idx for idx, name in enumerate(class_names)}
+
     def prepare_data(self):
         pass
 
@@ -134,11 +141,21 @@ class ImageFolderDataModule(pl.LightningDataModule):
         test_dir = self._first_existing_dir(root, ("test", "testing"))
 
         if train_dir is not None and val_dir is not None:
-            self.train_dataset = FlatImageDataset(train_dir, transform=self._train_transform())
-            self.val_dataset = FlatImageDataset(val_dir, transform=self._eval_transform())
+            class_to_idx = self._class_to_idx(train_dir)
+            self.train_dataset = FlatImageDataset(
+                train_dir,
+                transform=self._train_transform(),
+                class_to_idx=class_to_idx,
+            )
+            self.val_dataset = FlatImageDataset(
+                val_dir,
+                transform=self._eval_transform(),
+                class_to_idx=class_to_idx,
+            )
             self.test_dataset = FlatImageDataset(
                 test_dir if test_dir is not None else val_dir,
                 transform=self._eval_transform(),
+                class_to_idx=class_to_idx,
             )
             return
 

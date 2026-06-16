@@ -85,6 +85,53 @@ def test_dictionary_learning_normalizes_and_projects_dictionary():
     )
 
 
+def test_separable_dictionary_composes_low_rank_patch_dictionary():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=16,
+        embedding_dim=2,
+        sparsity_level=2,
+        patch_based=True,
+        patch_size=2,
+        patch_stride=2,
+        separable_dictionary_rank=2,
+        separable_dictionary_factor_dims=[2, 2, 4],
+    )
+    dictionary = dl.effective_dictionary()
+
+    assert dl.dictionary.requires_grad is False
+    assert dictionary.shape == (8, 16)
+    assert torch.allclose(dictionary.norm(dim=0), torch.ones(16), atol=1e-5)
+
+    z = torch.randn(1, 2, 4, 4, requires_grad=True)
+    z_out, loss, sparse_codes = dl(z)
+    (z_out.mean() + loss).backward()
+
+    assert z_out.shape == z.shape
+    assert torch.isfinite(loss)
+    assert sparse_codes.support.shape == (1, 2, 2, 2)
+    assert dl.dictionary.grad is None
+    factor_grads = [factor.grad for factor in dl.separable_dictionary_factors]
+    assert all(grad is not None for grad in factor_grads)
+    assert sum(float(grad.abs().sum()) for grad in factor_grads if grad is not None) > 0.0
+
+
+def test_separable_dictionary_auto_factor_dims_multiply_to_vocab_size():
+    dl = DictionaryLearning(
+        num_embeddings=8192,
+        embedding_dim=16,
+        sparsity_level=2,
+        patch_based=True,
+        patch_size=8,
+        patch_stride=8,
+        separable_dictionary_rank=1,
+    )
+
+    factor_dims = dl.separable_dictionary_factor_dims
+    assert factor_dims[0] * factor_dims[1] * factor_dims[2] == dl.num_embeddings
+    assert dl.effective_dictionary().shape == (16 * 8 * 8, 8192)
+
+
 def test_dictionary_data_sampling_jitters_short_batches_instead_of_duplicates():
     torch.manual_seed(0)
     dl = DictionaryLearning(num_embeddings=8, embedding_dim=4, sparsity_level=2)
@@ -100,36 +147,78 @@ def test_dictionary_data_sampling_jitters_short_batches_instead_of_duplicates():
     assert float(off_diag.abs().max()) < 0.9999
 
 
-def test_online_ksvd_refresh_reduces_batch_reconstruction_error():
+def test_dictionary_learning_data_initializes_from_first_batch():
+    torch.manual_seed(0)
     dl = DictionaryLearning(
-        num_embeddings=2,
+        num_embeddings=8,
         embedding_dim=2,
         sparsity_level=1,
-        online_ksvd_enabled=True,
-        online_ksvd_blend=1.0,
+        data_init_from_first_batch=True,
     )
-    with torch.no_grad():
-        dl.dictionary.copy_(
-            torch.tensor(
-                [
-                    [0.8, 0.2],
-                    [0.6, 0.98],
-                ],
-                dtype=torch.float32,
-            )
-        )
-        dl.normalize_dictionary_()
-    signals = torch.eye(2)
-    support = torch.tensor([[0], [1]], dtype=torch.long)
-    values = torch.ones(2, 1)
+    before = dl.dictionary.detach().clone()
+    z = torch.randn(1, 2, 2, 4)
 
-    before = (signals - dl.dictionary.detach() @ torch.eye(2)).square().mean()
-    stats = dl.online_ksvd_refresh_(signals, support, values)
-    after = (signals - dl.dictionary.detach() @ torch.eye(2)).square().mean()
+    dl(z)
 
-    assert int(stats["atoms_updated"].item()) == 2
-    assert after < before
-    assert torch.allclose(dl.dictionary.norm(dim=0), torch.ones(2), atol=1e-6)
+    assert bool(dl._data_initialized.item())
+    assert not torch.allclose(dl.dictionary.detach(), before)
+    assert torch.allclose(
+        dl.dictionary.detach().norm(dim=0),
+        torch.ones(dl.num_embeddings),
+        atol=1e-5,
+    )
+
+
+def test_ste_keeps_encoder_grad_and_loss_trains_dictionary():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=8,
+        embedding_dim=4,
+        sparsity_level=2,
+    )
+    z = torch.randn(2, 4, 3, 3, requires_grad=True)
+
+    z_out, loss, _ = dl(z)
+    # The straight-through estimator routes decoder gradients to the encoder
+    # input, while the dictionary atoms learn from the returned bottleneck loss.
+    (z_out.square().mean() + loss).backward()
+
+    assert z.grad is not None
+    assert z.grad.abs().sum() > 0
+    assert dl.dictionary.grad is not None
+    assert dl.dictionary.grad.abs().sum() > 0
+
+
+def test_one_shot_topk_support_matches_abs_correlations_on_orthogonal_dictionary():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=4,
+        sparsity_level=2,
+    )
+    dictionary = torch.eye(4)
+    signals = torch.tensor(
+        [
+            [3.0, -0.5],
+            [-1.0, 2.5],
+            [2.0, 0.25],
+            [0.5, -4.0],
+        ]
+    )
+
+    support, values = dl.batch_topk_with_support(signals, dictionary)
+
+    assert support.tolist() == [[0, 2], [3, 1]]
+    assert torch.allclose(
+        values,
+        torch.tensor(
+            [
+                [3.0, 2.0],
+                [-4.0, 2.5],
+            ]
+        ),
+        atol=1e-6,
+    )
 
 
 def test_batch_omp_with_coef_max_hard_bounds_coefficients():
@@ -304,18 +393,17 @@ def test_patch_dictionary_learning_hann_reconstructs_exact_signal_with_full_iden
     assert torch.allclose(z_out, z, atol=1e-5)
 
 
-def test_dictionary_through_decoder_keeps_encoder_gradient_path():
+def test_ste_keeps_encoder_gradient_path():
     torch.manual_seed(0)
     dl = DictionaryLearning(
         num_embeddings=8,
         embedding_dim=4,
         sparsity_level=2,
-        dictionary_through_decoder=True,
     )
     z = torch.randn(1, 4, 2, 2, requires_grad=True)
 
-    z_out, _loss, _sparse_codes = dl(z)
-    z_out.sum().backward()
+    z_out, loss, _sparse_codes = dl(z)
+    (z_out.sum() + loss).backward()
 
     assert z.grad is not None
     assert float(z.grad.abs().sum()) > 0.0

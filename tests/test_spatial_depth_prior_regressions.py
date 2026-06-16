@@ -172,6 +172,53 @@ def test_spatial_depth_prior_quantized_training_masks_previously_used_atoms():
     assert torch.isfinite(logits[0, 0, 1, 4])
 
 
+def test_text_conditioning_prefix_preserves_prompt_order():
+    cfg = SpatialDepthPriorConfig(
+        vocab_size=5,
+        atom_vocab_size=3,
+        coeff_vocab_size=2,
+        H=1,
+        W=1,
+        D=4,
+        real_valued_coeffs=False,
+        d_model=8,
+        n_heads=2,
+        n_spatial_layers=0,
+        n_depth_layers=0,
+        d_ff=16,
+        dropout=0.0,
+        text_conditional=True,
+        text_vocab_size=16,
+        text_max_length=4,
+        text_pad_id=0,
+        text_prefix_length=2,
+    )
+    model = SpatialDepthPrior(cfg).eval()
+    text_a = torch.tensor([[2, 3, 4, 5]], dtype=torch.long)
+    text_b = torch.tensor([[4, 5, 2, 3]], dtype=torch.long)
+    mask = torch.ones_like(text_a, dtype=torch.bool)
+
+    pooled_a, prefix_a = model._text_condition(
+        text_a,
+        mask,
+        batch_size=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    pooled_b, prefix_b = model._text_condition(
+        text_b,
+        mask,
+        batch_size=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert torch.allclose(pooled_a, pooled_b)
+    assert prefix_a.shape == (1, 2, cfg.d_model)
+    assert prefix_b.shape == (1, 2, cfg.d_model)
+    assert not torch.allclose(prefix_a, prefix_b)
+
+
 def test_spatial_depth_prior_quantized_rejects_too_few_atoms_for_unique_support():
     try:
         SpatialDepthPrior(

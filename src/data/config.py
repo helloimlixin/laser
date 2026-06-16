@@ -33,6 +33,7 @@ class DataConfig:
     audio_min_crop_rms: float = 0.0
     audio_crop_attempts: int = 1
     audio_fade_samples: int = 0
+    stl10_include_unlabeled: bool = True
     
     @classmethod
     def from_dict(cls, config_dict):

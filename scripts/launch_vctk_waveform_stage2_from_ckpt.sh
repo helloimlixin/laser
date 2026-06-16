@@ -156,8 +156,10 @@ export HYDRA_FULL_ERROR=1
 export TMPDIR="/tmp/laser_\${SLURM_JOB_ID:-\$\$}"
 export TEMP="\$TMPDIR"
 export TMP="\$TMPDIR"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPYCACHEPREFIX="\$TMPDIR/pycache"
 
-mkdir -p "\$TMPDIR" "$stage2_dir/wandb"
+mkdir -p "\$TMPDIR" "\$PYTHONPYCACHEPREFIX" "$stage2_dir/wandb"
 
 PYTHON_BIN="\${PYTHON_BIN:-\$(command -v python3 || command -v python || true)}"
 if [[ -z "\$PYTHON_BIN" ]]; then
@@ -305,6 +307,14 @@ if [[ -z "\$CONTAINER_BIN" ]]; then
     fi
   done
 fi
+
+CONTAINER_CACHE_DIR="\${CONTAINER_CACHE_DIR:-/tmp/laser_container_cache_\${SLURM_JOB_ID:-\$\$}}"
+CONTAINER_TMPDIR="\${CONTAINER_TMPDIR:-/tmp/laser_container_tmp_\${SLURM_JOB_ID:-\$\$}}"
+export APPTAINER_CACHEDIR="\${APPTAINER_CACHEDIR:-\$CONTAINER_CACHE_DIR}"
+export SINGULARITY_CACHEDIR="\${SINGULARITY_CACHEDIR:-\$CONTAINER_CACHE_DIR}"
+export APPTAINER_TMPDIR="\${APPTAINER_TMPDIR:-\$CONTAINER_TMPDIR}"
+export SINGULARITY_TMPDIR="\${SINGULARITY_TMPDIR:-\$CONTAINER_TMPDIR}"
+mkdir -p "\$APPTAINER_CACHEDIR" "\$SINGULARITY_CACHEDIR" "\$APPTAINER_TMPDIR" "\$SINGULARITY_TMPDIR"
 
 if [[ -n "\$CONTAINER_BIN" ]]; then
   "\$CONTAINER_BIN" exec --nv \\

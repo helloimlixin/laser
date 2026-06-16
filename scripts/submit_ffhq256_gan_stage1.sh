@@ -26,7 +26,7 @@ MEM_MB="${MEM_MB:-120000}"
 # -- Data --------------------------------------------------------------------
 FFHQ_DIR="${FFHQ_DIR:-/scratch/$USER/datasets/ffhq}"
 IMAGE_SIZE="${IMAGE_SIZE:-256}"
-BATCH_SIZE="${BATCH_SIZE:-4}"   # ds4 + discriminator is heavier than zdmy0xi3 (ds5)
+BATCH_SIZE="${BATCH_SIZE:-2}"   # fits 24GB (ds4+attention+LPIPS OOMs at batch 4 on a 3090)
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
 # -- Stage-1 knobs (match zdmy0xi3's optimizer schedule) ---------------------
@@ -34,6 +34,10 @@ STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
 STAGE1_LR="${STAGE1_LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-500}"
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.05}"
+# Discriminator warmup (training batches before the critic engages). Lower than
+# the config default so the memory-heaviest (GAN-active) phase is exercised early
+# — a 24GB card that survives this survives the whole run.
+DISC_START="${DISC_START:-1000}"
 
 # -- Output / logging --------------------------------------------------------
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -87,6 +91,7 @@ python train_stage1_autoencoder.py \\
   seed=42 \\
   output_dir="$RUN_DIR/stage1" \\
   model=laser_ffhq_gan \\
+  model.disc_start_step=$DISC_START \\
   data=ffhq \\
   data.data_dir="$FFHQ_DIR" \\
   data.image_size=$IMAGE_SIZE \\

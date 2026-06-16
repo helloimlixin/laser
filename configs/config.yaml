@@ -10,6 +10,7 @@ defaults:
 seed: 42
 output_dir: outputs
 ckpt_path: null
+init_ckpt_path: null
 hydra:
   run:
     dir: ${output_dir}/${now:%Y-%m-%d_%H-%M-%S}

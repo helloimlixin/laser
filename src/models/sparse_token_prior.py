@@ -13,21 +13,57 @@ from .gpt_prior import GPTPrior, GPTPriorConfig
 from .spatial_prior import SpatialDepthPrior, SpatialDepthPriorConfig
 
 
-def _unpack_cached_batch(batch) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
-    """Normalize tensor- and tuple-based cache batches into tokens and optional coeffs."""
+def _unpack_cached_batch(
+    batch,
+) -> tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """Normalize tensor- and tuple-based cache batches into tokens and optional metadata.
+
+    CachedTokenDataset emits fields in this order:
+    tokens, optional real-valued coeffs, optional class label, optional text tokens,
+    optional text mask, optional non-tensor audio metadata.  Keep the parser dtype
+    aware so text tokens with the same 2-D shape as tokens are not mistaken for
+    real-valued coefficients.
+    """
     if torch.is_tensor(batch):
-        return batch, None, None
+        return batch, None, None, None, None
     if not isinstance(batch, (tuple, list)) or len(batch) == 0:
         raise ValueError("Sparse-token batches must be a tensor or a non-empty sequence.")
     tokens = batch[0]
     if not torch.is_tensor(tokens):
         raise ValueError("Sparse-token batches must start with a token tensor.")
     coeffs = None
+    class_labels = None
+    text_tokens = None
+    text_mask = None
+    batch_size = int(tokens.shape[0])
     for item in batch[1:]:
-        if torch.is_tensor(item):
+        if not torch.is_tensor(item):
+            continue
+        if (
+            coeffs is None
+            and tuple(item.shape) == tuple(tokens.shape)
+            and torch.is_floating_point(item)
+        ):
             coeffs = item
-            break
-    return tokens, coeffs, None
+        elif (
+            class_labels is None
+            and item.ndim == 1
+            and int(item.shape[0]) == batch_size
+            and item.dtype != torch.bool
+        ):
+            class_labels = item
+        elif item.ndim == 2 and int(item.shape[0]) == batch_size:
+            if item.dtype == torch.bool:
+                text_mask = item
+            elif text_tokens is None:
+                text_tokens = item
+    return tokens, coeffs, class_labels, text_tokens, text_mask
 
 
 def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
@@ -56,6 +92,13 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
             "prior_coeff_prior_std": float(cfg.coeff_prior_std),
             "prior_coeff_min_std": float(cfg.coeff_min_std),
             "prior_support_order": str(getattr(cfg, "support_order", "none") or "none"),
+            "prior_class_conditional": bool(getattr(cfg, "class_conditional", False)),
+            "prior_num_classes": int(getattr(cfg, "num_classes", 0) or 0),
+            "prior_text_conditional": bool(getattr(cfg, "text_conditional", False)),
+            "prior_text_vocab_size": int(getattr(cfg, "text_vocab_size", 0) or 0),
+            "prior_text_max_length": int(getattr(cfg, "text_max_length", 0) or 0),
+            "prior_text_pad_id": int(getattr(cfg, "text_pad_id", 0) or 0),
+            "prior_text_prefix_length": int(getattr(cfg, "text_prefix_length", 0) or 0),
         }
     if isinstance(prior, GPTPrior) and isinstance(cfg, GPTPriorConfig):
         return {
@@ -227,6 +270,13 @@ def build_sparse_prior_from_cache(
     dropout: float,
     n_global_spatial_tokens: int = 0,
     autoregressive_coeffs: bool = True,
+    class_conditional: bool = False,
+    num_classes: int = 0,
+    text_conditional: bool = False,
+    text_vocab_size: int = 0,
+    text_max_length: int = 0,
+    text_pad_id: int = 0,
+    text_prefix_length: int = 16,
 ) -> nn.Module:
     """Build a maintained sparse-token prior from a cached token grid."""
     if grid_shape is None:
@@ -274,6 +324,13 @@ def build_sparse_prior_from_cache(
                 coeff_min_std=float(meta.get("variational_coeff_min_std", 0.01)),
                 autoregressive_coeffs=bool(autoregressive_coeffs),
                 support_order=support_order,
+                class_conditional=bool(class_conditional),
+                num_classes=int(num_classes),
+                text_conditional=bool(text_conditional),
+                text_vocab_size=int(text_vocab_size),
+                text_max_length=int(text_max_length),
+                text_pad_id=int(text_pad_id),
+                text_prefix_length=int(text_prefix_length),
             )
         )
 
@@ -307,6 +364,13 @@ def build_sparse_prior_from_cache(
                 coeff_max=coeff_max,
                 autoregressive_coeffs=bool(autoregressive_coeffs),
                 support_order=support_order,
+                class_conditional=bool(class_conditional),
+                num_classes=int(num_classes),
+                text_conditional=bool(text_conditional),
+                text_vocab_size=int(text_vocab_size),
+                text_max_length=int(text_max_length),
+                text_pad_id=int(text_pad_id),
+                text_prefix_length=int(text_prefix_length),
             )
         )
     if architecture == "gpt":
@@ -370,6 +434,13 @@ def build_sparse_prior_from_hparams(
         H, W, D = token_cache_grid_shape(cache)
     meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
     support_order = str(hparams.get("prior_support_order", meta.get("support_order", "none")) or "none")
+    class_conditional = bool(hparams.get("prior_class_conditional", False))
+    num_classes = int(hparams.get("prior_num_classes", meta.get("num_classes", 0)) or 0)
+    text_conditional = bool(hparams.get("prior_text_conditional", False))
+    text_vocab_size = int(hparams.get("prior_text_vocab_size", meta.get("text_vocab_size", 0)) or 0)
+    text_max_length = int(hparams.get("prior_text_max_length", meta.get("text_max_length", 0)) or 0)
+    text_pad_id = int(hparams.get("prior_text_pad_id", meta.get("text_pad_id", 0)) or 0)
+    text_prefix_length = int(hparams.get("prior_text_prefix_length", meta.get("text_prefix_length", 0)) or 0)
     if real_valued_coeffs:
         atom_vocab_size = infer_sparse_atom_vocab_size(cache, atom_vocab_size=atom_vocab_size)
         total_vocab_size = int(total_vocab_size or atom_vocab_size)
@@ -408,6 +479,13 @@ def build_sparse_prior_from_hparams(
                 coeff_min_std=float(hparams.get("prior_coeff_min_std", 0.01)),
                 autoregressive_coeffs=bool(autoregressive_coeffs),
                 support_order=support_order,
+                class_conditional=class_conditional,
+                num_classes=num_classes,
+                text_conditional=text_conditional,
+                text_vocab_size=text_vocab_size,
+                text_max_length=text_max_length,
+                text_pad_id=text_pad_id,
+                text_prefix_length=text_prefix_length,
             )
         )
 
@@ -453,6 +531,8 @@ class SparseTokenPriorModule(pl.LightningModule):
         coeff_huber_delta: float = 0.5,
         sample_coeff_temperature: Optional[float] = None,
         sample_coeff_mode: str = "gaussian",
+        atom_label_smoothing: float = 0.0,
+        atom_coverage_weight: float = 0.0,
     ):
         super().__init__()
         self.prior = prior
@@ -461,6 +541,13 @@ class SparseTokenPriorModule(pl.LightningModule):
         self.warmup_steps = max(0, int(warmup_steps))
         self.min_lr_ratio = float(max(0.0, min(float(min_lr_ratio), 1.0)))
         self.atom_loss_weight = float(atom_loss_weight)
+        # Anti-collapse levers for the atom-id head (both default off -> exact
+        # legacy behavior). Label smoothing softens the CE targets so the prior
+        # cannot over-peak on the few dominant atoms; the coverage weight rewards a
+        # high-entropy batch-marginal atom distribution so generation keeps using a
+        # broad atom support instead of collapsing to tens of atoms.
+        self.atom_label_smoothing = float(min(max(atom_label_smoothing, 0.0), 1.0))
+        self.atom_coverage_weight = float(max(0.0, atom_coverage_weight))
         self.coeff_loss_weight = float(coeff_loss_weight)
         self.coeff_depth_weighting = str(coeff_depth_weighting).strip().lower()
         self.coeff_focal_gamma = float(max(0.0, coeff_focal_gamma))
@@ -563,13 +650,44 @@ class SparseTokenPriorModule(pl.LightningModule):
             prog_bar=(prefix != "test"),
         )
 
+    def _atom_ce_loss(self, logits_flat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Atom-id cross-entropy that stays finite under -inf-masked logits.
+
+        The spatial_depth prior masks invalid / already-selected atoms to -inf
+        (spatial_prior.py). Plain ``F.cross_entropy(..., label_smoothing>0)`` would
+        spread the smoothing mass onto those -inf classes and return +inf, so when
+        smoothing is on we distribute it uniformly over only the finite-logit
+        (valid) classes. With smoothing off this is exactly the legacy CE.
+        """
+        eps = self.atom_label_smoothing
+        if eps <= 0.0:
+            return F.cross_entropy(logits_flat, target)
+        logp = F.log_softmax(logits_flat, dim=-1)
+        finite = torch.isfinite(logp)
+        nll = -logp.gather(1, target.unsqueeze(1)).squeeze(1)
+        # mean of -logp over valid classes only; zero out -inf so 0*(-inf) is not NaN
+        safe_logp = torch.where(finite, logp, torch.zeros_like(logp))
+        n_valid = finite.sum(dim=1).clamp_min(1)
+        uniform = -(safe_logp.sum(dim=1) / n_valid)
+        return ((1.0 - eps) * nll + eps * uniform).mean()
+
     def _real_valued_shared_step(self, batch, prefix: str) -> torch.Tensor:
-        tok_flat, coeff_flat, _ = _unpack_cached_batch(batch)
+        tok_flat, coeff_flat, class_labels, text_tokens, text_mask = _unpack_cached_batch(batch)
         if coeff_flat is None:
             raise ValueError("Real-valued sparse-token training expects batches of (tokens_flat, coeffs_flat).")
 
         tok_flat = tok_flat.to(self.device, dtype=torch.long, non_blocking=True)
         coeff_flat = coeff_flat.to(self.device, dtype=torch.float32, non_blocking=True)
+        if class_labels is not None:
+            class_labels = class_labels.to(self.device, dtype=torch.long, non_blocking=True)
+        if bool(getattr(self.prior, "text_conditional", False)):
+            if text_tokens is None:
+                raise ValueError("ar.text_conditional=true requires text_tokens in the token cache.")
+            text_tokens = text_tokens.to(self.device, dtype=torch.long, non_blocking=True)
+            text_mask = None if text_mask is None else text_mask.to(self.device, dtype=torch.bool, non_blocking=True)
+        else:
+            text_tokens = None
+            text_mask = None
         bsz = tok_flat.size(0)
         cfg = self.prior.cfg
         # Token indices are integer tensors with no gradient; a single contiguous
@@ -579,17 +697,21 @@ class SparseTokenPriorModule(pl.LightningModule):
         coeff_grid = coeff_flat.view(bsz, int(cfg.H) * int(cfg.W), int(cfg.D))
 
         loss_type = str(self.coeff_loss_type or "mse")
-        forward_out = self.prior(tok_grid, coeff_grid)
+        forward_out = self.prior(
+            tok_grid,
+            coeff_grid,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
         if bool(getattr(self.prior, "gaussian_coeffs", False)):
             atom_logits, coeff_pred, coeff_logvar_pred = forward_out
         else:
             atom_logits, coeff_pred = forward_out
             coeff_logvar_pred = None
 
-        ce_loss = F.cross_entropy(
-            atom_logits.reshape(-1, int(cfg.vocab_size)),
-            tok_grid.reshape(-1),
-        )
+        atom_logits_flat = atom_logits.reshape(-1, int(cfg.vocab_size))
+        ce_loss = self._atom_ce_loss(atom_logits_flat, tok_grid.reshape(-1))
         pred_coeff = self._clamp_coeffs(coeff_pred)
         target_coeff = self._clamp_coeffs(coeff_grid)
         if loss_type == "mse":
@@ -612,14 +734,31 @@ class SparseTokenPriorModule(pl.LightningModule):
             raise RuntimeError(f"Unexpected coeff_loss_type: {loss_type!r}")
 
         loss = self.atom_loss_weight * ce_loss + self.coeff_loss_weight * coeff_reg_loss
+
+        # Collapse diagnostics: the batch-marginal predicted atom distribution and
+        # its entropy. Logged regardless of the regularizer weight so the collapse
+        # (low coverage_frac -> few atoms ever predicted) is visible in baseline
+        # runs too. When atom_coverage_weight > 0 we also reward this entropy.
+        atom_marginal = F.softmax(atom_logits_flat, dim=-1).mean(dim=0).clamp_min(1e-12)
+        atom_marginal_entropy = -(atom_marginal * atom_marginal.log()).sum()
+        atom_coverage_frac = atom_marginal_entropy / math.log(float(cfg.vocab_size))
+        if self.atom_coverage_weight > 0.0:
+            loss = loss - self.atom_coverage_weight * atom_marginal_entropy
+
         atom_preds = atom_logits.argmax(dim=-1)
         atom_accuracy = (atom_preds == tok_grid).float().mean()
+        atom_pred_unique_frac = (
+            atom_preds.reshape(-1).unique().numel() / float(cfg.vocab_size)
+        )
         coeff_mae = (pred_coeff - target_coeff).abs().mean()
 
         log_kwargs = self._step_log_kwargs(prefix, bsz)
         self.log(f"{prefix}/loss", loss, **log_kwargs)
         self.log(f"{prefix}/ce_loss", ce_loss, **log_kwargs)
         self.log(f"{prefix}/atom_accuracy", atom_accuracy, **log_kwargs)
+        self.log(f"{prefix}/atom_marginal_entropy", atom_marginal_entropy, **log_kwargs)
+        self.log(f"{prefix}/atom_coverage_frac", atom_coverage_frac, **log_kwargs)
+        self.log(f"{prefix}/atom_pred_unique_frac", atom_pred_unique_frac, **log_kwargs)
         self.log(f"{prefix}/coeff_reg_loss", coeff_reg_loss, **log_kwargs)
         self.log(f"{prefix}/coeff_mae", coeff_mae, **log_kwargs)
         if loss_type == "mse":
@@ -683,13 +822,28 @@ class SparseTokenPriorModule(pl.LightningModule):
         if getattr(self.prior, "real_valued_coeffs", False):
             return self._real_valued_shared_step(batch, prefix)
 
-        tok_flat, _, _ = _unpack_cached_batch(batch)
+        tok_flat, _, class_labels, text_tokens, text_mask = _unpack_cached_batch(batch)
         tok_flat = tok_flat.to(self.device, dtype=torch.long, non_blocking=True)
+        if class_labels is not None:
+            class_labels = class_labels.to(self.device, dtype=torch.long, non_blocking=True)
+        if bool(getattr(self.prior, "text_conditional", False)):
+            if text_tokens is None:
+                raise ValueError("ar.text_conditional=true requires text_tokens in the token cache.")
+            text_tokens = text_tokens.to(self.device, dtype=torch.long, non_blocking=True)
+            text_mask = None if text_mask is None else text_mask.to(self.device, dtype=torch.bool, non_blocking=True)
+        else:
+            text_tokens = None
+            text_mask = None
         bsz = tok_flat.size(0)
         cfg = self.prior.cfg
         tok_grid = tok_flat.view(bsz, int(cfg.H) * int(cfg.W), int(cfg.D))
 
-        logits = self.prior(tok_grid)
+        logits = self.prior(
+            tok_grid,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
         per_token_ce = F.cross_entropy(
             logits.reshape(-1, int(cfg.vocab_size)),
             tok_grid.reshape(-1),
@@ -748,11 +902,17 @@ class SparseTokenPriorModule(pl.LightningModule):
         *,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         generated = self.generate_sparse_codes(
             batch_size,
             temperature=temperature,
             top_k=top_k,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
         )
         if getattr(self.prior, "real_valued_coeffs", False):
             return generated[0]
@@ -767,6 +927,9 @@ class SparseTokenPriorModule(pl.LightningModule):
         top_k: Optional[int] = None,
         coeff_temperature: Optional[float] = None,
         coeff_sample_mode: Optional[str] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ):
         if coeff_temperature is None:
             coeff_temperature = self.sample_coeff_temperature
@@ -778,5 +941,8 @@ class SparseTokenPriorModule(pl.LightningModule):
             top_k=top_k,
             coeff_temperature=coeff_temperature,
             coeff_sample_mode=coeff_sample_mode,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
             show_progress=False,
         )

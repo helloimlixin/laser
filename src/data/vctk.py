@@ -20,6 +20,38 @@ CROP_MODE_SLICE = 0
 CROP_MODE_PAD = 1
 
 
+def _vctk_utterance_stem(path: Union[str, Path]) -> str:
+    stem = Path(path).stem
+    pieces = stem.split("_")
+    if len(pieces) >= 2 and pieces[0].startswith("p"):
+        return f"{pieces[0]}_{pieces[1]}"
+    return stem
+
+
+def _find_vctk_transcript_path(path: Union[str, Path]) -> Path | None:
+    audio_path = Path(path)
+    speaker = audio_path.parent.name
+    utterance = _vctk_utterance_stem(audio_path)
+    candidates = []
+    for root in (audio_path.parent, *audio_path.parents):
+        candidates.append(root / "txt" / speaker / f"{utterance}.txt")
+        candidates.append(root / "VCTK-Corpus" / "txt" / speaker / f"{utterance}.txt")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _read_vctk_transcript(path: Union[str, Path]) -> str:
+    transcript = _find_vctk_transcript_path(path)
+    if transcript is None:
+        return ""
+    try:
+        return transcript.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return ""
+
+
 def _target_hw(image_size: Union[int, Sequence[int]]) -> Tuple[int, int]:
     if isinstance(image_size, int):
         side = int(image_size)
@@ -175,6 +207,7 @@ class VCTKSpectrogramDataset(Dataset):
         if self.win_length > self.n_fft:
             raise ValueError(f"stft_win_length ({self.win_length}) must be <= stft_n_fft ({self.n_fft})")
         self.window = torch.hann_window(self.win_length, periodic=True)
+        self.texts = [_read_vctk_transcript(path) for path in self.paths]
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -243,6 +276,8 @@ class VCTKSpectrogramDataset(Dataset):
         spectrogram, spec_meta = self._waveform_to_spectrogram(waveform)
         meta = {
             "path": str(path),
+            "speaker_id": path.parent.name,
+            "text": self.texts[index],
             "crop_mode": torch.tensor(int(crop_meta["crop_mode"]), dtype=torch.int64),
             "crop_offset": torch.tensor(int(crop_meta["crop_offset"]), dtype=torch.int64),
             "source_num_samples": torch.tensor(int(crop_meta["source_num_samples"]), dtype=torch.int64),
@@ -279,6 +314,7 @@ class VCTKWaveformDataset(Dataset):
         self.fade_samples = max(0, int(getattr(config, "audio_fade_samples", 0)))
         if self.audio_num_samples <= 0:
             raise ValueError(f"audio_num_samples must be positive, got {self.audio_num_samples}")
+        self.texts = [_read_vctk_transcript(path) for path in self.paths]
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -362,6 +398,8 @@ class VCTKWaveformDataset(Dataset):
         )
         meta = {
             "path": str(path),
+            "speaker_id": path.parent.name,
+            "text": self.texts[index],
             "crop_mode": torch.tensor(int(crop_meta["crop_mode"]), dtype=torch.int64),
             "crop_offset": torch.tensor(int(crop_meta["crop_offset"]), dtype=torch.int64),
             "source_num_samples": torch.tensor(int(crop_meta["source_num_samples"]), dtype=torch.int64),

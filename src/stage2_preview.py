@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Optional
@@ -9,18 +10,20 @@ from typing import Optional
 import lightning as pl
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from src.audio_logging import (
     audio_config_from_source,
     build_generated_audio_log_payload,
+    normalize_generated_waveform_for_preview,
 )
 from src.data.token_cache import load_token_cache
-from src.s2 import sample as sample_s2, sample_slide, save_grid
+from src.s2 import pick_nrow, sample as sample_s2, sample_slide, save_grid
 from src.stage2_compat import (
     ensure_stage2_cache_metadata as add_cache_meta,
     load_stage1_decoder_bundle as load_s1,
 )
+from src.text_conditioning import encode_prompts_from_cache
 from src.wandb_media import log_wandb_images, log_wandb_payload
 
 
@@ -42,6 +45,9 @@ def _sample_for_preview(
     top_k: int,
     ctemp,
     cmode,
+    class_labels: Optional[torch.Tensor] = None,
+    text_tokens: Optional[torch.Tensor] = None,
+    text_mask: Optional[torch.Tensor] = None,
     dev: torch.device,
 ):
     """Sample full-size previews when a GPT prior was trained on latent crops."""
@@ -75,6 +81,9 @@ def _sample_for_preview(
         top_k=top_k,
         ctemp=ctemp,
         cmode=cmode,
+        class_labels=class_labels,
+        text_tokens=text_tokens,
+        text_mask=text_mask,
         dev=dev,
     )
 
@@ -95,6 +104,193 @@ def _grid_uint8(images: list[np.ndarray], *, nrow: int) -> np.ndarray:
         col = idx % nrow
         grid[row * height: (row + 1) * height, col * width: (col + 1) * width] = image
     return grid
+
+
+_DEFAULT_CLASS_NAMES = {
+    "cifar10": [
+        "airplane",
+        "automobile",
+        "bird",
+        "cat",
+        "deer",
+        "dog",
+        "frog",
+        "horse",
+        "ship",
+        "truck",
+    ],
+    "stl10": [
+        "airplane",
+        "bird",
+        "car",
+        "cat",
+        "deer",
+        "dog",
+        "horse",
+        "monkey",
+        "ship",
+        "truck",
+    ],
+}
+
+
+def _class_names_from_cache(cache: Optional[dict]) -> list[str]:
+    meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+    raw = meta.get("class_names")
+    if isinstance(raw, dict):
+        ordered = sorted(((int(value), str(key)) for key, value in raw.items()), key=lambda item: item[0])
+        if ordered:
+            return [name for _, name in ordered]
+    if isinstance(raw, (list, tuple)):
+        names = [str(item) for item in raw]
+        if names:
+            return names
+    dataset = str(meta.get("dataset", "")).strip().lower()
+    return list(_DEFAULT_CLASS_NAMES.get(dataset, []))
+
+
+def _class_label_texts(cache: Optional[dict], labels: Optional[torch.Tensor]) -> list[str]:
+    if labels is None:
+        return []
+    label_list = [int(label) for label in labels.detach().cpu().reshape(-1).tolist()]
+    names = _class_names_from_cache(cache)
+    texts = []
+    for label in label_list:
+        if 0 <= label < len(names):
+            texts.append(f"{label}: {names[label]}")
+        else:
+            texts.append(str(label))
+    return texts
+
+
+def _to_uint8_pil(image: torch.Tensor) -> Image.Image:
+    image = image.detach().cpu().to(torch.float32)
+    if image.ndim != 3:
+        raise ValueError(f"Expected CHW image tensor, got {tuple(image.shape)}")
+    image = image.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
+    array = image.permute(1, 2, 0).contiguous().numpy()
+    if array.shape[-1] == 1:
+        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
+    return Image.fromarray(array, mode="RGB")
+
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str) -> int:
+    try:
+        left, _, right, _ = draw.textbbox((0, 0), text)
+        return int(right - left)
+    except Exception:
+        return int(draw.textlength(text))
+
+
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int) -> str:
+    text = str(text)
+    if _text_width(draw, text) <= max_width:
+        return text
+    suffix = "..."
+    keep = max(1, len(text) - 1)
+    while keep > 1:
+        candidate = text[:keep].rstrip() + suffix
+        if _text_width(draw, candidate) <= max_width:
+            return candidate
+        keep -= 1
+    return suffix
+
+
+def _save_labeled_image_grid(
+    imgs: torch.Tensor,
+    labels: torch.Tensor,
+    cache: Optional[dict],
+    out_dir: Path,
+    *,
+    stem: str,
+    nrow: Optional[int] = None,
+) -> Optional[Path]:
+    label_texts = _class_label_texts(cache, labels)
+    if not label_texts:
+        return None
+    n = min(int(imgs.size(0)), len(label_texts))
+    if n <= 0:
+        return None
+    panels: list[Image.Image] = []
+    for image, label_text in zip(imgs[:n], label_texts[:n]):
+        pil = _to_uint8_pil(image).convert("RGB")
+        width, height = pil.size
+        label_height = 28
+        panel = Image.new("RGB", (width, height + label_height), "white")
+        draw = ImageDraw.Draw(panel)
+        fitted = _fit_text(draw, label_text, max(1, width - 6))
+        draw.text((3, 3), fitted, fill="black")
+        panel.paste(pil, (0, label_height))
+        panels.append(panel)
+    if not panels:
+        return None
+    nrow = pick_nrow(len(panels), nrow)
+    rows = int(math.ceil(len(panels) / float(max(1, nrow))))
+    cell_w, cell_h = panels[0].size
+    grid = Image.new("RGB", (nrow * cell_w, rows * cell_h), "white")
+    for idx, panel in enumerate(panels):
+        row = idx // nrow
+        col = idx % nrow
+        grid.paste(panel, (col * cell_w, row * cell_h))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{stem}_labeled.png"
+    grid.save(path)
+    return path
+
+
+def _write_class_label_manifest(path: Path, labels: Optional[torch.Tensor], cache: Optional[dict]) -> None:
+    label_texts = _class_label_texts(cache, labels)
+    if labels is None or not label_texts:
+        return
+    label_list = [int(label) for label in labels.detach().cpu().reshape(-1).tolist()]
+    entries = [
+        {
+            "index": int(idx),
+            "class_id": int(label),
+            "class_name": text.split(": ", 1)[1] if ": " in text else "",
+            "label": text,
+        }
+        for idx, (label, text) in enumerate(zip(label_list, label_texts))
+    ]
+    if path.is_dir():
+        txt_path = path / "class_labels.txt"
+        tsv_path = path / "class_labels.tsv"
+        json_path = path / "class_labels.json"
+    else:
+        txt_path = path.with_suffix(".class_labels.txt")
+        tsv_path = path.with_suffix(".class_labels.tsv")
+        json_path = path.with_suffix(".class_labels.json")
+    txt_path.write_text("\n".join(label_texts) + "\n", encoding="utf-8")
+    tsv_path.write_text(
+        "index\tclass_id\tclass_name\tlabel\n"
+        + "\n".join(
+            f"{entry['index']}\t{entry['class_id']}\t{entry['class_name']}\t{entry['label']}"
+            for entry in entries
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    json_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_text_prompt_manifest(path: Path, *, stem: str, prompts: list[str]) -> None:
+    if not prompts:
+        return
+    root = path if path.is_dir() else path.parent
+    root.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for idx, prompt in enumerate(prompts):
+        expected = root / f"{stem}_{idx:02d}.wav"
+        file_name = expected.name if expected.exists() else ""
+        entries.append({"index": int(idx), "file": file_name, "text": str(prompt)})
+    (root / "prompts.txt").write_text("\n".join(str(prompt) for prompt in prompts) + "\n", encoding="utf-8")
+    (root / "sample_texts.tsv").write_text(
+        "index\tfile\ttext\n"
+        + "\n".join(f"{entry['index']}\t{entry['file']}\t{entry['text']}" for entry in entries)
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "conditioning.json").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 
 
 def _colorize_scalar_maps(
@@ -360,10 +556,15 @@ def _log_sparse_visuals(logger, visual_paths: dict[str, Path], *, step: int, cap
         )
 
 
-def _save_waveform_samples(samples: torch.Tensor, out_dir, *, stem: str, sample_rate: int) -> Path:
+def _save_waveform_samples(samples: torch.Tensor, out_dir, *, stem: str, sample_rate: int, audio_config=None) -> Path:
     out_root = Path(out_dir).expanduser().resolve() / "audio_samples" / stem
     out_root.mkdir(parents=True, exist_ok=True)
     waveforms = samples.detach().cpu().to(torch.float32)[:, 0].clamp(-1.0, 1.0)
+    if audio_config is not None:
+        waveforms = torch.stack(
+            [normalize_generated_waveform_for_preview(waveform, audio_config) for waveform in waveforms],
+            dim=0,
+        )
     try:
         import numpy as np
         from scipy.io import wavfile
@@ -395,6 +596,8 @@ class Stage2SamplePreviewCallback(pl.Callback):
         cmode: Optional[str] = None,
         s1_root: str = "outputs",
         use_wandb: bool = False,
+        text_prompts: Optional[list[str]] = None,
+        class_labels: Optional[list[int]] = None,
     ):
         super().__init__()
         self.cache_pt = str(cache_pt)
@@ -408,12 +611,38 @@ class Stage2SamplePreviewCallback(pl.Callback):
         self.cmode = None if cmode is None else str(cmode).strip().lower()
         self.s1_root = str(s1_root)
         self.use_wandb = bool(use_wandb)
+        self.text_prompts = list(text_prompts or [])
+        self.class_labels = [int(label) for label in (class_labels or [])]
         self._last_step = -1
         self._last_epoch = -1
         self._cache = None
         self._s1 = None
         self._shape = None
         self._disabled_reason = None
+
+    def _text_condition(self, dev: torch.device, n: int):
+        cache = self._cache if isinstance(self._cache, dict) else {}
+        prior_needs_text = bool(self.text_prompts) or bool((cache.get("meta", {}) or {}).get("has_text_conditioning"))
+        if not prior_needs_text:
+            return None, None, []
+        prompts = self.text_prompts
+        if not prompts:
+            prompts = list(cache.get("text", []) or [])
+        if not prompts:
+            prompts = [""]
+        tokens, mask, normalized = encode_prompts_from_cache(prompts, cache=cache, n=n, device=dev)
+        return tokens, mask, normalized
+
+    def _class_condition(self, dev: torch.device, n: int):
+        if not self.class_labels:
+            return None
+        labels = torch.as_tensor(self.class_labels, device=dev, dtype=torch.long).reshape(-1)
+        if int(labels.numel()) <= 0:
+            return None
+        if int(labels.numel()) < int(n):
+            reps = int(math.ceil(float(n) / float(max(1, int(labels.numel())))))
+            labels = labels.repeat(reps)
+        return labels[: int(n)]
 
     @staticmethod
     def _barrier_if_needed(trainer: pl.Trainer):
@@ -445,7 +674,16 @@ class Stage2SamplePreviewCallback(pl.Callback):
         else:
             self._s1.model = self._s1.model.to(dev)
 
-    def _log(self, trainer: pl.Trainer, *, step: int, epoch: Optional[int], direct: Path, batch=None):
+    def _log(
+        self,
+        trainer: pl.Trainer,
+        *,
+        step: int,
+        epoch: Optional[int],
+        direct: Path,
+        batch=None,
+        text_prompts: Optional[list[str]] = None,
+    ):
         if not self.use_wandb:
             return
         logger = getattr(trainer, "logger", None)
@@ -490,6 +728,7 @@ class Stage2SamplePreviewCallback(pl.Callback):
                     split="generation",
                     max_items=min(4, int(batch.imgs.size(0))),
                     artifact_dir=self.out_dir,
+                    captions=list(text_prompts or []),
                 )
             )
             payload.update(_sparse_generation_stats(batch, self._cache))
@@ -511,6 +750,8 @@ class Stage2SamplePreviewCallback(pl.Callback):
         was_training = bool(mod.training)
         mod.eval()
         try:
+            class_labels = self._class_condition(dev, self.n)
+            text_tokens, text_mask, text_prompts = self._text_condition(dev, self.n)
             batch = _sample_for_preview(
                 mod,
                 self._s1,
@@ -521,6 +762,9 @@ class Stage2SamplePreviewCallback(pl.Callback):
                 top_k=self.top_k,
                 ctemp=self.ctemp,
                 cmode=self.cmode,
+                class_labels=class_labels,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
                 dev=dev,
             )
         finally:
@@ -528,12 +772,33 @@ class Stage2SamplePreviewCallback(pl.Callback):
                 mod.train()
 
         stem = f"s{step:07d}" if epoch is None else f"e{epoch:03d}_s{step:07d}"
+        log_direct = None
         if _is_waveform_samples(batch.imgs):
             cache_meta = self._cache.get("meta", {}) if isinstance(self._cache, dict) else {}
-            sample_rate = int(audio_config_from_source(cache_meta)["sample_rate"])
-            direct = _save_waveform_samples(batch.imgs, self.out_dir, stem=stem, sample_rate=sample_rate)
+            audio_config = audio_config_from_source(cache_meta)
+            sample_rate = int(audio_config["sample_rate"])
+            direct = _save_waveform_samples(
+                batch.imgs,
+                self.out_dir,
+                stem=stem,
+                sample_rate=sample_rate,
+                audio_config=audio_config,
+            )
+            if text_prompts:
+                _write_text_prompt_manifest(direct, stem=stem, prompts=text_prompts)
         else:
+            nrow = pick_nrow(int(batch.imgs.size(0)), None)
             direct = save_grid(batch.imgs, self.out_dir, stem=stem)
+            if class_labels is not None:
+                log_direct = _save_labeled_image_grid(
+                    batch.imgs,
+                    class_labels,
+                    self._cache,
+                    self.out_dir,
+                    stem=stem,
+                    nrow=nrow,
+                )
+                _write_class_label_manifest(direct, class_labels, self._cache)
             visual_paths = _build_sparse_visuals(batch, self._cache, self.out_dir, stem=stem)
             if self.use_wandb and trainer.is_global_zero:
                 logger = getattr(trainer, "logger", None)
@@ -544,7 +809,14 @@ class Stage2SamplePreviewCallback(pl.Callback):
                     else f"step={log_step} epoch={int(epoch)}"
                 )
                 _log_sparse_visuals(logger, visual_paths, step=log_step, caption=cap)
-        self._log(trainer, step=step, epoch=epoch, direct=direct, batch=batch)
+        self._log(
+            trainer,
+            step=step,
+            epoch=epoch,
+            direct=log_direct or direct,
+            batch=batch,
+            text_prompts=text_prompts,
+        )
         if epoch is None:
             print(f"Saved s2 samples at step {step}: {direct}")
         else:
@@ -590,6 +862,8 @@ def save_final_generation_preview(
     cmode,
     s1_root: str,
     use_wandb: bool,
+    text_prompts: Optional[list[str]] = None,
+    class_labels: Optional[list[int]] = None,
     return_batch: bool = False,
 ):
     saver = Stage2SamplePreviewCallback(
@@ -602,6 +876,8 @@ def save_final_generation_preview(
         cmode=cmode,
         s1_root=s1_root,
         use_wandb=use_wandb,
+        text_prompts=text_prompts,
+        class_labels=class_labels,
     )
     saver._ready(mod.device)
     shape = _prior_token_shape(mod, saver._shape)
@@ -609,6 +885,8 @@ def save_final_generation_preview(
     was_training = bool(mod.training)
     mod.eval()
     try:
+        labels = saver._class_condition(mod.device, saver.n)
+        text_tokens, text_mask, normalized_prompts = saver._text_condition(mod.device, saver.n)
         batch = _sample_for_preview(
             mod,
             saver._s1,
@@ -619,6 +897,9 @@ def save_final_generation_preview(
             top_k=saver.top_k,
             ctemp=saver.ctemp,
             cmode=saver.cmode,
+            class_labels=labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
             dev=mod.device,
         )
     finally:
@@ -626,12 +907,35 @@ def save_final_generation_preview(
             mod.train()
     step = max(1, int(getattr(trainer, "global_step", 0) or 0))
     stem = f"final_s{step:07d}"
+    log_direct = None
     if _is_waveform_samples(batch.imgs):
         cache_meta = saver._cache.get("meta", {}) if isinstance(saver._cache, dict) else {}
-        sample_rate = int(audio_config_from_source(cache_meta)["sample_rate"])
-        direct = _save_waveform_samples(batch.imgs, saver.out_dir, stem=stem, sample_rate=sample_rate)
+        audio_config = audio_config_from_source(cache_meta)
+        sample_rate = int(audio_config["sample_rate"])
+        direct = _save_waveform_samples(
+            batch.imgs,
+            saver.out_dir,
+            stem=stem,
+            sample_rate=sample_rate,
+            audio_config=audio_config,
+        )
+        if normalized_prompts:
+            _write_text_prompt_manifest(Path(direct), stem=stem, prompts=normalized_prompts)
+        if labels is not None:
+            _write_class_label_manifest(Path(direct), labels, saver._cache)
     else:
+        nrow = pick_nrow(int(batch.imgs.size(0)), None)
         direct = save_grid(batch.imgs, saver.out_dir, stem=stem)
+        if labels is not None:
+            log_direct = _save_labeled_image_grid(
+                batch.imgs,
+                labels,
+                saver._cache,
+                saver.out_dir,
+                stem=stem,
+                nrow=nrow,
+            )
+            _write_class_label_manifest(Path(direct), labels, saver._cache)
         visual_paths = _build_sparse_visuals(batch, saver._cache, saver.out_dir, stem=stem)
         if use_wandb:
             _log_sparse_visuals(
@@ -640,7 +944,14 @@ def save_final_generation_preview(
                 step=step,
                 caption=f"step={step}",
             )
-    saver._log(trainer, step=step, epoch=None, direct=direct, batch=batch)
+    saver._log(
+        trainer,
+        step=step,
+        epoch=None,
+        direct=log_direct or direct,
+        batch=batch,
+        text_prompts=normalized_prompts,
+    )
     if return_batch:
         return direct, batch, saver._cache
     return direct

@@ -27,11 +27,14 @@ EXCLUDES = (
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".cache",
+    ".pydeps",
     ".tmp",
     ".tmp_*",
     "cluster_logs",
     "wandb",
     "runs",
+    "submission_snapshots",
     "source_snapshot_*",
     "pre_variation_snapshot_*",
     "*.out",
@@ -68,10 +71,6 @@ def _user() -> str:
 
 def _scratch_path(*parts: str) -> str:
     return str(Path("/scratch") / _user() / Path(*parts))
-
-
-def _cache_path(*parts: str) -> str:
-    return str(Path("/cache/home") / _user() / Path(*parts))
 
 
 def _snapshot_ignore(repo: Path):
@@ -207,8 +206,12 @@ def snapshot_repo(repo: Path, snapshot_root: Path, *, stem: str) -> Path:
 def _dataset_cases(
     vctk_dir: Path,
     *,
+    celeba_dir: Optional[Path] = None,
+    celebahq_dir: Optional[Path] = None,
     coco_dir: Optional[Path] = None,
     ffhq_dir: Optional[Path] = None,
+    imagenet_dir: Optional[Path] = None,
+    imagenette2_dir: Optional[Path] = None,
     maestro_dir: Optional[Path] = None,
     model_family: str = "vqvae",
 ) -> list[SmokeCase]:
@@ -229,7 +232,7 @@ def _dataset_cases(
             name="celeba",
             data_config="celeba",
             model_config=image_model_config,
-            data_dir=_scratch_path("datasets", "celeba_packed_128"),
+            data_dir=str(celeba_dir or Path(_scratch_path("datasets", "celeba_packed_128"))),
             image_size=128,
             batch_size=1,
             stage2_batch_size=2,
@@ -253,7 +256,7 @@ def _dataset_cases(
             name="celebahq",
             data_config="celebahq",
             model_config=image_model_config,
-            data_dir=_scratch_path("datasets", "celebahq_packed_256"),
+            data_dir=str(celebahq_dir or Path(_scratch_path("datasets", "celebahq_packed_256"))),
             image_size=256,
             batch_size=2,
             stage2_batch_size=2,
@@ -283,6 +286,54 @@ def _dataset_cases(
             stage2_batch_size=4,
             num_workers=4,
             cache_max_items=64,
+            stage1_max_steps=8,
+            stage2_max_steps=16,
+            stage1_limit_train_batches=8,
+            stage2_limit_train_batches=8,
+            extra_stage1_overrides=(
+                "model.compute_fid=false",
+                "model.num_embeddings=256",
+                "model.embedding_dim=32",
+                "model.num_hiddens=96",
+                "model.num_residual_blocks=1",
+                "model.num_residual_hiddens=32",
+            ),
+            extra_stage2_overrides=("ar.d_model=192", "ar.n_heads=4", "ar.n_layers=4", "ar.d_ff=384"),
+        ),
+        SmokeCase(
+            name="imagenette2",
+            data_config="imagenette2",
+            model_config=image_model_config,
+            data_dir=str(imagenette2_dir or Path(_scratch_path("datasets", "imagenette2"))),
+            image_size=224,
+            batch_size=4,
+            stage2_batch_size=4,
+            num_workers=4,
+            cache_max_items=64,
+            stage1_max_steps=8,
+            stage2_max_steps=16,
+            stage1_limit_train_batches=8,
+            stage2_limit_train_batches=8,
+            extra_stage1_overrides=(
+                "model.compute_fid=false",
+                "model.num_embeddings=256",
+                "model.embedding_dim=32",
+                "model.num_hiddens=96",
+                "model.num_residual_blocks=1",
+                "model.num_residual_hiddens=32",
+            ),
+            extra_stage2_overrides=("ar.d_model=192", "ar.n_heads=4", "ar.n_layers=4", "ar.d_ff=384"),
+        ),
+        SmokeCase(
+            name="imagenet",
+            data_config="imagenet",
+            model_config=image_model_config,
+            data_dir=str(imagenet_dir or Path(_scratch_path("Projects", "data", "imagenet"))),
+            image_size=256,
+            batch_size=4,
+            stage2_batch_size=4,
+            num_workers=8,
+            cache_max_items=128,
             stage1_max_steps=8,
             stage2_max_steps=16,
             stage1_limit_train_batches=8,
@@ -423,6 +474,7 @@ def _full_stage1_batch_size(case: SmokeCase) -> int:
         "celebahq": 8,
         "coco": 2,
         "ffhq": 8,
+        "imagenet": 8,
         "maestro": 8,
         "vctk": 8,
     }.get(case.name, case.batch_size)
@@ -433,6 +485,7 @@ def _full_stage2_batch_size(case: SmokeCase) -> int:
         "celebahq": 8,
         "coco": 4,
         "ffhq": 8,
+        "imagenet": 8,
         "maestro": 8,
         "vctk": 8,
     }.get(case.name, case.stage2_batch_size)
@@ -448,6 +501,36 @@ def _bash_array(items: Iterable[str]) -> str:
     return "\n".join(lines)
 
 
+def _hydra_override_key(item: str) -> Optional[str]:
+    """Return the logical key for a Hydra override, if it sets one.
+
+    Later overrides win in Hydra. Collapsing earlier duplicates keeps generated
+    run scripts readable while preserving the resolved config.
+    """
+    raw = str(item).strip()
+    if "=" not in raw:
+        return None
+    key = raw.split("=", 1)[0].strip()
+    while key.startswith("+"):
+        key = key[1:]
+    if key.startswith("~"):
+        key = key[1:]
+    return key or None
+
+
+def _dedupe_hydra_overrides(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped_reversed: list[str] = []
+    for item in reversed([str(value) for value in items]):
+        key = _hydra_override_key(item)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped_reversed.append(item)
+    return list(reversed(deduped_reversed))
+
+
 def _safe_label(raw: str) -> str:
     label = re.sub(r"[^A-Za-z0-9_-]+", "-", str(raw).strip())
     label = label.strip("-_")
@@ -456,8 +539,8 @@ def _safe_label(raw: str) -> str:
     return label
 
 
-def _per_process_batch_size(global_batch_size: int, num_devices: int) -> int:
-    devices = max(1, int(num_devices))
+def _per_process_batch_size(global_batch_size: int, num_processes: int) -> int:
+    devices = max(1, int(num_processes))
     batch_size = max(1, int(global_batch_size))
     return max(1, (batch_size + devices - 1) // devices)
 
@@ -473,17 +556,23 @@ def write_job_files(
     full_training: bool,
     model_family: str,
     stage1_epochs: int,
+    stage1_adv_epochs: int,
     stage2_epochs: int,
+    stage2_kind: str,
     num_gpus: int,
     stage1_only: bool = False,
     extra_cache_args: tuple[str, ...] = (),
     extra_stage1_overrides: tuple[str, ...] = (),
+    extra_stage1_adv_overrides: tuple[str, ...] = (),
     extra_stage2_overrides: tuple[str, ...] = (),
+    extra_diffusion_args: tuple[str, ...] = (),
+    num_nodes: int = 1,
 ) -> tuple[Path, Path, Path]:
     run_dir = run_root / case.name
     run_dir.mkdir(parents=True, exist_ok=True)
     log_base = run_dir / case.name
     stage1_dir = run_dir / "stage1"
+    stage1_adv_dir = run_dir / "stage1_adv"
     stage2_dir = run_dir / "stage2"
     token_cache = run_dir / "token_cache.pt"
     run_script = run_dir / "run.sh"
@@ -502,9 +591,11 @@ def write_job_files(
     generation_metric_samples = 32 if is_audio else 64
     model_family = str(model_family).strip().lower()
     trainer_devices = max(1, int(num_gpus))
-    trainer_strategy = "ddp" if trainer_devices > 1 else "auto"
-    stage1_data_batch_size = _per_process_batch_size(stage1_batch_size, trainer_devices)
-    stage2_data_batch_size = _per_process_batch_size(stage2_batch_size, trainer_devices)
+    trainer_nodes = max(1, int(num_nodes))
+    trainer_world_size = trainer_devices * trainer_nodes
+    trainer_strategy = "ddp" if trainer_world_size > 1 else "auto"
+    stage1_data_batch_size = _per_process_batch_size(stage1_batch_size, trainer_world_size)
+    stage2_data_batch_size = _per_process_batch_size(stage2_batch_size, trainer_world_size)
 
     stage1_overrides = [
         f"output_dir={stage1_dir}",
@@ -527,6 +618,7 @@ def write_job_files(
         # the allocation idle before cache extraction starts.
         "train.run_test_after_fit=false",
         f"train.devices={trainer_devices}",
+        f"train.num_nodes={trainer_nodes}",
         f"train.strategy={trainer_strategy}",
         "train.precision=bf16-mixed",
         "train.accelerator=gpu",
@@ -568,6 +660,22 @@ def write_job_files(
     if not full_training:
         stage1_overrides.extend(case.extra_stage1_overrides)
     stage1_overrides.extend(extra_stage1_overrides)
+    stage1_overrides = _dedupe_hydra_overrides(stage1_overrides)
+
+    stage1_adv_overrides: list[str] = []
+    if int(stage1_adv_epochs) > 0:
+        stage1_adv_overrides = list(stage1_overrides)
+        stage1_adv_overrides.extend(
+            (
+                f"output_dir={stage1_adv_dir}",
+                f"train.max_epochs={int(stage1_adv_epochs)}",
+                f"wandb.name={case.name}-stage1-adversarial",
+                f"wandb.tags=[{run_tag},{model_family},{case.name},stage1,adversarial{',synthetic_vctk' if synthetic_vctk and case.name == 'vctk' else ''}]",
+                f"wandb.save_dir={stage1_adv_dir / 'wandb'}",
+            )
+        )
+        stage1_adv_overrides.extend(extra_stage1_adv_overrides)
+        stage1_adv_overrides = _dedupe_hydra_overrides(stage1_adv_overrides)
 
     stage2_overrides = [
         f"token_cache_path={token_cache}",
@@ -589,6 +697,7 @@ def write_job_files(
         f"train_ar.compute_generation_fid={'false' if is_audio else 'true'}",
         f"train_ar.compute_audio_generation_metrics={'true' if is_audio else 'false'}",
         f"train_ar.devices={trainer_devices}",
+        f"train_ar.num_nodes={trainer_nodes}",
         f"train_ar.strategy={trainer_strategy}",
         "train_ar.precision=bf16-mixed",
         "train_ar.accelerator=gpu",
@@ -606,6 +715,46 @@ def write_job_files(
     if not full_training:
         stage2_overrides.extend(case.extra_stage2_overrides)
     stage2_overrides.extend(extra_stage2_overrides)
+    stage2_overrides = _dedupe_hydra_overrides(stage2_overrides)
+
+    diffusion_args = [
+        "--token-cache-path", str(token_cache),
+        "--output-dir", str(stage2_dir),
+        "--output-root", str(run_dir),
+        "--seed", "42",
+        "--batch-size", str(stage2_data_batch_size),
+        "--num-workers", str(case.num_workers),
+        "--max-epochs", str(stage2_epochs),
+        "--max-steps", str(stage2_max_steps),
+        "--accelerator", "gpu",
+        "--devices", str(trainer_devices),
+        "--precision", "bf16-mixed",
+        "--gradient-clip-val", "1.0",
+        "--log-every-n-steps", log_every_n_steps,
+        "--val-check-interval", "1.0",
+        "--limit-train-batches", stage2_limit_train,
+        "--limit-val-batches", limit_eval_batches,
+        "--max-items", str(cache_max_items),
+        # W&B logging so the diffusion run's loss + post-fit FID land in the same
+        # project/group as the AR-prior runs.
+        "--wandb-project", project,
+        "--wandb-group", group_name,
+        "--wandb-name", f"{case.name}-stage2-diffusion",
+        "--wandb-save-dir", str(stage2_dir / "wandb"),
+    ]
+    # Post-fit generation FID is image-only (src/stage2_metrics supports
+    # celeba/celebahq; other datasets are skipped gracefully). 256 samples gives a
+    # more stable estimate than the AR runs' in-loop count; a unified matched-N
+    # post-hoc FID is the rigorous AR-vs-diffusion comparison.
+    if not is_audio:
+        diffusion_args += [
+            "--compute-generation-fid",
+            "--generation-metric-num-samples", "256",
+            "--fid-dataset", str(case.name),
+            "--fid-data-dir", str(case.data_dir),
+            "--fid-image-size", str(case.image_size),
+        ]
+    diffusion_args.extend(extra_diffusion_args)
 
     cache_args = [
         "--stage1-checkpoint", "$CKPT",
@@ -626,17 +775,25 @@ def write_job_files(
         f"""#!/bin/bash
 set -euo pipefail
 
-export PYTHONUSERBASE="{_scratch_path('.pydeps', 'laser_src_py311')}"
+export PYTHONUSERBASE="${{PYTHONUSERBASE:-{_scratch_path('.pydeps', 'laser_src_py311')}}}"
 export PATH="$PYTHONUSERBASE/bin:$PATH"
-export PYTHONPATH="{snapshot_path}${{PYTHONPATH:+:$PYTHONPATH}}"
+export PYTHONPATH="$PYTHONUSERBASE/lib/python3.11/site-packages:$PYTHONUSERBASE/lib/python3.12/site-packages:{snapshot_path}${{PYTHONPATH:+:$PYTHONPATH}}"
 export WANDB_MODE="${{WANDB_MODE:-online}}"
+export LASER_DISABLE_WANDB_MEDIA="${{LASER_DISABLE_WANDB_MEDIA:-1}}"
 export PYTORCH_CUDA_ALLOC_CONF="${{PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}"
+export PYTHONUNBUFFERED=1
+export XDG_CACHE_HOME="${{XDG_CACHE_HOME:-/scratch/{_user()}/.cache}}"
+export TORCH_HOME="${{TORCH_HOME:-$XDG_CACHE_HOME/torch}}"
+export PIP_CACHE_DIR="${{PIP_CACHE_DIR:-$XDG_CACHE_HOME/pip}}"
+export WANDB_CACHE_DIR="${{WANDB_CACHE_DIR:-$XDG_CACHE_HOME/wandb}}"
+export WANDB_CONFIG_DIR="${{WANDB_CONFIG_DIR:-/scratch/{_user()}/.config/wandb}}"
+export MPLCONFIGDIR="${{MPLCONFIGDIR:-$XDG_CACHE_HOME/matplotlib}}"
 export HYDRA_FULL_ERROR=1
 export TMPDIR="/tmp/laser_${{SLURM_JOB_ID:-$$}}"
 export TEMP="$TMPDIR"
 export TMP="$TMPDIR"
 
-mkdir -p "$TMPDIR" "{stage1_dir / 'wandb'}" "{stage2_dir / 'wandb'}"
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$PIP_CACHE_DIR" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR" "$MPLCONFIGDIR" "{stage1_dir / 'wandb'}" "{stage1_adv_dir / 'wandb'}" "{stage2_dir / 'wandb'}"
 
 PYTHON_BIN="${{PYTHON_BIN:-$(command -v python3 || command -v python || true)}}"
 if [[ -z "$PYTHON_BIN" ]]; then
@@ -654,20 +811,36 @@ if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,
   exit 2
 fi
 
-"$PYTHON_BIN" -m pip install --user --quiet \
+run_user_pip_install() {{
+  mkdir -p "$PYTHONUSERBASE"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock 9
+      "$PYTHON_BIN" -m pip install --user --quiet "$@" 2>/dev/null || true
+    ) 9>"$PYTHONUSERBASE/.install.lock"
+  else
+    "$PYTHON_BIN" -m pip install --user --quiet "$@" 2>/dev/null || true
+  fi
+}}
+
+run_user_pip_install \
   numpy scipy wandb lightning omegaconf hydra-core rich 'torchmetrics[image]' \
-  torch-fidelity matplotlib lpips soundfile 2>/dev/null || true
+  torch-fidelity matplotlib lpips soundfile pystoi
+# pesq has no cp311 wheel and the runtime container has no C compiler, so it is
+# pre-built once and staged into the shared $PYTHONUSERBASE (see
+# scripts/tools/build_pesq_into_pydeps.sh); _has_pesq() in src/audio_logging.py
+# picks it up if present, otherwise PESQ is skipped gracefully (STOI still logs).
 
 if ! "$PYTHON_BIN" - <<'PY'
 import importlib.util
 raise SystemExit(0 if importlib.util.find_spec("visqol") is not None else 1)
 PY
 then
-  "$PYTHON_BIN" -m pip install --user --quiet bazelisk pybind11 protobuf 2>/dev/null || true
+  run_user_pip_install bazelisk pybind11 protobuf
   if ! command -v bazel >/dev/null 2>&1 && command -v bazelisk >/dev/null 2>&1; then
     ln -sf "$(command -v bazelisk)" "$PYTHONUSERBASE/bin/bazel" 2>/dev/null || true
   fi
-  "$PYTHON_BIN" -m pip install --user --quiet "git+https://github.com/google/visqol.git" 2>/dev/null || true
+  run_user_pip_install "git+https://github.com/google/visqol.git"
 fi
 
 "$PYTHON_BIN" - <<'PY'
@@ -694,11 +867,6 @@ STAGE1_ARGS=(
 echo "=== Stage 1: autoencoder training ({case.name}) ==="
 "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ARGS[@]}}"
 
-if [[ "{'1' if stage1_only else '0'}" == "1" ]]; then
-  echo "=== Stage 1 only requested; skipping token cache and stage 2 ({case.name}) ==="
-  exit 0
-fi
-
 CKPT="$(find "{stage1_dir}" -path '*/final.ckpt' -type f | sort | tail -1)"
 if [[ -z "$CKPT" ]]; then
   CKPT="$(find "{stage1_dir}" -path '*/last.ckpt' -type f | sort | tail -1)"
@@ -708,12 +876,47 @@ if [[ -z "$CKPT" ]]; then
   exit 1
 fi
 
+if [[ "{'1' if int(stage1_adv_epochs) > 0 else '0'}" == "1" ]]; then
+  RECON_CKPT="$CKPT"
+  STAGE1_ADV_ARGS=(
+{_bash_array(stage1_adv_overrides)}
+    "init_ckpt_path=${{RECON_CKPT}}"
+  )
+
+  echo "=== Stage 1 adversarial continuation ({case.name}) ==="
+  "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ADV_ARGS[@]}}"
+
+  CKPT="$(find "{stage1_adv_dir}" -path '*/final.ckpt' -type f | sort | tail -1)"
+  if [[ -z "$CKPT" ]]; then
+    CKPT="$(find "{stage1_adv_dir}" -path '*/last.ckpt' -type f | sort | tail -1)"
+  fi
+  if [[ -z "$CKPT" ]]; then
+    echo "No adversarial stage-1 checkpoint found under {stage1_adv_dir}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "{'1' if stage1_only else '0'}" == "1" ]]; then
+  echo "=== Stage 1 only requested; skipping token cache and stage 2 ({case.name}) ==="
+  exit 0
+fi
+
 CACHE_ARGS=(
 {_bash_array(cache_args)}
 )
 
 echo "=== Token cache extraction ({case.name}) ==="
 "$PYTHON_BIN" cache.py "${{CACHE_ARGS[@]}}"
+
+if [[ "{stage2_kind}" == "diffusion" ]]; then
+  DIFFUSION_ARGS=(
+{_bash_array(diffusion_args)}
+  )
+
+  echo "=== Stage 2: sparse coefficient diffusion prior ({case.name}) ==="
+  "$PYTHON_BIN" train_stage2_diffusion_prior.py "${{DIFFUSION_ARGS[@]}}"
+  exit 0
+fi
 
 STAGE2_ARGS=(
 {_bash_array(stage2_overrides)}
@@ -726,17 +929,31 @@ echo "=== Stage 2: transformer prior training + generation ({case.name}) ==="
     )
     os.chmod(run_script, 0o755)
 
+    data_bind = f'    --bind "{case.data_dir}" \\\n'
     sbatch_script.write_text(
         f"""#!/bin/bash
 set -euo pipefail
+
+BOOTSTRAP_LOG="{run_dir}/bootstrap_${{SLURM_JOB_ID:-manual}}.log"
+exec > "$BOOTSTRAP_LOG" 2>&1
+set -x
+echo "bootstrap-start host=$(hostname) date=$(date) job=${{SLURM_JOB_ID:-manual}}"
+LASER_NODES={trainer_nodes}
+LAUNCH=()
+if [[ "$LASER_NODES" -gt 1 ]]; then
+  LAUNCH=(srun --nodes="$LASER_NODES" --ntasks="$LASER_NODES" --ntasks-per-node=1)
+fi
 
 if ! command -v module >/dev/null 2>&1; then
   if [[ -f /usr/share/lmod/lmod/init/bash ]]; then
     set +u; source /usr/share/lmod/lmod/init/bash; set -u
   elif [[ -f /usr/share/Modules/init/bash ]]; then
     set +u; source /usr/share/Modules/init/bash; set -u
+  elif [[ -f /etc/profile.d/modules.sh ]]; then
+    set +u; source /etc/profile.d/modules.sh; set -u
   fi
 fi
+echo "module=$(command -v module || true)"
 
 CONTAINER_BIN=""
 for candidate in singularity apptainer; do
@@ -758,19 +975,28 @@ if [[ -z "$CONTAINER_BIN" ]]; then
     fi
   done
 fi
+echo "container_bin=$CONTAINER_BIN"
+
+CONTAINER_CACHE_DIR="${{CONTAINER_CACHE_DIR:-/scratch/{_user()}/Projects/laser/.cache/laser_container_shared}}"
+export APPTAINER_CACHEDIR="${{APPTAINER_CACHEDIR:-$CONTAINER_CACHE_DIR}}"
+export SINGULARITY_CACHEDIR="${{SINGULARITY_CACHEDIR:-$CONTAINER_CACHE_DIR}}"
+mkdir -p "$APPTAINER_CACHEDIR" "$SINGULARITY_CACHEDIR"
 
 IMAGE="${{IMAGE:-docker://pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime}}"
+echo "image=$IMAGE"
+nvidia-smi || true
 
 if [[ -n "$CONTAINER_BIN" ]]; then
-  "$CONTAINER_BIN" exec --nv \
+  "${{LAUNCH[@]}}" "$CONTAINER_BIN" exec --nv \
     --bind "{snapshot_path}" \
     --bind "/scratch/{_user()}" \
+{data_bind}    --bind "/projects" \
     --bind "{run_dir}" \
     --bind /dev/shm \
     "$IMAGE" \
     bash "{run_script}"
 else
-  bash "{run_script}"
+  "${{LAUNCH[@]}}" bash "{run_script}"
 fi
 """,
         encoding="utf-8",
@@ -788,19 +1014,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit", default=None)
     parser.add_argument("--cpus-per-task", type=int, default=8)
     parser.add_argument("--mem-mb", type=int, default=64000)
-    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--gpus", type=int, default=1, help="GPUs per node.")
+    parser.add_argument("--nodes", type=int, default=1, help="Number of SLURM nodes to request.")
     parser.add_argument("--project", default=None)
     parser.add_argument("--model-family", default="laser", choices=("vqvae", "laser"))
     parser.add_argument("--run-label", default="", help="Optional label inserted into snapshot, run root, and W&B group names.")
     parser.add_argument("--vctk-dir", default=_scratch_path("datasets", "VCTK-Corpus-smoke"))
+    parser.add_argument("--celeba-dir", default=_scratch_path("datasets", "celeba_packed_128"))
+    parser.add_argument("--celebahq-dir", default=_scratch_path("datasets", "celebahq_packed_256"))
     parser.add_argument("--coco-dir", default=_scratch_path("data", "coco"))
     parser.add_argument("--ffhq-dir", default=_scratch_path("datasets", "ffhq"))
+    parser.add_argument("--imagenet-dir", default=_scratch_path("Projects", "data", "imagenet"))
+    parser.add_argument("--imagenette2-dir", default=_scratch_path("datasets", "imagenette2"))
     parser.add_argument("--maestro-dir", default=_scratch_path("datasets", "maestro", "maestro-v3.0.0"))
-    parser.add_argument("--cases", default="", help="Comma-separated subset of cases to submit, e.g. celeba,celebahq,stl10,vctk.")
+    parser.add_argument("--cases", default="", help="Comma-separated subset of cases to submit, e.g. celeba,celebahq,imagenet,stl10,vctk.")
     parser.add_argument("--full-training", action="store_true", help="Use full configs/data limits instead of smoke settings.")
     parser.add_argument("--stage1-only", action="store_true", help="Train stage 1, then skip token cache extraction and stage 2.")
     parser.add_argument("--stage1-epochs", type=int, default=None, help="Stage-1 autoencoder epochs.")
-    parser.add_argument("--stage2-epochs", type=int, default=None, help="Stage-2 transformer epochs.")
+    parser.add_argument(
+        "--stage1-adv-epochs",
+        type=int,
+        default=0,
+        help="Optional extra stage-1 epochs run after the first stage-1 phase, resuming from its checkpoint.",
+    )
+    parser.add_argument("--stage2-epochs", type=int, default=None, help="Stage-2 prior epochs.")
+    parser.add_argument(
+        "--stage2-kind",
+        choices=("transformer", "diffusion"),
+        default="transformer",
+        help="Stage-2 prior type to train after token cache extraction.",
+    )
     parser.add_argument(
         "--stage1-override",
         action="append",
@@ -814,10 +1057,22 @@ def parse_args() -> argparse.Namespace:
         help="Extra Hydra override appended to every stage-2 run. Repeat as needed.",
     )
     parser.add_argument(
+        "--stage1-adv-override",
+        action="append",
+        default=[],
+        help="Extra Hydra override appended only to the optional adversarial stage-1 continuation.",
+    )
+    parser.add_argument(
         "--cache-arg",
         action="append",
         default=[],
         help="Extra argument appended to cache.py. Repeat for flags and values, e.g. --cache-arg --coeff-bins --cache-arg 256.",
+    )
+    parser.add_argument(
+        "--diffusion-arg",
+        action="append",
+        default=[],
+        help="Extra argument appended to train_stage2_diffusion_prior.py when --stage2-kind=diffusion.",
     )
     parser.add_argument("--exclude-nodes", default="", help="Optional SLURM node exclusion list passed to sbatch --exclude.")
     parser.add_argument("--dependency", default="", help="Optional SLURM dependency expression, e.g. afterok:12345.")
@@ -831,10 +1086,21 @@ def main() -> int:
     model_family = str(args.model_family).strip().lower()
     full_training = bool(args.full_training)
     stage1_only = bool(args.stage1_only)
+    stage2_kind = str(args.stage2_kind or "transformer").strip().lower()
+    num_nodes = max(1, int(args.nodes))
+    if int(args.nodes) < 1:
+        raise SystemExit("--nodes must be >= 1.")
+    if int(args.gpus) < 1:
+        raise SystemExit("--gpus must be >= 1.")
+    if num_nodes > 1 and not stage1_only:
+        raise SystemExit("--nodes > 1 is currently supported only with --stage1-only; cache extraction and stage 2 need single-rank orchestration.")
     stage1_epochs = int(args.stage1_epochs if args.stage1_epochs is not None else (10 if full_training else 1))
+    stage1_adv_epochs = int(args.stage1_adv_epochs or 0)
     stage2_epochs = int(args.stage2_epochs if args.stage2_epochs is not None else (10 if full_training else 1))
     if stage1_epochs <= 0 or stage2_epochs <= 0:
         raise SystemExit("Stage epoch counts must be positive.")
+    if stage1_adv_epochs < 0:
+        raise SystemExit("Stage-1 adversarial epoch count must be non-negative.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_kind = "train" if full_training else "smoke"
     time_limit = str(args.time_limit or ("2-00:00:00" if full_training else "04:00:00"))
@@ -865,8 +1131,12 @@ def main() -> int:
         coco_dir = Path(args.coco_dir).expanduser().resolve()
     cases = _dataset_cases(
         vctk_dir,
+        celeba_dir=Path(args.celeba_dir).expanduser().resolve(),
+        celebahq_dir=Path(args.celebahq_dir).expanduser().resolve(),
         coco_dir=coco_dir,
         ffhq_dir=Path(args.ffhq_dir).expanduser().resolve(),
+        imagenet_dir=Path(args.imagenet_dir).expanduser().resolve(),
+        imagenette2_dir=Path(args.imagenette2_dir).expanduser().resolve(),
         maestro_dir=Path(args.maestro_dir).expanduser().resolve(),
         model_family=model_family,
     )
@@ -898,20 +1168,26 @@ def main() -> int:
             full_training=full_training,
             model_family=model_family,
             stage1_epochs=stage1_epochs,
+            stage1_adv_epochs=stage1_adv_epochs,
             stage2_epochs=stage2_epochs,
+            stage2_kind=stage2_kind,
             num_gpus=int(args.gpus),
+            num_nodes=num_nodes,
             stage1_only=stage1_only,
             extra_cache_args=tuple(str(v) for v in args.cache_arg),
             extra_stage1_overrides=tuple(str(v) for v in args.stage1_override),
+            extra_stage1_adv_overrides=tuple(str(v) for v in args.stage1_adv_override),
             extra_stage2_overrides=tuple(str(v) for v in args.stage2_override),
+            extra_diffusion_args=tuple(str(v) for v in args.diffusion_arg),
         )
         log_base = run_dir / case.name
         sbatch_cmd = [
             "sbatch",
             f"--partition={args.partition}",
             f"--job-name={job_prefix}{run_kind[:3]}-{case.name}",
-            "--nodes=1",
-            "--ntasks=1",
+            f"--nodes={num_nodes}",
+            f"--ntasks={num_nodes}",
+            "--ntasks-per-node=1",
             f"--cpus-per-task={int(args.cpus_per_task)}",
             f"--gres=gpu:{int(args.gpus)}",
             f"--mem={int(args.mem_mb)}",
@@ -948,8 +1224,13 @@ def main() -> int:
     if label:
         print(f"Label:     {label}")
     print(f"Mode:      {('full training' if full_training else 'smoke')}{' stage1-only' if stage1_only else ''}")
-    print(f"Epochs:    stage1={stage1_epochs}" + ("" if stage1_only else f" stage2={stage2_epochs}"))
-    print(f"GPUs/job:  {int(args.gpus)}")
+    if not stage1_only:
+        print(f"Stage 2:   {stage2_kind}")
+    adv_part = f" stage1_adv={stage1_adv_epochs}" if stage1_adv_epochs > 0 else ""
+    print(f"Epochs:    stage1={stage1_epochs}{adv_part}" + ("" if stage1_only else f" stage2={stage2_epochs}"))
+    print(f"Nodes/job: {num_nodes}")
+    print(f"GPUs/node: {int(args.gpus)}")
+    print(f"GPUs/job:  {num_nodes * int(args.gpus)}")
     if synthetic_vctk:
         print(f"VCTK path: {vctk_dir} (synthetic smoke corpus generated because no real WAV/FLAC corpus was present)")
     else:

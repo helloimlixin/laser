@@ -62,11 +62,11 @@ fi
 
 COMMON_STAGE1=(
   --stage1-override train.limit_train_batches=1.0
-  --stage1-override train.limit_val_batches=1.0
-  --stage1-override train.limit_test_batches=1.0
+  --stage1-override train.limit_val_batches=256
+  --stage1-override train.limit_test_batches=256
   --stage1-override train.run_test_after_fit=false
   --stage1-override train.gradient_clip_val=1.0
-  --stage1-override train.val_check_interval=1.0
+  --stage1-override train.val_check_interval=0.25
   --stage1-override model.compute_fid=true
   --stage1-override model.out_tanh=true
 )

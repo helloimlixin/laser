@@ -34,7 +34,8 @@ class STL10DataModule(pl.LightningDataModule):
     def prepare_data(self):
         STL10(self.config.data_dir, split="train", download=True)
         STL10(self.config.data_dir, split="test", download=True)
-        STL10(self.config.data_dir, split="unlabeled", download=True)
+        if bool(getattr(self.config, "stl10_include_unlabeled", True)):
+            STL10(self.config.data_dir, split="unlabeled", download=True)
 
     def setup(self, stage=None):
         image_size = (
@@ -69,12 +70,6 @@ class STL10DataModule(pl.LightningDataModule):
             transform=train_transform,
             download=False,
         )
-        unlabeled_split = STL10(
-            self.config.data_dir,
-            split="unlabeled",
-            transform=train_transform,
-            download=False,
-        )
         test_split = STL10(
             self.config.data_dir,
             split="test",
@@ -82,7 +77,16 @@ class STL10DataModule(pl.LightningDataModule):
             download=False,
         )
 
-        self.train_dataset = ConcatDataset([train_split, unlabeled_split])
+        if bool(getattr(self.config, "stl10_include_unlabeled", True)):
+            unlabeled_split = STL10(
+                self.config.data_dir,
+                split="unlabeled",
+                transform=train_transform,
+                download=False,
+            )
+            self.train_dataset = ConcatDataset([train_split, unlabeled_split])
+        else:
+            self.train_dataset = train_split
         self.val_dataset = test_split
         self.test_dataset = test_split
 

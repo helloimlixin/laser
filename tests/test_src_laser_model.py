@@ -446,6 +446,26 @@ def test_laser_init_no_longer_exposes_removed_sparse_coding_knobs():
     assert "pattern_temperature" not in params
     assert "orthogonality_weight" not in params
     assert "dictionary_update_mode" not in params
+    # Collapsed to a single plain gradient-trained dictionary (June 2026): the
+    # online-K-SVD, dictionary-through-decoder, usage-EMA and dead-atom-revival
+    # knobs were all removed.
+    assert "dictionary_through_decoder" not in params
+    assert "dead_atom_revival_steps" not in params
+    assert "dictionary_usage_ema_decay" not in params
+    assert "dictionary_usage_grad_scale" not in params
+    assert "dictionary_usage_grad_min" not in params
+    assert "dictionary_usage_grad_max" not in params
+    assert "dictionary_ksvd_lr" not in params
+    assert "dictionary_ksvd_update_every" not in params
+    assert "dictionary_ksvd_min_usage" not in params
+    assert "dictionary_ksvd_max_atoms_per_step" not in params
+    assert "online_ksvd_enabled" not in params
+    assert "online_ksvd_start_step" not in params
+    assert "online_ksvd_interval_steps" not in params
+    assert "online_ksvd_stop_step" not in params
+    assert "online_ksvd_max_samples" not in params
+    assert "online_ksvd_max_atoms" not in params
+    assert "online_ksvd_blend" not in params
     assert "dict_ema_decay" not in params
     assert "dict_ema_eps" not in params
     assert "fast_omp" not in params

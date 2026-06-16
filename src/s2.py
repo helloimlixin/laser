@@ -377,6 +377,8 @@ def _make_net(
         coeff_huber_delta=float(merged.get("coeff_huber_delta", 0.5)),
         sample_coeff_temperature=merged.get("sample_coeff_temperature"),
         sample_coeff_mode=str(merged.get("sample_coeff_mode") or "gaussian"),
+        atom_label_smoothing=float(merged.get("atom_label_smoothing", 0.0)),
+        atom_coverage_weight=float(merged.get("atom_coverage_weight", 0.0)),
     )
     net.load_state_dict(state)
     net.save_hyperparameters(merged)
@@ -475,6 +477,9 @@ def sample(
     top_k: Optional[int] = None,
     ctemp: Optional[float] = None,
     cmode: Optional[str] = None,
+    class_labels: Optional[torch.Tensor] = None,
+    text_tokens: Optional[torch.Tensor] = None,
+    text_mask: Optional[torch.Tensor] = None,
     dev=None,
 ) -> Batch:
     h, w, d = shape
@@ -490,12 +495,25 @@ def sample(
 
     while left > 0:
         cur = min(bs, left)
+        text_slice = None
+        mask_slice = None
+        class_slice = None
+        offset = int(n) - left
+        if class_labels is not None:
+            class_slice = torch.as_tensor(class_labels[offset: offset + cur], device=dev, dtype=torch.long)
+        if text_tokens is not None:
+            text_slice = text_tokens[offset: offset + cur].to(device=dev, dtype=torch.long)
+        if text_mask is not None:
+            mask_slice = text_mask[offset: offset + cur].to(device=dev, dtype=torch.bool)
         out = net.generate_sparse_codes(
             cur,
             temperature=float(temp),
             top_k=top_k,
             coeff_temperature=ctemp,
             coeff_sample_mode=cmode,
+            class_labels=class_slice,
+            text_tokens=text_slice,
+            text_mask=mask_slice,
         )
         if bool(getattr(net.prior, "real_valued_coeffs", False)):
             atom_ids, vals = out
@@ -532,6 +550,59 @@ def _window_origin(pos: int, total: int, window: int) -> int:
     if window >= total:
         return 0
     return min(max(int(pos) - int(window) + 1, 0), int(total) - int(window))
+
+
+@torch.no_grad()
+def _sample_gpt_site_from_window(
+    prior,
+    prompt_tokens: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    *,
+    local_site: int,
+    temperature: float,
+    top_k: Optional[int],
+) -> torch.Tensor:
+    """Sample one spatial site's depth stream from a crop-trained GPT prior."""
+    batch_size, n_sites, depth = prompt_tokens.shape
+    seq_len = int(n_sites) * int(depth)
+    device = prompt_tokens.device
+    prompt_flat = prior._flatten_tokens(prompt_tokens)
+    mask_flat = torch.as_tensor(prompt_mask, device=device, dtype=torch.bool).reshape(batch_size, seq_len)
+    target_start = int(local_site) * int(depth)
+    target_end = target_start + int(depth)
+    if target_start < 0 or target_end > seq_len:
+        raise ValueError(f"local_site={local_site} is outside crop with {n_sites} sites")
+
+    seq = prompt_flat.clone()
+    bos = torch.full((batch_size, 1), int(prior.bos_token_id), device=device, dtype=torch.long)
+    if int(getattr(prior, "n_global_spatial_tokens", 0)) != 0:
+        raise ValueError("VQGAN-style sliding-window sampling expects no global prefix tokens.")
+
+    if target_start > 0:
+        prefix = torch.cat([bos, prompt_flat[:, :target_start]], dim=1)
+    else:
+        prefix = bos
+    logits, kv_cache = prior._forward_step(prefix, kv_cache=None, start_pos=0)
+
+    for step in range(target_start, target_end):
+        step_logits = prior._ban_used_atoms(logits[:, -1, :], seq, step=step)
+        sampled = prior._sample_from_logits(
+            step_logits,
+            temperature=float(temperature),
+            top_k=top_k,
+        )
+        clamp_now = mask_flat[:, step]
+        if clamp_now.any():
+            sampled = torch.where(clamp_now, prompt_flat[:, step], sampled)
+        seq[:, step] = sampled
+        if step + 1 < target_end:
+            logits, kv_cache = prior._forward_step(
+                sampled.unsqueeze(1),
+                kv_cache=kv_cache,
+                start_pos=step + 1,
+            )
+
+    return seq[:, target_start:target_end]
 
 
 @torch.no_grad()
@@ -586,15 +657,14 @@ def sample_slide(
                 cc = torch.arange(left_col, left_col + crop_w, device=dev).view(1, 1, crop_w, 1)
                 prompt_mask = ((rr < r) | ((rr == r) & (cc < c))).expand(cur, crop_h, crop_w, d)
 
-                window_tokens = prior.generate(
-                    batch_size=cur,
+                full[:, r, c, :] = _sample_gpt_site_from_window(
+                    prior,
+                    prompt_tokens.view(cur, crop_h * crop_w, d),
+                    prompt_mask.reshape(cur, crop_h * crop_w, d),
+                    local_site=local_r * crop_w + local_c,
                     temperature=float(temp),
                     top_k=top_k,
-                    prompt_tokens=prompt_tokens.view(cur, crop_h * crop_w, d),
-                    prompt_mask=prompt_mask.reshape(cur, crop_h * crop_w, d),
-                    show_progress=False,
                 )
-                full[:, r, c, :] = window_tokens[:, local_r * crop_w + local_c, :]
 
         img = decode_stage2_outputs(
             s1,

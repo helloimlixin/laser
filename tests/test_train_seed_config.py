@@ -19,3 +19,8 @@ def test_data_configs_inherit_root_seed():
 def test_training_is_deterministic_by_default():
     cfg = _compose("data=cifar10")
     assert cfg.train.deterministic is True
+
+
+def test_stage1_init_ckpt_path_is_structured_config_key():
+    cfg = _compose("data=cifar10", "init_ckpt_path=/tmp/stage1/final.ckpt")
+    assert cfg.init_ckpt_path == "/tmp/stage1/final.ckpt"

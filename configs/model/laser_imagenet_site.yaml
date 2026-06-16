@@ -2,25 +2,9 @@
 # (imagenet-site-ds4-k16-a8192-prod-150k) with the frozen-dictionary fix.
 #
 # WHY THIS EXISTS
-#   Run 88qwzymn rose monotonically in train/bottleneck_loss while PSNR plateaued
-#   then regressed. Root cause: it used dictionary_update_mode=online_ksvd, but the
-#   K-SVD atom update was only wired into the adversarial/manual training path. On
-#   the non-adversarial (automatic-optimization) route the dictionary is
-#   requires_grad=False AND the K-SVD call never fired, so the dictionary stayed
-#   FROZEN at its data-init for the whole run (dict_coherence bit-identical at
-#   0k/16k/33k). The encoder then ran away from the fixed atoms (coeff_abs_max
-#   saturated coef_max=16) and the z_e<->z_dl gap (= bottleneck_loss) grew.
-#
-# TWO CHANGES vs 88qwzymn:
-#   1. dictionary_update_mode: online_ksvd -> gradient   (known-good update path;
-#      dictionary is in the optimizer and learns via backprop on the automatic route)
-#   2. commitment_cost: 0.05 -> 0.25   (pin the encoder to the dictionary manifold;
-#      0.05 was too weak, especially with dictionary_through_decoder=true)
-#
-#   NOTE: optimizer_step now also calls online_ksvd_update_() (self-guarded), so
-#   online_ksvd is no longer broken on the automatic path. If you specifically want
-#   K-SVD atoms instead of gradient atoms, override on the CLI:
-#       model.dictionary_update_mode=online_ksvd model.dictionary_ksvd_lr=0.08
+#   Relaunch of 88qwzymn (which plateaued/regressed) with the plain gradient-trained
+#   dictionary and commitment_cost 0.05 -> 0.25 (pin the encoder to the dictionary
+#   manifold). The dictionary is a normal Adam parameter that learns via backprop.
 #
 # LAUNCH (mirrors the original; train.* / data.* stay on the CLI):
 #   python train_stage1_autoencoder.py \
@@ -66,33 +50,14 @@ dict_learning_rate: 2.5e-4
 coef_max: 16
 bounded_omp_refine_steps: 8
 
-# EMA usage tracking (smooths the dictionary gradient across a large overcomplete set).
-dictionary_usage_ema_decay: 0.99
-dictionary_usage_grad_scale: 0.0
-dictionary_usage_grad_min: 0.1
-dictionary_usage_grad_max: 10.0
-
 # Variational coefficients off (matches 88qwzymn).
 variational_coeffs: false
 variational_coeff_refine_weight: 0.0
 variational_coeff_target_std: 0.25
 variational_coeff_min_std: 0.01
 
-# A2 switch on: decoder gradients also flow into the dictionary atoms. This needs a
-# non-trivial commitment_cost (see above) so the encoder does not drift off-manifold.
-dictionary_through_decoder: true
+# Initialize dictionary atoms from the first batch's encoder latents.
 data_init_from_first_batch: true
-dead_atom_revival_steps: 100
-
-# Dictionary atom update.
-#   gradient    -> dictionary is an Adam parameter, learns via backprop (used here).
-#   online_ksvd -> removed from Adam; mini-batch K-SVD on fixed OMP supports
-#                  (now fires on the automatic path too via optimizer_step).
-dictionary_update_mode: gradient   # FIX: was online_ksvd (frozen on the non-adversarial path)
-dictionary_ksvd_lr: 0.08
-dictionary_ksvd_update_every: 1
-dictionary_ksvd_min_usage: 1
-dictionary_ksvd_max_atoms_per_step: 512
 
 # Per-site sparse coding (no latent patches).
 patch_based: false

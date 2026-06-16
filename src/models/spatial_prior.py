@@ -90,6 +90,13 @@ class SpatialDepthPriorConfig:
     coeff_min_std: float = 0.01
     autoregressive_coeffs: bool = True
     support_order: str = "none"
+    class_conditional: bool = False
+    num_classes: int = 0
+    text_conditional: bool = False
+    text_vocab_size: int = 0
+    text_max_length: int = 0
+    text_pad_id: int = 0
+    text_prefix_length: int = 16
 
 
 def build_spatial_depth_prior_config(
@@ -152,8 +159,33 @@ class SpatialDepthPrior(nn.Module):
         self.real_valued_coeffs = bool(cfg.real_valued_coeffs)
         self.gaussian_coeffs = bool(self.real_valued_coeffs and cfg.gaussian_coeffs)
         self.autoregressive_coeffs = bool(cfg.autoregressive_coeffs)
+        self.class_conditional = bool(getattr(cfg, "class_conditional", False))
+        self.num_classes = int(getattr(cfg, "num_classes", 0) or 0)
+        if self.class_conditional and self.num_classes <= 0:
+            raise ValueError("class_conditional=True requires num_classes > 0")
+        self.text_conditional = bool(getattr(cfg, "text_conditional", False))
+        self.text_vocab_size = int(getattr(cfg, "text_vocab_size", 0) or 0)
+        self.text_max_length = int(getattr(cfg, "text_max_length", 0) or 0)
+        self.text_pad_id = int(getattr(cfg, "text_pad_id", 0) or 0)
+        self.text_prefix_length = int(getattr(cfg, "text_prefix_length", 16) or 0)
+        if self.text_conditional:
+            if self.text_vocab_size <= 2:
+                raise ValueError("text_conditional=True requires text_vocab_size > 2")
+            if self.text_max_length <= 0:
+                raise ValueError("text_conditional=True requires text_max_length > 0")
+            if self.text_pad_id < 0 or self.text_pad_id >= self.text_vocab_size:
+                raise ValueError(
+                    f"text_pad_id must be in [0, text_vocab_size), got {self.text_pad_id}"
+                )
+            if self.text_prefix_length < 0:
+                raise ValueError(
+                    f"text_prefix_length must be >= 0, got {self.text_prefix_length}"
+                )
         self.support_order = str(getattr(cfg, "support_order", "none") or "none").strip().lower()
-        if self.support_order not in {"none", "atom_id"}:
+        # "magnitude" (matching-pursuit order, baked into the cache targets) imposes no
+        # generation-time constraint, so it behaves like "none"; only "atom_id" enables
+        # the monotonic atom-id mask.
+        if self.support_order not in {"none", "atom_id", "magnitude"}:
             raise ValueError(f"Unsupported sparse support_order: {self.support_order!r}")
         self.n_global_spatial_tokens = int(cfg.n_global_spatial_tokens)
         if self.n_global_spatial_tokens < 0:
@@ -212,6 +244,31 @@ class SpatialDepthPrior(nn.Module):
         self.row_emb = nn.Embedding(cfg.H, cfg.d_model)
         self.col_emb = nn.Embedding(cfg.W, cfg.d_model)
         self.depth_emb = nn.Embedding(self.rollout_depth, cfg.d_model)
+        self.class_emb = (
+            nn.Embedding(self.num_classes, cfg.d_model)
+            if self.class_conditional
+            else None
+        )
+        self.text_emb = (
+            nn.Embedding(self.text_vocab_size, cfg.d_model, padding_idx=self.text_pad_id)
+            if self.text_conditional
+            else None
+        )
+        self.text_pos_emb = (
+            nn.Embedding(self.text_max_length, cfg.d_model)
+            if self.text_conditional
+            else None
+        )
+        self.text_norm = nn.LayerNorm(cfg.d_model) if self.text_conditional else None
+        self.text_proj = (
+            nn.Sequential(
+                nn.Linear(cfg.d_model, cfg.d_model),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, cfg.d_model),
+            )
+            if self.text_conditional
+            else None
+        )
         self.start_emb = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         nn.init.normal_(self.start_emb, std=0.02)
         self.global_spatial_tokens = None
@@ -326,6 +383,143 @@ class SpatialDepthPrior(nn.Module):
             torch.tensor(1 if self.autoregressive_coeffs else 0, dtype=torch.int64),
             persistent=True,
         )
+
+    def _class_condition(
+        self,
+        class_labels: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.class_emb is None:
+            return None
+        if class_labels is None:
+            class_labels = torch.randint(
+                0,
+                self.num_classes,
+                (batch_size,),
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            class_labels = torch.as_tensor(class_labels, device=device, dtype=torch.long).reshape(-1)
+            if int(class_labels.numel()) != int(batch_size):
+                raise ValueError(
+                    f"Expected {batch_size} class labels, got {int(class_labels.numel())}"
+                )
+        return self.class_emb(class_labels.clamp(0, self.num_classes - 1)).to(dtype=dtype)
+
+    def _prepare_text_inputs(
+        self,
+        text_tokens: Optional[torch.Tensor],
+        text_mask: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.text_emb is None:
+            return None, None
+        max_len = int(self.text_max_length)
+        if text_tokens is None:
+            text_tokens = torch.full(
+                (batch_size, max_len),
+                int(self.text_pad_id),
+                device=device,
+                dtype=torch.long,
+            )
+            text_mask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
+        else:
+            text_tokens = torch.as_tensor(text_tokens, device=device, dtype=torch.long)
+            if text_tokens.ndim != 2 or int(text_tokens.size(0)) != int(batch_size):
+                raise ValueError(
+                    f"Expected text_tokens with shape [B, L] and B={batch_size}, got {tuple(text_tokens.shape)}"
+                )
+            if int(text_tokens.size(1)) > max_len:
+                text_tokens = text_tokens[:, :max_len]
+                if text_mask is not None:
+                    text_mask = torch.as_tensor(text_mask, device=device, dtype=torch.bool)[:, :max_len]
+            elif int(text_tokens.size(1)) < max_len:
+                pad = max_len - int(text_tokens.size(1))
+                text_tokens = F.pad(text_tokens, (0, pad), value=int(self.text_pad_id))
+                if text_mask is not None:
+                    raw_mask = torch.as_tensor(text_mask, device=device, dtype=torch.bool)
+                    text_mask = torch.cat(
+                        [
+                            raw_mask,
+                            torch.zeros(raw_mask.size(0), pad, device=device, dtype=torch.bool),
+                        ],
+                        dim=1,
+                    )
+            if text_mask is None:
+                text_mask = text_tokens.ne(int(self.text_pad_id))
+            else:
+                text_mask = torch.as_tensor(text_mask, device=device, dtype=torch.bool)
+                if tuple(text_mask.shape) != tuple(text_tokens.shape):
+                    raise ValueError(
+                        f"text_mask shape {tuple(text_mask.shape)} must match text_tokens {tuple(text_tokens.shape)}"
+                    )
+
+        return text_tokens.clamp(0, self.text_vocab_size - 1), text_mask
+
+    def _pool_text_prefix(
+        self,
+        emb: torch.Tensor,
+        text_mask: torch.Tensor,
+        prefix_len: int,
+    ) -> torch.Tensor:
+        prefix_len = int(prefix_len)
+        if prefix_len <= 0:
+            return emb[:, :0, :]
+        if int(emb.size(1)) == prefix_len:
+            return emb * text_mask.to(dtype=emb.dtype).unsqueeze(-1)
+
+        weights = text_mask.to(dtype=emb.dtype).unsqueeze(-1)
+        weighted = emb * weights
+        pooled = F.adaptive_avg_pool1d(
+            weighted.transpose(1, 2),
+            prefix_len,
+        ).transpose(1, 2)
+        denom = F.adaptive_avg_pool1d(
+            weights.transpose(1, 2),
+            prefix_len,
+        ).transpose(1, 2).clamp_min(1.0e-6)
+        return pooled / denom
+
+    def _text_condition(
+        self,
+        text_tokens: Optional[torch.Tensor],
+        text_mask: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        text_tokens, text_mask = self._prepare_text_inputs(
+            text_tokens,
+            text_mask,
+            batch_size=batch_size,
+            device=device,
+        )
+        if text_tokens is None or text_mask is None:
+            return None, None
+
+        max_len = int(self.text_max_length)
+        positions = torch.arange(max_len, device=device, dtype=torch.long)
+        emb = self.text_emb(text_tokens) + self.text_pos_emb(positions).unsqueeze(0)
+        emb = emb.to(dtype=dtype)
+        weights = text_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+        denom = weights.sum(dim=1).clamp_min(1.0)
+        pooled = (emb * weights).sum(dim=1) / denom
+        pooled = self.text_norm(pooled)
+        pooled = self.text_proj(pooled).to(dtype=dtype)
+
+        prefix = None
+        if int(self.text_prefix_length) > 0:
+            prefix = self._pool_text_prefix(emb, text_mask, int(self.text_prefix_length))
+            prefix = self.text_norm(prefix)
+            prefix = self.text_proj(prefix).to(dtype=dtype)
+        return pooled, prefix
 
     def _load_from_state_dict(
         self,
@@ -456,6 +650,11 @@ class SpatialDepthPrior(nn.Module):
         _sync_optional_module("coeff_token_emb", self.coeff_token_emb)
         _sync_optional_module("token_type_emb", self.token_type_emb)
         _sync_optional_module("atom_coeff_emb", self.atom_coeff_emb)
+        _sync_optional_module("class_emb", self.class_emb)
+        _sync_optional_module("text_emb", self.text_emb)
+        _sync_optional_module("text_pos_emb", self.text_pos_emb)
+        _sync_optional_module("text_norm", self.text_norm)
+        _sync_optional_module("text_proj", self.text_proj)
         _sync_optional_module("coeff_head", self.coeff_head)
         _sync_optional_module("coeff_token_head", self.coeff_token_head)
         super()._load_from_state_dict(
@@ -485,25 +684,54 @@ class SpatialDepthPrior(nn.Module):
             pos = pos.to(dtype=dtype)
         return pos
 
-    def _prepend_global_spatial_tokens(self, spatial_in: torch.Tensor) -> torch.Tensor:
-        if self.global_spatial_tokens is None:
+    def _conditioning_prefix_tokens(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        text_prefix: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        pieces = []
+        if self.global_spatial_tokens is not None:
+            pieces.append(
+                self.global_spatial_tokens.expand(batch_size, -1, -1).to(dtype=dtype)
+            )
+        if text_prefix is not None and int(text_prefix.size(1)) > 0:
+            pieces.append(text_prefix.to(dtype=dtype))
+        if not pieces:
+            return None
+        return torch.cat(pieces, dim=1)
+
+    def _prepend_global_spatial_tokens(
+        self,
+        spatial_in: torch.Tensor,
+        text_prefix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        prefix = self._conditioning_prefix_tokens(
+            int(spatial_in.size(0)),
+            spatial_in.dtype,
+            text_prefix=text_prefix,
+        )
+        if prefix is None:
             return spatial_in
-        global_tokens = self.global_spatial_tokens.expand(spatial_in.size(0), -1, -1).to(dtype=spatial_in.dtype)
-        return torch.cat([global_tokens, spatial_in], dim=1)
+        return torch.cat([prefix.to(device=spatial_in.device), spatial_in], dim=1)
 
     def _prime_spatial_kv_with_global_tokens(
         self,
         batch_size: int,
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]],
+        text_prefix: Optional[torch.Tensor] = None,
     ) -> list[Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        if self.global_spatial_tokens is None:
+        prefix = self._conditioning_prefix_tokens(
+            batch_size,
+            self._activation_dtype(self.start_emb.device),
+            text_prefix=text_prefix,
+        )
+        if prefix is None:
             return spatial_kv
 
-        global_h = self.global_spatial_tokens.expand(batch_size, -1, -1).to(
-            dtype=self._activation_dtype(self.global_spatial_tokens.device)
-        )
+        prefix = prefix.to(device=self.start_emb.device)
         _, spatial_kv = run_transformer_blocks(
-            global_h,
+            prefix,
             self.spatial_blocks,
             None,
             kv_cache=spatial_kv,
@@ -691,6 +919,9 @@ class SpatialDepthPrior(nn.Module):
         self,
         tokens: torch.Tensor,
         coeffs: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         tokens, coeffs, act_dtype = self._prepare_depth_inputs(tokens, coeffs)
         B, T, D = tokens.shape
@@ -710,14 +941,34 @@ class SpatialDepthPrior(nn.Module):
             spatial_in[:, 1:] = self.spatial_fuse(prev_flat)
 
         spatial_in = spatial_in + self._spatial_pos(T, device, dtype=act_dtype).unsqueeze(0)
-        spatial_h = self._prepend_global_spatial_tokens(spatial_in)
+        class_cond = self._class_condition(
+            class_labels,
+            batch_size=B,
+            device=device,
+            dtype=act_dtype,
+        )
+        if class_cond is not None:
+            spatial_in = spatial_in + class_cond.unsqueeze(1)
+        text_cond, text_prefix = self._text_condition(
+            text_tokens,
+            text_mask,
+            batch_size=B,
+            device=device,
+            dtype=act_dtype,
+        )
+        if text_cond is not None:
+            spatial_in = spatial_in + text_cond.unsqueeze(1)
+        prefix_len = int(self.n_global_spatial_tokens)
+        if text_prefix is not None:
+            prefix_len += int(text_prefix.size(1))
+        spatial_h = self._prepend_global_spatial_tokens(spatial_in, text_prefix=text_prefix)
         spatial_h, _ = run_transformer_blocks(
             spatial_h,
             self.spatial_blocks,
             self.spatial_ln,
         )
-        if self.n_global_spatial_tokens > 0:
-            spatial_h = spatial_h[:, self.n_global_spatial_tokens:]
+        if prefix_len > 0:
+            spatial_h = spatial_h[:, prefix_len:]
         return spatial_h
 
     def _forward_depth_hidden_from_spatial(
@@ -772,8 +1023,17 @@ class SpatialDepthPrior(nn.Module):
         self,
         tokens: torch.Tensor,
         coeffs: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        spatial_h = self._forward_spatial_hidden(tokens, coeffs)
+        spatial_h = self._forward_spatial_hidden(
+            tokens,
+            coeffs,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
         return self._forward_depth_hidden_from_spatial(spatial_h, tokens, coeffs)
 
     def _predict_coeff_distribution_from_concat(
@@ -858,11 +1118,20 @@ class SpatialDepthPrior(nn.Module):
         self,
         tokens: torch.Tensor,
         coeffs: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
         mask_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if mask_tokens is None:
             mask_tokens = tokens
-        depth_h = self._forward_depth_hidden(tokens, coeffs)
+        depth_h = self._forward_depth_hidden(
+            tokens,
+            coeffs,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
         token_logits = self.token_head(depth_h)
         token_logits = self._masked_training_logits(token_logits, tokens=mask_tokens)
         return token_logits, depth_h
@@ -907,6 +1176,9 @@ class SpatialDepthPrior(nn.Module):
         self,
         tokens: torch.Tensor,
         coeffs: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
         return_features: bool = False,
         mask_tokens: Optional[torch.Tensor] = None,
     ):
@@ -925,7 +1197,14 @@ class SpatialDepthPrior(nn.Module):
             real-valued mode: (atom_logits [B, H*W, D, vocab], coeff_mean [B, H*W, D], coeff_logvar [B, H*W, D] or None)
             quantized mode:   token_logits [B, H*W, D, vocab]
         """
-        token_logits, depth_h = self.forward_features(tokens, coeffs, mask_tokens=mask_tokens)
+        token_logits, depth_h = self.forward_features(
+            tokens,
+            coeffs,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            mask_tokens=mask_tokens,
+        )
         if not self.real_valued_coeffs:
             if return_features:
                 return token_logits, depth_h
@@ -999,6 +1278,9 @@ class SpatialDepthPrior(nn.Module):
         prompt_tokens: Optional[torch.Tensor] = None,
         prompt_coeffs: Optional[torch.Tensor] = None,
         prompt_mask: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Unconditional generation with KV-cached spatial transformer.
 
@@ -1023,6 +1305,19 @@ class SpatialDepthPrior(nn.Module):
         cfg = self.cfg
         T = cfg.H * cfg.W
         D = self.output_depth
+        class_cond = self._class_condition(
+            class_labels,
+            batch_size=batch_size,
+            device=device,
+            dtype=self._activation_dtype(device),
+        )
+        text_cond, text_prefix = self._text_condition(
+            text_tokens,
+            text_mask,
+            batch_size=batch_size,
+            device=device,
+            dtype=self._activation_dtype(device),
+        )
         prompt_tokens, prompt_coeffs, prompt_mask = self._prepare_prompt_inputs(
             batch_size=batch_size,
             T=T,
@@ -1054,7 +1349,11 @@ class SpatialDepthPrior(nn.Module):
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
             None
         ] * len(self.spatial_blocks)
-        spatial_kv = self._prime_spatial_kv_with_global_tokens(batch_size, spatial_kv)
+        spatial_kv = self._prime_spatial_kv_with_global_tokens(
+            batch_size,
+            spatial_kv,
+            text_prefix=text_prefix,
+        )
 
         steps = tqdm(
             range(T),
@@ -1081,6 +1380,10 @@ class SpatialDepthPrior(nn.Module):
             x_new = x_new + (
                 self.row_emb(self._rows[t]) + self.col_emb(self._cols[t])
             ).to(dtype=x_new.dtype)
+            if class_cond is not None:
+                x_new = x_new + class_cond.unsqueeze(1).to(dtype=x_new.dtype)
+            if text_cond is not None:
+                x_new = x_new + text_cond.unsqueeze(1).to(dtype=x_new.dtype)
 
             spatial_h = x_new
             spatial_h, spatial_kv = run_transformer_blocks(

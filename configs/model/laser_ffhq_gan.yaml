@@ -65,6 +65,8 @@ perceptual_warmup_steps: 2000
 
 # --- PatchGAN adversarial loss (the main sharpness lever) ---
 adversarial_weight: 0.8
+adversarial_start_step: 5000
+adversarial_warmup_steps: 0
 # Let the autoencoder learn coarse structure before the critic engages.
 disc_start_step: 5000
 disc_num_layers: 3
@@ -78,17 +80,10 @@ use_adaptive_disc_weight: true
 disc_factor: 1.0
 disc_weight_max: 10000.0
 
-# --- Dictionary maintenance / diagnostics (unchanged from laser.yaml) ---
-dictionary_through_decoder: false
-dictionary_update_mode: gradient
-dictionary_ksvd_lr: 0.2
-dictionary_ksvd_update_every: 1
-dictionary_ksvd_min_usage: 1
-dictionary_ksvd_max_atoms_per_step: 512
-dictionary_usage_ema_decay: 0.99
-dictionary_usage_grad_scale: 0.0
-dictionary_usage_grad_min: 0.1
-dictionary_usage_grad_max: 10.0
+# --- Dictionary maintenance (unchanged from laser.yaml) ---
+data_init_from_first_batch: false
+separable_dictionary_rank: 0
+separable_dictionary_factor_dims: null
 variational_coeffs: false
 variational_coeff_refine_weight: 0.0
 variational_coeff_target_std: 0.25

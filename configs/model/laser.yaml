@@ -83,14 +83,6 @@ dict_learning_rate: 2.5e-4
 coef_max: null
 bounded_omp_refine_steps: 8
 
-# EMA-like dictionary usage tracking. The dictionary remains a DDP-synchronized
-# parameter, while per-atom usage counts smooth the dictionary gradient so a few
-# frequent atoms do not dominate large overcomplete patch dictionaries.
-dictionary_usage_ema_decay: 0.99
-dictionary_usage_grad_scale: 0.0
-dictionary_usage_grad_min: 0.1
-dictionary_usage_grad_max: 10.0
-
 # Optional variational posterior over continuous sparse coefficients.
 # This keeps the support depth fixed while giving stage 2 a Gaussian
 # coefficient target when caches are extracted with coeff_bins=0.
@@ -107,25 +99,16 @@ variational_coeff_refine_weight: 0.0
 variational_coeff_target_std: 0.25
 variational_coeff_min_std: 0.01
 
-# A2 switch (May 2026): when true, skip the straight-through estimator inside
-# the bottleneck so decoder gradients flow into the dictionary atoms (and the
-# coeff_variational_* networks in variational mode). Off by default — current
-# training matches the legacy proto/VQ-style behavior where the dictionary
-# learns only from dl_latent_loss. Turning this on usually requires raising
-# commitment_cost so the encoder stays pinned to the dictionary manifold.
-dictionary_through_decoder: false
+# Initialize dictionary atoms from the first batch's encoder latents before the
+# first OMP solve.
 data_init_from_first_batch: false
-dead_atom_revival_steps: 0
 
-# Dictionary atom update.
-# `gradient` uses the standard Adam path. `online_ksvd` removes the dictionary
-# from Adam and applies a mini-batch K-SVD-style least-squares atom update on
-# the fixed OMP supports after each training step.
-dictionary_update_mode: gradient
-dictionary_ksvd_lr: 0.2
-dictionary_ksvd_update_every: 1
-dictionary_ksvd_min_usage: 1
-dictionary_ksvd_max_atoms_per_step: 512
+# Low-separation-rank dictionary parameterization. Disabled by default.
+# When rank > 0, the dense patch dictionary is composed as a sum of rank many
+# separable Kronecker terms across (channels, patch_y, patch_x). Leave factor
+# dims null to auto-factor num_embeddings across those three modes.
+separable_dictionary_rank: 0
+separable_dictionary_factor_dims: null
 
 # Latent patch sparse coding.
 # Keep this disabled for the RQ-AE encoder/decoder stack while reconstruction
@@ -144,15 +127,6 @@ patch_reconstruction: tile
 # Increase this if the sparse codes are still too dense.
 sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regularization
 
-# Optional online K-SVD-style dictionary refresh. Disabled by default.
-online_ksvd_enabled: false
-online_ksvd_start_step: 0
-online_ksvd_interval_steps: 0
-online_ksvd_stop_step: null
-online_ksvd_max_samples: 512
-online_ksvd_max_atoms: 256
-online_ksvd_blend: 0.25
-
 # Perceptual loss weight (LPIPS)
 # Keep disabled while validating reconstruction capacity. The scratch reference
 # trains stage 1 with MSE reconstruction only.
@@ -168,6 +142,8 @@ perceptual_warmup_steps: 0
 # legacy single-optimizer (automatic optimization) training path exactly.
 # Set >0 (e.g. 0.8) to enable; this switches stage-1 to manual optimization.
 adversarial_weight: 0.0
+adversarial_start_step: 0
+adversarial_warmup_steps: 0
 # Autoencoder warmup (in training batches) before the critic starts. Below this
 # step training is pure reconstruction so the critic does not fight an untrained
 # decoder. Tie roughly to perceptual_start_step.
@@ -182,6 +158,21 @@ disc_spectral: false
 disc_loss: hinge
 # Optional separate LR for the critic (null -> use the autoencoder learning_rate).
 disc_learning_rate: null
+# Raw waveform audio uses a HiFi-GAN-style multi-period/multi-scale critic
+# instead of the 2D image PatchGAN.
+audio_adversarial_type: hifigan
+audio_disc_periods: [2, 3, 5, 7, 11]
+audio_disc_num_scales: 3
+audio_disc_max_channels: 512
+# Optional DAC/Encodec-style complex-STFT critics (empty = MPD/MSD only).
+audio_disc_stft_fft_sizes: []
+# HiFi-GAN feature-matching loss (L1 between critic intermediate features for
+# real vs generated audio) — the core perceptual GAN signal. 0.0 = off.
+audio_feature_matching_weight: 0.0
+# Multi-scale log-mel L1 reconstruction loss (DAC/HiFi-GAN). 0.0 = off.
+audio_mel_loss_weight: 0.0
+audio_mel_fft_sizes: [512, 1024, 2048]
+audio_mel_n_mels: 80
 # VQGAN adaptive weight: balances recon vs adversarial gradients at the decoder
 # output layer so the GAN term neither vanishes nor dominates.
 use_adaptive_disc_weight: true
