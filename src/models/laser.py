@@ -129,6 +129,8 @@ class LASER(VisualsMixin, pl.LightningModule):
             audio_mel_loss_weight=0.0,
             audio_mel_fft_sizes=(512, 1024, 2048),
             audio_mel_n_mels=80,
+            adversarial_start_recon_mse=None,
+            adversarial_quality_ema_decay=0.99,
             discriminator_learning_rate=None,
             discriminator_beta1=0.5,
             discriminator_beta2=0.9,
@@ -226,6 +228,11 @@ class LASER(VisualsMixin, pl.LightningModule):
             adversarial_warmup_steps: Linear adversarial weight ramp length after start
             audio_adversarial_type: waveform discriminator family; "hifigan" enables
                 a compact multi-period/multi-scale critic for raw waveform audio
+            adversarial_start_recon_mse: Optional train reconstruction-MSE EMA threshold.
+                When set, adversarial generator/discriminator updates remain disabled
+                until the train reconstruction MSE EMA is at or below this value.
+            adversarial_quality_ema_decay: Decay for the train reconstruction-MSE EMA
+                used by adversarial_start_recon_mse. Set 0 to gate on the current batch.
             discriminator_learning_rate: Optional discriminator LR; defaults to learning_rate
             discriminator_beta1: Discriminator Adam beta1
             discriminator_beta2: Discriminator Adam beta2
@@ -347,6 +354,28 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.adversarial_weight = float(adversarial_weight)
         self.adversarial_start_step = max(int(adversarial_start_step), 0)
         self.adversarial_warmup_steps = max(int(adversarial_warmup_steps), 0)
+        self.adversarial_start_recon_mse = (
+            None if adversarial_start_recon_mse is None else float(adversarial_start_recon_mse)
+        )
+        if self.adversarial_start_recon_mse is not None:
+            if (
+                not math.isfinite(self.adversarial_start_recon_mse)
+                or self.adversarial_start_recon_mse < 0.0
+            ):
+                raise ValueError(
+                    "adversarial_start_recon_mse must be finite and >= 0 when provided, got "
+                    f"{self.adversarial_start_recon_mse}"
+                )
+        self.adversarial_quality_ema_decay = float(adversarial_quality_ema_decay)
+        if (
+            not math.isfinite(self.adversarial_quality_ema_decay)
+            or self.adversarial_quality_ema_decay < 0.0
+            or self.adversarial_quality_ema_decay >= 1.0
+        ):
+            raise ValueError(
+                "adversarial_quality_ema_decay must be in [0, 1), got "
+                f"{self.adversarial_quality_ema_decay}"
+            )
         self.discriminator_learning_rate = (
             float(discriminator_learning_rate)
             if discriminator_learning_rate is not None
@@ -688,6 +717,11 @@ class LASER(VisualsMixin, pl.LightningModule):
         # discriminator halves of a manual-optimization training step.
         self._adv_cache = None
         self._lr_total_steps = 1
+        self.register_buffer(
+            "_train_recon_mse_ema",
+            torch.tensor(float("inf"), dtype=torch.float32),
+            persistent=False,
+        )
         # Updated by configure_optimizers / on_train_start; "uninit" means the
         # schedule helper hasn't been reached yet — _lr_multiplier_for_step will
         # behave as if the schedule is disabled when min_lr_ratio>=1 and
@@ -1049,11 +1083,42 @@ class LASER(VisualsMixin, pl.LightningModule):
         progress = (step - self.perceptual_start_step) / float(max(1, self.perceptual_warmup_steps))
         return float(self.perceptual_weight) * max(0.0, min(1.0, progress))
 
+    def _distributed_mean_detached(self, value: torch.Tensor) -> torch.Tensor:
+        value = value.detach().to(dtype=torch.float32)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            value = value.clone()
+            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+            value.div_(torch.distributed.get_world_size())
+        return value
+
+    @torch.no_grad()
+    def _update_adversarial_quality_ema(self, recon_mse_loss: torch.Tensor) -> None:
+        if self.adversarial_start_recon_mse is None:
+            return
+        recon_mse = self._distributed_mean_detached(recon_mse_loss)
+        if not bool(torch.isfinite(recon_mse).item()):
+            return
+        if not bool(torch.isfinite(self._train_recon_mse_ema).item()):
+            self._train_recon_mse_ema.copy_(recon_mse)
+            return
+        decay = float(self.adversarial_quality_ema_decay)
+        self._train_recon_mse_ema.mul_(decay).add_(recon_mse, alpha=1.0 - decay)
+
+    def _adversarial_quality_ready(self) -> bool:
+        if self.adversarial_start_recon_mse is None:
+            return True
+        ema = self._train_recon_mse_ema
+        if not bool(torch.isfinite(ema).item()):
+            return False
+        return float(ema.detach().cpu().item()) <= float(self.adversarial_start_recon_mse)
+
     def _effective_adversarial_weight(self, prefix: str) -> float:
         if prefix != "train" or self.adversarial_weight <= 0 or self.discriminator is None:
             return 0.0
         step = int(getattr(self, "global_step", 0))
         if step < self.adversarial_start_step:
+            return 0.0
+        if not self._adversarial_quality_ready():
             return 0.0
         if self.adversarial_warmup_steps <= 0:
             return float(self.adversarial_weight)
@@ -1423,6 +1488,8 @@ class LASER(VisualsMixin, pl.LightningModule):
             + self.recon_l1_weight * recon_l1_loss
             + self.recon_edge_weight * recon_edge_loss
         )
+        if prefix == "train":
+            self._update_adversarial_quality_ema(recon_mse_loss)
         input_mean = input_std = recon_mean = recon_std = None
         if should_log_distribution_metrics:
             input_mean = x.mean()
@@ -1662,6 +1729,18 @@ class LASER(VisualsMixin, pl.LightningModule):
             recon_raw.new_tensor(float(adversarial_weight)),
             **log_kwargs,
         )
+        if prefix == "train" and self.adversarial_start_recon_mse is not None:
+            quality_ready = self._adversarial_quality_ready()
+            self.log(
+                'train/adversarial_quality_recon_mse_ema',
+                self._train_recon_mse_ema.to(device=x.device, dtype=torch.float32),
+                **log_kwargs,
+            )
+            self.log(
+                'train/adversarial_quality_ready',
+                recon_raw.new_tensor(float(quality_ready)),
+                **log_kwargs,
+            )
         if psnr is not None:
             self.log(f'{prefix}/psnr', psnr, prog_bar=True, **log_kwargs)
         if is_audio:
