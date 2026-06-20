@@ -18,8 +18,10 @@ PROJECT="${PROJECT:-laser}"
 RUN_ROOT_BASE="${RUN_ROOT_BASE:-/scratch/$USER/runs/laser_imagenet_short_token_classcond}"
 IMAGENET_DIR="${IMAGENET_DIR:-/scratch/$USER/Projects/data/imagenet}"
 DRY_RUN="${DRY_RUN:-0}"
-export LASER_DISABLE_WANDB_MEDIA="${LASER_DISABLE_WANDB_MEDIA:-1}"
-VIS_LOG_EVERY_N_STEPS="${VIS_LOG_EVERY_N_STEPS:-0}"
+export LASER_DISABLE_WANDB_MEDIA="${LASER_DISABLE_WANDB_MEDIA:-0}"
+VIS_LOG_EVERY_N_STEPS="${VIS_LOG_EVERY_N_STEPS:-1000}"
+DIAG_LOG_INTERVAL="${DIAG_LOG_INTERVAL:-100}"
+DICTIONARY_VIS_MAX_VECTORS="${DICTIONARY_VIS_MAX_VECTORS:-1024}"
 
 # Stage lengths are step-bounded because one literal ImageNet epoch is too large
 # for a chained stage1 -> stage1_adv -> cache -> stage2 sweep job.
@@ -59,7 +61,9 @@ COMMON_STAGE1=(
   "model.bottleneck_loss_weight=1.0"
   "model.coef_max=16.0"
   "model.log_images_every_n_steps=$VIS_LOG_EVERY_N_STEPS"
-  "model.enable_val_latent_visuals=false"
+  "model.diag_log_interval=$DIAG_LOG_INTERVAL"
+  "model.enable_val_latent_visuals=true"
+  "model.codebook_visual_max_vectors=$DICTIONARY_VIS_MAX_VECTORS"
   "model.patch_based=false"
   "model.patch_size=1"
   "model.patch_stride=1"

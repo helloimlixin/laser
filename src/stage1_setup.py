@@ -351,6 +351,10 @@ def vqvae_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int) -> d
         "out_tanh": bool(_cfg_get(model_cfg, "out_tanh", False)),
         "enable_codebook_visuals": bool(_cfg_get(model_cfg, "enable_codebook_visuals", False)),
         "codebook_visual_max_vectors": int(_cfg_get(model_cfg, "codebook_visual_max_vectors", 1024)),
+        "speaker_conditioning": bool(_cfg_get(model_cfg, "speaker_conditioning", False)),
+        "speaker_conditioning_num_speakers": int(_cfg_get(model_cfg, "speaker_conditioning_num_speakers", 0)),
+        "speaker_embedding_dim": int(_cfg_get(model_cfg, "speaker_embedding_dim", 64)),
+        "speaker_conversion_log": bool(_cfg_get(model_cfg, "speaker_conversion_log", True)),
     }
 
 

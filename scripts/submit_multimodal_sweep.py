@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import os
 import re
 import shlex
@@ -539,6 +540,15 @@ def _safe_label(raw: str) -> str:
     return label
 
 
+def _bounded_label(raw: str, *, max_length: int = 120) -> str:
+    label = _safe_label(raw)
+    if len(label) <= max_length:
+        return label
+    digest = hashlib.sha1(label.encode("utf-8")).hexdigest()[:10]
+    keep = max(1, max_length - len(digest) - 1)
+    return f"{label[:keep].rstrip('-_')}-{digest}"
+
+
 def _per_process_batch_size(global_batch_size: int, num_processes: int) -> int:
     devices = max(1, int(num_processes))
     batch_size = max(1, int(global_batch_size))
@@ -779,7 +789,7 @@ export PYTHONUSERBASE="${{PYTHONUSERBASE:-{_scratch_path('.pydeps', 'laser_src_p
 export PATH="$PYTHONUSERBASE/bin:$PATH"
 export PYTHONPATH="$PYTHONUSERBASE/lib/python3.11/site-packages:$PYTHONUSERBASE/lib/python3.12/site-packages:{snapshot_path}${{PYTHONPATH:+:$PYTHONPATH}}"
 export WANDB_MODE="${{WANDB_MODE:-online}}"
-export LASER_DISABLE_WANDB_MEDIA="${{LASER_DISABLE_WANDB_MEDIA:-1}}"
+export LASER_DISABLE_WANDB_MEDIA="${{LASER_DISABLE_WANDB_MEDIA:-0}}"
 export PYTORCH_CUDA_ALLOC_CONF="${{PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}"
 export PYTHONUNBUFFERED=1
 export XDG_CACHE_HOME="${{XDG_CACHE_HOME:-/scratch/{_user()}/.cache}}"
@@ -858,6 +868,23 @@ if not cuda_available:
 print(f"CUDA device: {{torch.cuda.get_device_name(0)}}")
 PY
 
+select_stage1_checkpoint() {{
+  local root="$1"
+  local ckpt=""
+  ckpt="$(
+    find "$root" -path '*/checkpoints/*' -type f -name '*.ckpt' \
+      ! -name 'last.ckpt' ! -name 'final.ckpt' -printf '%T@ %p\\n' \
+      | sort -n | tail -1 | cut -d ' ' -f2-
+  )"
+  if [[ -z "$ckpt" ]]; then
+    ckpt="$(find "$root" -path '*/checkpoints/*' -type f -name 'last.ckpt' | sort | tail -1)"
+  fi
+  if [[ -z "$ckpt" ]]; then
+    ckpt="$(find "$root" -path '*/checkpoints/*' -type f -name 'final.ckpt' | sort | tail -1)"
+  fi
+  printf '%s\\n' "$ckpt"
+}}
+
 cd "{snapshot_path}"
 
 STAGE1_ARGS=(
@@ -867,10 +894,7 @@ STAGE1_ARGS=(
 echo "=== Stage 1: autoencoder training ({case.name}) ==="
 "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ARGS[@]}}"
 
-CKPT="$(find "{stage1_dir}" -path '*/final.ckpt' -type f | sort | tail -1)"
-if [[ -z "$CKPT" ]]; then
-  CKPT="$(find "{stage1_dir}" -path '*/last.ckpt' -type f | sort | tail -1)"
-fi
+CKPT="$(select_stage1_checkpoint "{stage1_dir}")"
 if [[ -z "$CKPT" ]]; then
   echo "No stage-1 checkpoint found under {stage1_dir}" >&2
   exit 1
@@ -886,10 +910,7 @@ if [[ "{'1' if int(stage1_adv_epochs) > 0 else '0'}" == "1" ]]; then
   echo "=== Stage 1 adversarial continuation ({case.name}) ==="
   "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ADV_ARGS[@]}}"
 
-  CKPT="$(find "{stage1_adv_dir}" -path '*/final.ckpt' -type f | sort | tail -1)"
-  if [[ -z "$CKPT" ]]; then
-    CKPT="$(find "{stage1_adv_dir}" -path '*/last.ckpt' -type f | sort | tail -1)"
-  fi
+  CKPT="$(select_stage1_checkpoint "{stage1_adv_dir}")"
   if [[ -z "$CKPT" ]]; then
     echo "No adversarial stage-1 checkpoint found under {stage1_adv_dir}" >&2
     exit 1
@@ -905,8 +926,30 @@ CACHE_ARGS=(
 {_bash_array(cache_args)}
 )
 
-echo "=== Token cache extraction ({case.name}) ==="
-"$PYTHON_BIN" cache.py "${{CACHE_ARGS[@]}}"
+NODE_RANK="${{SLURM_PROCID:-${{SLURM_NODEID:-0}}}}"
+CACHE_DONE="{token_cache}.done"
+CACHE_FAILED="{token_cache}.failed"
+
+if [[ "$NODE_RANK" == "0" ]]; then
+  rm -f "$CACHE_DONE" "$CACHE_FAILED"
+  echo "=== Token cache extraction ({case.name}) ==="
+  if "$PYTHON_BIN" cache.py "${{CACHE_ARGS[@]}}"; then
+    touch "$CACHE_DONE"
+  else
+    rc=$?
+    touch "$CACHE_FAILED"
+    exit "$rc"
+  fi
+else
+  echo "=== Waiting for token cache extraction ({case.name}) ==="
+  while [[ ! -f "$CACHE_DONE" && ! -f "$CACHE_FAILED" ]]; do
+    sleep 30
+  done
+  if [[ -f "$CACHE_FAILED" ]]; then
+    echo "Token cache extraction failed on rank 0." >&2
+    exit 1
+  fi
+fi
 
 if [[ "{stage2_kind}" == "diffusion" ]]; then
   DIFFUSION_ARGS=(
@@ -939,9 +982,16 @@ exec > "$BOOTSTRAP_LOG" 2>&1
 set -x
 echo "bootstrap-start host=$(hostname) date=$(date) job=${{SLURM_JOB_ID:-manual}}"
 LASER_NODES={trainer_nodes}
+LASER_GPUS_PER_NODE={trainer_devices}
+LASER_WORLD_SIZE={trainer_world_size}
 LAUNCH=()
 if [[ "$LASER_NODES" -gt 1 ]]; then
-  LAUNCH=(srun --nodes="$LASER_NODES" --ntasks="$LASER_NODES" --ntasks-per-node=1)
+  LAUNCH=(
+    srun
+    --nodes="$LASER_NODES"
+    --ntasks="$LASER_WORLD_SIZE"
+    --ntasks-per-node="$LASER_GPUS_PER_NODE"
+  )
 fi
 
 if ! command -v module >/dev/null 2>&1; then
@@ -1092,8 +1142,8 @@ def main() -> int:
         raise SystemExit("--nodes must be >= 1.")
     if int(args.gpus) < 1:
         raise SystemExit("--gpus must be >= 1.")
-    if num_nodes > 1 and not stage1_only:
-        raise SystemExit("--nodes > 1 is currently supported only with --stage1-only; cache extraction and stage 2 need single-rank orchestration.")
+    if num_nodes > 1 and not stage1_only and stage2_kind != "transformer":
+        raise SystemExit("--nodes > 1 full-pipeline orchestration is currently supported only for transformer stage 2.")
     stage1_epochs = int(args.stage1_epochs if args.stage1_epochs is not None else (10 if full_training else 1))
     stage1_adv_epochs = int(args.stage1_adv_epochs or 0)
     stage2_epochs = int(args.stage2_epochs if args.stage2_epochs is not None else (10 if full_training else 1))
@@ -1149,12 +1199,14 @@ def main() -> int:
         if not cases:
             raise SystemExit("No cases selected for submission.")
 
-    group_name = f"{model_family}-{run_kind}{group_label_part}-{stamp}"
+    group_name = _bounded_label(f"{model_family}-{run_kind}{group_label_part}-{stamp}")
     run_root_base = args.run_root_base or _scratch_path("runs", f"{model_family}_{run_kind}")
     run_root = Path(run_root_base).expanduser().resolve() / group_name
     run_root.mkdir(parents=True, exist_ok=True)
     project = args.project or ("laser-multimodal-training" if full_training else "laser-multimodal-smoke")
     job_prefix = "ls" if model_family == "laser" else "vq"
+    slurm_ntasks = num_nodes * int(args.gpus) if num_nodes > 1 else 1
+    slurm_ntasks_per_node = int(args.gpus) if num_nodes > 1 else 1
 
     submissions = []
     for case in cases:
@@ -1186,8 +1238,8 @@ def main() -> int:
             f"--partition={args.partition}",
             f"--job-name={job_prefix}{run_kind[:3]}-{case.name}",
             f"--nodes={num_nodes}",
-            f"--ntasks={num_nodes}",
-            "--ntasks-per-node=1",
+            f"--ntasks={slurm_ntasks}",
+            f"--ntasks-per-node={slurm_ntasks_per_node}",
             f"--cpus-per-task={int(args.cpus_per_task)}",
             f"--gres=gpu:{int(args.gpus)}",
             f"--mem={int(args.mem_mb)}",

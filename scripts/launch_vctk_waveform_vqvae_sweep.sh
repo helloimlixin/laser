@@ -25,6 +25,12 @@ WARMUP_STEPS="${WARMUP_STEPS:-750}"
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.05}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-25}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-1.0}"
+CASE_FILTER="${CASE_FILTER:-}"
+ENABLE_CODEBOOK_VISUALS="${ENABLE_CODEBOOK_VISUALS:-true}"
+CODEBOOK_VISUAL_MAX_VECTORS="${CODEBOOK_VISUAL_MAX_VECTORS:-1024}"
+SPEAKER_CONDITIONING="${SPEAKER_CONDITIONING:-false}"
+SPEAKER_EMBEDDING_DIM="${SPEAKER_EMBEDDING_DIM:-64}"
+SPEAKER_CONVERSION_LOG="${SPEAKER_CONVERSION_LOG:-true}"
 
 mkdir -p "$SNAPSHOT_ROOT" "$OUT_ROOT"
 
@@ -75,6 +81,7 @@ echo "Snapshot: $SNAPSHOT_DIR"
 echo "Output root: $OUT_ROOT"
 
 CASES=(
+  "ds64_k512_d64_originalish|[4,4,4]|512|64|128|3|64"
   "ds64_k1024_d64_restart|[4,4,4]|1024|64|128|3|64"
   "ds64_k1024_d96_restart|[4,4,4]|1024|96|160|3|80"
   "ds64_k2048_d64_restart|[4,4,4]|2048|64|128|3|64"
@@ -84,6 +91,9 @@ CASES=(
 submitted=0
 for case_def in "${CASES[@]}"; do
   IFS="|" read -r case_name rates num_embeddings embedding_dim num_hiddens residual_blocks residual_hiddens <<<"$case_def"
+  if [[ -n "$CASE_FILTER" && ",$CASE_FILTER," != *",$case_name,"* ]]; then
+    continue
+  fi
   run_dir="$OUT_ROOT/$case_name"
   mkdir -p "$run_dir"
   run_script="$run_dir/run.sh"
@@ -108,7 +118,7 @@ mkdir -p "\$TMPDIR" "$run_dir/wandb"
 
 python -m pip install --user --quiet \
   scipy wandb lightning omegaconf hydra-core rich 'torchmetrics[image]' \
-  torch-fidelity matplotlib lpips soundfile
+  torch-fidelity matplotlib lpips soundfile pystoi
 
 cd "$SNAPSHOT_DIR"
 python train_stage1_autoencoder.py \
@@ -132,6 +142,11 @@ python train_stage1_autoencoder.py \
   model.audio_multires_stft_loss_weight=1.0 \
   model.audio_multires_stft_fft_sizes=[512,1024,2048] \
   model.compute_fid=false \
+  model.enable_codebook_visuals="$ENABLE_CODEBOOK_VISUALS" \
+  model.codebook_visual_max_vectors="$CODEBOOK_VISUAL_MAX_VECTORS" \
+  model.speaker_conditioning="$SPEAKER_CONDITIONING" \
+  model.speaker_embedding_dim="$SPEAKER_EMBEDDING_DIM" \
+  model.speaker_conversion_log="$SPEAKER_CONVERSION_LOG" \
   train.learning_rate="$LEARNING_RATE" \
   train.warmup_steps="$WARMUP_STEPS" \
   train.min_lr_ratio="$MIN_LR_RATIO" \

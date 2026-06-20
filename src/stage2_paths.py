@@ -58,6 +58,8 @@ def default_token_cache_filename(
     image_size: int,
     coeff_bins: int,
     coeff_quantization: str = "uniform",
+    coeff_mu: float = 0.0,
+    support_order: str = "atom_id",
 ) -> str:
     dataset = str(dataset).strip().lower()
     split = str(split).strip().lower()
@@ -65,6 +67,13 @@ def default_token_cache_filename(
     parts = [dataset, split, f"img{int(image_size)}", f"cb{int(coeff_bins)}"]
     if quant != "uniform":
         parts.append(quant)
+        mu = float(coeff_mu)
+        if mu > 0.0:
+            mu_token = f"{mu:g}".replace("-", "m").replace(".", "p")
+            parts.append(f"mu{mu_token}")
+    order = str(support_order or "atom_id").strip().lower()
+    if order not in {"", "none", "atom_id"}:
+        parts.append(f"order{order}")
     return "__".join(parts) + ".pt"
 
 
@@ -80,6 +89,8 @@ def default_token_cache_path(
     image_size: int,
     coeff_bins: int,
     coeff_quantization: str = "uniform",
+    coeff_mu: float = 0.0,
+    support_order: str = "atom_id",
 ) -> Path:
     return token_cache_dir(ar_output_dir) / default_token_cache_filename(
         dataset=dataset,
@@ -87,6 +98,8 @@ def default_token_cache_path(
         image_size=image_size,
         coeff_bins=coeff_bins,
         coeff_quantization=coeff_quantization,
+        coeff_mu=coeff_mu,
+        support_order=support_order,
     )
 
 

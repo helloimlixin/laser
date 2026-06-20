@@ -20,7 +20,7 @@ RUN_ROOT_BASE="${RUN_ROOT_BASE:-/scratch/$USER/runs/laser_nonpatch_deep_cond_mul
 SNAPSHOT_ROOT="${SNAPSHOT_ROOT:-/scratch/$USER/submission_snapshots}"
 PYTHON_SUBMIT="${PYTHON_SUBMIT:-/projects/community/miniconda/2023.11/bd387/base/bin/python}"
 export PYTHON_BIN="${PYTHON_BIN:-python3}"
-export LASER_DISABLE_WANDB_MEDIA="${LASER_DISABLE_WANDB_MEDIA:-1}"
+export LASER_DISABLE_WANDB_MEDIA="${LASER_DISABLE_WANDB_MEDIA:-0}"
 
 DRY_RUN="${DRY_RUN:-0}"
 CASES="${CASES:-celebahq,ffhq,imagenet,vctk}"
@@ -36,6 +36,8 @@ VCTK_DIR="${VCTK_DIR:-/scratch/$USER/Projects/data/VCTK-Corpus/VCTK-Corpus}"
 # single-node because cache extraction and stage 2 are single-rank orchestrated.
 IMAGE_GPUS="${IMAGE_GPUS:-2}"
 AUDIO_GPUS="${AUDIO_GPUS:-2}"
+IMAGE_NODES="${IMAGE_NODES:-1}"
+AUDIO_NODES="${AUDIO_NODES:-1}"
 IMAGE_CPUS_PER_TASK="${IMAGE_CPUS_PER_TASK:-12}"
 AUDIO_CPUS_PER_TASK="${AUDIO_CPUS_PER_TASK:-12}"
 IMAGE_MEM_MB="${IMAGE_MEM_MB:-240000}"
@@ -44,13 +46,28 @@ EXCLUDE_NODES="${EXCLUDE_NODES:-gpu018,gpuk[005-018]}"
 
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-75}"
 STAGE1_ADV_EPOCHS="${STAGE1_ADV_EPOCHS:-25}"
+STAGE1_ONLY="${STAGE1_ONLY:-0}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-300}"
 STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-300000}"
 
 IMAGE_NUM_EMBEDDINGS="${IMAGE_NUM_EMBEDDINGS:-8192}"
 IMAGE_EMBEDDING_DIM="${IMAGE_EMBEDDING_DIM:-128}"
+IMAGE_CODEC_CAPACITY="${IMAGE_CODEC_CAPACITY:-strong}"
+IMAGE_ATTENTION_PROFILE="${IMAGE_ATTENTION_PROFILE:-standard}"
+IMAGE_USE_MID_ATTENTION="${IMAGE_USE_MID_ATTENTION:-true}"
+IMAGE_DROPOUT="${IMAGE_DROPOUT:-0.0}"
 COEFF_BINS="${COEFF_BINS:-256}"
 COEF_MAX="${COEF_MAX:-16.0}"
+IMAGE_COEFF_BINS="${IMAGE_COEFF_BINS:-128}"
+IMAGE_CACHE_COEF_MAX="${IMAGE_CACHE_COEF_MAX:-$COEF_MAX}"
+IMAGE_COEFF_QUANTIZATION="${IMAGE_COEFF_QUANTIZATION:-mu_law}"
+IMAGE_COEFF_MU="${IMAGE_COEFF_MU:-255.0}"
+IMAGE_SUPPORT_ORDER="${IMAGE_SUPPORT_ORDER:-magnitude}"
+VCTK_COEFF_BINS="${VCTK_COEFF_BINS:-$COEFF_BINS}"
+VCTK_CACHE_COEF_MAX="${VCTK_CACHE_COEF_MAX:-$COEF_MAX}"
+VCTK_COEFF_QUANTIZATION="${VCTK_COEFF_QUANTIZATION:-uniform}"
+VCTK_COEFF_MU="${VCTK_COEFF_MU:-0.0}"
+VCTK_SUPPORT_ORDER="${VCTK_SUPPORT_ORDER:-magnitude}"
 COMMITMENT_COST="${COMMITMENT_COST:-0.25}"
 BOTTLENECK_LOSS_WEIGHT="${BOTTLENECK_LOSS_WEIGHT:-0.75}"
 STAGE1_LR="${STAGE1_LR:-1.0e-4}"
@@ -66,14 +83,36 @@ DISCRIMINATOR_CHANNELS="${DISCRIMINATOR_CHANNELS:-64}"
 DISCRIMINATOR_LAYERS="${DISCRIMINATOR_LAYERS:-3}"
 USE_ADAPTIVE_DISC_WEIGHT="${USE_ADAPTIVE_DISC_WEIGHT:-true}"
 BOUNDED_OMP_REFINE_STEPS="${BOUNDED_OMP_REFINE_STEPS:-16}"
-VIS_LOG_EVERY_N_STEPS="${VIS_LOG_EVERY_N_STEPS:-0}"
+VIS_LOG_EVERY_N_STEPS="${VIS_LOG_EVERY_N_STEPS:-1000}"
 DIAG_LOG_INTERVAL="${DIAG_LOG_INTERVAL:-100}"
 DICTIONARY_VIS_MAX_VECTORS="${DICTIONARY_VIS_MAX_VECTORS:-1024}"
 
-IMAGE_STAGE1_BATCH_SIZE="${IMAGE_STAGE1_BATCH_SIZE:-3}"
-IMAGENET_STAGE1_BATCH_SIZE="${IMAGENET_STAGE1_BATCH_SIZE:-2}"
+case "$IMAGE_CODEC_CAPACITY" in
+  base)
+    DEFAULT_IMAGE_STAGE1_BATCH_SIZE=3
+    DEFAULT_IMAGENET_STAGE1_BATCH_SIZE=2
+    DEFAULT_IMAGE_CACHE_BATCH_SIZE=8
+    ;;
+  strong)
+    DEFAULT_IMAGE_STAGE1_BATCH_SIZE=2
+    DEFAULT_IMAGENET_STAGE1_BATCH_SIZE=1
+    DEFAULT_IMAGE_CACHE_BATCH_SIZE=6
+    ;;
+  xl)
+    DEFAULT_IMAGE_STAGE1_BATCH_SIZE=1
+    DEFAULT_IMAGENET_STAGE1_BATCH_SIZE=1
+    DEFAULT_IMAGE_CACHE_BATCH_SIZE=4
+    ;;
+  *)
+    echo "Unsupported IMAGE_CODEC_CAPACITY: $IMAGE_CODEC_CAPACITY (expected base, strong, or xl)" >&2
+    exit 2
+    ;;
+esac
+
+IMAGE_STAGE1_BATCH_SIZE="${IMAGE_STAGE1_BATCH_SIZE:-$DEFAULT_IMAGE_STAGE1_BATCH_SIZE}"
+IMAGENET_STAGE1_BATCH_SIZE="${IMAGENET_STAGE1_BATCH_SIZE:-$DEFAULT_IMAGENET_STAGE1_BATCH_SIZE}"
 IMAGE_STAGE2_BATCH_SIZE="${IMAGE_STAGE2_BATCH_SIZE:-4}"
-IMAGE_CACHE_BATCH_SIZE="${IMAGE_CACHE_BATCH_SIZE:-8}"
+IMAGE_CACHE_BATCH_SIZE="${IMAGE_CACHE_BATCH_SIZE:-$DEFAULT_IMAGE_CACHE_BATCH_SIZE}"
 IMAGE_NUM_WORKERS="${IMAGE_NUM_WORKERS:-4}"
 IMAGENET_NUM_WORKERS="${IMAGENET_NUM_WORKERS:-8}"
 IMAGE_VAL_CHECK_INTERVAL="${IMAGE_VAL_CHECK_INTERVAL:-0.25}"
@@ -91,12 +130,16 @@ STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-1500}"
 STAGE2_GLOBAL_TOKENS="${STAGE2_GLOBAL_TOKENS:-16}"
 STAGE2_COEFF_HUBER_DELTA="${STAGE2_COEFF_HUBER_DELTA:-0.25}"
 
-VCTK_STAGE1_BATCH_SIZE="${VCTK_STAGE1_BATCH_SIZE:-4}"
-VCTK_STAGE2_BATCH_SIZE="${VCTK_STAGE2_BATCH_SIZE:-4}"
-VCTK_CACHE_BATCH_SIZE="${VCTK_CACHE_BATCH_SIZE:-8}"
+VCTK_STAGE2_BATCH_SIZE="${VCTK_STAGE2_BATCH_SIZE:-2}"
 VCTK_NUM_WORKERS="${VCTK_NUM_WORKERS:-4}"
 VCTK_NUM_EMBEDDINGS="${VCTK_NUM_EMBEDDINGS:-8192}"
 VCTK_EMBEDDING_DIM="${VCTK_EMBEDDING_DIM:-128}"
+VCTK_CODEC_CAPACITY="${VCTK_CODEC_CAPACITY:-strong}"
+VCTK_DILATION_CYCLE="${VCTK_DILATION_CYCLE:-}"
+VCTK_AUDIO_NUM_SAMPLES="${VCTK_AUDIO_NUM_SAMPLES:-65536}"
+VCTK_AUDIO_MAX_DURATION_SECONDS="${VCTK_AUDIO_MAX_DURATION_SECONDS:-4.096}"
+VCTK_AUDIO_MIN_DURATION_SECONDS="${VCTK_AUDIO_MIN_DURATION_SECONDS:-0.0}"
+VCTK_REQUIRE_TEXT="${VCTK_REQUIRE_TEXT:-true}"
 VCTK_COMMITMENT_COST="${VCTK_COMMITMENT_COST:-1.0}"
 VCTK_BOTTLENECK_LOSS_WEIGHT="${VCTK_BOTTLENECK_LOSS_WEIGHT:-0.75}"
 VCTK_STAGE1_LR="${VCTK_STAGE1_LR:-1.5e-4}"
@@ -111,6 +154,31 @@ VCTK_GENERATION_METRIC_NUM_SAMPLES="${VCTK_GENERATION_METRIC_NUM_SAMPLES:-16}"
 VCTK_TEXT_MAX_LENGTH="${VCTK_TEXT_MAX_LENGTH:-160}"
 VCTK_TEXT_PREFIX_LENGTH="${VCTK_TEXT_PREFIX_LENGTH:-16}"
 VCTK_SAMPLE_PROMPTS="${VCTK_SAMPLE_PROMPTS:-[\"The quick brown fox jumps over the lazy dog.\",\"A calm voice reads this sentence clearly.\",\"Please bring the warm tea to the table.\",\"The train arrived before sunrise.\",\"Several people waited outside the station.\",\"She opened the window and listened to the rain.\",\"This recording should follow the written text.\",\"A small boat moved slowly across the lake.\"]}"
+
+case "$VCTK_CODEC_CAPACITY" in
+  base)
+    DEFAULT_VCTK_STAGE1_BATCH_SIZE=4
+    DEFAULT_VCTK_CACHE_BATCH_SIZE=8
+    DEFAULT_VCTK_DILATION_CYCLE='[1,3,9]'
+    ;;
+  strong)
+    DEFAULT_VCTK_STAGE1_BATCH_SIZE=2
+    DEFAULT_VCTK_CACHE_BATCH_SIZE=6
+    DEFAULT_VCTK_DILATION_CYCLE='[1,3,9,27]'
+    ;;
+  xl)
+    DEFAULT_VCTK_STAGE1_BATCH_SIZE=1
+    DEFAULT_VCTK_CACHE_BATCH_SIZE=4
+    DEFAULT_VCTK_DILATION_CYCLE='[1,3,9,27]'
+    ;;
+  *)
+    echo "Unsupported VCTK_CODEC_CAPACITY: $VCTK_CODEC_CAPACITY (expected base, strong, or xl)" >&2
+    exit 2
+    ;;
+esac
+VCTK_STAGE1_BATCH_SIZE="${VCTK_STAGE1_BATCH_SIZE:-$DEFAULT_VCTK_STAGE1_BATCH_SIZE}"
+VCTK_CACHE_BATCH_SIZE="${VCTK_CACHE_BATCH_SIZE:-$DEFAULT_VCTK_CACHE_BATCH_SIZE}"
+VCTK_DILATION_CYCLE="${VCTK_DILATION_CYCLE:-$DEFAULT_VCTK_DILATION_CYCLE}"
 
 case_enabled() {
   local wanted="$1"
@@ -136,34 +204,67 @@ image_channels() {
 }
 
 image_attn() {
-  case "$1" in
-    5) printf '[8,16]' ;;
-    6) printf '[4,8,16]' ;;
-    *) echo "Unsupported image downsample depth: $1" >&2; exit 2 ;;
+  case "$IMAGE_ATTENTION_PROFILE:$1" in
+    mid_only:5|mid_only:6) printf '[]' ;;
+    standard:5) printf '[8,16]' ;;
+    standard:6) printf '[4,8,16]' ;;
+    wide:5) printf '[8,16,32]' ;;
+    wide:6) printf '[4,8,16,32]' ;;
+    *) echo "Unsupported image attention profile/depth: $IMAGE_ATTENTION_PROFILE d$1" >&2; exit 2 ;;
   esac
 }
 
 image_num_hiddens() {
-  case "$1" in
-    5) printf '128' ;;
-    6) printf '160' ;;
-    *) echo "Unsupported image downsample depth: $1" >&2; exit 2 ;;
+  case "$IMAGE_CODEC_CAPACITY:$1" in
+    base:5) printf '128' ;;
+    base:6) printf '160' ;;
+    strong:5) printf '192' ;;
+    strong:6) printf '224' ;;
+    xl:5) printf '224' ;;
+    xl:6) printf '256' ;;
+    *) echo "Unsupported image capacity/depth: $IMAGE_CODEC_CAPACITY d$1" >&2; exit 2 ;;
+  esac
+}
+
+image_num_residual_blocks() {
+  case "$IMAGE_CODEC_CAPACITY:$1" in
+    base:5|base:6) printf '3' ;;
+    strong:5|strong:6) printf '4' ;;
+    xl:5|xl:6) printf '4' ;;
+    *) echo "Unsupported image capacity/depth: $IMAGE_CODEC_CAPACITY d$1" >&2; exit 2 ;;
   esac
 }
 
 image_residual_hiddens() {
-  case "$1" in
-    5) printf '96' ;;
-    6) printf '112' ;;
-    *) echo "Unsupported image downsample depth: $1" >&2; exit 2 ;;
+  case "$IMAGE_CODEC_CAPACITY:$1" in
+    base:5) printf '96' ;;
+    base:6) printf '112' ;;
+    strong:5) printf '128' ;;
+    strong:6) printf '160' ;;
+    xl:5) printf '160' ;;
+    xl:6) printf '192' ;;
+    *) echo "Unsupported image capacity/depth: $IMAGE_CODEC_CAPACITY d$1" >&2; exit 2 ;;
   esac
 }
 
 image_extra_decoder_layers() {
-  case "$1" in
-    5) printf '2' ;;
-    6) printf '3' ;;
-    *) echo "Unsupported image downsample depth: $1" >&2; exit 2 ;;
+  case "$IMAGE_CODEC_CAPACITY:$1" in
+    base:5) printf '2' ;;
+    base:6) printf '3' ;;
+    strong:5) printf '3' ;;
+    strong:6) printf '4' ;;
+    xl:5) printf '4' ;;
+    xl:6) printf '5' ;;
+    *) echo "Unsupported image capacity/depth: $IMAGE_CODEC_CAPACITY d$1" >&2; exit 2 ;;
+  esac
+}
+
+image_backbone_latent_channels() {
+  case "$IMAGE_CODEC_CAPACITY" in
+    base) printf '512' ;;
+    strong) printf '768' ;;
+    xl) printf '1024' ;;
+    *) echo "Unsupported IMAGE_CODEC_CAPACITY: $IMAGE_CODEC_CAPACITY" >&2; exit 2 ;;
   esac
 }
 
@@ -183,27 +284,54 @@ vctk_rates() {
   esac
 }
 
-vctk_sites() {
+vctk_downsample_factor() {
   case "$1" in
-    5) printf '64' ;;
-    6) printf '32' ;;
+    5) printf '256' ;;
+    6) printf '512' ;;
     *) echo "Unsupported VCTK downsample depth: $1" >&2; exit 2 ;;
   esac
 }
 
+vctk_sites() {
+  local factor
+  factor="$(vctk_downsample_factor "$1")"
+  if (( VCTK_AUDIO_NUM_SAMPLES % factor != 0 )); then
+    echo "VCTK_AUDIO_NUM_SAMPLES=$VCTK_AUDIO_NUM_SAMPLES must be divisible by d$1 factor=$factor" >&2
+    exit 2
+  fi
+  printf '%d' "$(( VCTK_AUDIO_NUM_SAMPLES / factor ))"
+}
+
 vctk_num_hiddens() {
-  case "$1" in
-    5) printf '224' ;;
-    6) printf '256' ;;
-    *) echo "Unsupported VCTK downsample depth: $1" >&2; exit 2 ;;
+  case "$VCTK_CODEC_CAPACITY:$1" in
+    base:5) printf '224' ;;
+    base:6) printf '256' ;;
+    strong:5) printf '288' ;;
+    strong:6) printf '320' ;;
+    xl:5) printf '352' ;;
+    xl:6) printf '384' ;;
+    *) echo "Unsupported VCTK capacity/depth: $VCTK_CODEC_CAPACITY d$1" >&2; exit 2 ;;
+  esac
+}
+
+vctk_num_residual_blocks() {
+  case "$VCTK_CODEC_CAPACITY:$1" in
+    base:5|base:6) printf '3' ;;
+    strong:5|strong:6) printf '4' ;;
+    xl:5|xl:6) printf '5' ;;
+    *) echo "Unsupported VCTK capacity/depth: $VCTK_CODEC_CAPACITY d$1" >&2; exit 2 ;;
   esac
 }
 
 vctk_residual_hiddens() {
-  case "$1" in
-    5) printf '112' ;;
-    6) printf '128' ;;
-    *) echo "Unsupported VCTK downsample depth: $1" >&2; exit 2 ;;
+  case "$VCTK_CODEC_CAPACITY:$1" in
+    base:5) printf '112' ;;
+    base:6) printf '128' ;;
+    strong:5) printf '144' ;;
+    strong:6) printf '160' ;;
+    xl:5) printf '176' ;;
+    xl:6) printf '192' ;;
+    *) echo "Unsupported VCTK capacity/depth: $VCTK_CODEC_CAPACITY d$1" >&2; exit 2 ;;
   esac
 }
 
@@ -237,14 +365,34 @@ fi
 if [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" ]]; then
   COMMON_ARGS+=(--dry-run)
 fi
+if [[ "$STAGE1_ONLY" == "1" || "$STAGE1_ONLY" == "true" ]]; then
+  COMMON_ARGS+=(--stage1-only)
+fi
 
-COMMON_CACHE_ARGS=(
+IMAGE_CACHE_ARGS=(
   --cache-arg=--coeff-bins
-  --cache-arg="$COEFF_BINS"
+  --cache-arg="$IMAGE_COEFF_BINS"
   --cache-arg=--coeff-max
-  --cache-arg="$COEF_MAX"
+  --cache-arg="$IMAGE_CACHE_COEF_MAX"
   --cache-arg=--coeff-quantization
-  --cache-arg=uniform
+  --cache-arg="$IMAGE_COEFF_QUANTIZATION"
+  --cache-arg=--coeff-mu
+  --cache-arg="$IMAGE_COEFF_MU"
+  --cache-arg=--support-order
+  --cache-arg="$IMAGE_SUPPORT_ORDER"
+)
+
+VCTK_CACHE_ARGS=(
+  --cache-arg=--coeff-bins
+  --cache-arg="$VCTK_COEFF_BINS"
+  --cache-arg=--coeff-max
+  --cache-arg="$VCTK_CACHE_COEF_MAX"
+  --cache-arg=--coeff-quantization
+  --cache-arg="$VCTK_COEFF_QUANTIZATION"
+  --cache-arg=--coeff-mu
+  --cache-arg="$VCTK_COEFF_MU"
+  --cache-arg=--support-order
+  --cache-arg="$VCTK_SUPPORT_ORDER"
 )
 
 COMMON_STAGE2=(
@@ -258,13 +406,14 @@ COMMON_STAGE2=(
   --stage2-override ar.n_global_spatial_tokens="$STAGE2_GLOBAL_TOKENS"
   --stage2-override ar.coeff_loss_type=auto
   --stage2-override ar.coeff_huber_delta="$STAGE2_COEFF_HUBER_DELTA"
-  --stage2-override ar.sample_coeff_mode=gaussian
+  --stage2-override ar.sample_coeff_mode=mean
   --stage2-override train_ar.sample_top_k=0
-  --stage2-override train_ar.sample_coeff_mode=gaussian
+  --stage2-override train_ar.sample_coeff_mode=mean
   --stage2-override train_ar.sample_every_n_epochs=2
-  --stage2-override train_ar.sample_log_to_wandb=false
+  --stage2-override train_ar.sample_log_to_wandb=true
   --stage2-override train_ar.run_test_after_fit=false
-  --stage2-override train_ar.save_final_samples_after_fit=false
+  --stage2-override train_ar.save_final_samples_after_fit=true
+  --stage2-override train_ar.deterministic=false
 )
 
 submit_image_dataset() {
@@ -279,10 +428,14 @@ submit_image_dataset() {
   attn="$(image_attn "$downsample")"
   local hidden
   hidden="$(image_num_hiddens "$downsample")"
+  local residual_blocks
+  residual_blocks="$(image_num_residual_blocks "$downsample")"
   local residual_hidden
   residual_hidden="$(image_residual_hiddens "$downsample")"
   local extra_decoder_layers
   extra_decoder_layers="$(image_extra_decoder_layers "$downsample")"
+  local backbone_latent_channels
+  backbone_latent_channels="$(image_backbone_latent_channels)"
   local stage1_batch="$IMAGE_STAGE1_BATCH_SIZE"
   local num_workers="$IMAGE_NUM_WORKERS"
   local limit_val="$IMAGE_LIMIT_VAL_BATCHES"
@@ -315,16 +468,17 @@ submit_image_dataset() {
     )
   fi
 
-  local recipe_label="nonpatch-d${downsample}k${sparsity}-${conditional_label}-a${IMAGE_NUM_EMBEDDINGS}-q${COEFF_BINS}-seq${token_length}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
+  local recipe_label="nonpatch-d${downsample}k${sparsity}-${conditional_label}-${IMAGE_CODEC_CAPACITY}-attn${IMAGE_ATTENTION_PROFILE}-drop${IMAGE_DROPOUT}-a${IMAGE_NUM_EMBEDDINGS}-e${IMAGE_EMBEDDING_DIM}-${IMAGE_COEFF_QUANTIZATION}-q${IMAGE_COEFF_BINS}-ord${IMAGE_SUPPORT_ORDER}-seq${token_length}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
   "$PYTHON_SUBMIT" scripts/submit_multimodal_sweep.py \
     "${COMMON_ARGS[@]}" \
     --gpus "$IMAGE_GPUS" \
+    --nodes "$IMAGE_NODES" \
     --cpus-per-task "$IMAGE_CPUS_PER_TASK" \
     --mem-mb "$IMAGE_MEM_MB" \
     --cases "$dataset" \
     --model-family laser \
     --run-label "${RUN_TAG}-${dataset}-${recipe_label}" \
-    "${COMMON_CACHE_ARGS[@]}" \
+    "${IMAGE_CACHE_ARGS[@]}" \
     --cache-arg=--batch-size \
     --cache-arg="$IMAGE_CACHE_BATCH_SIZE" \
     "${COMMON_STAGE2[@]}" \
@@ -351,8 +505,9 @@ submit_image_dataset() {
     --stage1-override model.backbone=vqgan \
     --stage1-override model.num_hiddens="$hidden" \
     --stage1-override model.num_downsamples="$downsample" \
+    --stage1-override model.dropout="$IMAGE_DROPOUT" \
     --stage1-override model.channel_multipliers="$channels" \
-    --stage1-override model.backbone_latent_channels=512 \
+    --stage1-override model.backbone_latent_channels="$backbone_latent_channels" \
     --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$IMAGE_EMBEDDING_DIM" \
     --stage1-override model.num_embeddings="$IMAGE_NUM_EMBEDDINGS" \
@@ -366,10 +521,10 @@ submit_image_dataset() {
     --stage1-override model.coef_max="$COEF_MAX" \
     --stage1-override model.dict_learning_rate="$STAGE1_DICT_LR" \
     --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
-    --stage1-override model.num_residual_blocks=3 \
+    --stage1-override model.num_residual_blocks="$residual_blocks" \
     --stage1-override model.num_residual_hiddens="$residual_hidden" \
     --stage1-override model.decoder_extra_residual_layers="$extra_decoder_layers" \
-    --stage1-override model.use_mid_attention=true \
+    --stage1-override model.use_mid_attention="$IMAGE_USE_MID_ATTENTION" \
     --stage1-override model.attn_resolutions="$attn" \
     --stage1-override model.data_init_from_first_batch=true \
     --stage1-override model.out_tanh=true \
@@ -386,7 +541,7 @@ submit_image_dataset() {
     --stage1-override model.compute_fid=true \
     --stage1-override model.log_images_every_n_steps="$VIS_LOG_EVERY_N_STEPS" \
     --stage1-override model.diag_log_interval="$DIAG_LOG_INTERVAL" \
-    --stage1-override model.enable_val_latent_visuals=false \
+    --stage1-override model.enable_val_latent_visuals=true \
     --stage1-override model.codebook_visual_max_vectors="$DICTIONARY_VIS_MAX_VECTORS" \
     --stage1-adv-override model.adversarial_weight="$ADVERSARIAL_WEIGHT" \
     --stage1-adv-override model.adversarial_start_step=0 \
@@ -409,23 +564,37 @@ submit_vctk() {
   sites="$(vctk_sites "$downsample")"
   local hidden
   hidden="$(vctk_num_hiddens "$downsample")"
+  local residual_blocks
+  residual_blocks="$(vctk_num_residual_blocks "$downsample")"
   local residual_hidden
   residual_hidden="$(vctk_residual_hiddens "$downsample")"
+  local require_text_cache_arg="--audio-require-text"
+  if [[ "$VCTK_REQUIRE_TEXT" == "0" || "$VCTK_REQUIRE_TEXT" == "false" ]]; then
+    require_text_cache_arg="--no-audio-require-text"
+  fi
   local token_length=$((sites * sparsity * 2))
-  local recipe_label="wave-d${downsample}k${sparsity}-textcond-a${VCTK_NUM_EMBEDDINGS}-q${COEFF_BINS}-seq${token_length}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
+  local recipe_label="wave-d${downsample}k${sparsity}-textcond-${VCTK_CODEC_CAPACITY}-a${VCTK_NUM_EMBEDDINGS}-e${VCTK_EMBEDDING_DIM}-${VCTK_COEFF_QUANTIZATION}-q${VCTK_COEFF_BINS}-ord${VCTK_SUPPORT_ORDER}-seq${token_length}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
   "$PYTHON_SUBMIT" scripts/submit_multimodal_sweep.py \
     "${COMMON_ARGS[@]}" \
     --gpus "$AUDIO_GPUS" \
+    --nodes "$AUDIO_NODES" \
     --cpus-per-task "$AUDIO_CPUS_PER_TASK" \
     --mem-mb "$AUDIO_MEM_MB" \
     --cases vctk \
     --model-family laser \
     --run-label "${RUN_TAG}-vctk-${recipe_label}" \
-    "${COMMON_CACHE_ARGS[@]}" \
+    "${VCTK_CACHE_ARGS[@]}" \
     --cache-arg=--batch-size \
     --cache-arg="$VCTK_CACHE_BATCH_SIZE" \
     --cache-arg=--audio-representation \
     --cache-arg=waveform \
+    --cache-arg=--audio-num-samples \
+    --cache-arg="$VCTK_AUDIO_NUM_SAMPLES" \
+    --cache-arg=--audio-max-duration-seconds \
+    --cache-arg="$VCTK_AUDIO_MAX_DURATION_SECONDS" \
+    --cache-arg=--audio-min-duration-seconds \
+    --cache-arg="$VCTK_AUDIO_MIN_DURATION_SECONDS" \
+    --cache-arg="$require_text_cache_arg" \
     --cache-arg=--text-max-length \
     --cache-arg="$VCTK_TEXT_MAX_LENGTH" \
     --cache-arg=--audio-dc-remove \
@@ -460,6 +629,10 @@ submit_vctk() {
     --stage1-override data.batch_size="$VCTK_STAGE1_BATCH_SIZE" \
     --stage1-override data.num_workers="$VCTK_NUM_WORKERS" \
     --stage1-override data.audio_dc_remove=true \
+    --stage1-override data.audio_num_samples="$VCTK_AUDIO_NUM_SAMPLES" \
+    --stage1-override data.audio_max_duration_seconds="$VCTK_AUDIO_MAX_DURATION_SECONDS" \
+    --stage1-override data.audio_min_duration_seconds="$VCTK_AUDIO_MIN_DURATION_SECONDS" \
+    --stage1-override data.audio_require_text="$VCTK_REQUIRE_TEXT" \
     --stage1-override data.audio_peak_normalize=true \
     --stage1-override data.audio_target_peak=0.95 \
     --stage1-override data.audio_rms_normalize=true \
@@ -475,11 +648,13 @@ submit_vctk() {
     --stage1-override train.deterministic=false \
     --stage1-override train.log_every_n_steps=20 \
     --stage1-override train.run_test_after_fit=false \
+    --stage1-override checkpoint.save_top_k=1 \
     --stage1-override model.audio_downsample_rates="$rates" \
+    --stage1-override model.audio_dilation_cycle="$VCTK_DILATION_CYCLE" \
     --stage1-override model.num_embeddings="$VCTK_NUM_EMBEDDINGS" \
     --stage1-override model.embedding_dim="$VCTK_EMBEDDING_DIM" \
     --stage1-override model.num_hiddens="$hidden" \
-    --stage1-override model.num_residual_blocks=3 \
+    --stage1-override model.num_residual_blocks="$residual_blocks" \
     --stage1-override model.num_residual_hiddens="$residual_hidden" \
     --stage1-override model.patch_based=false \
     --stage1-override model.patch_size=1 \
@@ -530,9 +705,9 @@ echo "RUN_TAG=$RUN_TAG"
 echo "CASES=$CASES"
 echo "DOWNSAMPLE_LAYERS=$DOWNSAMPLE_LAYERS SPARSITY_LEVELS=$SPARSITY_LEVELS"
 echo "PARTITION=$PARTITION TIME_LIMIT=$TIME_LIMIT DRY_RUN=$DRY_RUN"
-echo "epochs: stage1=$STAGE1_EPOCHS stage1_adv=$STAGE1_ADV_EPOCHS stage2=$STAGE2_EPOCHS max_steps=$STAGE2_MAX_STEPS"
-echo "image atoms=$IMAGE_NUM_EMBEDDINGS q=$COEFF_BINS gpus/job=$IMAGE_GPUS; imagenet stage2=class_conditional"
-echo "vctk atoms=$VCTK_NUM_EMBEDDINGS q=$COEFF_BINS gpus/job=$AUDIO_GPUS; stage2=text_conditional"
+echo "epochs: stage1=$STAGE1_EPOCHS stage1_adv=$STAGE1_ADV_EPOCHS stage2=$STAGE2_EPOCHS max_steps=$STAGE2_MAX_STEPS stage1_only=$STAGE1_ONLY"
+echo "image codec_capacity=$IMAGE_CODEC_CAPACITY attention_profile=$IMAGE_ATTENTION_PROFILE use_mid_attention=$IMAGE_USE_MID_ATTENTION dropout=$IMAGE_DROPOUT atoms=$IMAGE_NUM_EMBEDDINGS emb_dim=$IMAGE_EMBEDDING_DIM q=$IMAGE_COEFF_BINS coeff_quant=$IMAGE_COEFF_QUANTIZATION mu=$IMAGE_COEFF_MU cache_coef_max=$IMAGE_CACHE_COEF_MAX support_order=$IMAGE_SUPPORT_ORDER nodes/job=$IMAGE_NODES gpus/node=$IMAGE_GPUS; imagenet stage2=class_conditional"
+echo "vctk codec_capacity=$VCTK_CODEC_CAPACITY dilation_cycle=$VCTK_DILATION_CYCLE audio_num_samples=$VCTK_AUDIO_NUM_SAMPLES duration_filter=[$VCTK_AUDIO_MIN_DURATION_SECONDS,$VCTK_AUDIO_MAX_DURATION_SECONDS] require_text=$VCTK_REQUIRE_TEXT atoms=$VCTK_NUM_EMBEDDINGS q=$VCTK_COEFF_BINS coeff_quant=$VCTK_COEFF_QUANTIZATION mu=$VCTK_COEFF_MU cache_coef_max=$VCTK_CACHE_COEF_MAX support_order=$VCTK_SUPPORT_ORDER nodes/job=$AUDIO_NODES gpus/node=$AUDIO_GPUS; stage2=text_conditional"
 
 IFS=',' read -r -a DOWNSAMPLE_ARRAY <<< "$DOWNSAMPLE_LAYERS"
 IFS=',' read -r -a SPARSITY_ARRAY <<< "$SPARSITY_LEVELS"

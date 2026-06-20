@@ -1,5 +1,6 @@
 import os
 import tempfile
+from typing import Mapping
 
 import torch
 import torch.nn as nn
@@ -69,6 +70,10 @@ class VQVAE(pl.LightningModule):
             decoder_extra_residual_layers=1,
             enable_codebook_visuals=False,
             codebook_visual_max_vectors=1024,
+            speaker_conditioning=False,
+            speaker_conditioning_num_speakers=0,
+            speaker_embedding_dim=64,
+            speaker_conversion_log=True,
     ):
         """Initialize VQVAE model.
 
@@ -132,6 +137,10 @@ class VQVAE(pl.LightningModule):
         self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.enable_codebook_visuals = bool(enable_codebook_visuals)
         self.codebook_visual_max_vectors = max(1, int(codebook_visual_max_vectors))
+        self.speaker_conditioning = bool(speaker_conditioning)
+        self.speaker_conditioning_num_speakers = max(0, int(speaker_conditioning_num_speakers or 0))
+        self.speaker_embedding_dim = max(1, int(speaker_embedding_dim or 1))
+        self.speaker_conversion_log = bool(speaker_conversion_log)
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
         self.in_channels = int(in_channels)
@@ -142,6 +151,11 @@ class VQVAE(pl.LightningModule):
         self._codebook_snapshot_steps = []
 
         self.is_waveform_audio = self.audio_backbone == "waveform" and int(in_channels) == 1
+        self.speaker_conditioning_enabled = bool(
+            self.is_waveform_audio
+            and self.speaker_conditioning
+            and self.speaker_conditioning_num_speakers > 0
+        )
 
         enc_dec_kwargs = None
         if not self.is_waveform_audio:
@@ -216,6 +230,15 @@ class VQVAE(pl.LightningModule):
                 stride=1,
                 padding=1,
             )
+            if self.speaker_conditioning_enabled:
+                self.speaker_embedding = nn.Embedding(
+                    self.speaker_conditioning_num_speakers,
+                    self.speaker_embedding_dim,
+                )
+                self.speaker_to_decoder = nn.Linear(self.speaker_embedding_dim, num_hiddens)
+            else:
+                self.speaker_embedding = None
+                self.speaker_to_decoder = None
             self.decoder = AudioDecoder(
                 in_channels=num_hiddens,
                 num_hiddens=num_hiddens,
@@ -235,6 +258,8 @@ class VQVAE(pl.LightningModule):
                     kernel_size=1,
                     stride=1,
                 )
+            self.speaker_embedding = None
+            self.speaker_to_decoder = None
             self.decoder = Decoder(
                 **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
             )
@@ -307,6 +332,49 @@ class VQVAE(pl.LightningModule):
             return torch.tanh(x_recon)
         return x_recon
 
+    def _speaker_indices_from_audio_meta(
+        self,
+        audio_meta,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not self.speaker_conditioning_enabled:
+            return None
+        raw = None
+        if isinstance(audio_meta, Mapping):
+            raw = audio_meta.get("speaker_index", None)
+        if raw is None:
+            return torch.zeros(int(batch_size), dtype=torch.long, device=device)
+        if torch.is_tensor(raw):
+            indices = raw.to(device=device, dtype=torch.long).view(-1)
+        else:
+            indices = torch.as_tensor(raw, dtype=torch.long, device=device).view(-1)
+        if int(indices.numel()) < int(batch_size):
+            pad = torch.zeros(int(batch_size) - int(indices.numel()), dtype=torch.long, device=device)
+            indices = torch.cat([indices, pad], dim=0)
+        indices = indices[: int(batch_size)]
+        return indices.clamp_(0, self.speaker_conditioning_num_speakers - 1)
+
+    def _condition_decoder_input(
+        self,
+        z: torch.Tensor,
+        speaker_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self.speaker_conditioning_enabled or z.ndim != 3:
+            return z
+        if speaker_indices is None:
+            speaker_indices = torch.zeros(int(z.size(0)), dtype=torch.long, device=z.device)
+        else:
+            speaker_indices = speaker_indices.to(device=z.device, dtype=torch.long).view(-1)
+            if int(speaker_indices.numel()) < int(z.size(0)):
+                pad = torch.zeros(int(z.size(0)) - int(speaker_indices.numel()), dtype=torch.long, device=z.device)
+                speaker_indices = torch.cat([speaker_indices, pad], dim=0)
+            speaker_indices = speaker_indices[: int(z.size(0))]
+        speaker_indices = speaker_indices.clamp(0, self.speaker_conditioning_num_speakers - 1)
+        speaker_bias = self.speaker_to_decoder(self.speaker_embedding(speaker_indices))
+        return z + speaker_bias.to(dtype=z.dtype).unsqueeze(-1)
+
     def _encode_quantized(self, x):
         z = self.pre_bottleneck(self.encoder(x))
         z_q, loss, perplexity, encodings = self._quantize(z)
@@ -328,7 +396,7 @@ class VQVAE(pl.LightningModule):
             indices = torch.argmax(encodings, dim=1).view(B, H_z * W_z)
         return indices, H_z, W_z
 
-    def decode_from_indices(self, indices, H_z, W_z):
+    def decode_from_indices(self, indices, H_z, W_z, speaker_indices=None):
         """
         Decode codebook indices back to images using the decoder.
         Args:
@@ -346,6 +414,7 @@ class VQVAE(pl.LightningModule):
         else:
             z_q = z_q_flat.view(B, H_z, W_z, -1).permute(0, 3, 1, 2).contiguous()  # [B, D, H_z, W_z]
         z_q = self.post_bottleneck(z_q)
+        z_q = self._condition_decoder_input(z_q, speaker_indices)
         recon = self._apply_output_activation(self.decoder(z_q))
         return recon
 
@@ -363,7 +432,7 @@ class VQVAE(pl.LightningModule):
         _, z_q, quantization_loss, _, _ = self._encode_quantized(x)
         return z_q, quantization_loss
     
-    def decode(self, z_q):
+    def decode(self, z_q, speaker_indices=None):
         """
         Decode latent representation to reconstruction
         
@@ -374,12 +443,13 @@ class VQVAE(pl.LightningModule):
             x_recon: Reconstructed input
         """
         z_q = self.post_bottleneck(z_q)
+        z_q = self._condition_decoder_input(z_q, speaker_indices)
         x_recon = self.decoder(z_q)
         return self._apply_output_activation(x_recon)
 
-    def forward(self, x):
+    def forward(self, x, speaker_indices=None):
         _, z_q, vq_loss, perplexity, _ = self._encode_quantized(x)
-        recon = self.decode(z_q)
+        recon = self.decode(z_q, speaker_indices=speaker_indices)
         if recon.shape[-1] != x.shape[-1] and recon.ndim == 3 and x.ndim == 3:
             if recon.shape[-1] > x.shape[-1]:
                 recon = recon[..., : x.shape[-1]]
@@ -405,9 +475,14 @@ class VQVAE(pl.LightningModule):
         audio_meta = extract_audio_metadata_from_batch(batch)
         is_audio = has_audio_metadata(audio_meta)
         is_waveform_audio = is_audio and x.ndim == 3
+        speaker_indices = self._speaker_indices_from_audio_meta(
+            audio_meta,
+            batch_size=batch_size,
+            device=x.device,
+        )
         
         # Forward pass
-        recon_raw, vq_loss, perplexity = self(x)
+        recon_raw, vq_loss, perplexity = self(x, speaker_indices=speaker_indices)
         # Keep raw for loss; sanitized copies for metrics/visualization
         recon_vis = torch.nan_to_num(recon_raw.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
         x_vis = torch.nan_to_num(x.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
@@ -773,6 +848,7 @@ class VQVAE(pl.LightningModule):
             payload = {
                 f"{split}/reconstruction_error": F.mse_loss(x_recon, x).item(),
             }
+            artifact_dir = getattr(self.logger, "save_dir", None) or getattr(self._trainer_ref(), "default_root_dir", None)
             payload.update(
                 build_audio_log_payload(
                     x,
@@ -781,9 +857,41 @@ class VQVAE(pl.LightningModule):
                     audio_source=dm.config,
                     split=split,
                     max_items=4,
-                    artifact_dir=getattr(self.logger, "save_dir", None) or getattr(self._trainer_ref(), "default_root_dir", None),
+                    artifact_dir=artifact_dir,
                 )
             )
+            if (
+                self.speaker_conditioning_enabled
+                and self.speaker_conversion_log
+                and split != "train"
+                and self.speaker_conditioning_num_speakers > 1
+            ):
+                with torch.no_grad():
+                    source_speakers = self._speaker_indices_from_audio_meta(
+                        audio_meta,
+                        batch_size=int(x.size(0)),
+                        device=x.device,
+                    )
+                    target_speakers = (source_speakers + 1) % self.speaker_conditioning_num_speakers
+                    _, z_q, _, _, _ = self._encode_quantized(x)
+                    converted = self.decode(z_q, speaker_indices=target_speakers)
+                    if converted.shape[-1] != x.shape[-1]:
+                        if converted.shape[-1] > x.shape[-1]:
+                            converted = converted[..., : x.shape[-1]]
+                        else:
+                            converted = F.pad(converted, (0, x.shape[-1] - converted.shape[-1]))
+                    converted = torch.nan_to_num(converted.detach(), nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+                payload.update(
+                    build_audio_log_payload(
+                        x,
+                        converted,
+                        audio_meta=audio_meta,
+                        audio_source=dm.config,
+                        split=f"{split}/speaker_conversion",
+                        max_items=4,
+                        artifact_dir=artifact_dir,
+                    )
+                )
             log_wandb_payload(logger, payload, step=step)
             return
 

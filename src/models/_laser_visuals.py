@@ -7,6 +7,7 @@ their own.
 """
 
 import os
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,90 @@ from src.wandb_media import log_wandb_images, log_wandb_payload, log_wandb_video
 
 class VisualsMixin:
     """Image/codebook/heatmap visualization methods for LASER."""
+
+    def _visual_split(self, key, split=None):
+        if split not in (None, ""):
+            return str(split)
+        text = str(key)
+        return text.split("/", 1)[0] if "/" in text else "misc"
+
+    def _visual_name(self, key):
+        text = str(key).replace("/", "_")
+        cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+        return cleaned.strip("_") or "visual"
+
+    def _visual_step(self, step):
+        try:
+            value = int(step)
+        except (TypeError, ValueError):
+            value = int(getattr(self, "global_step", 0) or 0)
+        return max(value, 0)
+
+    def _visual_root(self, key, split=None):
+        logger = getattr(self, "logger", None)
+        trainer = self._trainer_ref()
+        candidates = (
+            getattr(logger, "save_dir", None),
+            getattr(getattr(logger, "experiment", None), "dir", None),
+            getattr(trainer, "default_root_dir", None),
+        )
+        base = next((item for item in candidates if item not in (None, "")), ".")
+        root = Path(base).expanduser().resolve() / "visual_media" / self._visual_split(key, split)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"[LASER] Could not create local visual artifact dir {root}: {exc}", flush=True)
+            return None
+        return root
+
+    def _visual_path(self, key, *, step=None, suffix=".png", index=None, split=None):
+        root = self._visual_root(key, split=split)
+        if root is None:
+            return None
+        stem = f"step_{self._visual_step(step):09d}_{self._visual_name(key)}"
+        if index is not None:
+            stem = f"{stem}_{int(index):02d}"
+        return root / f"{stem}{suffix}"
+
+    def _save_local_visual_image(self, key, image, *, step=None, index=None, split=None):
+        path = self._visual_path(key, step=step, suffix=".png", index=index, split=split)
+        if path is None:
+            return None
+        try:
+            import numpy as np
+            from PIL import Image
+
+            if torch.is_tensor(image):
+                array = image.detach().cpu().numpy()
+            else:
+                array = np.asarray(image)
+            if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+                array = np.moveaxis(array, 0, -1)
+            if array.ndim == 3 and array.shape[-1] == 4:
+                array = array[..., :3]
+            if array.ndim == 3 and array.shape[-1] == 1:
+                array = array[..., 0]
+            if array.ndim not in (2, 3):
+                return None
+            array = np.nan_to_num(array)
+            if np.issubdtype(array.dtype, np.floating):
+                if float(array.max(initial=0.0)) <= 1.0 and float(array.min(initial=0.0)) >= 0.0:
+                    array = array * 255.0
+                array = np.clip(array, 0.0, 255.0).astype("uint8")
+            else:
+                array = np.clip(array, 0, 255).astype("uint8")
+            Image.fromarray(array).save(path)
+            return path
+        except Exception as exc:
+            print(f"[LASER] Could not save local visual {path}: {exc}", flush=True)
+            return None
+
+    def _save_local_visual_payload(self, payload, *, step=None):
+        for key, value in dict(payload).items():
+            if not isinstance(value, dict) or str(value.get("kind", "")).lower() != "image":
+                continue
+            for idx, item in enumerate(list(value.get("items", []) or [])):
+                self._save_local_visual_image(key, item, step=step, index=idx)
 
     def _snapshot_dictionary(self):
         """Store a copy of the current dictionary atoms for trajectory animation.
@@ -59,6 +144,7 @@ class VisualsMixin:
             return
 
         step = self._wandb_epoch_end_step()
+        self._save_local_visual_image("val/dictionary_scatter", image, step=step)
         log_wandb_images(
             logger,
             "val/dictionary_scatter",
@@ -76,13 +162,23 @@ class VisualsMixin:
             return
         if len(self._dict_snapshots) < 2:
             return
-        import tempfile, os
 
         logger = getattr(self, "logger", None)
         if logger is None:
             return
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
-            gif_path = tmp.name
+        step = self._wandb_epoch_end_step()
+        gif_path = self._visual_path(
+            "val/dictionary_atom_trajectories",
+            step=step,
+            suffix=".gif",
+        )
+        delete_after = False
+        if gif_path is None:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+                gif_path = Path(tmp.name)
+            delete_after = True
         try:
             saved = save_codebook_trajectory_gif(
                 self._dict_snapshots,
@@ -93,7 +189,6 @@ class VisualsMixin:
             )
             if saved is None:
                 return
-            step = self._wandb_epoch_end_step()
             log_wandb_video(
                 logger,
                 "val/dictionary_atom_trajectories",
@@ -103,10 +198,11 @@ class VisualsMixin:
                 formats=["gif"],
             )
         finally:
-            try:
-                os.unlink(gif_path)
-            except OSError:
-                pass
+            if delete_after:
+                try:
+                    os.unlink(gif_path)
+                except OSError:
+                    pass
 
     def log_images(self, x, recon, prefix='val', max_images=8, audio_meta=None):
         """Log reconstruction images to wandb."""
@@ -168,6 +264,12 @@ class VisualsMixin:
         combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         combined = self._wandb_display_array(combined)
 
+        self._save_local_visual_image(
+            f"{prefix}/reconstruction_grid",
+            combined,
+            step=step,
+            split=prefix,
+        )
         log_wandb_images(
             logger,
             f"{prefix}/images",
@@ -328,6 +430,7 @@ class VisualsMixin:
                 log_payload["val/recon_error_map"]["caption"].append(cap)
             if log_payload:
                 step = self._wandb_epoch_end_step()
+                self._save_local_visual_payload(log_payload, step=step)
                 log_wandb_payload(self.logger, log_payload, step=step)
         finally:
             if was_training:

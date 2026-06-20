@@ -1,5 +1,6 @@
 import math
 import os
+import wave
 from pathlib import Path
 from typing import List, Sequence, Tuple, Union
 
@@ -168,6 +169,30 @@ def _read_audio_file(path: Union[str, Path]) -> Tuple[int, np.ndarray]:
     raise ValueError(f"Unsupported VCTK audio extension for {path}")
 
 
+def _audio_duration_seconds(path: Union[str, Path]) -> float | None:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".wav":
+            with wave.open(str(path), "rb") as handle:
+                rate = int(handle.getframerate())
+                frames = int(handle.getnframes())
+            return None if rate <= 0 else frames / float(rate)
+        if suffix == ".flac":
+            try:
+                import soundfile as sf
+                info = sf.info(str(path))
+                rate = int(info.samplerate)
+                frames = int(info.frames)
+                return None if rate <= 0 else frames / float(rate)
+            except Exception:
+                sample_rate, samples = _read_audio_file(path)
+                return None if int(sample_rate) <= 0 else int(np.asarray(samples).shape[0]) / float(sample_rate)
+    except Exception:
+        return None
+    return None
+
+
 class VCTKSpectrogramDataset(Dataset):
     def __init__(
         self,
@@ -175,6 +200,7 @@ class VCTKSpectrogramDataset(Dataset):
         config: DataConfig,
         *,
         train: bool,
+        speaker_to_index: dict[str, int] | None = None,
     ):
         if not paths:
             raise RuntimeError("No VCTK audio files provided for dataset split.")
@@ -208,6 +234,9 @@ class VCTKSpectrogramDataset(Dataset):
             raise ValueError(f"stft_win_length ({self.win_length}) must be <= stft_n_fft ({self.n_fft})")
         self.window = torch.hann_window(self.win_length, periodic=True)
         self.texts = [_read_vctk_transcript(path) for path in self.paths]
+        self.speaker_to_index = dict(speaker_to_index or {
+            speaker: idx for idx, speaker in enumerate(sorted({path.parent.name for path in self.paths}))
+        })
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -277,6 +306,10 @@ class VCTKSpectrogramDataset(Dataset):
         meta = {
             "path": str(path),
             "speaker_id": path.parent.name,
+            "speaker_index": torch.tensor(
+                int(self.speaker_to_index.get(path.parent.name, 0)),
+                dtype=torch.int64,
+            ),
             "text": self.texts[index],
             "crop_mode": torch.tensor(int(crop_meta["crop_mode"]), dtype=torch.int64),
             "crop_offset": torch.tensor(int(crop_meta["crop_offset"]), dtype=torch.int64),
@@ -295,6 +328,7 @@ class VCTKWaveformDataset(Dataset):
         config: DataConfig,
         *,
         train: bool,
+        speaker_to_index: dict[str, int] | None = None,
     ):
         if not paths:
             raise RuntimeError("No VCTK audio files provided for dataset split.")
@@ -315,6 +349,9 @@ class VCTKWaveformDataset(Dataset):
         if self.audio_num_samples <= 0:
             raise ValueError(f"audio_num_samples must be positive, got {self.audio_num_samples}")
         self.texts = [_read_vctk_transcript(path) for path in self.paths]
+        self.speaker_to_index = dict(speaker_to_index or {
+            speaker: idx for idx, speaker in enumerate(sorted({path.parent.name for path in self.paths}))
+        })
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -399,6 +436,10 @@ class VCTKWaveformDataset(Dataset):
         meta = {
             "path": str(path),
             "speaker_id": path.parent.name,
+            "speaker_index": torch.tensor(
+                int(self.speaker_to_index.get(path.parent.name, 0)),
+                dtype=torch.int64,
+            ),
             "text": self.texts[index],
             "crop_mode": torch.tensor(int(crop_meta["crop_mode"]), dtype=torch.int64),
             "crop_offset": torch.tensor(int(crop_meta["crop_offset"]), dtype=torch.int64),
@@ -418,6 +459,9 @@ class VCTKDataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+        self.speaker_ids: list[str] = []
+        self.speaker_to_index: dict[str, int] = {}
+        self.num_speakers = 0
 
     def _loader_generator(self, offset: int = 0) -> torch.Generator:
         generator = torch.Generator()
@@ -438,6 +482,48 @@ class VCTKDataModule(pl.LightningDataModule):
         if audio_paths:
             return audio_paths
         raise RuntimeError(f"No WAV/FLAC audio files found under {base}")
+
+    def _filter_audio_files(self, paths: Sequence[Path]) -> List[Path]:
+        min_duration = max(0.0, float(getattr(self.config, "audio_min_duration_seconds", 0.0) or 0.0))
+        max_duration = max(0.0, float(getattr(self.config, "audio_max_duration_seconds", 0.0) or 0.0))
+        require_text = bool(getattr(self.config, "audio_require_text", False))
+        if min_duration <= 0.0 and max_duration <= 0.0 and not require_text:
+            return list(paths)
+
+        kept: list[Path] = []
+        dropped_no_text = 0
+        dropped_duration = 0
+        for path in paths:
+            if require_text and not _read_vctk_transcript(path).strip():
+                dropped_no_text += 1
+                continue
+            duration = _audio_duration_seconds(path)
+            if duration is None:
+                if min_duration > 0.0 or max_duration > 0.0:
+                    dropped_duration += 1
+                    continue
+            else:
+                if min_duration > 0.0 and duration < min_duration:
+                    dropped_duration += 1
+                    continue
+                if max_duration > 0.0 and duration > max_duration:
+                    dropped_duration += 1
+                    continue
+            kept.append(path)
+
+        if not kept:
+            raise RuntimeError(
+                "VCTK duration/text filters removed every audio file "
+                f"(min_duration={min_duration}, max_duration={max_duration}, require_text={require_text})."
+            )
+        if len(kept) != len(paths):
+            print(
+                "VCTK filter kept "
+                f"{len(kept)}/{len(paths)} files "
+                f"(dropped_no_text={dropped_no_text}, dropped_duration={dropped_duration}, "
+                f"min_duration={min_duration}, max_duration={max_duration}, require_text={require_text})"
+            )
+        return kept
 
     def _resolve_data_dir(self) -> str:
         flac_error = None
@@ -506,9 +592,13 @@ class VCTKDataModule(pl.LightningDataModule):
             return
         data_dir = self._resolve_data_dir()
         audio_paths = self._list_audio_files(data_dir)
+        audio_paths = self._filter_audio_files(audio_paths)
         num_items = len(audio_paths)
         if num_items < 3:
             raise RuntimeError("VCTK dataset must contain at least three WAV files for train/val/test splits.")
+        self.speaker_ids = sorted({path.parent.name for path in audio_paths})
+        self.speaker_to_index = {speaker: idx for idx, speaker in enumerate(self.speaker_ids)}
+        self.num_speakers = len(self.speaker_ids)
 
         generator = torch.Generator().manual_seed(int(self.config.seed))
         indices = torch.randperm(num_items, generator=generator)
@@ -534,9 +624,24 @@ class VCTKDataModule(pl.LightningDataModule):
             "Unsupported audio_representation "
             f"{representation!r}; expected 'spectrogram' or 'waveform'"
         )
-        self.train_dataset = dataset_cls(gather(train_idx), self.config, train=True)
-        self.val_dataset = dataset_cls(gather(val_idx), self.config, train=False)
-        self.test_dataset = dataset_cls(gather(test_idx), self.config, train=False)
+        self.train_dataset = dataset_cls(
+            gather(train_idx),
+            self.config,
+            train=True,
+            speaker_to_index=self.speaker_to_index,
+        )
+        self.val_dataset = dataset_cls(
+            gather(val_idx),
+            self.config,
+            train=False,
+            speaker_to_index=self.speaker_to_index,
+        )
+        self.test_dataset = dataset_cls(
+            gather(test_idx),
+            self.config,
+            train=False,
+            speaker_to_index=self.speaker_to_index,
+        )
 
     def train_dataloader(self):
         return self._build_loader(

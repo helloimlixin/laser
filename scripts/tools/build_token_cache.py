@@ -68,6 +68,7 @@ def _default_output_path(args):
             image_size=int(args.image_size),
             coeff_bins=int(args.coeff_vocab_size),
             coeff_quantization=str(args.coeff_quantization),
+            coeff_mu=float(args.coeff_mu),
         )
     return (
         Path(args.ar_output_dir).expanduser().resolve()

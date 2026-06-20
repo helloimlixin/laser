@@ -1166,6 +1166,26 @@ def _write_wav_audio_file(root: Path, stem: str, waveform: torch.Tensor, *, samp
     return path
 
 
+def _write_audio_preview_pair(
+    artifact_dir: Any,
+    split: str,
+    basename: str,
+    original_waveform: torch.Tensor,
+    reconstructed_waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+) -> None:
+    if artifact_dir in (None, ""):
+        return
+    try:
+        root = _audio_artifact_root(artifact_dir, split)
+        _write_wav_audio_file(root, f"{basename}_original", original_waveform, sample_rate=sample_rate)
+        _write_wav_audio_file(root, f"{basename}_reconstructed", reconstructed_waveform, sample_rate=sample_rate)
+    except Exception:
+        # W&B media still carries the payload; local WAV export is best-effort.
+        return
+
+
 def _representative_audio_spec_item(audio_meta: Optional[Mapping[str, Any]], config: Mapping[str, Any]) -> dict:
     if isinstance(audio_meta, Mapping) and "spec_min" in audio_meta and "spec_max" in audio_meta:
         spec_min_values = _tensor_1d(audio_meta["spec_min"], dtype=torch.float32)
@@ -1437,6 +1457,14 @@ def build_audio_log_payload(
                 ]
             )
             audio_sample_rates.extend([int(config["sample_rate"]), int(config["sample_rate"])])
+            _write_audio_preview_pair(
+                artifact_dir,
+                split,
+                basename,
+                original_waveform,
+                recon_waveform,
+                sample_rate=int(config["sample_rate"]),
+            )
             try:
                 original_mel = _mel_db(original_waveform, config)
                 recon_mel = _mel_db(recon_waveform, config)
@@ -1540,6 +1568,14 @@ def build_audio_log_payload(
                 int(config["sample_rate"]),
                 int(config["sample_rate"]),
             ]
+        )
+        _write_audio_preview_pair(
+            artifact_dir,
+            split,
+            basename,
+            original_waveform,
+            recon_waveform,
+            sample_rate=int(config["sample_rate"]),
         )
 
         original_mel = _mel_db(original_waveform, config)
