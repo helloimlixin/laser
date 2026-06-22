@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Unified training launcher for LASER experiments.
 
-This is a small argparse facade over the maintained Hydra entrypoints.  It keeps
-paper-facing commands short while preserving the existing training code paths.
+This is a small argparse facade over the maintained Hydra stage implementations.
+It keeps paper-facing commands short while preserving raw Hydra override access.
 Example:
 
-    python train.py --stage 1 --adversarial true --num_gpus 8 \
+    python train.py stage1 --adversarial true --num_gpus 8 \
       --dataset imagenet --modality image --conditioning class
+
+    python train.py stage1 model=laser data=cifar10
+    python train.py stage2 token_cache_path=/path/to/token_cache.pt
 """
 
 from __future__ import annotations
@@ -31,6 +34,64 @@ IMAGE_DATASETS = {
     "stl10",
 }
 AUDIO_DATASETS = {"vctk", "maestro"}
+STAGE_TOKEN_ALIASES = {
+    "1": "1",
+    "stage1": "1",
+    "stage-1": "1",
+    "2": "2",
+    "stage2": "2",
+    "stage-2": "2",
+}
+FACADE_FLAGS = {
+    "--stage",
+    "--dataset",
+    "--modality",
+    "--conditioning",
+    "--adversarial",
+    "--num_gpus",
+    "--num-gpus",
+    "--num_nodes",
+    "--num-nodes",
+    "--devices_per_node",
+    "--devices-per-node",
+    "--downsample_layers",
+    "--downsample-layers",
+    "--sparsity_level",
+    "--sparsity-level",
+    "--num_embeddings",
+    "--num-embeddings",
+    "--embedding_dim",
+    "--embedding-dim",
+    "--image_size",
+    "--image-size",
+    "--data_dir",
+    "--data-dir",
+    "--batch_size",
+    "--batch-size",
+    "--num_workers",
+    "--num-workers",
+    "--epochs",
+    "--max_steps",
+    "--max-steps",
+    "--precision",
+    "--learning_rate",
+    "--learning-rate",
+    "--dict_learning_rate",
+    "--dict-learning-rate",
+    "--output_root",
+    "--output-root",
+    "--output_dir",
+    "--output-dir",
+    "--run_name",
+    "--run-name",
+    "--project",
+    "--token_cache_path",
+    "--token-cache-path",
+    "--num_classes",
+    "--num-classes",
+    "--dry_run",
+    "--dry-run",
+}
 
 
 @dataclass(frozen=True)
@@ -61,11 +122,28 @@ def _positive_int(raw: str) -> int:
 
 def _stage(raw: str) -> str:
     value = str(raw).strip().lower()
-    if value in {"1", "stage1", "stage-1"}:
-        return "1"
-    if value in {"2", "stage2", "stage-2"}:
-        return "2"
+    if value in STAGE_TOKEN_ALIASES:
+        return STAGE_TOKEN_ALIASES[value]
     raise argparse.ArgumentTypeError("stage must be 1 or 2")
+
+
+def _stage_token(raw: str) -> str | None:
+    return STAGE_TOKEN_ALIASES.get(str(raw).strip().lower())
+
+
+def _split_flag_name(arg: str) -> str:
+    return arg.split("=", 1)[0]
+
+
+def _inject_stage_option(argv: list[str]) -> list[str]:
+    stage = _stage_token(argv[0]) if argv else None
+    if stage:
+        return ["--stage", stage, *argv[1:]]
+    return argv
+
+
+def _looks_like_facade_args(argv: Iterable[str]) -> bool:
+    return any(_split_flag_name(arg) in FACADE_FLAGS for arg in argv)
 
 
 def _default_output_root() -> str:
@@ -89,46 +167,51 @@ def _slurm_num_nodes() -> int | None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified LASER training launcher. Unknown trailing args are passed through as Hydra overrides.",
+        description=(
+            "Unified LASER training launcher. Pass stage1/stage2 as the first argument "
+            "or use --stage. Unknown trailing args are passed through as Hydra overrides."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--stage", required=True, type=_stage, help="Training stage: 1 for autoencoder, 2 for prior.")
+    parser.add_argument("--stage", required=True, type=_stage, help="Training stage: stage1 for autoencoder, stage2 for prior.")
     parser.add_argument("--dataset", required=True, help="Dataset config name, e.g. imagenet, celebahq, ffhq, vctk.")
     parser.add_argument("--modality", required=True, choices=("image", "audio"))
     parser.add_argument("--conditioning", default="none", choices=("none", "class", "text"))
     parser.add_argument("--adversarial", type=_str_bool, default=False, help="Enable stage-1 adversarial loss.")
-    parser.add_argument("--num_gpus", type=_positive_int, default=1, help="Total GPUs requested for the run.")
+    parser.add_argument("--num_gpus", "--num-gpus", type=_positive_int, default=1, help="Total GPUs requested for the run.")
     parser.add_argument(
         "--num_nodes",
+        "--num-nodes",
         default="auto",
         help="Number of nodes. Use auto to infer from SLURM_JOB_NUM_NODES/SLURM_NNODES when present.",
     )
     parser.add_argument(
         "--devices_per_node",
+        "--devices-per-node",
         type=_positive_int,
         default=None,
         help="Override Lightning train.devices/train_ar.devices directly.",
     )
-    parser.add_argument("--downsample_layers", type=int, default=5, choices=(5, 6))
-    parser.add_argument("--sparsity_level", type=_positive_int, default=3)
-    parser.add_argument("--num_embeddings", type=_positive_int, default=None)
-    parser.add_argument("--embedding_dim", type=_positive_int, default=None)
-    parser.add_argument("--image_size", type=_positive_int, default=None)
-    parser.add_argument("--data_dir", default=None)
-    parser.add_argument("--batch_size", type=_positive_int, default=None, help="Per-process batch size.")
-    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--downsample_layers", "--downsample-layers", type=int, default=5, choices=(5, 6))
+    parser.add_argument("--sparsity_level", "--sparsity-level", type=_positive_int, default=3)
+    parser.add_argument("--num_embeddings", "--num-embeddings", type=_positive_int, default=None)
+    parser.add_argument("--embedding_dim", "--embedding-dim", type=_positive_int, default=None)
+    parser.add_argument("--image_size", "--image-size", type=_positive_int, default=None)
+    parser.add_argument("--data_dir", "--data-dir", default=None)
+    parser.add_argument("--batch_size", "--batch-size", type=_positive_int, default=None, help="Per-process batch size.")
+    parser.add_argument("--num_workers", "--num-workers", type=int, default=None)
     parser.add_argument("--epochs", type=_positive_int, default=None)
-    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--max_steps", "--max-steps", type=int, default=-1)
     parser.add_argument("--precision", default="bf16-mixed")
-    parser.add_argument("--learning_rate", default=None)
-    parser.add_argument("--dict_learning_rate", default=None)
-    parser.add_argument("--output_root", default=_default_output_root())
-    parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--run_name", default=None)
+    parser.add_argument("--learning_rate", "--learning-rate", default=None)
+    parser.add_argument("--dict_learning_rate", "--dict-learning-rate", default=None)
+    parser.add_argument("--output_root", "--output-root", default=_default_output_root())
+    parser.add_argument("--output_dir", "--output-dir", default=None)
+    parser.add_argument("--run_name", "--run-name", default=None)
     parser.add_argument("--project", default="laser")
-    parser.add_argument("--token_cache_path", default=None, help="Required for --stage 2.")
-    parser.add_argument("--num_classes", type=_positive_int, default=None)
-    parser.add_argument("--dry_run", action="store_true", help="Print the translated command without executing it.")
+    parser.add_argument("--token_cache_path", "--token-cache-path", default=None, help="Required for --stage 2.")
+    parser.add_argument("--num_classes", "--num-classes", type=_positive_int, default=None)
+    parser.add_argument("--dry_run", "--dry-run", action="store_true", help="Print the translated command without executing it.")
     return parser
 
 
@@ -315,7 +398,7 @@ def _stage1_adversarial_overrides(args: argparse.Namespace) -> list[str]:
 def _stage1_command(args: argparse.Namespace, resources: ResourcePlan, extra: list[str]) -> list[str]:
     run_name = _run_name(args)
     output_dir = _output_dir(args, run_name)
-    script = Path(__file__).resolve().with_name("train_stage1_autoencoder.py")
+    script = Path(__file__).resolve()
     overrides = [
         f"model={_model_config(args.modality, args.downsample_layers)}",
         *_common_overrides(args, resources, run_name, output_dir),
@@ -352,13 +435,13 @@ def _stage1_command(args: argparse.Namespace, resources: ResourcePlan, extra: li
         overrides.append(f"model.embedding_dim={args.embedding_dim}")
     overrides.extend(_stage1_adversarial_overrides(args))
     overrides.extend(extra)
-    return [sys.executable, str(script), *overrides]
+    return [sys.executable, str(script), "stage1", *overrides]
 
 
 def _stage2_command(args: argparse.Namespace, resources: ResourcePlan, extra: list[str]) -> list[str]:
     run_name = _run_name(args)
     output_dir = _output_dir(args, run_name)
-    script = Path(__file__).resolve().with_name("train_stage2_prior.py")
+    script = Path(__file__).resolve()
     overrides = [
         f"token_cache_path={Path(args.token_cache_path).expanduser()}",
         f"output_dir={output_dir}",
@@ -404,12 +487,13 @@ def _stage2_command(args: argparse.Namespace, resources: ResourcePlan, extra: li
             ]
         )
     overrides.extend(extra)
-    return [sys.executable, str(script), *overrides]
+    return [sys.executable, str(script), "stage2", *overrides]
 
 
 def build_command(argv: list[str] | None = None) -> list[str]:
     parser = _build_parser()
-    args, unknown = parser.parse_known_args(argv)
+    normalized = _inject_stage_option(list(argv) if argv is not None else sys.argv[1:])
+    args, unknown = parser.parse_known_args(normalized)
     extra = _normalize_unknown(unknown)
     _validate(args)
     resources = _resolve_resources(args.num_gpus, args.num_nodes, args.devices_per_node)
@@ -418,9 +502,28 @@ def build_command(argv: list[str] | None = None) -> list[str]:
     return _stage2_command(args, resources, extra)
 
 
+def _dispatch_stage(stage: str, stage_argv: list[str]) -> int:
+    sys.argv = [sys.argv[0], *stage_argv]
+    if stage == "1":
+        from train_stage1_autoencoder import train as train_stage1
+
+        train_stage1()
+    else:
+        from train_stage2_prior import main as train_stage2
+
+        train_stage2()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    stage = _stage_token(raw_argv[0]) if raw_argv else None
+    if stage and not _looks_like_facade_args(raw_argv[1:]):
+        return _dispatch_stage(stage, raw_argv[1:])
+
     parser = _build_parser()
-    args, unknown = parser.parse_known_args(argv)
+    normalized = _inject_stage_option(raw_argv)
+    args, unknown = parser.parse_known_args(normalized)
     extra = _normalize_unknown(unknown)
     _validate(args)
     resources = _resolve_resources(args.num_gpus, args.num_nodes, args.devices_per_node)
