@@ -106,7 +106,7 @@ echo "========================================"
 echo "STAGE 1: ImageNet-256 LASER site (laser_imagenet_site)"
 echo "========================================"
 
-python train_stage1_autoencoder.py \\
+python train.py stage1 \\
   seed=42 \\
   output_dir="$RUN_DIR/stage1" \\
   model=laser_imagenet_site \\

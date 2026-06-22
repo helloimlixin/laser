@@ -79,7 +79,7 @@ echo "STAGE2_DIR=${STAGE2_DIR}"
 echo "CACHE=${CACHE}"
 echo "WANDB_GROUP=${WANDB_GROUP}"
 
-"${PYTHON_BIN}" train_stage1_autoencoder.py \
+"${PYTHON_BIN}" train.py stage1 \
   output_dir="${STAGE1_DIR}" \
   hydra.run.dir="${STAGE1_DIR}/hydra" \
   model=laser \
@@ -170,7 +170,7 @@ echo "[$(date --iso-8601=seconds)] stage-1 checkpoint: ${CKPT}"
 
 echo "[$(date --iso-8601=seconds)] token cache: ${CACHE}"
 
-"${PYTHON_BIN}" train_stage2_prior.py \
+"${PYTHON_BIN}" train.py stage2 \
   output_dir="${STAGE2_DIR}" \
   hydra.run.dir="${STAGE2_DIR}/hydra" \
   token_cache_path="${CACHE}" \

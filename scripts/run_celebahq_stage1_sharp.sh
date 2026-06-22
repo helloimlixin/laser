@@ -46,7 +46,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 mkdir -p "${RUN_ROOT}"
 
-"${PYTHON_BIN}" train_stage1_autoencoder.py \
+"${PYTHON_BIN}" train.py stage1 \
   output_dir="${RUN_ROOT}" \
   hydra.run.dir="${RUN_ROOT}/hydra" \
   model=laser \

@@ -794,7 +794,7 @@ echo "=== Using supplied stage-1 checkpoint ({case.name}): $CKPT ==="
 )
 
 echo "=== Stage 1: autoencoder training ({case.name}) ==="
-"$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ARGS[@]}}"
+"$PYTHON_BIN" train.py stage1 "${{STAGE1_ARGS[@]}}"
 
 CKPT="$(select_stage1_checkpoint "{stage1_dir}")"
 if [[ -z "$CKPT" ]]; then
@@ -810,7 +810,7 @@ if [[ "{'1' if int(stage1_adv_epochs) > 0 else '0'}" == "1" ]]; then
   )
 
   echo "=== Stage 1 adversarial continuation ({case.name}) ==="
-  "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ADV_ARGS[@]}}"
+  "$PYTHON_BIN" train.py stage1 "${{STAGE1_ADV_ARGS[@]}}"
 
   CKPT="$(select_stage1_checkpoint "{stage1_adv_dir}")"
   if [[ -z "$CKPT" ]]; then
@@ -977,7 +977,7 @@ STAGE2_ARGS=(
 )
 
 echo "=== Stage 2: transformer prior training + generation ({case.name}) ==="
-"$PYTHON_BIN" train_stage2_prior.py "${{STAGE2_ARGS[@]}}"
+"$PYTHON_BIN" train.py stage2 "${{STAGE2_ARGS[@]}}"
 """,
         encoding="utf-8",
     )

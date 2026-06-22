@@ -157,7 +157,7 @@ find_stage1_ckpt() {
 
 run_stage1() {
   local -a args=(
-    train_stage1_autoencoder.py
+    train.py stage1
     "seed=$SEED"
     "output_dir=$STAGE1_DIR"
     "model=$MODEL_CONFIG"
@@ -275,7 +275,7 @@ run_stage2() {
   fi
 
   local -a args=(
-    train_stage2_prior.py
+    train.py stage2
     "token_cache_path=$TOKEN_CACHE"
     "output_dir=$STAGE2_DIR"
     "seed=$SEED"

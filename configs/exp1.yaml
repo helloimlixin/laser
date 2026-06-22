@@ -1,0 +1,31 @@
+# Example direct Hydra experiment config.
+# Run with:
+#   python train.py --config configs/exp1.yaml
+
+stage: stage1
+
+# Config-group selections use Hydra override strings when the same section also
+# needs nested parameter overrides below.
+overrides:
+  - model=laser
+  - data=cifar10
+
+output_dir: outputs/exp1/stage1
+
+train:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  max_epochs: 75
+  run_test_after_fit: false
+
+data:
+  batch_size: 2
+  num_workers: 4
+
+model:
+  sparsity_level: 3
+  patch_based: false
+  patch_size: 1
+  patch_stride: 1

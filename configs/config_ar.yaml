@@ -1,5 +1,5 @@
 # Maintained stage-2 transformer prior config
-# Usage: python train_stage2_prior.py token_cache_path=/path/to/tokens_cache.pt
+# Usage: python train.py stage2 token_cache_path=/path/to/tokens_cache.pt
 
 # =============================================================================
 # Sparse prior training requires a token cache produced by the maintained
@@ -91,7 +91,7 @@ ar:
 train_ar:
   batch_size: 256
   max_epochs: 100
-  # Checkpoint policy is enforced by train_stage2_prior.py:
+  # Checkpoint policy is enforced by train.py stage2:
   # keep the best 3 monitored checkpoints plus last.ckpt, saved/uploaded each epoch.
   checkpoint_save_top_k: 3
   checkpoint_save_last: true
@@ -142,7 +142,7 @@ train_ar:
 # =============================================================================
 # Token-cache loader settings
 # Maintained stage-2 training reads dataset/image metadata from the token cache.
-# Only num_workers is used directly by train_stage2_prior.py.
+# Only num_workers is used directly by train.py stage2.
 # =============================================================================
 data:
   dataset: null

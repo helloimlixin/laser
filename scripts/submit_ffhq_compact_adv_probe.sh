@@ -76,7 +76,7 @@ export HYDRA_FULL_ERROR=1
 mkdir -p "\$PYTHONUSERBASE" "\$XDG_CACHE_HOME" "\$TORCH_HOME" "\$PIP_CACHE_DIR" "\$WANDB_CACHE_DIR" "\$WANDB_CONFIG_DIR" "\$MPLCONFIGDIR" "$RUN_DIR/wandb"
 
 cd "$SNAPSHOT_PATH"
-"$PYTHON_BIN" train_stage1_autoencoder.py \\
+"$PYTHON_BIN" train.py stage1 \\
   seed=42 \\
   output_dir="$RUN_DIR/stage1_adv_probe" \\
   init_ckpt_path="$INIT_CKPT" \\

@@ -59,7 +59,7 @@ echo "WANDB=${WANDB_PROJECT}/${WANDB_GROUP}/${WANDB_ID}"
 echo "STAGE2_MAX_EPOCHS=${STAGE2_MAX_EPOCHS}"
 echo "STAGE2_MAX_STEPS=${STAGE2_MAX_STEPS}"
 
-"${PYTHON_BIN}" train_stage2_prior.py \
+"${PYTHON_BIN}" train.py stage2 \
   output_dir="${STAGE2_DIR}" \
   hydra.run.dir="${STAGE2_DIR}/hydra_continue_8eqmawdn" \
   token_cache_path="${CACHE}" \

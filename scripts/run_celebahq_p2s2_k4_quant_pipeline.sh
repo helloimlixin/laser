@@ -178,7 +178,7 @@ if [[ -n "${STAGE2_SAMPLE_VARIANTS}" ]]; then
 fi
 
 if [[ -z "${STAGE1_CKPT}" ]]; then
-  "${PYTHON_BIN}" train_stage1_autoencoder.py \
+  "${PYTHON_BIN}" train.py stage1 \
     output_dir="${STAGE1_DIR}" \
     hydra.run.dir="${STAGE1_DIR}/hydra" \
     model=laser \
@@ -289,7 +289,7 @@ echo "[$(date --iso-8601=seconds)] stage-1 checkpoint: ${STAGE1_CKPT}"
 
 echo "[$(date --iso-8601=seconds)] token cache: ${CACHE}"
 
-"${PYTHON_BIN}" train_stage2_prior.py \
+"${PYTHON_BIN}" train.py stage2 \
   output_dir="${STAGE2_DIR}" \
   hydra.run.dir="${STAGE2_DIR}/hydra" \
   token_cache_path="${CACHE}" \

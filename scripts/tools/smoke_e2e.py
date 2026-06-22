@@ -194,7 +194,8 @@ def _build_stage1_command(args: argparse.Namespace, subset_dir: Path, stage1_roo
     num_embeddings = args.num_embeddings if args.num_embeddings is not None else (128 if args.patch_based else 32)
     command = [
         sys.executable,
-        "train_stage1_autoencoder.py",
+        "train.py",
+        "stage1",
         f"output_dir={stage1_root}",
         f"hydra.run.dir={stage1_root / 'hydra'}",
         "model=laser",
@@ -267,7 +268,8 @@ def _build_extract_command(args: argparse.Namespace, subset_dir: Path, stage1_ro
 def _build_stage2_command(args: argparse.Namespace, subset_dir: Path, ar_root: Path) -> list[str]:
     return [
         sys.executable,
-        "train_stage2_prior.py",
+        "train.py",
+        "stage2",
         f"output_dir={ar_root}",
         "token_cache_path=null",
         "data.dataset=celeba",

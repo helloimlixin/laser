@@ -124,7 +124,7 @@ echo "=== Extract real-valued sparse cache ==="
   --coeff-max 8.0
 
 echo "=== Train AR atom-id prior only ==="
-{q(python_bin)} train_stage2_prior.py \
+{q(python_bin)} train.py stage2 \
   token_cache_path={q(cache_path)} \
   output_dir={q(ar_dir)} \
   seed=42 \

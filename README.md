@@ -54,7 +54,7 @@ pip install -r requirements.txt
 │   │   ├── lpips.py
 │   └── visualizations/     # Visualization utilities
 ├── tests/                  # Unit tests
-├── train_stage1_autoencoder.py                # Main training script
+├── train.py                       # Unified training entry point
 └── test.py                 # Testing script
 ```
 
@@ -63,17 +63,50 @@ pip install -r requirements.txt
 ### Training
 
 ```bash
+# Train from a YAML experiment config
+python train.py --config configs/exp1.yaml
+
 # Train LASER with OMP sparse coding
-python train_stage1_autoencoder.py model=laser data=cifar10
+python train.py stage1 model=laser data=cifar10
 
 # Train LASER on CelebA
-python train_stage1_autoencoder.py model=laser data=celeba
+python train.py stage1 model=laser data=celeba
 
 # Train VQ-VAE baseline
-python train_stage1_autoencoder.py model=vqvae data=cifar10
+python train.py stage1 model=vqvae data=cifar10
 
 # Override config parameters
-python train_stage1_autoencoder.py model=laser data=celeba train.max_epochs=50 model.sparsity_level=16
+python train.py stage1 model=laser data=celeba train.max_epochs=50 model.sparsity_level=16
+```
+
+YAML experiment configs can either be direct Hydra settings:
+
+```yaml
+stage: stage1
+overrides:
+  - model=laser
+  - data=cifar10
+output_dir: outputs/exp1/stage1
+train:
+  max_epochs: 75
+model:
+  sparsity_level: 3
+```
+
+or launcher-style shortcuts with extra Hydra overrides:
+
+```yaml
+stage: stage2
+dataset: imagenet
+modality: image
+conditioning: class
+token_cache_path: /path/to/tokens.pt
+num_gpus: 2
+overrides:
+  ar:
+    d_model: 512
+  train_ar:
+    max_epochs: 100
 ```
 
 ### Testing
@@ -187,7 +220,7 @@ Interpretation:
 For the real full dataset, prefer the maintained entrypoints directly instead of `scripts/tools/smoke_e2e.py`.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train_stage1_autoencoder.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 train.py stage1 \
   model=laser \
   data=celeba \
   data.data_dir=/home/xl598/Projects/data/celeba \
@@ -232,7 +265,7 @@ python3 cache.py \
 #### Full-Dataset Stage 2
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train_stage2_prior.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 train.py stage2 \
   output_dir=outputs/ar \
   token_cache_path=null \
   data.num_workers=8 \
@@ -305,22 +338,22 @@ All configuration is managed through Hydra. Adjust the YAML files under `configs
 
 ```bash
 # Override specific parameters
-python train_stage1_autoencoder.py model=laser data=celeba train.max_epochs=100 model.sparsity_level=8
+python train.py stage1 model=laser data=celeba train.max_epochs=100 model.sparsity_level=8
 
 # Tune sparse coding capacity
-python train_stage1_autoencoder.py model=laser model.sparsity_level=10 model.num_embeddings=1024
+python train.py stage1 model=laser model.sparsity_level=10 model.num_embeddings=1024
 
 # Switch to the legacy simple backbone
-python train_stage1_autoencoder.py model=laser model.backbone=simple
+python train.py stage1 model=laser model.backbone=simple
 ```
 
 ## LASER: Maintained Model Architecture
 
 This section describes the maintained `src/` training and sampling path:
 
-- stage 1: [train_stage1_autoencoder.py](train_stage1_autoencoder.py)
+- stage 1: [train.py](train.py) `stage1`
 - token extraction: [cache.py](cache.py)
-- stage 2: [train_stage2_prior.py](train_stage2_prior.py)
+- stage 2: [train.py](train.py) `stage2`
 
 Older exploratory code under `scratch/` may use different defaults. The section below is the authoritative description of the current maintained model.
 
@@ -521,7 +554,7 @@ That metadata is important because patch-based token grids and latent grids are 
 
 ### Stage 2: Sparse-Token Priors
 
-The maintained stage-2 training path is [train_stage2_prior.py](train_stage2_prior.py). It trains a transformer prior over the cached sparse representation instead of over pixels.
+The maintained stage-2 training path is [train.py](train.py) `stage2`. It trains a transformer prior over the cached sparse representation instead of over pixels.
 
 The default config in [configs/config_ar.yaml](configs/config_ar.yaml) uses:
 
@@ -1163,7 +1196,7 @@ transforms = [
 
 6. **Early Stopping**:
 ```python
-# In train_stage1_autoencoder.py
+# In train.py (stage1)
 from lightning.pytorch.callbacks import EarlyStopping
 early_stop = EarlyStopping(
     monitor='val/loss',
@@ -1241,7 +1274,7 @@ python scripts/kmeans_quantize_sparse_codes.py \
 After generating the token files, launch AR/ImageGPT training with:
 
 ```bash
-python train_stage2_prior.py \
+python train.py stage2 \
   token_cache_path=outputs/ar_tokens/celeba/tokens_cache.pt \
   data.dataset=celeba
 ```

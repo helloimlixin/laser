@@ -121,7 +121,7 @@ python -m pip install --user --quiet \
   torch-fidelity matplotlib lpips soundfile pystoi
 
 cd "$SNAPSHOT_DIR"
-python train_stage1_autoencoder.py \
+python train.py stage1 \
   seed=42 \
   output_dir="$run_dir" \
   model=vqvae_audio_waveform \

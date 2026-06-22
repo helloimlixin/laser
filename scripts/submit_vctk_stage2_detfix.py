@@ -241,7 +241,7 @@ STAGE2_ARGS=(
 )
 
 echo "=== VCTK Stage 2 deterministic fix retry ({run.case}) ==="
-"$PYTHON_BIN" train_stage2_prior.py "${{STAGE2_ARGS[@]}}"
+"$PYTHON_BIN" train.py stage2 "${{STAGE2_ARGS[@]}}"
 """,
         encoding="utf-8",
     )

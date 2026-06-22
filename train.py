@@ -20,7 +20,7 @@ import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 IMAGE_DATASETS = {
@@ -43,6 +43,7 @@ STAGE_TOKEN_ALIASES = {
     "stage-2": "2",
 }
 FACADE_FLAGS = {
+    "--config",
     "--stage",
     "--dataset",
     "--modality",
@@ -91,6 +92,46 @@ FACADE_FLAGS = {
     "--num-classes",
     "--dry_run",
     "--dry-run",
+}
+FACADE_CONFIG_KEYS = {
+    "stage": "--stage",
+    "dataset": "--dataset",
+    "modality": "--modality",
+    "conditioning": "--conditioning",
+    "adversarial": "--adversarial",
+    "num_gpus": "--num-gpus",
+    "num_nodes": "--num-nodes",
+    "devices_per_node": "--devices-per-node",
+    "downsample_layers": "--downsample-layers",
+    "sparsity_level": "--sparsity-level",
+    "num_embeddings": "--num-embeddings",
+    "embedding_dim": "--embedding-dim",
+    "image_size": "--image-size",
+    "data_dir": "--data-dir",
+    "batch_size": "--batch-size",
+    "num_workers": "--num-workers",
+    "epochs": "--epochs",
+    "max_steps": "--max-steps",
+    "precision": "--precision",
+    "learning_rate": "--learning-rate",
+    "dict_learning_rate": "--dict-learning-rate",
+    "output_root": "--output-root",
+    "output_dir": "--output-dir",
+    "run_name": "--run-name",
+    "project": "--project",
+    "token_cache_path": "--token-cache-path",
+    "num_classes": "--num-classes",
+    "dry_run": "--dry-run",
+}
+CONFIG_META_KEYS = {
+    "config",
+    "description",
+    "direct",
+    "hydra_overrides",
+    "launcher",
+    "mode",
+    "name",
+    "overrides",
 }
 
 
@@ -146,6 +187,253 @@ def _looks_like_facade_args(argv: Iterable[str]) -> bool:
     return any(_split_flag_name(arg) in FACADE_FLAGS for arg in argv)
 
 
+def _normalize_config_key(key: str) -> str:
+    return str(key).strip().replace("-", "_")
+
+
+def _hydra_literal(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_hydra_literal(item) for item in value) + "]"
+    text = str(value)
+    if text == "" or any(ch in text for ch in " \t\n,[]{}:=#"):
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return text
+
+
+def _flatten_hydra_overrides(prefix: str, value: Any) -> list[str]:
+    if isinstance(value, dict):
+        flattened: list[str] = []
+        for key, child in value.items():
+            child_key = str(key).strip()
+            child_prefix = f"{prefix}.{child_key}" if prefix else child_key
+            flattened.extend(_flatten_hydra_overrides(child_prefix, child))
+        return flattened
+    return [f"{prefix}={_hydra_literal(value)}"]
+
+
+def _coerce_hydra_overrides(value: Any, *, source: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        flattened: list[str] = []
+        for key, child in value.items():
+            flattened.extend(_flatten_hydra_overrides(str(key).strip(), child))
+        return flattened
+    if isinstance(value, (list, tuple)):
+        flattened = []
+        for item in value:
+            if isinstance(item, str):
+                flattened.append(item)
+            elif isinstance(item, dict):
+                flattened.extend(_coerce_hydra_overrides(item, source=source))
+            else:
+                raise SystemExit(f"{source} entries must be strings or mappings, got {type(item).__name__}.")
+        return flattened
+    if isinstance(value, str):
+        return [value]
+    raise SystemExit(f"{source} must be a string, list, or mapping, got {type(value).__name__}.")
+
+
+def _load_yaml_config(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path).expanduser()
+    if not config_path.is_file():
+        raise SystemExit(f"Config file not found: {config_path}")
+    try:
+        from omegaconf import OmegaConf
+
+        loaded = OmegaConf.load(config_path)
+        data = OmegaConf.to_container(loaded, resolve=True)
+    except Exception as exc:
+        raise SystemExit(f"Could not read config file {config_path}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"Config file {config_path} must contain a YAML mapping at the top level.")
+    return dict(data)
+
+
+def _extract_config_arg(argv: list[str]) -> tuple[str | None, list[str]]:
+    config_path = None
+    rest: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--config":
+            if idx + 1 >= len(argv):
+                raise SystemExit("--config requires a YAML file path.")
+            config_path = argv[idx + 1]
+            idx += 2
+            continue
+        if arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            idx += 1
+            continue
+        rest.append(arg)
+        idx += 1
+    return config_path, rest
+
+
+def _merge_launcher_config(config: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    launcher = config.get("launcher")
+    if launcher is not None:
+        if not isinstance(launcher, dict):
+            raise SystemExit("launcher must be a YAML mapping when present.")
+        merged.update(launcher)
+    for key, value in config.items():
+        if key != "launcher":
+            merged[key] = value
+    return merged
+
+
+def _config_lookup(config: dict[str, Any], normalized_key: str):
+    for key, value in config.items():
+        if _normalize_config_key(key) == normalized_key:
+            return key, value
+    return None, None
+
+
+def _config_mode(config: dict[str, Any]) -> str:
+    _, explicit = _config_lookup(config, "mode")
+    if explicit is not None:
+        mode = str(explicit).strip().lower()
+        if mode in {"direct", "hydra", "raw"}:
+            return "direct"
+        if mode in {"facade", "launcher", "shortcut"}:
+            return "facade"
+        raise SystemExit(f"Unsupported config mode {explicit!r}; use direct or facade.")
+    _, direct = _config_lookup(config, "direct")
+    if bool(direct):
+        return "direct"
+    dataset_key, _ = _config_lookup(config, "dataset")
+    modality_key, _ = _config_lookup(config, "modality")
+    return "facade" if dataset_key and modality_key else "direct"
+
+
+def _config_stage(config: dict[str, Any]) -> str:
+    _, raw_stage = _config_lookup(config, "stage")
+    if raw_stage is None:
+        raise SystemExit("YAML config requires a stage: stage1 or stage2.")
+    try:
+        stage = _stage(str(raw_stage))
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(str(exc)) from exc
+    return "stage1" if stage == "1" else "stage2"
+
+
+def _config_hydra_overrides(config: dict[str, Any], *, consumed: set[str]) -> list[str]:
+    overrides: list[str] = []
+    for special in ("overrides", "hydra_overrides"):
+        _, value = _config_lookup(config, special)
+        overrides.extend(_coerce_hydra_overrides(value, source=special))
+    for key, value in config.items():
+        normalized = _normalize_config_key(key)
+        if normalized in consumed or normalized in CONFIG_META_KEYS:
+            continue
+        overrides.extend(_flatten_hydra_overrides(str(key).strip(), value))
+    return overrides
+
+
+def _config_facade_argv(config: dict[str, Any]) -> list[str]:
+    consumed = set(CONFIG_META_KEYS)
+    argv: list[str] = []
+    for normalized_key, flag in FACADE_CONFIG_KEYS.items():
+        actual_key, value = _config_lookup(config, normalized_key)
+        if actual_key is None or value is None:
+            continue
+        consumed.add(_normalize_config_key(actual_key))
+        if normalized_key == "dry_run":
+            if bool(value):
+                argv.append(flag)
+            continue
+        argv.extend([flag, _hydra_literal(value) if isinstance(value, (list, tuple)) else str(value)])
+    argv.extend(_config_hydra_overrides(config, consumed=consumed))
+    return argv
+
+
+def _config_direct_argv(config: dict[str, Any]) -> list[str]:
+    consumed = set(CONFIG_META_KEYS)
+    consumed.add("stage")
+    stage = _config_stage(config)
+    argv = [stage]
+    _, dry_run = _config_lookup(config, "dry_run")
+    if dry_run is not None:
+        consumed.add("dry_run")
+    argv.extend(_config_hydra_overrides(config, consumed=consumed))
+    if bool(dry_run):
+        argv.append("--dry-run")
+    return argv
+
+
+def _argv_from_config(path: str | Path) -> tuple[list[str], bool]:
+    config = _merge_launcher_config(_load_yaml_config(path))
+    mode = _config_mode(config)
+    if mode == "direct":
+        return _config_direct_argv(config), True
+    return _config_facade_argv(config), False
+
+
+def _expand_config_argv(argv: list[str]) -> tuple[list[str], bool]:
+    config_path, rest = _extract_config_arg(argv)
+    if config_path is None:
+        return argv, False
+    config_argv, direct = _argv_from_config(config_path)
+    if rest and (stage := _stage_token(rest[0])):
+        rest = ["--stage", stage, *rest[1:]]
+    return [*config_argv, *rest], direct
+
+
+def _strip_direct_dry_run(argv: list[str]) -> tuple[list[str], bool]:
+    cleaned = []
+    dry_run = False
+    for arg in argv:
+        if arg in {"--dry-run", "--dry_run"}:
+            dry_run = True
+        else:
+            cleaned.append(arg)
+    return cleaned, dry_run
+
+
+def _optional_container_for_cli_tests(value):
+    if value is None:
+        return None
+    try:
+        from omegaconf import OmegaConf
+    except Exception:
+        return value
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def _cfg_attr(obj, name: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _sample_text_prompts(cfg) -> list[str]:
+    train_ar = _cfg_attr(cfg, "train_ar")
+    prompts = _optional_container_for_cli_tests(_cfg_attr(train_ar, "sample_text_prompts"))
+    if prompts:
+        return list(prompts)
+    ar = _cfg_attr(cfg, "ar")
+    prompts = _optional_container_for_cli_tests(_cfg_attr(ar, "sample_text_prompts"))
+    return list(prompts or [])
+
+
+_STAGE_ENTRYPOINTS = None
+
+
 def _default_output_root() -> str:
     user = os.environ.get("USER", "unknown")
     scratch = Path("/scratch") / user
@@ -169,13 +457,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Unified LASER training launcher. Pass stage1/stage2 as the first argument "
-            "or use --stage. Unknown trailing args are passed through as Hydra overrides."
+            "or use --stage. Use --config configs/exp.yaml to load run settings from YAML. "
+            "Unknown trailing args are passed through as Hydra overrides."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--stage", required=True, type=_stage, help="Training stage: stage1 for autoencoder, stage2 for prior.")
-    parser.add_argument("--dataset", required=True, help="Dataset config name, e.g. imagenet, celebahq, ffhq, vctk.")
-    parser.add_argument("--modality", required=True, choices=("image", "audio"))
+    parser.add_argument("--config", default=None, help="YAML experiment config for launcher settings and Hydra overrides.")
+    parser.add_argument("--stage", default=None, type=_stage, help="Training stage: stage1 for autoencoder, stage2 for prior.")
+    parser.add_argument("--dataset", default=None, help="Dataset config name, e.g. imagenet, celebahq, ffhq, vctk.")
+    parser.add_argument("--modality", default=None, choices=("image", "audio"))
     parser.add_argument("--conditioning", default="none", choices=("none", "class", "text"))
     parser.add_argument("--adversarial", type=_str_bool, default=False, help="Enable stage-1 adversarial loss.")
     parser.add_argument("--num_gpus", "--num-gpus", type=_positive_int, default=1, help="Total GPUs requested for the run.")
@@ -325,6 +615,12 @@ def _tags(args: argparse.Namespace) -> str:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    if not args.stage:
+        raise SystemExit("Specify a stage with stage1/stage2, --stage, or a YAML config containing stage.")
+    if not args.dataset:
+        raise SystemExit("--dataset is required for launcher-style runs. Direct YAML configs can use data=... instead.")
+    if not args.modality:
+        raise SystemExit("--modality is required for launcher-style runs. Direct YAML configs can use data=... instead.")
     dataset = args.dataset.strip().lower()
     if args.conditioning == "class" and args.modality != "image":
         raise SystemExit("--conditioning class is only valid with --modality image.")
@@ -492,7 +788,10 @@ def _stage2_command(args: argparse.Namespace, resources: ResourcePlan, extra: li
 
 def build_command(argv: list[str] | None = None) -> list[str]:
     parser = _build_parser()
-    normalized = _inject_stage_option(list(argv) if argv is not None else sys.argv[1:])
+    expanded, direct_config = _expand_config_argv(list(argv) if argv is not None else sys.argv[1:])
+    if direct_config:
+        return [sys.executable, str(Path(__file__).resolve()), *_strip_direct_dry_run(expanded)[0]]
+    normalized = _inject_stage_option(expanded)
     args, unknown = parser.parse_known_args(normalized)
     extra = _normalize_unknown(unknown)
     _validate(args)
@@ -501,28 +800,1047 @@ def build_command(argv: list[str] | None = None) -> list[str]:
         return _stage1_command(args, resources, extra)
     return _stage2_command(args, resources, extra)
 
+def _load_stage_entrypoints():
+    global _STAGE_ENTRYPOINTS
+    if _STAGE_ENTRYPOINTS is not None:
+        return _STAGE_ENTRYPOINTS
+
+    # -----------------------------------------------------------------------------
+    # Stage 1 Hydra implementation
+    # -----------------------------------------------------------------------------
+    """Train the maintained stage-1 autoencoder."""
+
+    import os
+    import sys
+    import warnings
+
+    if sys.version_info < (3, 10):
+        raise SystemExit(
+            "ERROR: train.py stage1 requires Python >= 3.10. "
+            "Set PYTHON_BIN to a supported environment or run through scripts/run.sh."
+        )
+
+    # Windows: PyTorch (LLVM OpenMP) and MKL/NumPy (Intel OpenMP) can both load and trigger OMP #15.
+    if os.name == "nt":
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+    # Suppress TF32 deprecation warnings (PyTorch 2.9 with Lightning compatibility)
+    warnings.filterwarnings('ignore', message='.*TF32.*')
+    os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
+
+    import torch
+
+    from src.hydra_argparse_compat import patch_argparse_for_hydra_on_py314
+
+    patch_argparse_for_hydra_on_py314()
+    import hydra
+    from omegaconf import DictConfig, open_dict
+
+    from src.lightning_warning_filters import register as register_lightning_warning_filters
+
+    register_lightning_warning_filters()
+    import lightning as pl
+    from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping, RichProgressBar
+    from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
+    from lightning.pytorch.loggers import WandbLogger
+    from lightning.pytorch.plugins.environments import LightningEnvironment
+    import wandb
+    from datetime import datetime
+
+    # Reduce DeepSpeed info logs
+    os.environ.setdefault("DEEPSPEED_LOG_LEVEL", "warning")
+    # Required by cuBLAS for deterministic kernels on supported CUDA paths.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    torch.set_float32_matmul_precision('medium')
+
+    from src.pl_trainer_util import resolve_val_check_interval
+    from src.stage1_setup import (
+        build_stage1_datamodule,
+        build_stage1_model,
+        data_config_from_section,
+        infer_data_channels,
+    )
+
+    # Configure progress bar theme
+    progress_bar = RichProgressBar(
+        theme=RichProgressBarTheme(
+            description="green_yellow",
+            progress_bar="green1",
+            progress_bar_finished="green1",
+            progress_bar_pulse="green1",
+            batch_progress="green_yellow",
+            time="grey82",
+            processing_speed="grey82",
+            metrics="grey82"
+        ),
+        leave=True
+    )
+
+    STAGE1_TITLE = "STAGE 1: AUTOENCODER TRAINING"
+    STAGE1_MODE = "stage1_autoencoder"
+    CHECKPOINT_SAVE_TOP_K = 3
+    CHECKPOINT_SAVE_LAST = True
+    CHECKPOINT_EVERY_N_EPOCHS = 1
+    WANDB_LOG_MODEL = "all"
+
+
+    def _default_stage1_run_name(model_type: str) -> str:
+        return f"{str(model_type).strip().lower()}-autoencoder"
+
+
+    def _resolve_ckpt_file(path: str) -> str:
+        path = os.path.expanduser(str(path))
+        if os.path.isdir(path):
+            preferred = [
+                "final.ckpt",
+                "last.ckpt",
+                "mp_rank_00_model_states.pt",
+                "model.pth",
+                "model.pt",
+                "state_dict.pth",
+                "state_dict.pt",
+                "weights.pt",
+                "weights.pth",
+            ]
+            for name in preferred:
+                cand = os.path.join(path, name)
+                if os.path.isfile(cand):
+                    return cand
+            for root, _, files in os.walk(path):
+                for filename in sorted(files):
+                    if filename.endswith((".pt", ".pth", ".ckpt", ".bin")):
+                        return os.path.join(root, filename)
+            raise FileNotFoundError(f"No checkpoint file found under directory: {path}")
+        return path
+
+
+    @hydra.main(config_path="configs", config_name="config", version_base="1.2")
+    def train_stage1(cfg: DictConfig):
+        """
+        Main training function using Hydra for configuration.
+    
+        Args:
+            cfg: Hydra configuration object containing model and training parameters
+        """
+        ckpt_path = getattr(cfg, "ckpt_path", None)
+        if ckpt_path:
+            ckpt_path = _resolve_ckpt_file(ckpt_path)
+            print(f"\nResume checkpoint: {ckpt_path}")
+        deterministic = bool(getattr(cfg.train, "deterministic", False))
+        resolved_in_channels = infer_data_channels(cfg.data)
+        torch.use_deterministic_algorithms(deterministic, warn_only=True)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = deterministic
+            torch.backends.cudnn.benchmark = not deterministic
+
+        # Print detailed experiment configuration
+        print("\n" + "=" * 60)
+        print(STAGE1_TITLE)
+        print("=" * 60)
+        print("\nExperiment Configuration:")
+    
+        print("\nGeneral Settings:")
+        print("Stage Role: autoencoder training")
+        print(f"Random Seed: {cfg.seed}")
+        print(f"Output Directory: {cfg.output_dir}")
+    
+        print("\nDataset Configuration:")
+        print(f"Dataset: {cfg.data.dataset}")
+        print(f"Data Directory: {cfg.data.data_dir}")
+        print(f"Batch Size: {cfg.data.batch_size}")
+        print(f"Number of Workers: {cfg.data.num_workers}")
+        print(f"Image Size: {cfg.data.image_size}")
+        print(f"Mean: {cfg.data.mean}")
+        print(f"Std: {cfg.data.std}")
+        if str(cfg.data.dataset).strip().lower() in {"vctk", "maestro"}:
+            print(f"Audio Representation: {getattr(cfg.data, 'audio_representation', 'spectrogram')}")
+            print(f"Sample Rate: {cfg.data.sample_rate}")
+            print(f"Audio Samples Per Clip: {cfg.data.audio_num_samples}")
+            print(f"STFT FFT Size: {cfg.data.stft_n_fft}")
+            print(f"STFT Hop Length: {cfg.data.stft_hop_length}")
+
+        print("\nModel Configuration:")
+        print(f"Model Type: {cfg.model.type}")
+        print(f"Input Channels: {resolved_in_channels}")
+        print(f"Hidden Dimensions: {cfg.model.num_hiddens}")
+        print(f"Embedding Dimensions: {cfg.model.embedding_dim}")
+        print(f"Number of Residual Blocks: {cfg.model.num_residual_blocks}")
+        print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
+        if cfg.model.type == "laser":
+            print(f"Backbone: {getattr(cfg.model, 'backbone', 'simple')}")
+            print(f"Dictionary Size: {cfg.model.num_embeddings}")
+            print(f"Sparsity: {cfg.model.sparsity_level}")
+            print(f"Bypass Bottleneck: {bool(getattr(cfg.model, 'bypass_bottleneck', False))}")
+            print(f"Coefficient Quantization Bound: {getattr(cfg.model, 'coef_max', None)}")
+            if str(getattr(cfg.model, 'backbone', 'simple')).strip().lower() != "simple":
+                print(f"Downsamples: {getattr(cfg.model, 'num_downsamples', 2)}")
+                print(f"Attention Resolutions: {tuple(getattr(cfg.model, 'attn_resolutions', ())) or ()}")
+                print(f"Use Mid Attention: {bool(getattr(cfg.model, 'use_mid_attention', True))}")
+                channel_multipliers = getattr(cfg.model, 'channel_multipliers', None)
+                if channel_multipliers not in (None, "", ()):
+                    print(f"Channel Multipliers: {tuple(channel_multipliers)}")
+                print(
+                    "Backbone Latent Channels: "
+                    f"{getattr(cfg.model, 'backbone_latent_channels', cfg.model.embedding_dim)}"
+                )
+                print(f"Max Channel Multiplier: {getattr(cfg.model, 'max_ch_mult', 2)}")
+        elif cfg.model.type == "vqvae":
+            print(f"Number of Embeddings: {cfg.model.num_embeddings}")
+        else:
+            raise ValueError(f"Unsupported model type: {cfg.model.type}")
+    
+        print("\nTraining Configuration:")
+        print(f"Learning Rate: {cfg.train.learning_rate}")
+        print(f"Reconstruction MSE Weight: {float(getattr(cfg.model, 'recon_mse_weight', 1.0))}")
+        print(f"Reconstruction L1 Weight: {float(getattr(cfg.model, 'recon_l1_weight', 0.0))}")
+        print(f"Reconstruction Edge Weight: {float(getattr(cfg.model, 'recon_edge_weight', 0.0))}")
+        print(f"Audio Multi-Resolution Loss Weight: {float(getattr(cfg.model, 'audio_multires_loss_weight', 0.0))}")
+        print(f"Audio Multi-Resolution Scales: {tuple(getattr(cfg.model, 'audio_multires_scales', (1, 2, 4, 8)))}")
+        print(f"Perceptual Weight: {float(getattr(cfg.model, 'perceptual_weight', 0.0))}")
+        print(f"Perceptual Start Step: {int(getattr(cfg.model, 'perceptual_start_step', 0))}")
+        print(f"Perceptual Warmup Steps: {int(getattr(cfg.model, 'perceptual_warmup_steps', 0))}")
+        print(f"Adversarial Weight: {float(getattr(cfg.model, 'adversarial_weight', 0.0))}")
+        print(f"Adversarial Start Step: {int(getattr(cfg.model, 'adversarial_start_step', 0))}")
+        print(f"Adversarial Warmup Steps: {int(getattr(cfg.model, 'adversarial_warmup_steps', 0))}")
+        print(f"Adversarial Start Recon MSE: {getattr(cfg.model, 'adversarial_start_recon_mse', None)}")
+        print(f"Adversarial Quality EMA Decay: {float(getattr(cfg.model, 'adversarial_quality_ema_decay', 0.99))}")
+        print(f"Beta: {cfg.train.beta}")
+        print(f"Max Epochs: {cfg.train.max_epochs}")
+        print(f"Max Steps: {getattr(cfg.train, 'max_steps', -1)}")
+        print(f"Accelerator: {cfg.train.accelerator}")
+        print(f"Num Nodes: {getattr(cfg.train, 'num_nodes', 1)}")
+        print(f"Devices: {cfg.train.devices}")
+        print(f"Precision: {cfg.train.precision}")
+        print(f"Gradient Clip Value: {cfg.train.gradient_clip_val}")
+        print(f"Deterministic: {deterministic}")
+        print(f"Limit Train Batches: {getattr(cfg.train, 'limit_train_batches', 1.0)}")
+        print(f"Limit Val Batches: {getattr(cfg.train, 'limit_val_batches', 1.0)}")
+        print(f"Limit Test Batches: {getattr(cfg.train, 'limit_test_batches', 1.0)}")
+        print(f"Run Test After Fit: {bool(getattr(cfg.train, 'run_test_after_fit', False))}")
+    
+        print("\nWandB Configuration:")
+        print(f"Project: {cfg.wandb.project}")
+        print(f"Run Name: {cfg.wandb.name}")
+        print(f"Save Directory: {cfg.wandb.save_dir}")
+    
+        # Resolve checkpoint directory (base from config + run timestamp + model type)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_ckpt_dir = getattr(cfg.checkpoint, "dirpath", os.path.join(cfg.output_dir, "checkpoints"))
+        run_ckpt_dir = os.path.join(base_ckpt_dir, f'run_{timestamp}', cfg.model.type)
+        os.makedirs(run_ckpt_dir, exist_ok=True)
+
+        # Determine monitor key and mode (configurable, with safe defaults per model)
+        configured_monitor = getattr(cfg.checkpoint, "monitor", None)
+        if configured_monitor:
+            monitor_key = configured_monitor
+        else:
+            monitor_key = "val/loss"
+        monitor_mode = getattr(cfg.checkpoint, "mode", "min")
+        filename_template = getattr(cfg.checkpoint, "filename", f"{cfg.model.type}-{{epoch:03d}}")
+        with open_dict(cfg):
+            cfg.checkpoint.save_top_k = CHECKPOINT_SAVE_TOP_K
+            cfg.checkpoint.save_last = CHECKPOINT_SAVE_LAST
+
+        print("\nCheckpoint Configuration:")
+        print(f"Base Save Directory: {base_ckpt_dir}")
+        print(f"Run Save Directory:  {run_ckpt_dir}")
+        print(f"Filename Template:   {filename_template}")
+        print(f"Monitor:             {monitor_key} (mode={monitor_mode})")
+        print(f"Save Top K:          {cfg.checkpoint.save_top_k}")
+        print(f"Save Last:           {cfg.checkpoint.save_last}")
+        print(f"Every N Epochs:      {CHECKPOINT_EVERY_N_EPOCHS}")
+        print(f"W&B Checkpoint Upload: {WANDB_LOG_MODEL}")
+        print("=" * 60 + "\n")
+
+        # Set random seed for reproducibility
+        pl.seed_everything(cfg.seed, workers=True)
+    
+        # Print GPU information
+        print(f"GPU available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"GPU device: {torch.cuda.get_device_name(0)}")
+    
+        # Initialize data module
+        print(f"Initializing data module for dataset: {cfg.data.dataset}")
+        data_config = data_config_from_section(cfg.data)
+        datamodule = build_stage1_datamodule(data_config)
+
+        # Print dataset info for debugging
+        print(f"Using dataset: {cfg.data.dataset}")
+        print(f"Data module type: {type(datamodule).__name__}")
+
+        if (
+            str(getattr(cfg.model, "type", "")).strip().lower() == "vqvae"
+            and bool(getattr(cfg.model, "speaker_conditioning", False))
+            and int(getattr(cfg.model, "speaker_conditioning_num_speakers", 0) or 0) <= 0
+            and str(getattr(cfg.data, "dataset", "")).strip().lower() in {"vctk", "maestro"}
+        ):
+            datamodule.prepare_data()
+            datamodule.setup("fit")
+            num_speakers = int(getattr(datamodule, "num_speakers", 0) or 0)
+            if num_speakers <= 0:
+                raise RuntimeError("Speaker conditioning was requested, but no speakers were found in the data module.")
+            with open_dict(cfg):
+                cfg.model.speaker_conditioning_num_speakers = num_speakers
+            print(f"Inferred VQ-VAE speaker conditioning classes: {num_speakers}")
+
+        if int(cfg.model.in_channels) != resolved_in_channels:
+            print(
+                f"Adjusting model input channels from {int(cfg.model.in_channels)} "
+                f"to {resolved_in_channels} to match dataset {cfg.data.dataset}."
+            )
+    
+        model = build_stage1_model(cfg.model, cfg.train, cfg.data)
+        trainer_gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 0.0) or 0.0)
+        uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
+        if uses_manual_opt:
+            model.manual_gradient_clip_val = trainer_gradient_clip_val
+            trainer_gradient_clip_val = 0.0
+            print(
+                "Manual optimization active (adversarial); applying gradient clipping "
+                f"inside the model with value {model.manual_gradient_clip_val}."
+            )
+
+        if ckpt_path:
+            # Older checkpoints may contain metric module state such as
+            # val_rfid/test_fid. Current models instantiate those lazily, so strict
+            # resume would reject otherwise valid training checkpoints.
+            model.strict_loading = False
+
+        # Initialize wandb logger
+        base_run_name = str(getattr(cfg.wandb, "name", "") or "").strip() or _default_stage1_run_name(cfg.model.type)
+        if bool(getattr(cfg.wandb, "append_timestamp", False)):
+            run_name = f"{base_run_name}_{timestamp}"
+        else:
+            run_name = base_run_name
+        run_group = str(getattr(cfg.wandb, "group", "") or "").strip() or None
+        run_tags = list(getattr(cfg.wandb, "tags", []) or [])
+        devices_cfg = cfg.train.devices
+        try:
+            num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
+        except Exception:
+            num_devices = 1
+        if num_devices > 1:
+            wandb.setup()
+        wandb_logger = WandbLogger(
+            project=cfg.wandb.project,
+            name=run_name,
+            save_dir=cfg.wandb.save_dir,
+            group=run_group,
+            tags=run_tags if run_tags else None,
+            log_model=WANDB_LOG_MODEL,
+        )
+        wandb_logger.log_hyperparams(
+            {
+                "training_stage": "stage1",
+                "stage_role": "autoencoder_training",
+                "training_mode": STAGE1_MODE,
+                "model_type": cfg.model.type,
+                "dataset": cfg.data.dataset,
+                "input_channels": resolved_in_channels,
+            }
+        )
+
+        # Initialize callbacks
+        callbacks = [
+            ModelCheckpoint(
+                dirpath=run_ckpt_dir,
+                filename=filename_template,
+                save_top_k=CHECKPOINT_SAVE_TOP_K,
+                monitor=monitor_key,
+                mode=monitor_mode,
+                save_last=CHECKPOINT_SAVE_LAST,
+                every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
+            ),
+            LearningRateMonitor(logging_interval='step'),
+            progress_bar
+        ]
+        # Add EarlyStopping only if configured
+        if getattr(cfg.train, "early_stopping_patience", None):
+            callbacks.insert(1, EarlyStopping(
+                monitor=monitor_key,
+                patience=cfg.train.early_stopping_patience,
+                mode=monitor_mode
+            ))
+
+        # Initialize trainer
+        # Choose DDP only when using >1 device. Single-GPU DDP still inits torch.distributed (NCCL on CUDA),
+        # which is unavailable on many Windows PyTorch builds — use auto instead.
+        strategy_cfg = getattr(cfg.train, "strategy", None)
+        if strategy_cfg is None:
+            if cfg.model.type == "vqvae" and num_devices and num_devices > 1:
+                strategy_cfg = "ddp"
+        # Lightning rejects strategy=None; null / unset in config means default (auto).
+        if strategy_cfg is None:
+            strategy_cfg = "auto"
+        strat_lower = str(strategy_cfg).lower()
+        if num_devices <= 1 and strat_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
+            strategy_cfg = "auto"
+            strat_lower = "auto"
+        if "find_unused" in strat_lower:
+            strategy_cfg = "ddp"
+            strat_lower = "ddp"
+            print("Using standard DDP; unused-parameter detection is disabled.")
+        val_check_interval = resolve_val_check_interval(
+            datamodule, getattr(cfg.train, "val_check_interval", 1.0)
+        )
+        max_steps = int(getattr(cfg.train, "max_steps", -1) or -1)
+        trainer_plugins = [LightningEnvironment()] if num_devices > 1 and strat_lower.startswith("ddp") else None
+        trainer = pl.Trainer(
+            max_epochs=cfg.train.max_epochs,
+            max_steps=max_steps,
+            accelerator=cfg.train.accelerator,
+            num_nodes=int(getattr(cfg.train, "num_nodes", 1) or 1),
+            devices=cfg.train.devices,
+            strategy=strategy_cfg,
+            plugins=trainer_plugins,
+            logger=wandb_logger,
+            callbacks=callbacks,
+            precision=cfg.train.precision,
+            gradient_clip_val=trainer_gradient_clip_val,
+            log_every_n_steps=cfg.train.log_every_n_steps,
+            val_check_interval=val_check_interval,
+            limit_train_batches=getattr(cfg.train, "limit_train_batches", 1.0),
+            limit_val_batches=getattr(cfg.train, "limit_val_batches", 1.0),
+            limit_test_batches=getattr(cfg.train, "limit_test_batches", 1.0),
+            deterministic=deterministic,
+            enable_progress_bar=True,
+            enable_model_summary=(str(cfg.train.precision) == "32"),
+            reload_dataloaders_every_n_epochs=0,
+            num_sanity_val_steps=0,
+        )
+
+        # Train and test model (use PyTorch defaults for matmul precision to avoid API mixing)
+        print("\nStarting autoencoder training...")
+        trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
+        print("\nAutoencoder training complete.")
+
+        final_ckpt_path = os.path.join(run_ckpt_dir, "final.ckpt")
+        # In DDP, Lightning's checkpoint path may involve strategy collectives. All
+        # ranks need to enter the call; Lightning handles rank-zero-only file writes.
+        trainer.save_checkpoint(final_ckpt_path)
+        if trainer.is_global_zero:
+            print(f"Saved final stage-1 checkpoint: {final_ckpt_path}")
+
+        if not bool(getattr(cfg.train, "run_test_after_fit", False)):
+            return
+
+        # Keep DDP test evaluation distributed. Launching a new single-rank trainer
+        # while the original process group/environment is still alive can hang when
+        # model logs use sync_dist=True.
+        if num_devices > 1 and str(strategy_cfg).lower().startswith("ddp"):
+            if trainer.is_global_zero:
+                print("\nRunning autoencoder test evaluation with the DDP trainer...")
+            trainer.test(model, datamodule=datamodule)
+            if trainer.is_global_zero:
+                print("\nAutoencoder evaluation complete.")
+            return
+
+        if not trainer.is_global_zero:
+            return
+
+        print("\nRunning autoencoder test evaluation...")
+        test_trainer = pl.Trainer(
+            accelerator=('gpu' if (cfg.train.accelerator == 'gpu' and torch.cuda.is_available()) else 'cpu'),
+            devices=1,
+            logger=wandb_logger,
+            precision=cfg.train.precision,
+            deterministic=deterministic,
+            limit_test_batches=getattr(cfg.train, "limit_test_batches", 1.0),
+            enable_progress_bar=True,
+            enable_model_summary=(str(cfg.train.precision) == "32")
+        )
+        test_trainer.test(model, datamodule=datamodule)
+        print("\nAutoencoder evaluation complete.")
+
+    # -----------------------------------------------------------------------------
+    # Stage 2 Hydra implementation
+    # -----------------------------------------------------------------------------
+    """Train the maintained stage-2 transformer prior and save generation previews."""
+
+    import os
+    import sys
+    import warnings
+    from datetime import datetime
+    from pathlib import Path
+
+    if sys.version_info < (3, 10):
+        raise SystemExit(
+            "ERROR: train.py stage2 requires Python >= 3.10. "
+            "Set PYTHON_BIN to a supported environment or run through scripts/run.sh."
+        )
+
+    if os.name == "nt":
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+    warnings.filterwarnings("ignore", message=".*TF32.*")
+    os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
+
+    from src.hydra_argparse_compat import patch_argparse_for_hydra_on_py314
+
+    patch_argparse_for_hydra_on_py314()
+    import hydra
+
+    from src.lightning_warning_filters import register as reg_lit_warn
+
+    reg_lit_warn()
+    import lightning as pl
+    import torch
+    import wandb
+    from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
+    from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
+    from lightning.pytorch.loggers import WandbLogger
+    from lightning.pytorch.plugins.environments import LightningEnvironment
+    from omegaconf import DictConfig, OmegaConf
+
+    from src.data.token_cache import TokenCacheDataModule
+    from src.models.sparse_token_prior import (
+        SparseTokenPriorModule,
+        build_sparse_prior_from_cache,
+        infer_sparse_vocab_sizes,
+    )
+    from src.pl_trainer_util import resolve_val_check_interval
+    from src.stage2_compat import ensure_stage2_cache_metadata as add_cache_meta
+    from src.stage2_metrics import build_stage2_metrics_payload
+    from src.stage2_paths import infer_latest_token_cache as pick_cache
+    from src.stage2_preview import (
+        Stage2SamplePreviewCallback,
+        save_final_generation_preview,
+    )
+    from src.wandb_media import log_wandb_payload
+
+    torch.set_float32_matmul_precision("medium")
+
+    CHECKPOINT_SAVE_TOP_K = 3
+    CHECKPOINT_SAVE_LAST = True
+    CHECKPOINT_EVERY_N_EPOCHS = 1
+    WANDB_LOG_MODEL = "all"
+
+    bar = RichProgressBar(
+        theme=RichProgressBarTheme(
+            description="green_yellow",
+            progress_bar="green1",
+            progress_bar_finished="green1",
+            progress_bar_pulse="green1",
+            batch_progress="green_yellow",
+            time="grey82",
+            processing_speed="grey82",
+            metrics="grey82",
+        ),
+        leave=True,
+    )
+
+    STAGE2_TITLE = "STAGE 2: TRANSFORMER PRIOR TRAINING + GENERATION"
+    STAGE2_MODE = "stage2_transformer_generation"
+
+
+    def _default_stage2_run_name() -> str:
+        return "stage2-transformer"
+
+
+    def _optional_container(value):
+        if value is None:
+            return None
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+        return value
+
+    def _sample_text_prompts(cfg) -> list[str]:
+        train_ar = getattr(cfg, "train_ar", None)
+        prompts = _optional_container(getattr(train_ar, "sample_text_prompts", None)) if train_ar is not None else None
+        if prompts:
+            return list(prompts)
+        ar = getattr(cfg, "ar", None)
+        prompts = _optional_container(getattr(ar, "sample_text_prompts", None)) if ar is not None else None
+        return list(prompts or [])
+
+
+    def arch_name(raw) -> str:
+        text = str(raw or "sparse_spatial_depth").strip().lower()
+        if text in {"sparse_spatial_depth", "spatial_depth"}:
+            return "spatial_depth"
+        if text in {"mingpt", "gpt"}:
+            return "gpt"
+        raise ValueError(f"Unsupported stage-2 architecture: {raw!r}")
+
+
+    def _preferred_module_device(module: torch.nn.Module) -> torch.device:
+        """Return the module device, falling back to the current CUDA device."""
+        try:
+            param = next(module.parameters())
+            if param.device.type != "cpu":
+                return param.device
+        except StopIteration:
+            pass
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
+
+    def build(cfg: DictConfig):
+        if not cfg.token_cache_path:
+            cache_pt = pick_cache(ar_output_dir=cfg.output_dir)
+            if cache_pt is None:
+                need = Path(str(cfg.output_dir)).expanduser().resolve() / "token_cache"
+                raise ValueError(
+                    f"Sparse prior runs require token_cache_path, and no cache could be inferred under {need}"
+                )
+            cfg.token_cache_path = str(cache_pt)
+            print(f"Inferred token_cache_path: {cfg.token_cache_path}")
+
+        dm = TokenCacheDataModule(
+            cache_path=cfg.token_cache_path,
+            batch_size=cfg.train_ar.batch_size,
+            num_workers=cfg.data.num_workers,
+            seed=cfg.seed,
+            validation_fraction=getattr(cfg.train_ar, "validation_split", 0.05),
+            test_fraction=getattr(cfg.train_ar, "test_split", 0.05),
+            max_items=getattr(cfg.train_ar, "max_items", 0),
+            crop_h_sites=getattr(cfg.train_ar, "crop_h_sites", 0),
+            crop_w_sites=getattr(cfg.train_ar, "crop_w_sites", 0),
+        )
+        dm.setup("fit")
+        dm.cache = add_cache_meta(
+            dm.cache,
+            token_cache_path=cfg.token_cache_path,
+            output_root=Path(str(cfg.output_dir)).expanduser().resolve().parent,
+        )
+
+        arch = arch_name(getattr(cfg.ar, "type", "sparse_spatial_depth"))
+        real = dm.cache.get("coeffs_flat") is not None
+        if real and arch != "spatial_depth":
+            raise ValueError("Real-valued sparse-token caches are only supported with ar.type=sparse_spatial_depth.")
+        if arch == "gpt":
+            H, W, D = dm.token_shape
+            if int(D) % 2 != 0:
+                raise ValueError(
+                    "ar.type=gpt requires an even token depth because it models an interleaved atom/coeff stream. "
+                    f"Got token shape {(H, W, D)}. VQ-VAE caches use depth 1, so keep ar.type=sparse_spatial_depth."
+                )
+            seq_len = int(H * W * D)
+            window_sites = int(getattr(cfg.ar, "window_sites", 0) or 0)
+            if seq_len > 8192 and window_sites <= 0:
+                raise ValueError(
+                    "ar.type=gpt without ar.window_sites is a full-sequence GPT over the flattened sparse token stream and "
+                    f"is not practical for sequence length {seq_len} from token shape {(H, W, D)}. "
+                    "Use a much shorter token grid, set ar.window_sites for local sliding-window attention, "
+                    "or keep ar.type=sparse_spatial_depth for this cache."
+                )
+
+        cache_meta = dm.cache.get("meta", {}) if isinstance(dm.cache, dict) else {}
+        class_conditional = bool(getattr(cfg.ar, "class_conditional", False))
+        text_conditional = bool(getattr(cfg.ar, "text_conditional", False))
+        if class_conditional and dm.cache.get("class_labels") is None:
+            raise ValueError("ar.class_conditional=true requires class_labels in the token cache.")
+        if text_conditional and dm.cache.get("text_tokens") is None:
+            raise ValueError("ar.text_conditional=true requires text_tokens in the token cache.")
+
+        resolved_num_classes = int(getattr(cfg.ar, "num_classes", 0) or cache_meta.get("num_classes", 0) or 0)
+        if class_conditional and resolved_num_classes <= 0:
+            raise ValueError("ar.class_conditional=true requires ar.num_classes or cache meta num_classes > 0.")
+        cfg.ar.num_classes = resolved_num_classes
+
+        resolved_text_vocab_size = int(getattr(cfg.ar, "text_vocab_size", 0) or cache_meta.get("text_vocab_size", 0) or 0)
+        resolved_text_max_length = int(getattr(cfg.ar, "text_max_length", 0) or cache_meta.get("text_max_length", 0) or 0)
+        resolved_text_pad_id = int(getattr(cfg.ar, "text_pad_id", 0) or cache_meta.get("text_pad_id", 0) or 0)
+        if text_conditional:
+            if resolved_text_vocab_size <= 2 or resolved_text_max_length <= 0:
+                raise ValueError(
+                    "ar.text_conditional=true requires text_vocab_size > 2 and text_max_length > 0 "
+                    "from config or token cache metadata."
+                )
+            cfg.ar.text_vocab_size = resolved_text_vocab_size
+            cfg.ar.text_max_length = resolved_text_max_length
+            cfg.ar.text_pad_id = resolved_text_pad_id
+
+        prior = build_sparse_prior_from_cache(
+            dm.cache,
+            architecture=arch,
+            total_vocab_size=cfg.ar.vocab_size,
+            atom_vocab_size=cfg.ar.atom_vocab_size,
+            coeff_vocab_size=cfg.ar.coeff_vocab_size,
+            grid_shape=dm.token_shape,
+            window_sites=getattr(cfg.ar, "window_sites", 0),
+            d_model=cfg.ar.d_model,
+            n_heads=cfg.ar.n_heads,
+            n_layers=cfg.ar.n_layers,
+            d_ff=cfg.ar.d_ff,
+            dropout=cfg.ar.dropout,
+            n_global_spatial_tokens=cfg.ar.n_global_spatial_tokens,
+            autoregressive_coeffs=cfg.ar.autoregressive_coeffs,
+            class_conditional=class_conditional,
+            num_classes=resolved_num_classes,
+            text_conditional=text_conditional,
+            text_vocab_size=resolved_text_vocab_size,
+            text_max_length=resolved_text_max_length,
+            text_pad_id=resolved_text_pad_id,
+            text_prefix_length=cfg.ar.text_prefix_length,
+        )
+        if real:
+            atom_vocab = int(prior.atom_vocab_size)
+            vocab = int(prior.cfg.vocab_size)
+            coeff_vocab = 0
+        else:
+            vocab, atom_vocab, coeff_vocab = infer_sparse_vocab_sizes(
+                dm.cache,
+                total_vocab_size=cfg.ar.vocab_size,
+                atom_vocab_size=cfg.ar.atom_vocab_size,
+                coeff_vocab_size=cfg.ar.coeff_vocab_size,
+            )
+        if cfg.ar.vocab_size != vocab:
+            print(f"Adjusting sparse vocab_size from {cfg.ar.vocab_size} to {vocab} from cache metadata")
+            cfg.ar.vocab_size = vocab
+        if cfg.ar.atom_vocab_size != atom_vocab:
+            print(f"Resolved atom_vocab_size = {atom_vocab}")
+            cfg.ar.atom_vocab_size = atom_vocab
+        coeff_cfg = None if real else int(coeff_vocab)
+        if cfg.ar.coeff_vocab_size != coeff_cfg:
+            print(f"Resolved coeff_vocab_size = {coeff_cfg}")
+            cfg.ar.coeff_vocab_size = coeff_cfg
+
+        model = SparseTokenPriorModule(
+            prior=prior,
+            learning_rate=cfg.ar.learning_rate,
+            weight_decay=cfg.ar.weight_decay,
+            warmup_steps=cfg.ar.warmup_steps,
+            min_lr_ratio=cfg.ar.min_lr_ratio,
+            atom_loss_weight=cfg.ar.atom_loss_weight,
+            coeff_loss_weight=cfg.ar.coeff_loss_weight,
+            coeff_depth_weighting=cfg.ar.coeff_depth_weighting,
+            coeff_focal_gamma=cfg.ar.coeff_focal_gamma,
+            coeff_loss_type=cfg.ar.coeff_loss_type,
+            coeff_huber_delta=cfg.ar.coeff_huber_delta,
+            sample_coeff_temperature=cfg.ar.sample_coeff_temperature,
+            sample_coeff_mode=cfg.ar.sample_coeff_mode,
+        )
+        model.save_hyperparameters(
+            {
+                "token_cache_path": str(Path(str(cfg.token_cache_path)).expanduser().resolve()),
+                "resolved_atom_vocab_size": int(atom_vocab),
+                "resolved_coeff_vocab_size": int(coeff_vocab),
+                "resolved_total_vocab_size": int(vocab),
+                "token_cache_real_valued": bool(real),
+                "class_conditional": class_conditional,
+                "num_classes": int(resolved_num_classes),
+                "text_conditional": text_conditional,
+                "text_vocab_size": int(resolved_text_vocab_size),
+                "text_max_length": int(resolved_text_max_length),
+            }
+        )
+        return model, dm
+
+
+    @hydra.main(config_path="configs", config_name="config_ar", version_base="1.2")
+    def train_stage2(cfg: DictConfig):
+        mode = arch_name(getattr(cfg.ar, "type", "sparse_spatial_depth"))
+        cfg.ar.type = mode
+
+        print("\n" + "=" * 60)
+        print(STAGE2_TITLE)
+        print("=" * 60)
+        print(f"\nTransformer Mode: {mode}")
+        print(f"Token Cache: {cfg.token_cache_path}")
+
+        print("\nModel Config:")
+        print(f"  Vocab Size: {cfg.ar.vocab_size}")
+        print(f"  Model Dim: {cfg.ar.d_model}")
+        print(f"  Heads: {cfg.ar.n_heads}")
+        print(f"  Layers: {cfg.ar.n_layers}")
+        print(f"  FF Dim: {cfg.ar.d_ff}")
+        print(f"  Dropout: {cfg.ar.dropout}")
+        print(f"  Atom Vocab Size: {cfg.ar.atom_vocab_size}")
+        print(f"  Coeff Vocab Size: {cfg.ar.coeff_vocab_size}")
+        print(f"  Window Sites: {getattr(cfg.ar, 'window_sites', 0)}")
+        print(f"  Global Spatial Tokens: {cfg.ar.n_global_spatial_tokens}")
+        print(f"  Autoregressive Coeffs: {cfg.ar.autoregressive_coeffs}")
+        print(f"  Coeff Loss Type: {cfg.ar.coeff_loss_type}")
+
+        print("\nTrain Config:")
+        print(f"  Learning Rate: {cfg.ar.learning_rate}")
+        print(f"  Warmup Steps: {cfg.ar.warmup_steps}")
+        print(f"  Max Steps: {cfg.ar.max_steps}")
+        print(f"  Num Nodes: {getattr(cfg.train_ar, 'num_nodes', 1)}")
+        print(f"  Batch Size: {cfg.train_ar.batch_size}")
+        print(f"  Max Epochs: {cfg.train_ar.max_epochs}")
+        print(f"  Limit Train Batches: {getattr(cfg.train_ar, 'limit_train_batches', 1.0)}")
+        print(f"  Limit Val Batches: {getattr(cfg.train_ar, 'limit_val_batches', 1.0)}")
+        print(f"  Limit Test Batches: {getattr(cfg.train_ar, 'limit_test_batches', 1.0)}")
+        print(f"  Crop H Sites: {getattr(cfg.train_ar, 'crop_h_sites', 0)}")
+        print(f"  Crop W Sites: {getattr(cfg.train_ar, 'crop_w_sites', 0)}")
+        print("=" * 60 + "\n")
+
+        pl.seed_everything(cfg.seed, workers=True)
+
+        print(f"GPU available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"GPU device: {torch.cuda.get_device_name(0)}")
+
+        model, dm = build(cfg)
+        print(f"Transformer Token Grid Shape: {dm.token_shape}")
+        cache_meta = dm.metadata
+        stage1_checkpoint = str(cache_meta.get("stage1_checkpoint") or "").strip()
+        if stage1_checkpoint:
+            print(f"Stage-1 decoder checkpoint: {stage1_checkpoint}")
+        else:
+            print("Stage-1 decoder checkpoint: unresolved from token cache metadata")
+        cache_dataset = str(cache_meta.get("dataset") or "").strip()
+        cfg_dataset = str(getattr(cfg.data, "dataset", "") or "").strip()
+        if cache_dataset:
+            if cfg_dataset and cfg_dataset.lower() != cache_dataset.lower():
+                print(f"Stage-2 transformer cache dataset: {cache_dataset} (ignoring data.dataset={cfg_dataset})")
+            else:
+                print(f"Stage-2 transformer cache dataset: {cache_dataset}")
+
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model parameters: {total:,} total, {trainable:,} trainable")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_dir = os.path.join(cfg.output_dir, "checkpoints", f"s2_{stamp}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        print(f"\nCheckpoint dir: {ckpt_dir}")
+        print(
+            "Checkpoint policy: "
+            f"save_top_k={CHECKPOINT_SAVE_TOP_K}, "
+            f"save_last={CHECKPOINT_SAVE_LAST}, "
+            f"every_n_epochs={CHECKPOINT_EVERY_N_EPOCHS}, "
+            f"wandb_log_model={WANDB_LOG_MODEL}"
+        )
+
+        base_run = str(getattr(cfg.wandb, "name", "") or "").strip() or _default_stage2_run_name()
+        if bool(getattr(cfg.wandb, "append_timestamp", False)):
+            run = f"{base_run}_{stamp}"
+        else:
+            run = base_run
+        run_group = str(getattr(cfg.wandb, "group", "") or "").strip() or None
+        run_tags = list(getattr(cfg.wandb, "tags", []) or [])
+        devices_cfg = cfg.train_ar.devices
+        try:
+            num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
+        except Exception:
+            num_devices = 1
+        if num_devices > 1:
+            wandb.setup()
+        wandb_id = str(getattr(cfg.wandb, "id", "") or "").strip() or None
+        wandb_resume = str(getattr(cfg.wandb, "resume", "") or "").strip() or None
+        wandb_kwargs = {}
+        if wandb_resume:
+            wandb_kwargs["resume"] = wandb_resume
+        wb = WandbLogger(
+            project=cfg.wandb.project,
+            name=run,
+            save_dir=cfg.wandb.save_dir,
+            group=run_group,
+            tags=run_tags if run_tags else None,
+            id=wandb_id,
+            log_model=WANDB_LOG_MODEL,
+            **wandb_kwargs,
+        )
+        step_every = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
+        epoch_every = int(getattr(cfg.train_ar, "sample_every_n_epochs", 0) or 0)
+        sample_out_dir = os.path.join(cfg.output_dir, "samples", f"s2_{stamp}")
+        sample_variants = _optional_container(getattr(cfg.train_ar, "sample_variants", None))
+        sample_text_prompts = _sample_text_prompts(cfg)
+        sample_class_labels = _optional_container(getattr(cfg.train_ar, "sample_class_labels", None)) or []
+        wb.log_hyperparams(
+            {
+                "training_stage": "stage2",
+                "stage_role": "transformer_generation",
+                "training_mode": STAGE2_MODE,
+                "legacy_training_mode": "s2",
+                "token_cache_path": cfg.token_cache_path,
+                "ar_vocab_size": cfg.ar.vocab_size,
+                "ar_d_model": cfg.ar.d_model,
+                "ar_n_heads": cfg.ar.n_heads,
+                "ar_n_layers": cfg.ar.n_layers,
+                "ar_d_ff": cfg.ar.d_ff,
+                "ar_dropout": cfg.ar.dropout,
+                "dataset": cache_dataset or cfg_dataset or None,
+                "config_dataset": cfg_dataset or None,
+                "stage1_checkpoint": stage1_checkpoint or None,
+                "sample_every_n_steps": step_every,
+                "sample_every_n_epochs": epoch_every,
+                "sample_num_images": int(getattr(cfg.train_ar, "sample_num_images", 4) or 4),
+                "sample_temperature": float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
+                "sample_top_k": int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+                "sample_class_labels": sample_class_labels,
+                "sample_text_prompts": sample_text_prompts,
+            }
+        )
+
+        cbs = [
+            ModelCheckpoint(
+                dirpath=ckpt_dir,
+                filename="s2-{epoch:03d}-{val/loss:.4f}",
+                save_top_k=CHECKPOINT_SAVE_TOP_K,
+                monitor="val/loss",
+                mode="min",
+                save_last=CHECKPOINT_SAVE_LAST,
+                every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
+            ),
+            LearningRateMonitor(logging_interval="step"),
+            bar,
+        ]
+        if step_every > 0 or epoch_every > 0:
+            cbs.append(
+                Stage2SamplePreviewCallback(
+                    cache_pt=str(cfg.token_cache_path),
+                    out_dir=sample_out_dir,
+                    step_every=step_every,
+                    epoch_every=epoch_every,
+                    n=int(getattr(cfg.train_ar, "sample_num_images", 4) or 4),
+                    temp=float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
+                    top_k=int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+                    ctemp=getattr(cfg.train_ar, "sample_coeff_temperature", cfg.ar.sample_coeff_temperature),
+                    cmode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
+                    sample_variants=sample_variants,
+                    s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
+                    use_wandb=bool(getattr(cfg.train_ar, "sample_log_to_wandb", False)),
+                    text_prompts=sample_text_prompts,
+                    class_labels=sample_class_labels,
+                )
+            )
+
+        val_every = resolve_val_check_interval(dm, getattr(cfg.train_ar, "val_check_interval", 1.0))
+        strategy_cfg = getattr(cfg.train_ar, "strategy", "auto")
+        strategy_lower = str(strategy_cfg).lower()
+        if num_devices <= 1 and strategy_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
+            strategy_cfg = "auto"
+            strategy_lower = "auto"
+        trainer_plugins = [LightningEnvironment()] if num_devices > 1 and strategy_lower.startswith("ddp") else None
+        trainer = pl.Trainer(
+            max_epochs=cfg.train_ar.max_epochs,
+            max_steps=int(getattr(cfg.ar, "max_steps", -1) or -1),
+            accelerator=cfg.train_ar.accelerator,
+            num_nodes=int(getattr(cfg.train_ar, "num_nodes", 1) or 1),
+            devices=cfg.train_ar.devices,
+            strategy=strategy_cfg,
+            plugins=trainer_plugins,
+            logger=wb,
+            callbacks=cbs,
+            precision=cfg.train_ar.precision,
+            gradient_clip_val=cfg.train_ar.gradient_clip_val,
+            log_every_n_steps=cfg.train_ar.log_every_n_steps,
+            val_check_interval=val_every,
+            limit_train_batches=getattr(cfg.train_ar, "limit_train_batches", 1.0),
+            limit_val_batches=getattr(cfg.train_ar, "limit_val_batches", 1.0),
+            limit_test_batches=getattr(cfg.train_ar, "limit_test_batches", 1.0),
+            deterministic=True,
+            enable_progress_bar=True,
+            num_sanity_val_steps=2,
+        )
+
+        ckpt_path = str(getattr(cfg, "ckpt_path", "") or "").strip() or None
+        if ckpt_path:
+            print(f"\nResuming transformer prior training from: {ckpt_path}")
+        else:
+            print("\nStarting transformer prior training...")
+        trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
+
+        run_test_cfg = getattr(cfg.train_ar, "run_test_after_fit", None)
+        run_test_after_fit = (num_devices <= 1) if run_test_cfg is None else bool(run_test_cfg)
+        if run_test_after_fit:
+            print("\nRunning transformer prior test evaluation...")
+            trainer.test(model, datamodule=dm)
+        elif trainer.is_global_zero:
+            print("\nSkipping post-fit transformer test evaluation for multi-device training.")
+
+        compute_generation_fid = bool(getattr(cfg.train_ar, "compute_generation_fid", False))
+        compute_audio_generation = bool(getattr(cfg.train_ar, "compute_audio_generation_metrics", False))
+        generation_metric_samples = int(getattr(cfg.train_ar, "generation_metric_num_samples", 0) or 0)
+        sample_count = int(getattr(cfg.train_ar, "sample_num_images", 4) or 0)
+        if compute_generation_fid or compute_audio_generation:
+            sample_count = max(sample_count, generation_metric_samples)
+        final_samples_cfg = getattr(cfg.train_ar, "save_final_samples_after_fit", None)
+        save_final_samples = (num_devices <= 1) if final_samples_cfg is None else bool(final_samples_cfg)
+        if not save_final_samples and trainer.is_global_zero and sample_count > 0:
+            print("Skipping final post-fit generation preview for multi-device training.")
+        if save_final_samples and trainer.is_global_zero and sample_count > 0:
+            try:
+                sample_device = _preferred_module_device(model)
+                if sample_device.type != "cpu":
+                    model.to(sample_device)
+                final_result = save_final_generation_preview(
+                    trainer=trainer,
+                    mod=model,
+                    cache_pt=str(cfg.token_cache_path),
+                    out_dir=sample_out_dir,
+                    n=sample_count,
+                    temp=float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
+                    top_k=int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+                    ctemp=getattr(cfg.train_ar, "sample_coeff_temperature", cfg.ar.sample_coeff_temperature),
+                    cmode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
+                    s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
+                    use_wandb=bool(getattr(cfg.train_ar, "sample_log_to_wandb", False)),
+                    text_prompts=sample_text_prompts,
+                    class_labels=sample_class_labels,
+                    return_batch=(compute_generation_fid or compute_audio_generation),
+                )
+                if isinstance(final_result, tuple):
+                    final_raw, final_batch, final_cache = final_result
+                else:
+                    final_raw, final_batch, final_cache = final_result, None, None
+                print(f"\nSaved final transformer generation preview: {final_raw}")
+                if final_batch is not None and final_cache is not None and generation_metric_samples > 0:
+                    metric_payload = build_stage2_metrics_payload(
+                        final_batch.imgs.to(sample_device),
+                        cfg=cfg,
+                        cache=final_cache,
+                        max_items=generation_metric_samples,
+                        compute_fid=compute_generation_fid,
+                        compute_audio=compute_audio_generation,
+                    )
+                    if metric_payload:
+                        step = max(1, int(getattr(trainer, "global_step", 0) or 0))
+                        log_wandb_payload(wb, metric_payload, step=step)
+                        print(f"Logged final generation metrics: {sorted(metric_payload)}")
+            except Exception as err:
+                print(f"\nWarning: could not save final transformer generation preview ({err})")
+        if save_final_samples:
+            Stage2SamplePreviewCallback._barrier_if_needed(trainer)
+
+        print("\nTransformer training complete.")
+        print(f"Best checkpoint: {cbs[0].best_model_path}")
+        return cbs[0].best_model_path
+
+
+    train_ar = train_stage2
+
+    _STAGE_ENTRYPOINTS = (train_stage1, train_stage2)
+    return _STAGE_ENTRYPOINTS
+
 
 def _dispatch_stage(stage: str, stage_argv: list[str]) -> int:
     sys.argv = [sys.argv[0], *stage_argv]
+    train_stage1_entry, train_stage2_entry = _load_stage_entrypoints()
     if stage == "1":
-        from train_stage1_autoencoder import train as train_stage1
-
-        train_stage1()
+        train_stage1_entry()
     else:
-        from train_stage2_prior import main as train_stage2
-
-        train_stage2()
+        train_stage2_entry()
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    stage = _stage_token(raw_argv[0]) if raw_argv else None
+    expanded, direct_config = _expand_config_argv(raw_argv)
+    if direct_config:
+        direct_argv, dry_run = _strip_direct_dry_run(expanded)
+        stage = _stage_token(direct_argv[0]) if direct_argv else None
+        if not stage:
+            raise SystemExit("Direct YAML config requires stage: stage1 or stage2.")
+        cmd = [sys.executable, str(Path(__file__).resolve()), *direct_argv]
+        if dry_run:
+            print("Launching:", shlex.join(cmd), flush=True)
+            return 0
+        return _dispatch_stage(stage, direct_argv[1:])
+
+    stage = _stage_token(expanded[0]) if expanded else None
     if stage and not _looks_like_facade_args(raw_argv[1:]):
-        return _dispatch_stage(stage, raw_argv[1:])
+        return _dispatch_stage(stage, expanded[1:])
 
     parser = _build_parser()
-    normalized = _inject_stage_option(raw_argv)
+    normalized = _inject_stage_option(expanded)
     args, unknown = parser.parse_known_args(normalized)
     extra = _normalize_unknown(unknown)
     _validate(args)

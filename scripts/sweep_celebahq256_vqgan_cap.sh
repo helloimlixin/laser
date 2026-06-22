@@ -214,7 +214,7 @@ echo "  hiddens=$num_hiddens  res_blocks=$num_res_blocks  res_hiddens=$num_res_h
 echo "  recon=$patch_recon  image_size=${IMAGE_SIZE}  batch_size=$BATCH_SIZE  lr=$STAGE1_LR"
 echo "========================================"
 
-python train_stage1_autoencoder.py \\
+python train.py stage1 \\
   seed=42 \\
   output_dir="\$STAGE1_DIR" \\
   model=laser \\
@@ -284,7 +284,7 @@ echo "========================================"
 echo "STAGE 2: AR Prior (${AR_N_LAYERS}L, d=$AR_D_MODEL, ${STAGE2_EPOCHS}ep)"
 echo "========================================"
 
-python train_stage2_prior.py \\
+python train.py stage2 \\
   token_cache_path="\$TOKEN_CACHE" \\
   output_dir="\$STAGE2_DIR" \\
   seed=42 \\

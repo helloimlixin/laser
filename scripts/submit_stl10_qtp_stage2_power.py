@@ -190,7 +190,7 @@ STAGE2_ARGS=(
 )
 
 echo "=== Stage 2: STL10 class-conditional qtp5wa8r-power prior ==="
-"$PYTHON_BIN" train_stage2_prior.py "${{STAGE2_ARGS[@]}}"
+"$PYTHON_BIN" train.py stage2 "${{STAGE2_ARGS[@]}}"
 """,
         encoding="utf-8",
     )

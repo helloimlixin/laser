@@ -85,7 +85,7 @@ echo "========================================"
 echo "STAGE 1: FFHQ-256 LASER + PatchGAN (laser_ffhq_gan)"
 echo "========================================"
 
-python train_stage1_autoencoder.py \\
+python train.py stage1 \\
   seed=42 \\
   output_dir="$RUN_DIR/stage1" \\
   model=laser_ffhq_gan \\

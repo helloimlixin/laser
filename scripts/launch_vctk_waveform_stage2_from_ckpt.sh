@@ -221,7 +221,7 @@ else
 fi
 
 echo "=== Stage 2: $MODEL_FAMILY $CASE_NAME, ${STAGE2_EPOCHS} epochs ==="
-"\$PYTHON_BIN" train_stage2_prior.py \\
+"\$PYTHON_BIN" train.py stage2 \\
   ckpt_path="$CKPT_PATH" \\
   token_cache_path="$token_cache" \\
   output_dir="$stage2_dir" \\

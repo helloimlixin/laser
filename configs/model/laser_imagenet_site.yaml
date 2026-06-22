@@ -7,7 +7,7 @@
 #   manifold). The dictionary is a normal Adam parameter that learns via backprop.
 #
 # LAUNCH (mirrors the original; train.* / data.* stay on the CLI):
-#   python train_stage1_autoencoder.py \
+#   python train.py stage1 \
 #     model=laser_imagenet_site data=imagenet \
 #     data.data_dir=/scratch/xl598/Projects/data/imagenet data.image_size=256 \
 #     data.batch_size=3 data.num_workers=8 seed=42 \

@@ -10,21 +10,22 @@ This folder holds short notes for the maintained code path.
 
 ## Code Map
 
-- Stage 1 train: [train_stage1_autoencoder.py](/scratch/xl598/Projects/laser/train_stage1_autoencoder.py)
+- Stage 1 train: [train.py](/scratch/xl598/Projects/laser/train.py) `stage1`
   (model in [laser.py](/scratch/xl598/Projects/laser/src/models/laser.py) and
   [bottleneck.py](/scratch/xl598/Projects/laser/src/models/bottleneck.py))
 - Token cache: [cache.py](/scratch/xl598/Projects/laser/cache.py)
-- Stage 2 train: [train_stage2_prior.py](/scratch/xl598/Projects/laser/train_stage2_prior.py)
+- Stage 2 train: [train.py](/scratch/xl598/Projects/laser/train.py) `stage2`
 - Stage 2 sample: [sample.py](/scratch/xl598/Projects/laser/sample.py)
 - Stage 2 runtime: [s2.py](/scratch/xl598/Projects/laser/src/s2.py)
 
 ## Naming
 
 The pipeline has one maintained entry point per stage:
-`train_stage1_autoencoder.py` → `cache.py` → `train_stage2_prior.py` → `sample.py`.
-The older `train.py`, `train_s2.py`/`train_ar.py`, `sample_s2.py`/`sample_ar.py`,
-`gen_s2.py`/`generate_ar.py`, `build_token_cache.py`, and `extract_token_cache.py`
-scripts have been removed in favor of these.
+`train.py stage1` → `cache.py` → `train.py stage2` → `sample.py`.
+Older split training and sampling aliases such as `train_s2.py`/`train_ar.py`,
+`sample_s2.py`/`sample_ar.py`, `gen_s2.py`/`generate_ar.py`,
+`build_token_cache.py`, and `extract_token_cache.py` have been removed in favor
+of these maintained entry points.
 
 ## Next Docs To Add
 

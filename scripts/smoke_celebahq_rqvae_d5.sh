@@ -113,7 +113,7 @@ echo "STAGE2_COEFF_BINS=${STAGE2_COEFF_BINS}  STAGE2_COEFF_MAX=${STAGE2_COEFF_MA
 echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPLE_NUM_IMAGES=${STAGE2_SAMPLE_NUM_IMAGES}  STAGE2_SAMPLE_TOP_K=${STAGE2_SAMPLE_TOP_K}" | tee -a "${LOG}"
 
 # Stage 1: autoencoder. VQGAN-style backbone with four downsampling stages.
-"${PYTHON_BIN}" train_stage1_autoencoder.py \
+"${PYTHON_BIN}" train.py stage1 \
   output_dir="${STAGE1_DIR}" \
   hydra.run.dir="${STAGE1_DIR}/hydra" \
   model=laser \
@@ -203,7 +203,7 @@ echo "[$(date --iso-8601=seconds)] stage1 checkpoint: ${CKPT}" | tee -a "${LOG}"
   2>&1 | tee -a "${LOG}"
 
 # Stage 2: sparse-token prior over cached tokens.
-"${PYTHON_BIN}" train_stage2_prior.py \
+"${PYTHON_BIN}" train.py stage2 \
   output_dir="${STAGE2_DIR}" \
   token_cache_path="${CACHE}" \
   data.dataset=celebahq \

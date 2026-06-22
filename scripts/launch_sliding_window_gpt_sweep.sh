@@ -9,7 +9,7 @@
 # spatial sites) at 256px. Quantized coeffs (256 bins) interleave atom/coeff
 # tokens to depth D = 2*sparsity_level = 16, so the flattened gpt sequence is
 # 32*32*16 = 16384 tokens. That TRIPS the seq_len>8192 guard in
-# train_stage2_prior.py:144-152, which REQUIRES ar.window_sites>0 -- i.e. full
+# train.py stage2:144-152, which REQUIRES ar.window_sites>0 -- i.e. full
 # attention is impractical and windowed local attention is what makes the fine
 # latent trainable. window_sites=64 (two 32-wide latent rows) -> 64*16 = 1024
 # token local span, plus the learned global spatial prefix.

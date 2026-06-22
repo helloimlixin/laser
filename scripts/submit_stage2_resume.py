@@ -234,7 +234,7 @@ STAGE2_ARGS=(
 )
 
 echo "=== Resume Stage 2: {run.run_id} ==="
-"$PYTHON_BIN" train_stage2_prior.py "${{STAGE2_ARGS[@]}}"
+"$PYTHON_BIN" train.py stage2 "${{STAGE2_ARGS[@]}}"
 """,
         encoding="utf-8",
     )
