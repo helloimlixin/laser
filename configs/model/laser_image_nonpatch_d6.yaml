@@ -1,0 +1,13 @@
+defaults:
+  - laser_image_nonpatch_d5
+  - _self_
+
+# 256x256 inputs -> 4x4 latent sites. Slightly wider decoder/encoder than d5
+# because the bottleneck is much more compressed.
+num_hiddens: 160
+num_residual_hiddens: 112
+decoder_extra_residual_layers: 3
+
+num_downsamples: 6
+channel_multipliers: [1, 1, 2, 2, 4, 4, 4]
+attn_resolutions: [4, 8, 16]

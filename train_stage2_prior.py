@@ -53,6 +53,11 @@ from src.wandb_media import log_wandb_payload
 
 torch.set_float32_matmul_precision("medium")
 
+CHECKPOINT_SAVE_TOP_K = 3
+CHECKPOINT_SAVE_LAST = True
+CHECKPOINT_EVERY_N_EPOCHS = 1
+WANDB_LOG_MODEL = "all"
+
 bar = RichProgressBar(
     theme=RichProgressBarTheme(
         description="green_yellow",
@@ -155,6 +160,32 @@ def build(cfg: DictConfig):
                 "or keep ar.type=sparse_spatial_depth for this cache."
             )
 
+    cache_meta = dm.cache.get("meta", {}) if isinstance(dm.cache, dict) else {}
+    class_conditional = bool(getattr(cfg.ar, "class_conditional", False))
+    text_conditional = bool(getattr(cfg.ar, "text_conditional", False))
+    if class_conditional and dm.cache.get("class_labels") is None:
+        raise ValueError("ar.class_conditional=true requires class_labels in the token cache.")
+    if text_conditional and dm.cache.get("text_tokens") is None:
+        raise ValueError("ar.text_conditional=true requires text_tokens in the token cache.")
+
+    resolved_num_classes = int(getattr(cfg.ar, "num_classes", 0) or cache_meta.get("num_classes", 0) or 0)
+    if class_conditional and resolved_num_classes <= 0:
+        raise ValueError("ar.class_conditional=true requires ar.num_classes or cache meta num_classes > 0.")
+    cfg.ar.num_classes = resolved_num_classes
+
+    resolved_text_vocab_size = int(getattr(cfg.ar, "text_vocab_size", 0) or cache_meta.get("text_vocab_size", 0) or 0)
+    resolved_text_max_length = int(getattr(cfg.ar, "text_max_length", 0) or cache_meta.get("text_max_length", 0) or 0)
+    resolved_text_pad_id = int(getattr(cfg.ar, "text_pad_id", 0) or cache_meta.get("text_pad_id", 0) or 0)
+    if text_conditional:
+        if resolved_text_vocab_size <= 2 or resolved_text_max_length <= 0:
+            raise ValueError(
+                "ar.text_conditional=true requires text_vocab_size > 2 and text_max_length > 0 "
+                "from config or token cache metadata."
+            )
+        cfg.ar.text_vocab_size = resolved_text_vocab_size
+        cfg.ar.text_max_length = resolved_text_max_length
+        cfg.ar.text_pad_id = resolved_text_pad_id
+
     prior = build_sparse_prior_from_cache(
         dm.cache,
         architecture=arch,
@@ -170,6 +201,13 @@ def build(cfg: DictConfig):
         dropout=cfg.ar.dropout,
         n_global_spatial_tokens=cfg.ar.n_global_spatial_tokens,
         autoregressive_coeffs=cfg.ar.autoregressive_coeffs,
+        class_conditional=class_conditional,
+        num_classes=resolved_num_classes,
+        text_conditional=text_conditional,
+        text_vocab_size=resolved_text_vocab_size,
+        text_max_length=resolved_text_max_length,
+        text_pad_id=resolved_text_pad_id,
+        text_prefix_length=cfg.ar.text_prefix_length,
     )
     if real:
         atom_vocab = int(prior.atom_vocab_size)
@@ -215,6 +253,11 @@ def build(cfg: DictConfig):
             "resolved_coeff_vocab_size": int(coeff_vocab),
             "resolved_total_vocab_size": int(vocab),
             "token_cache_real_valued": bool(real),
+            "class_conditional": class_conditional,
+            "num_classes": int(resolved_num_classes),
+            "text_conditional": text_conditional,
+            "text_vocab_size": int(resolved_text_vocab_size),
+            "text_max_length": int(resolved_text_max_length),
         }
     )
     return model, dm
@@ -268,6 +311,11 @@ def main(cfg: DictConfig):
     model, dm = build(cfg)
     print(f"Transformer Token Grid Shape: {dm.token_shape}")
     cache_meta = dm.metadata
+    stage1_checkpoint = str(cache_meta.get("stage1_checkpoint") or "").strip()
+    if stage1_checkpoint:
+        print(f"Stage-1 decoder checkpoint: {stage1_checkpoint}")
+    else:
+        print("Stage-1 decoder checkpoint: unresolved from token cache metadata")
     cache_dataset = str(cache_meta.get("dataset") or "").strip()
     cfg_dataset = str(getattr(cfg.data, "dataset", "") or "").strip()
     if cache_dataset:
@@ -284,6 +332,13 @@ def main(cfg: DictConfig):
     ckpt_dir = os.path.join(cfg.output_dir, "checkpoints", f"s2_{stamp}")
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"\nCheckpoint dir: {ckpt_dir}")
+    print(
+        "Checkpoint policy: "
+        f"save_top_k={CHECKPOINT_SAVE_TOP_K}, "
+        f"save_last={CHECKPOINT_SAVE_LAST}, "
+        f"every_n_epochs={CHECKPOINT_EVERY_N_EPOCHS}, "
+        f"wandb_log_model={WANDB_LOG_MODEL}"
+    )
 
     base_run = str(getattr(cfg.wandb, "name", "") or "").strip() or _default_stage2_run_name()
     if bool(getattr(cfg.wandb, "append_timestamp", False)):
@@ -311,8 +366,15 @@ def main(cfg: DictConfig):
         group=run_group,
         tags=run_tags if run_tags else None,
         id=wandb_id,
+        log_model=WANDB_LOG_MODEL,
         **wandb_kwargs,
     )
+    step_every = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
+    epoch_every = int(getattr(cfg.train_ar, "sample_every_n_epochs", 0) or 0)
+    sample_out_dir = os.path.join(cfg.output_dir, "samples", f"s2_{stamp}")
+    sample_variants = _optional_container(getattr(cfg.train_ar, "sample_variants", None))
+    sample_text_prompts = _optional_container(getattr(cfg.train_ar, "sample_text_prompts", None)) or []
+    sample_class_labels = _optional_container(getattr(cfg.train_ar, "sample_class_labels", None)) or []
     wb.log_hyperparams(
         {
             "training_stage": "stage2",
@@ -328,6 +390,14 @@ def main(cfg: DictConfig):
             "ar_dropout": cfg.ar.dropout,
             "dataset": cache_dataset or cfg_dataset or None,
             "config_dataset": cfg_dataset or None,
+            "stage1_checkpoint": stage1_checkpoint or None,
+            "sample_every_n_steps": step_every,
+            "sample_every_n_epochs": epoch_every,
+            "sample_num_images": int(getattr(cfg.train_ar, "sample_num_images", 4) or 4),
+            "sample_temperature": float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
+            "sample_top_k": int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+            "sample_class_labels": sample_class_labels,
+            "sample_text_prompts": sample_text_prompts,
         }
     )
 
@@ -335,18 +405,15 @@ def main(cfg: DictConfig):
         ModelCheckpoint(
             dirpath=ckpt_dir,
             filename="s2-{epoch:03d}-{val/loss:.4f}",
-            save_top_k=3,
+            save_top_k=CHECKPOINT_SAVE_TOP_K,
             monitor="val/loss",
             mode="min",
-            save_last=True,
+            save_last=CHECKPOINT_SAVE_LAST,
+            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
         ),
         LearningRateMonitor(logging_interval="step"),
         bar,
     ]
-    step_every = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
-    epoch_every = int(getattr(cfg.train_ar, "sample_every_n_epochs", 0) or 0)
-    sample_out_dir = os.path.join(cfg.output_dir, "samples", f"s2_{stamp}")
-    sample_variants = _optional_container(getattr(cfg.train_ar, "sample_variants", None))
     if step_every > 0 or epoch_every > 0:
         cbs.append(
             Stage2SamplePreviewCallback(
@@ -362,6 +429,8 @@ def main(cfg: DictConfig):
                 sample_variants=sample_variants,
                 s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
                 use_wandb=bool(getattr(cfg.train_ar, "sample_log_to_wandb", False)),
+                text_prompts=sample_text_prompts,
+                class_labels=sample_class_labels,
             )
         )
 
@@ -436,6 +505,8 @@ def main(cfg: DictConfig):
                 cmode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
                 s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
                 use_wandb=bool(getattr(cfg.train_ar, "sample_log_to_wandb", False)),
+                text_prompts=sample_text_prompts,
+                class_labels=sample_class_labels,
                 return_batch=(compute_generation_fid or compute_audio_generation),
             )
             if isinstance(final_result, tuple):

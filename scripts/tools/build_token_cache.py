@@ -18,6 +18,7 @@ from src.data.cifar10 import CIFAR10DataModule
 from src.data.config import DataConfig
 from src.data.imagenette2 import Imagenette2DataModule
 from src.models.laser import LASER
+from src.sparse_token_codec import build_coeff_bin_values
 from src.stage2_paths import default_token_cache_path
 
 
@@ -68,6 +69,7 @@ def _default_output_path(args):
             image_size=int(args.image_size),
             coeff_bins=int(args.coeff_vocab_size),
             coeff_quantization=str(args.coeff_quantization),
+            coeff_mu=float(args.coeff_mu),
         )
     return (
         Path(args.ar_output_dir).expanduser().resolve()
@@ -137,7 +139,7 @@ def main():
 
     coeff_bin_values = None
     if quantized_cache:
-        coeff_bin_values = model.bottleneck._coeff_bin_values(
+        coeff_bin_values = build_coeff_bin_values(
             coeff_vocab_size=int(args.coeff_vocab_size),
             coeff_max=float(coeff_max),
             coeff_quantization=str(args.coeff_quantization),

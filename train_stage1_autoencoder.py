@@ -24,7 +24,7 @@ from src.hydra_argparse_compat import patch_argparse_for_hydra_on_py314
 
 patch_argparse_for_hydra_on_py314()
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from src.lightning_warning_filters import register as register_lightning_warning_filters
 
@@ -69,6 +69,10 @@ progress_bar = RichProgressBar(
 
 STAGE1_TITLE = "STAGE 1: AUTOENCODER TRAINING"
 STAGE1_MODE = "stage1_autoencoder"
+CHECKPOINT_SAVE_TOP_K = 3
+CHECKPOINT_SAVE_LAST = True
+CHECKPOINT_EVERY_N_EPOCHS = 1
+WANDB_LOG_MODEL = "all"
 
 
 def _default_stage1_run_name(model_type: str) -> str:
@@ -158,11 +162,7 @@ def train(cfg: DictConfig):
         print(f"Dictionary Size: {cfg.model.num_embeddings}")
         print(f"Sparsity: {cfg.model.sparsity_level}")
         print(f"Bypass Bottleneck: {bool(getattr(cfg.model, 'bypass_bottleneck', False))}")
-        print(f"Coefficient Bound: {getattr(cfg.model, 'coef_max', None)}")
-        print(
-            "OMP Residual Tolerance: "
-            f"{getattr(cfg.model, 'omp_residual_tolerance', None)}"
-        )
+        print(f"Coefficient Quantization Bound: {getattr(cfg.model, 'coef_max', None)}")
         if str(getattr(cfg.model, 'backbone', 'simple')).strip().lower() != "simple":
             print(f"Downsamples: {getattr(cfg.model, 'num_downsamples', 2)}")
             print(f"Attention Resolutions: {tuple(getattr(cfg.model, 'attn_resolutions', ())) or ()}")
@@ -228,6 +228,9 @@ def train(cfg: DictConfig):
         monitor_key = "val/loss"
     monitor_mode = getattr(cfg.checkpoint, "mode", "min")
     filename_template = getattr(cfg.checkpoint, "filename", f"{cfg.model.type}-{{epoch:03d}}")
+    with open_dict(cfg):
+        cfg.checkpoint.save_top_k = CHECKPOINT_SAVE_TOP_K
+        cfg.checkpoint.save_last = CHECKPOINT_SAVE_LAST
 
     print("\nCheckpoint Configuration:")
     print(f"Base Save Directory: {base_ckpt_dir}")
@@ -236,6 +239,8 @@ def train(cfg: DictConfig):
     print(f"Monitor:             {monitor_key} (mode={monitor_mode})")
     print(f"Save Top K:          {cfg.checkpoint.save_top_k}")
     print(f"Save Last:           {cfg.checkpoint.save_last}")
+    print(f"Every N Epochs:      {CHECKPOINT_EVERY_N_EPOCHS}")
+    print(f"W&B Checkpoint Upload: {WANDB_LOG_MODEL}")
     print("=" * 60 + "\n")
 
     # Set random seed for reproducibility
@@ -255,6 +260,21 @@ def train(cfg: DictConfig):
     print(f"Using dataset: {cfg.data.dataset}")
     print(f"Data module type: {type(datamodule).__name__}")
 
+    if (
+        str(getattr(cfg.model, "type", "")).strip().lower() == "vqvae"
+        and bool(getattr(cfg.model, "speaker_conditioning", False))
+        and int(getattr(cfg.model, "speaker_conditioning_num_speakers", 0) or 0) <= 0
+        and str(getattr(cfg.data, "dataset", "")).strip().lower() in {"vctk", "maestro"}
+    ):
+        datamodule.prepare_data()
+        datamodule.setup("fit")
+        num_speakers = int(getattr(datamodule, "num_speakers", 0) or 0)
+        if num_speakers <= 0:
+            raise RuntimeError("Speaker conditioning was requested, but no speakers were found in the data module.")
+        with open_dict(cfg):
+            cfg.model.speaker_conditioning_num_speakers = num_speakers
+        print(f"Inferred VQ-VAE speaker conditioning classes: {num_speakers}")
+
     if int(cfg.model.in_channels) != resolved_in_channels:
         print(
             f"Adjusting model input channels from {int(cfg.model.in_channels)} "
@@ -263,13 +283,13 @@ def train(cfg: DictConfig):
     
     model = build_stage1_model(cfg.model, cfg.train, cfg.data)
     trainer_gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 0.0) or 0.0)
-    uses_manual_optimization = not bool(getattr(model, "automatic_optimization", True))
-    if uses_manual_optimization:
+    uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
+    if uses_manual_opt:
         model.manual_gradient_clip_val = trainer_gradient_clip_val
         trainer_gradient_clip_val = 0.0
         print(
-            "Manual optimization detected; disabling Lightning Trainer gradient "
-            f"clipping and using model-side clipping value {model.manual_gradient_clip_val}."
+            "Manual optimization active (adversarial); applying gradient clipping "
+            f"inside the model with value {model.manual_gradient_clip_val}."
         )
 
     if ckpt_path:
@@ -299,6 +319,7 @@ def train(cfg: DictConfig):
         save_dir=cfg.wandb.save_dir,
         group=run_group,
         tags=run_tags if run_tags else None,
+        log_model=WANDB_LOG_MODEL,
     )
     wandb_logger.log_hyperparams(
         {
@@ -316,10 +337,11 @@ def train(cfg: DictConfig):
         ModelCheckpoint(
             dirpath=run_ckpt_dir,
             filename=filename_template,
-            save_top_k=cfg.checkpoint.save_top_k,
+            save_top_k=CHECKPOINT_SAVE_TOP_K,
             monitor=monitor_key,
             mode=monitor_mode,
-            save_last=cfg.checkpoint.save_last
+            save_last=CHECKPOINT_SAVE_LAST,
+            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
         ),
         LearningRateMonitor(logging_interval='step'),
         progress_bar
@@ -346,13 +368,10 @@ def train(cfg: DictConfig):
     if num_devices <= 1 and strat_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
         strategy_cfg = "auto"
         strat_lower = "auto"
-    if uses_manual_optimization and strat_lower == "ddp":
-        strategy_cfg = "ddp_find_unused_parameters_true"
-        strat_lower = str(strategy_cfg).lower()
-        print(
-            "Manual optimization detected; using "
-            "ddp_find_unused_parameters_true so discriminator-only parameters are allowed."
-        )
+    if "find_unused" in strat_lower:
+        strategy_cfg = "ddp"
+        strat_lower = "ddp"
+        print("Using standard DDP; unused-parameter detection is disabled.")
     val_check_interval = resolve_val_check_interval(
         datamodule, getattr(cfg.train, "val_check_interval", 1.0)
     )

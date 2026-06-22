@@ -11,6 +11,7 @@ from src.checkpoint_io import (
     load_lightning_module,
     load_torch_payload,
 )
+from src.data.config import DataConfig
 
 
 class _ToyModule(torch.nn.Module):
@@ -73,3 +74,13 @@ def test_load_lightning_module_restores_safe_payload(tmp_path: Path):
     assert restored.scale == 0.75
     assert restored.enabled is True
     assert torch.equal(restored.linear.weight, ref.linear.weight)
+
+
+def test_load_torch_payload_falls_back_for_project_hparams(tmp_path: Path):
+    ckpt = tmp_path / "data-config.ckpt"
+    config = DataConfig(dataset="imagenette2", data_dir="/data/imagenette2", batch_size=4)
+    torch.save({"state_dict": {}, "hyper_parameters": {"data_config": config}}, ckpt)
+
+    raw = load_torch_payload(ckpt, map_location="cpu")
+
+    assert raw["hyper_parameters"]["data_config"] == config

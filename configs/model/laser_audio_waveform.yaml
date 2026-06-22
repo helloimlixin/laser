@@ -15,6 +15,7 @@ num_residual_hiddens: 64
 sparsity_level: 8
 commitment_cost: 0.1
 bottleneck_loss_weight: 0.5
+dictionary_loss_weight: null
 dict_learning_rate: 1.0e-4
 coef_max: 8.0
 recon_mse_weight: 0.5

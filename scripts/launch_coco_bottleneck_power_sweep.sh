@@ -63,7 +63,6 @@ COMMON_STAGE1=(
   --stage1-override model.sparsity_level=4
   --stage1-override model.sparsity_reg_weight=0.0
   --stage1-override model.coef_max=16.0
-  --stage1-override model.bounded_omp_refine_steps=16
   --stage1-override model.dict_learning_rate=1.0e-4
   --stage1-override model.recon_mse_weight=1.0
   --stage1-override model.recon_l1_weight=0.0

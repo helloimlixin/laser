@@ -38,6 +38,13 @@ ar:
   # tokens before raster-position generation begins.
   n_global_spatial_tokens: 8
   autoregressive_coeffs: true
+  class_conditional: false
+  num_classes: 0
+  text_conditional: false
+  text_vocab_size: 0
+  text_max_length: 0
+  text_pad_id: 0
+  text_prefix_length: 16
 
   # Model architecture
   d_model: 512
@@ -62,6 +69,13 @@ ar:
   coeff_loss_weight: 1.0
   coeff_depth_weighting: none
   coeff_focal_gamma: 0.0
+  # Anti-collapse for the atom-id head (real-valued spatial_depth path). Both
+  # default off (legacy behavior). atom_label_smoothing softens the CE targets so
+  # the prior cannot over-peak on the few dominant atoms; atom_coverage_weight
+  # rewards a high-entropy batch-marginal atom distribution so generation keeps a
+  # broad atom support instead of collapsing onto tens of atoms.
+  atom_label_smoothing: 0.0
+  atom_coverage_weight: 0.0
   # Keep the maintained stage-2 path token-prediction focused by default.
   coeff_loss_type: auto
   coeff_huber_delta: 0.5
@@ -69,6 +83,7 @@ ar:
   # Real-valued sparse coefficient sampling defaults. Ignored for quantized caches.
   sample_coeff_temperature: null
   sample_coeff_mode: gaussian
+  sample_text_prompts: []
 
 # =============================================================================
 # Stage-2 Transformer Training And Generation Configuration
@@ -76,6 +91,12 @@ ar:
 train_ar:
   batch_size: 256
   max_epochs: 100
+  # Checkpoint policy is enforced by train_stage2_prior.py:
+  # keep the best 3 monitored checkpoints plus last.ckpt, saved/uploaded each epoch.
+  checkpoint_save_top_k: 3
+  checkpoint_save_last: true
+  checkpoint_keep_recent: 3
+  checkpoint_every_n_epochs: 1
   accelerator: gpu
   num_nodes: 1
   devices: 1
@@ -97,6 +118,12 @@ train_ar:
   sample_every_n_steps: 0
   sample_every_n_epochs: 0
   sample_num_images: 4
+  # Optional explicit labels for class-conditional previews. When set, the
+  # preview sampler repeats/truncates these labels to sample_num_images.
+  sample_class_labels: []
+  # Optional explicit prompts for text-conditioned previews. When set, the
+  # preview sampler repeats/truncates these prompts to sample_num_images.
+  sample_text_prompts: []
   sample_temperature: 1.0
   sample_top_k: 0
   sample_coeff_temperature: null

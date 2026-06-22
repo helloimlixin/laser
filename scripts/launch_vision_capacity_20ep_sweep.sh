@@ -388,7 +388,6 @@ submit_vision_laser() {
     --stage1-override model.commitment_cost=1.0 \
     --stage1-override model.dict_learning_rate="$dict_lr" \
     --stage1-override model.coef_max=16.0 \
-    --stage1-override model.bounded_omp_refine_steps=16 \
     --stage1-override model.sparsity_reg_weight=0.0 \
     --stage1-override model.recon_mse_weight=1.0 \
     --stage1-override model.recon_l1_weight=0.0 \

@@ -1,0 +1,101 @@
+# LASER ImageNet-256 per-site variant — RELAUNCH of run 88qwzymn
+# (imagenet-site-ds4-k16-a8192-prod-150k) with the frozen-dictionary fix.
+#
+# WHY THIS EXISTS
+#   Relaunch of 88qwzymn (which plateaued/regressed) with the plain gradient-trained
+#   dictionary and commitment_cost 0.05 -> 0.25 (pin the encoder to the dictionary
+#   manifold). The dictionary is a normal Adam parameter that learns via backprop.
+#
+# LAUNCH (mirrors the original; train.* / data.* stay on the CLI):
+#   python train_stage1_autoencoder.py \
+#     model=laser_imagenet_site data=imagenet \
+#     data.data_dir=/scratch/xl598/Projects/data/imagenet data.image_size=256 \
+#     data.batch_size=3 data.num_workers=8 seed=42 \
+#     train.devices=3 train.strategy=ddp train.precision=bf16-mixed train.accelerator=gpu \
+#     train.learning_rate=1.0e-4 train.max_steps=150000 \
+#     train.val_check_interval=30000 train.limit_val_batches=256 \
+#     checkpoint.save_top_k=2 \
+#     wandb.project=laser wandb.name=imagenet-site-ds4-k16-a8192-gradient-150k
+
+type: laser
+in_channels: 3
+
+# --- Backbone (attention U-Net, vqgan family) ---
+backbone: vqgan
+num_hiddens: 160
+num_residual_blocks: 3
+num_residual_hiddens: 112
+decoder_extra_residual_layers: 3
+out_tanh: true
+dropout: 0.0
+
+# Latent resolution: 256 -> 16x16 (f16). 5 multipliers for 4 downsamples; latent
+# feature-map sizes are 256/128/64/32/16, so attention at 16 and 32 covers the
+# low-resolution stages.
+num_downsamples: 4
+channel_multipliers: [1, 1, 2, 2, 4]
+backbone_latent_channels: 512
+max_ch_mult: 4
+attn_resolutions: [16, 32]
+use_mid_attention: true
+bypass_bottleneck: false
+
+# --- Sparse dictionary bottleneck (per-site: patch_size/stride = 1) ---
+num_embeddings: 8192
+embedding_dim: 128
+sparsity_level: 16
+commitment_cost: 0.25          # FIX: was 0.05 — pin encoder to the dictionary manifold
+bottleneck_loss_weight: 0.25
+dictionary_loss_weight: null
+dict_learning_rate: 2.5e-4
+coef_max: 16
+
+# Variational coefficients off (matches 88qwzymn).
+variational_coeffs: false
+variational_coeff_refine_weight: 0.0
+variational_coeff_target_std: 0.25
+variational_coeff_min_std: 0.01
+
+# Initialize dictionary atoms from the first batch's encoder latents.
+data_init_from_first_batch: true
+
+# Per-site sparse coding (no latent patches).
+patch_based: false
+patch_size: 1
+patch_stride: 1
+patch_reconstruction: tile
+
+sparsity_reg_weight: 0.01
+
+# --- Reconstruction loss mix (L1-dominant + edge, matching 88qwzymn) ---
+recon_mse_weight: 0.25
+recon_l1_weight: 1.0
+recon_edge_weight: 0.5
+
+# Perceptual loss (LPIPS), warmed up after a short reconstruction-only phase.
+perceptual_weight: 0.2
+perceptual_start_step: 1000
+perceptual_warmup_steps: 2000
+
+# --- PatchGAN adversarial loss: OFF (automatic optimization, as in 88qwzymn) ---
+adversarial_weight: 0.0
+disc_start_step: 0
+disc_num_layers: 3
+disc_channels: 64
+disc_norm: batch
+disc_spectral: false
+disc_loss: hinge
+disc_learning_rate: null
+use_adaptive_disc_weight: true
+disc_factor: 1.0
+disc_weight_max: 10000.0
+
+beta: 0.9
+
+compute_fid: false
+fid_feature: 2048
+
+log_images_every_n_steps: 1000
+diag_log_interval: 1000
+enable_val_latent_visuals: true
+codebook_visual_max_vectors: 1024

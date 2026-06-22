@@ -41,24 +41,44 @@ def _filter_readable_paths(paths: List[Path]) -> List[Path]:
 
 
 class FlatImageDataset(Dataset):
+    @staticmethod
+    def _list_image_paths(root: Path) -> List[Path]:
+        image_paths: List[Path] = []
+        stack = [root]
+        suffixes = tuple(IMG_EXTENSIONS)
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            elif entry.name.lower().endswith(suffixes):
+                                image_paths.append(Path(entry.path))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        image_paths.sort()
+        return image_paths
+
     def __init__(
         self,
         root: Union[str, Path],
         transform=None,
         paths: Optional[List[Path]] = None,
+        class_to_idx: Optional[dict[str, int]] = None,
     ):
         self.root = Path(root)
         self.transform = transform
+        self.class_to_idx = None if class_to_idx is None else dict(class_to_idx)
         if paths is not None:
             if not paths:
                 raise RuntimeError("No image paths provided for dataset subset.")
             self.image_paths = [Path(p) for p in paths]
         else:
-            image_paths: List[Path] = []
-            for path in self.root.rglob('*'):
-                if path.is_file() and path.suffix.lower() in IMG_EXTENSIONS:
-                    image_paths.append(path)
-            image_paths.sort()
+            image_paths = self._list_image_paths(self.root)
             if not image_paths:
                 raise RuntimeError(f'No images found under {self.root}')
             self.image_paths = image_paths
@@ -66,6 +86,15 @@ class FlatImageDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.image_paths)
+
+    def _label_for_path(self, path: Path) -> int:
+        if not self.class_to_idx:
+            return 0
+        try:
+            class_name = path.relative_to(self.root).parts[0]
+        except ValueError:
+            class_name = path.parent.name
+        return int(self.class_to_idx.get(class_name, 0))
 
     def __getitem__(self, index: int):
         # Robust image loading: skip over unreadable images instead of injecting black placeholders
@@ -80,7 +109,7 @@ class FlatImageDataset(Dataset):
                     img = img.convert('RGB')
                 if self.transform is not None:
                     img = self.transform(img)
-                return img, 0
+                return img, self._label_for_path(path)
             except Exception as exc:
                 failures.append(str(path))
                 last_exc = exc
@@ -107,10 +136,21 @@ class PackedRGBImageDataset(Dataset):
         random_horizontal_flip: bool = False,
         random_crop_size: Optional[Tuple[int, int]] = None,
         indices: Optional[List[int]] = None,
+        crop_size: Optional[int] = None,
     ):
         self.root = Path(root)
         self.image_size = int(image_size)
         self.random_horizontal_flip = bool(random_horizontal_flip)
+        if random_crop_size is None and crop_size is not None:
+            crop = int(crop_size)
+            random_crop_size = (crop, crop)
+        if random_crop_size is not None:
+            crop_h, crop_w = (int(random_crop_size[0]), int(random_crop_size[1]))
+            random_crop_size = (
+                (crop_h, crop_w)
+                if crop_h < self.image_size or crop_w < self.image_size
+                else None
+            )
         self.random_crop_size = random_crop_size
         self.packed_path = _packed_celeba_file(self.root, self.image_size)
         if not self.packed_path.exists():

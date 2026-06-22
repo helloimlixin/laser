@@ -80,6 +80,34 @@ class _FakeGPTPrior:
         self.cfg = type("Cfg", (), {"H": h, "W": w, "D": d})()
         self.real_valued_coeffs = False
         self.fill = int(fill)
+        self.bos_token_id = 0
+        self.n_global_spatial_tokens = 0
+        self.vocab_size = max(16, self.fill + 1)
+
+    def _flatten_tokens(self, tokens):
+        return tokens.reshape(tokens.size(0), -1)
+
+    def _forward_step(self, tokens, kv_cache=None, start_pos=0):
+        logits = torch.zeros(
+            tokens.size(0),
+            tokens.size(1),
+            self.vocab_size,
+            dtype=torch.float32,
+            device=tokens.device,
+        )
+        logits[..., self.fill] = 1.0
+        return logits, kv_cache
+
+    def _ban_used_atoms(self, logits, seq, *, step):
+        return logits
+
+    def _sample_from_logits(self, logits, *, temperature, top_k):
+        return torch.full(
+            (logits.size(0),),
+            self.fill,
+            dtype=torch.long,
+            device=logits.device,
+        )
 
     def generate(
         self,
@@ -467,7 +495,7 @@ def _rq_state(*, embedding_dim=16, dict_rows=None, num_atoms=2048):
     }
 
 
-def test_infer_rq_stage1_config_recovers_patch_layout_from_checkpoint_shape():
+def test_infer_rq_stage1_config_defaults_patch_layout_to_nonoverlap():
     state = _rq_state(dict_rows=16 * 8 * 8)
     cache = {
         "shape": (16, 16, 32),
@@ -478,8 +506,8 @@ def test_infer_rq_stage1_config_recovers_patch_layout_from_checkpoint_shape():
 
     assert cfg["patch_based"] is True
     assert cfg["patch_size"] == 8
-    assert cfg["patch_stride"] == 4
-    assert cfg["patch_reconstruction"] == "center_crop"
+    assert cfg["patch_stride"] == 8
+    assert cfg["patch_reconstruction"] == "tile"
     assert cfg["sparsity_level"] == 16
 
 

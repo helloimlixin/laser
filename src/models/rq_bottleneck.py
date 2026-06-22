@@ -179,7 +179,6 @@ class RQBottleneck(nn.Module):
                 ]
             )
 
-        self._last_diag = {}
         self._last_latent_loss = None
         self._last_dl_latent_loss = None
         self._last_e_latent_loss = None
@@ -228,15 +227,6 @@ class RQBottleneck(nn.Module):
         self._last_dl_latent_loss = commitment_loss.detach()
         self._last_e_latent_loss = commitment_loss.detach()
         self._last_bottleneck_loss = bottleneck_loss.detach()
-        with torch.no_grad():
-            self._last_diag = {
-                "dict_norm_max": self.codebooks[0].weight[:-1].norm(dim=1).max().detach(),
-                "dict_norm_mean": self.codebooks[0].weight[:-1].norm(dim=1).mean().detach(),
-                "dict_norm_min": self.codebooks[0].weight[:-1].norm(dim=1).min().detach(),
-                "coeff_abs_max": torch.ones((), device=z_e.device),
-                "coeff_abs_mean": torch.ones((), device=z_e.device),
-                "coeff_clip_frac": torch.zeros((), device=z_e.device),
-            }
 
         sparse_codes = SparseCodes(
             support=codes,

@@ -7,6 +7,7 @@ the future-compatibility warning about unsafe pickle loads.
 
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -15,13 +16,26 @@ import torch
 T = TypeVar("T", bound=torch.nn.Module)
 
 
+def _is_weights_only_rejection(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        "weights_only" in message
+        or "Weights only load failed" in message
+        or "Unsupported global" in message
+    )
+
+
 def load_torch_payload(path, *, map_location="cpu") -> Any:
-    """Load a checkpoint payload with ``weights_only=True`` when available."""
+    """Load a local checkpoint payload across PyTorch weights-only defaults."""
     resolved = Path(path).expanduser().resolve()
     try:
         return torch.load(resolved, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(resolved, map_location=map_location)
+    except (pickle.UnpicklingError, RuntimeError) as exc:
+        if not _is_weights_only_rejection(exc):
+            raise
+        return torch.load(resolved, map_location=map_location, weights_only=False)
 
 
 def extract_state_dict(payload: Any) -> Any:

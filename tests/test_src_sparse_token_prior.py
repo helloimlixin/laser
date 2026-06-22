@@ -88,6 +88,40 @@ class _FakeQuantPrior(torch.nn.Module):
         return logits
 
 
+def test_unpack_cached_batch_keeps_text_tokens_separate_when_shapes_match():
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
+    text_tokens = torch.tensor([[2, 3, 4, 0], [5, 6, 0, 0]], dtype=torch.long)
+    text_mask = text_tokens.ne(0)
+
+    got_tokens, coeffs, class_labels, got_text, got_mask = sparse_token_prior_module._unpack_cached_batch(
+        (tokens, text_tokens, text_mask, {"path": ["a.wav", "b.wav"]})
+    )
+
+    assert torch.equal(got_tokens, tokens)
+    assert coeffs is None
+    assert class_labels is None
+    assert torch.equal(got_text, text_tokens)
+    assert torch.equal(got_mask, text_mask)
+
+
+def test_unpack_cached_batch_handles_real_coeffs_labels_and_text():
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
+    coeffs = torch.randn(2, 4)
+    labels = torch.tensor([4, 7], dtype=torch.long)
+    text_tokens = torch.tensor([[2, 3, 4, 0], [5, 6, 0, 0]], dtype=torch.long)
+    text_mask = text_tokens.ne(0)
+
+    got_tokens, got_coeffs, got_labels, got_text, got_mask = sparse_token_prior_module._unpack_cached_batch(
+        (tokens, coeffs, labels, text_tokens, text_mask)
+    )
+
+    assert torch.equal(got_tokens, tokens)
+    assert torch.equal(got_coeffs, coeffs)
+    assert torch.equal(got_labels, labels)
+    assert torch.equal(got_text, text_tokens)
+    assert torch.equal(got_mask, text_mask)
+
+
 def test_compute_quantized_rq_losses_keeps_atom_coeff_breakdown():
     per_token_ce = torch.tensor([[[1.0, 5.0, 3.0, 7.0]]], dtype=torch.float32)
 
@@ -191,7 +225,34 @@ def test_sparse_token_prior_module_manual_lr_schedule_applies_first_step_without
     optimizer = mod.configure_optimizers()
     mod._apply_scheduled_lrs(optimizer, step=0)
 
+    assert mod._lr_total_steps == 100
     assert optimizer.param_groups[0]["lr"] == 1e-4
+
+
+def test_sparse_token_prior_lr_schedule_does_not_force_lightning_step_estimate_property():
+    mod = SparseTokenPriorModule(
+        prior=_FakeQuantPrior(),
+        learning_rate=1e-3,
+        warmup_steps=10,
+        min_lr_ratio=0.01,
+    )
+
+    class TrainerStub:
+        max_steps = -1
+        max_epochs = 100
+        num_training_batches = float("inf")
+
+        @property
+        def estimated_stepping_batches(self):
+            raise AssertionError("estimated_stepping_batches should not be forced")
+
+    mod.__dict__["_trainer"] = TrainerStub()
+
+    optimizer = mod.configure_optimizers()
+    mod._apply_scheduled_lrs(optimizer, step=0)
+
+    assert mod._lr_total_steps == 1
+    assert optimizer.param_groups[0]["lr"] == 1e-5
 
 
 def test_src_spatial_depth_prior_quantized_generation_preserves_unique_atoms():
@@ -315,6 +376,45 @@ def test_build_sparse_prior_from_hparams_uses_saved_depth_layer_count():
     assert model.cfg.n_depth_layers == 2
     assert model.atom_vocab_size == 3
     assert model.coeff_vocab_size == 2
+
+
+def test_build_sparse_prior_from_hparams_preserves_old_text_checkpoint_behavior():
+    cache = {
+        "tokens_flat": torch.zeros(4, 8, dtype=torch.int32),
+        "shape": (1, 2, 4),
+        "meta": {
+            "num_atoms": 3,
+            "coeff_vocab_size": 2,
+            "text_vocab_size": 12,
+            "text_max_length": 8,
+            "text_pad_id": 0,
+        },
+    }
+
+    model = build_sparse_prior_from_hparams(
+        cache,
+        hparams={
+            "prior_architecture": "spatial_depth",
+            "prior_d_model": 8,
+            "prior_n_heads": 2,
+            "prior_n_spatial_layers": 2,
+            "prior_n_depth_layers": 1,
+            "prior_n_global_spatial_tokens": 1,
+            "prior_d_ff": 16,
+            "prior_dropout": 0.0,
+            "prior_atom_vocab_size": 3,
+            "prior_coeff_vocab_size": 2,
+            "prior_real_valued_coeffs": False,
+            "prior_autoregressive_coeffs": True,
+            "prior_text_conditional": True,
+            "prior_text_vocab_size": 12,
+            "prior_text_max_length": 8,
+            "prior_text_pad_id": 0,
+        },
+    )
+
+    assert model.text_conditional is True
+    assert model.text_prefix_length == 0
 
 
 def test_build_sparse_prior_from_cache_supports_gpt_aliases():

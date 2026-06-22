@@ -156,7 +156,6 @@ echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPL
   "model.attn_resolutions=${STAGE1_ATTN_RESOLUTIONS}" \
   +model.bottleneck_type="${BOTTLENECK_TYPE}" \
   +model.dictionary_through_decoder="${DICTIONARY_THROUGH_DECODER}" \
-  +model.omp_residual_tolerance="${OMP_RESIDUAL_TOLERANCE}" \
   +model.dead_atom_revival_steps="${DEAD_ATOM_REVIVAL_STEPS}" \
   +model.data_init_from_first_batch="${DATA_INIT_FROM_FIRST_BATCH}" \
   +model.rq_code_depth="${RQ_CODE_DEPTH}" \

@@ -1,0 +1,68 @@
+defaults:
+  - laser
+  - _self_
+
+# Image non-patch sparse bottleneck preset for paper runs.
+# 256x256 inputs -> 8x8 latent sites with one sparse code per site.
+type: laser
+in_channels: 3
+
+backbone: vqgan
+num_hiddens: 128
+num_residual_blocks: 3
+num_residual_hiddens: 96
+decoder_extra_residual_layers: 2
+out_tanh: true
+dropout: 0.0
+
+num_downsamples: 5
+channel_multipliers: [1, 1, 2, 2, 4, 4]
+backbone_latent_channels: 512
+max_ch_mult: 4
+attn_resolutions: [8, 16]
+use_mid_attention: true
+bypass_bottleneck: false
+
+num_embeddings: 8192
+embedding_dim: 128
+sparsity_level: 3
+commitment_cost: 0.25
+bottleneck_loss_weight: 0.75
+dictionary_loss_weight: null
+dict_learning_rate: 2.5e-4
+coef_max: 16.0
+data_init_from_first_batch: true
+
+patch_based: false
+patch_size: 1
+patch_stride: 1
+patch_reconstruction: tile
+sparsity_reg_weight: 0.0
+
+recon_mse_weight: 0.25
+recon_l1_weight: 1.0
+recon_edge_weight: 0.5
+perceptual_weight: 0.2
+perceptual_start_step: 1000
+perceptual_warmup_steps: 2000
+
+adversarial_weight: 0.0
+adversarial_start_step: 1000000000
+adversarial_warmup_steps: 0
+disc_start_step: 1000000000
+disc_num_layers: 3
+disc_channels: 64
+disc_norm: group
+disc_spectral: false
+disc_loss: hinge
+disc_learning_rate: 5.0e-5
+use_adaptive_disc_weight: true
+disc_factor: 1.0
+disc_weight_max: 10000.0
+
+compute_fid: true
+fid_feature: 2048
+log_images_every_n_steps: 0
+diag_log_interval: 100
+enable_val_latent_visuals: false
+codebook_visual_max_vectors: 1024

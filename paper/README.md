@@ -19,4 +19,4 @@ pdflatex main.tex
 
 The draft uses the official TMLR style files from `JmlrOrg/tmlr-style-file` and includes all referenced figures under `figures/`, so the `paper/` directory can be uploaded directly to Overleaf as one project folder.
 
-Important caveat: the current audio LASER evidence is partial. The local artifacts include completed VQ-VAE VCTK stage-1/stage-2 runs and interrupted LASER VCTK stage-1 runs, but no completed LASER VCTK token cache or stage-2 checkpoint.
+Reported evidence: this draft uses only the CelebA-HQ run group `laser-train-powerlong-0612-celebahq-p2s2k4-q256-20260612_001034` and the VCTK waveform run group `laser-train-vctkgan-0613_0705-noMel-vctk-power-ds256-p2s2k4-q256-20260613_070519`.

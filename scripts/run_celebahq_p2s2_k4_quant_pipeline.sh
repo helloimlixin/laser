@@ -19,7 +19,7 @@ IMAGE_SIZE="${IMAGE_SIZE:-256}"
 
 STAGE1_DIR="${STAGE1_DIR:-${RUN_ROOT}/stage1}"
 STAGE2_DIR="${STAGE2_DIR:-${RUN_ROOT}/stage2}"
-CACHE="${CACHE:-${RUN_ROOT}/token_cache_q256.pt}"
+CACHE="${CACHE:-}"
 
 STAGE1_CKPT="${STAGE1_CKPT:-}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-10}"
@@ -46,8 +46,40 @@ PATCH_BASED="${PATCH_BASED:-true}"
 PATCH_SIZE="${PATCH_SIZE:-2}"
 PATCH_STRIDE="${PATCH_STRIDE:-2}"
 SPARSITY_LEVEL="${SPARSITY_LEVEL:-4}"
-COEF_MAX="${COEF_MAX:-16.0}"
+COEF_MAX="${COEF_MAX:-auto_p99.9}"
+STAGE1_COEF_MAX="${STAGE1_COEF_MAX:-null}"
+CACHE_COEFF_MAX="${CACHE_COEFF_MAX:-${COEF_MAX}}"
+CACHE_COEFF_MAX_PADDING="${CACHE_COEFF_MAX_PADDING:-1.05}"
 COEFF_BINS="${COEFF_BINS:-256}"
+CACHE_COEFF_MODE="${CACHE_COEFF_MODE:-quantized}"
+CACHE_COEFF_MODE="$(printf '%s' "${CACHE_COEFF_MODE}" | tr '[:upper:]' '[:lower:]')"
+case "${CACHE_COEFF_MODE}" in
+  quantized|quant|q)
+    CACHE_COEFF_MODE="quantized"
+    CACHE_COEFF_BINS="${CACHE_COEFF_BINS:-${COEFF_BINS}}"
+    CACHE_SUFFIX="q${CACHE_COEFF_BINS}"
+    ;;
+  continuous|real|real_valued|none)
+    CACHE_COEFF_MODE="continuous"
+    CACHE_COEFF_BINS=0
+    CACHE_SUFFIX="realcoeff"
+    ;;
+  *)
+    echo "ERROR: CACHE_COEFF_MODE must be quantized or continuous, got ${CACHE_COEFF_MODE}" >&2
+    exit 2
+    ;;
+esac
+if ! [[ "${CACHE_COEFF_BINS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: CACHE_COEFF_BINS must be a non-negative integer, got ${CACHE_COEFF_BINS}" >&2
+  exit 2
+fi
+if [[ "${CACHE_COEFF_MODE}" == "quantized" && "${CACHE_COEFF_BINS}" -le 0 ]]; then
+  echo "ERROR: quantized cache mode requires CACHE_COEFF_BINS > 0" >&2
+  exit 2
+fi
+if [[ -z "${CACHE}" ]]; then
+  CACHE="${RUN_ROOT}/token_cache_${CACHE_SUFFIX}.pt"
+fi
 
 RECON_MSE_WEIGHT="${RECON_MSE_WEIGHT:-0.25}"
 RECON_L1_WEIGHT="${RECON_L1_WEIGHT:-1.0}"
@@ -108,13 +140,17 @@ LATENT_H=$(( IMAGE_SIZE / (2 ** STAGE1_DOWNSAMPLES) ))
 PATCH_BASED_LOWER="$(printf '%s' "${PATCH_BASED}" | tr '[:upper:]' '[:lower:]')"
 if [[ "${PATCH_BASED_LOWER}" == "true" || "${PATCH_BASED_LOWER}" == "1" || "${PATCH_BASED_LOWER}" == "yes" ]]; then
   PRIOR_H=$(( ((LATENT_H - PATCH_SIZE) / PATCH_STRIDE) + 1 ))
-  RUN_LABEL="p${PATCH_SIZE}s${PATCH_STRIDE}_k${SPARSITY_LEVEL}_a${NUM_EMBEDDINGS}_q${COEFF_BINS}"
+  RUN_LABEL="p${PATCH_SIZE}s${PATCH_STRIDE}_k${SPARSITY_LEVEL}_a${NUM_EMBEDDINGS}_${CACHE_SUFFIX}"
 else
   PRIOR_H="${LATENT_H}"
-  RUN_LABEL="site_d${STAGE1_DOWNSAMPLES}_k${SPARSITY_LEVEL}_a${NUM_EMBEDDINGS}_q${COEFF_BINS}"
+  RUN_LABEL="site_d${STAGE1_DOWNSAMPLES}_k${SPARSITY_LEVEL}_a${NUM_EMBEDDINGS}_${CACHE_SUFFIX}"
 fi
 PRIOR_W="${PRIOR_H}"
-PRIOR_D=$((SPARSITY_LEVEL * 2))
+if (( CACHE_COEFF_BINS <= 0 )); then
+  PRIOR_D="${SPARSITY_LEVEL}"
+else
+  PRIOR_D=$((SPARSITY_LEVEL * 2))
+fi
 STAGE2_VARIANT_ARGS=()
 if [[ -n "${STAGE2_SAMPLE_VARIANTS}" ]]; then
   STAGE2_VARIANT_ARGS=("+train_ar.sample_variants=[${STAGE2_SAMPLE_VARIANTS}]")
@@ -129,7 +165,8 @@ echo "STAGE2_DIR=${STAGE2_DIR}"
 echo "CACHE=${CACHE}"
 echo "WANDB_GROUP=${WANDB_GROUP}"
 echo "IMAGE_SIZE=${IMAGE_SIZE}  LATENT_H=${LATENT_H}  DOWNSAMPLES=${STAGE1_DOWNSAMPLES}  CHANNEL_MULTIPLIERS=${STAGE1_CHANNEL_MULTIPLIERS}"
-echo "PATCH_BASED=${PATCH_BASED}  PATCH=${PATCH_SIZE}/${PATCH_STRIDE}  SPARSITY_LEVEL=${SPARSITY_LEVEL}  NUM_EMBEDDINGS=${NUM_EMBEDDINGS}  COEFF_BINS=${COEFF_BINS}"
+echo "PATCH_BASED=${PATCH_BASED}  PATCH=${PATCH_SIZE}/${PATCH_STRIDE}  SPARSITY_LEVEL=${SPARSITY_LEVEL}  NUM_EMBEDDINGS=${NUM_EMBEDDINGS}"
+echo "CACHE_COEFF_MODE=${CACHE_COEFF_MODE}  CACHE_COEFF_BINS=${CACHE_COEFF_BINS}  STAGE1_COEF_MAX=${STAGE1_COEF_MAX}  CACHE_COEFF_MAX=${CACHE_COEFF_MAX}  CACHE_COEFF_MAX_PADDING=${CACHE_COEFF_MAX_PADDING}"
 echo "BOTTLENECK_LOSS_WEIGHT=${BOTTLENECK_LOSS_WEIGHT}  COMMITMENT_COST=${COMMITMENT_COST}"
 echo "STAGE1_COMPUTE_FID=${STAGE1_COMPUTE_FID}  STAGE1_FID_FEATURE=${STAGE1_FID_FEATURE}"
 echo "ADVERSARIAL_WEIGHT=${ADVERSARIAL_WEIGHT}  ADV_START_STEP=${ADVERSARIAL_START_STEP}  ADV_START_RECON_MSE=${ADVERSARIAL_START_RECON_MSE}"
@@ -184,7 +221,7 @@ if [[ -z "${STAGE1_CKPT}" ]]; then
     model.online_ksvd_max_samples="${ONLINE_KSVD_MAX_SAMPLES}" \
     model.online_ksvd_max_atoms="${ONLINE_KSVD_MAX_ATOMS}" \
     model.online_ksvd_blend="${ONLINE_KSVD_BLEND}" \
-    model.coef_max="${COEF_MAX}" \
+    model.coef_max="${STAGE1_COEF_MAX}" \
     model.dict_learning_rate="${STAGE1_DICT_LR}" \
     model.num_residual_blocks="${NUM_RESIDUAL_BLOCKS}" \
     model.num_residual_hiddens="${NUM_RESIDUAL_HIDDENS}" \
@@ -245,8 +282,9 @@ echo "[$(date --iso-8601=seconds)] stage-1 checkpoint: ${STAGE1_CKPT}"
   --num-workers "${CACHE_NUM_WORKERS}" \
   --seed 42 \
   --max-items "${CACHE_MAX_ITEMS}" \
-  --coeff-bins "${COEFF_BINS}" \
-  --coeff-max "${COEF_MAX}" \
+  --coeff-bins "${CACHE_COEFF_BINS}" \
+  --coeff-max "${CACHE_COEFF_MAX}" \
+  --coeff-max-padding "${CACHE_COEFF_MAX_PADDING}" \
   --device auto
 
 echo "[$(date --iso-8601=seconds)] token cache: ${CACHE}"

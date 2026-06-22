@@ -30,6 +30,9 @@ class CachedTokenDataset(Dataset):
         self,
         tokens_flat: torch.Tensor,
         coeffs_flat: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
         audio_meta: Optional[dict] = None,
         *,
         shape: Optional[tuple[int, int, int]] = None,
@@ -50,6 +53,40 @@ class CachedTokenDataset(Dataset):
         else:
             self.coeffs_flat = None
         self.tokens_flat = tokens_flat.to(torch.long).contiguous()
+        if class_labels is not None:
+            if not torch.is_tensor(class_labels):
+                class_labels = torch.as_tensor(class_labels)
+            class_labels = class_labels.to(torch.long).reshape(-1).contiguous()
+            if int(class_labels.shape[0]) != int(self.tokens_flat.size(0)):
+                raise ValueError(
+                    f"class_labels length {int(class_labels.shape[0])} must match tokens_flat length {int(self.tokens_flat.size(0))}"
+                )
+            self.class_labels = class_labels
+        else:
+            self.class_labels = None
+        if text_tokens is not None:
+            if not torch.is_tensor(text_tokens):
+                text_tokens = torch.as_tensor(text_tokens)
+            text_tokens = text_tokens.to(torch.long).contiguous()
+            if text_tokens.ndim != 2 or int(text_tokens.shape[0]) != int(self.tokens_flat.size(0)):
+                raise ValueError(
+                    f"text_tokens must have shape [N, L] with N={int(self.tokens_flat.size(0))}, "
+                    f"got {tuple(text_tokens.shape)}"
+                )
+            if text_mask is None:
+                text_mask = text_tokens.ne(0)
+            elif not torch.is_tensor(text_mask):
+                text_mask = torch.as_tensor(text_mask)
+            text_mask = text_mask.to(torch.bool).contiguous()
+            if tuple(text_mask.shape) != tuple(text_tokens.shape):
+                raise ValueError(
+                    f"text_mask shape {tuple(text_mask.shape)} must match text_tokens shape {tuple(text_tokens.shape)}"
+                )
+            self.text_tokens = text_tokens
+            self.text_mask = text_mask
+        else:
+            self.text_tokens = None
+            self.text_mask = None
         self.audio_meta = None if audio_meta is None else dict(audio_meta)
         self.shape = None if shape is None else tuple(int(v) for v in shape)
         self.crop_shape = None if crop_shape is None else tuple(int(v) for v in crop_shape)
@@ -66,7 +103,16 @@ class CachedTokenDataset(Dataset):
                 if key == "path":
                     continue
                 if not torch.is_tensor(value):
-                    value = torch.as_tensor(value)
+                    try:
+                        value = torch.as_tensor(value)
+                    except (TypeError, ValueError):
+                        sequence = list(value)
+                        if len(sequence) != total_items:
+                            raise ValueError(
+                                f"audio_meta[{key!r}] length {len(sequence)} must match tokens_flat length {total_items}"
+                            )
+                        self.audio_meta[key] = sequence
+                        continue
                 if int(value.shape[0]) != total_items:
                     raise ValueError(
                         f"audio_meta[{key!r}] batch dimension {int(value.shape[0])} must match tokens_flat length {total_items}"
@@ -119,6 +165,9 @@ class CachedTokenDataset(Dataset):
         real_idx = int(self.indices[idx]) if self.indices is not None else int(idx)
         tokens = self.tokens_flat[real_idx]
         coeffs = None if self.coeffs_flat is None else self.coeffs_flat[real_idx]
+        class_label = None if self.class_labels is None else self.class_labels[real_idx]
+        text_tokens = None if self.text_tokens is None else self.text_tokens[real_idx]
+        text_mask = None if self.text_mask is None else self.text_mask[real_idx]
         audio_meta = self._audio_meta_item(real_idx)
         if self.crop_shape is not None:
             full_h, full_w, full_d = self.shape
@@ -130,13 +179,19 @@ class CachedTokenDataset(Dataset):
             if coeffs is not None:
                 coeffs = coeffs.view(full_h, full_w, full_d)[top : top + crop_h, left : left + crop_w, :]
                 coeffs = coeffs.reshape(-1)
-        if coeffs is None:
-            if audio_meta is None:
-                return tokens
-            return tokens, audio_meta
-        if audio_meta is None:
-            return tokens, coeffs
-        return tokens, coeffs, audio_meta
+        parts = [tokens]
+        if coeffs is not None:
+            parts.append(coeffs)
+        if class_label is not None:
+            parts.append(class_label)
+        if text_tokens is not None:
+            parts.append(text_tokens)
+            parts.append(text_mask)
+        if audio_meta is not None:
+            parts.append(audio_meta)
+        if len(parts) == 1:
+            return tokens
+        return tuple(parts)
 
 
 class TokenCacheDataModule(pl.LightningDataModule):
@@ -197,24 +252,46 @@ class TokenCacheDataModule(pl.LightningDataModule):
         cache = load_token_cache(self.cache_path)
         tokens_flat = cache.get("tokens_flat")
         coeffs_flat = cache.get("coeffs_flat")
+        class_labels = cache.get("class_labels")
+        text_tokens = cache.get("text_tokens")
+        text_mask = cache.get("text_mask")
         audio_meta = cache.get("audio_meta")
         if self.max_items > 0:
             tokens_flat = tokens_flat[: self.max_items]
             if coeffs_flat is not None:
                 coeffs_flat = coeffs_flat[: self.max_items]
+            if class_labels is not None:
+                class_labels = class_labels[: self.max_items]
+            if text_tokens is not None:
+                text_tokens = text_tokens[: self.max_items]
+            if text_mask is not None:
+                text_mask = text_mask[: self.max_items]
             if isinstance(audio_meta, dict):
                 sliced_meta = {"path": list(audio_meta.get("path", []))[: self.max_items]}
                 for key, value in audio_meta.items():
                     if key == "path":
                         continue
-                    tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
-                    sliced_meta[key] = tensor[: self.max_items].clone()
+                    if torch.is_tensor(value):
+                        sliced_meta[key] = value[: self.max_items].clone()
+                        continue
+                    try:
+                        tensor = torch.as_tensor(value)
+                    except (TypeError, ValueError):
+                        sliced_meta[key] = list(value)[: self.max_items]
+                    else:
+                        sliced_meta[key] = tensor[: self.max_items].clone()
                 audio_meta = sliced_meta
 
         self.cache = dict(cache)
         self.cache["tokens_flat"] = tokens_flat
         if coeffs_flat is not None:
             self.cache["coeffs_flat"] = coeffs_flat
+        if class_labels is not None:
+            self.cache["class_labels"] = class_labels
+        if text_tokens is not None:
+            self.cache["text_tokens"] = text_tokens
+        if text_mask is not None:
+            self.cache["text_mask"] = text_mask
         if audio_meta is not None:
             self.cache["audio_meta"] = audio_meta
 
@@ -238,6 +315,9 @@ class TokenCacheDataModule(pl.LightningDataModule):
         self.dataset = CachedTokenDataset(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
             audio_meta=audio_meta,
             shape=full_shape,
         )
@@ -253,6 +333,9 @@ class TokenCacheDataModule(pl.LightningDataModule):
         self.train_dataset = CachedTokenDataset(
             tokens_flat=tokens_flat,
             coeffs_flat=coeffs_flat,
+            class_labels=class_labels,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
             audio_meta=audio_meta,
             shape=full_shape,
             crop_shape=crop_shape,
@@ -263,6 +346,9 @@ class TokenCacheDataModule(pl.LightningDataModule):
             CachedTokenDataset(
                 tokens_flat=tokens_flat,
                 coeffs_flat=coeffs_flat,
+                class_labels=class_labels,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
                 audio_meta=audio_meta,
                 shape=full_shape,
                 crop_shape=crop_shape,
@@ -276,6 +362,9 @@ class TokenCacheDataModule(pl.LightningDataModule):
             CachedTokenDataset(
                 tokens_flat=tokens_flat,
                 coeffs_flat=coeffs_flat,
+                class_labels=class_labels,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
                 audio_meta=audio_meta,
                 shape=full_shape,
                 crop_shape=crop_shape,

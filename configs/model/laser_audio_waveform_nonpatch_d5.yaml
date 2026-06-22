@@ -1,0 +1,59 @@
+defaults:
+  - laser_audio_waveform
+  - _self_
+
+# VCTK/MAESTRO waveform non-patch sparse bottleneck preset.
+# 32768 samples -> 64 latent sites with one sparse code per site.
+type: laser
+in_channels: 1
+backbone: simple
+audio_backbone: waveform
+audio_downsample_rates: [4, 4, 4, 2, 2]
+
+num_hiddens: 224
+num_residual_blocks: 3
+num_residual_hiddens: 112
+num_embeddings: 8192
+embedding_dim: 128
+sparsity_level: 3
+commitment_cost: 1.0
+bottleneck_loss_weight: 0.75
+dictionary_loss_weight: null
+dict_learning_rate: 1.5e-4
+coef_max: 16.0
+data_init_from_first_batch: true
+
+patch_based: false
+patch_size: 1
+patch_stride: 1
+patch_reconstruction: tile
+sparsity_reg_weight: 0.0
+
+recon_mse_weight: 0.5
+recon_l1_weight: 0.5
+recon_edge_weight: 0.0
+perceptual_weight: 0.0
+audio_waveform_l1_weight: 1.0
+audio_multires_stft_loss_weight: 1.0
+audio_multires_stft_fft_sizes: [512, 1024, 2048]
+out_tanh: true
+compute_fid: false
+
+adversarial_weight: 0.0
+adversarial_start_step: 1000000000
+adversarial_warmup_steps: 0
+disc_start_step: 1000000000
+audio_adversarial_type: hifigan
+audio_disc_periods: [2, 3, 5, 7, 11]
+audio_disc_num_scales: 3
+audio_disc_max_channels: 512
+disc_channels: 32
+disc_num_layers: 3
+disc_learning_rate: 5.0e-5
+disc_loss: hinge
+use_adaptive_disc_weight: true
+
+log_images_every_n_steps: 0
+diag_log_interval: 100
+enable_val_latent_visuals: false
+codebook_visual_max_vectors: 1024

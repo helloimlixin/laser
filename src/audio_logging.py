@@ -64,6 +64,7 @@ def _get_value(source: Any, key: str, default=None):
 def audio_config_from_source(source: Any) -> dict:
     win_length = _get_value(source, "stft_win_length", None)
     n_fft = int(_get_value(source, "stft_n_fft", 1024))
+    audio_max_gain = float(_get_value(source, "audio_max_gain", 8.0))
     return {
         "dataset": str(_get_value(source, "dataset", "") or ""),
         "mean": tuple(float(v) for v in (_get_value(source, "mean", (0.5,)) or (0.5,))),
@@ -83,7 +84,19 @@ def audio_config_from_source(source: Any) -> dict:
         "audio_target_peak": float(_get_value(source, "audio_target_peak", 0.95)),
         "audio_rms_normalize": bool(_get_value(source, "audio_rms_normalize", False)),
         "audio_target_rms": float(_get_value(source, "audio_target_rms", 0.12)),
-        "audio_max_gain": float(_get_value(source, "audio_max_gain", 8.0)),
+        "audio_max_gain": audio_max_gain,
+        "generated_audio_rms_normalize": bool(
+            _get_value(source, "generated_audio_rms_normalize", _get_value(source, "audio_rms_normalize", False))
+        ),
+        "generated_audio_target_rms": float(
+            _get_value(source, "generated_audio_target_rms", _get_value(source, "audio_target_rms", 0.12))
+        ),
+        "generated_audio_target_peak": float(
+            _get_value(source, "generated_audio_target_peak", _get_value(source, "audio_target_peak", 0.95))
+        ),
+        "generated_audio_max_gain": float(
+            _get_value(source, "generated_audio_max_gain", max(audio_max_gain, 64.0))
+        ),
         "audio_min_crop_rms": float(_get_value(source, "audio_min_crop_rms", 0.0)),
         "audio_crop_attempts": int(_get_value(source, "audio_crop_attempts", 1)),
         "audio_fade_samples": int(_get_value(source, "audio_fade_samples", 0)),
@@ -379,6 +392,14 @@ def _has_visqol_python_module() -> bool:
     return importlib.util.find_spec("visqol") is not None
 
 
+def _has_pesq() -> bool:
+    return importlib.util.find_spec("pesq") is not None
+
+
+def _has_stoi() -> bool:
+    return importlib.util.find_spec("pystoi") is not None
+
+
 def _visqol_mode(sample_rate: int) -> str:
     return "speech" if int(sample_rate) <= 16000 else "audio"
 
@@ -624,6 +645,68 @@ def compute_waveform_multires_stft_loss(
     }
 
 
+_MEL_FB_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
+def _cached_mel_filterbank(*, sample_rate: int, n_fft: int, n_mels: int, device, dtype) -> torch.Tensor:
+    key = (int(sample_rate), int(n_fft), int(n_mels))
+    fb = _MEL_FB_CACHE.get(key)
+    if fb is None:
+        fb = _mel_filterbank(sample_rate=int(sample_rate), n_fft=int(n_fft), n_mels=int(n_mels))
+        _MEL_FB_CACHE[key] = fb
+    return fb.to(device=device, dtype=dtype)
+
+
+def compute_waveform_multiscale_mel_loss(
+    inputs: torch.Tensor,
+    reconstructions: torch.Tensor,
+    *,
+    sample_rate: int = 16000,
+    fft_sizes: Optional[Sequence[int]] = None,
+    n_mels: Sequence[int] | int = 80,
+) -> dict[str, torch.Tensor]:
+    """Differentiable multi-scale log-mel L1 loss (DAC/HiFi-GAN style).
+
+    For each STFT resolution the magnitude spectrogram is projected onto a mel
+    filterbank, log-compressed, and compared with L1. This is the perceptual
+    reconstruction objective that pairs with the adversarial + feature-matching
+    losses. Returns ``{}`` for non-waveform inputs.
+    """
+    if not torch.is_tensor(inputs) or not torch.is_tensor(reconstructions):
+        return {}
+    if inputs.ndim != 3 or reconstructions.ndim != 3 or int(inputs.size(1)) != 1 or int(reconstructions.size(1)) != 1:
+        return {}
+
+    fft_sizes = _canonical_stft_sizes(fft_sizes, (512, 1024, 2048))
+    if isinstance(n_mels, int):
+        n_mels_list = [int(n_mels)] * len(fft_sizes)
+    else:
+        n_mels_list = [int(m) for m in n_mels]
+        if len(n_mels_list) != len(fft_sizes):
+            raise ValueError(
+                f"n_mels must be an int or match fft_sizes length (got {len(n_mels_list)} vs {len(fft_sizes)})"
+            )
+
+    eps = 1.0e-5
+    result_dtype = inputs.dtype if torch.is_floating_point(inputs) else torch.float32
+    recon = reconstructions.to(dtype=torch.float32)
+    target = inputs.to(dtype=torch.float32)
+    terms = []
+    for n_fft, mels in zip(fft_sizes, n_mels_list):
+        hop = max(1, n_fft // 4)
+        target_mag = _stft_magnitude_batch(target, n_fft=n_fft, hop_length=hop, win_length=n_fft)
+        recon_mag = _stft_magnitude_batch(recon, n_fft=n_fft, hop_length=hop, win_length=n_fft)
+        fb = _cached_mel_filterbank(
+            sample_rate=sample_rate, n_fft=n_fft, n_mels=mels, device=target_mag.device, dtype=target_mag.dtype
+        )
+        # [n_mels, F] @ [B, F, T] -> [B, n_mels, T]
+        target_mel = torch.log(torch.einsum("mf,bft->bmt", fb, target_mag).clamp_min(eps))
+        recon_mel = torch.log(torch.einsum("mf,bft->bmt", fb, recon_mag).clamp_min(eps))
+        terms.append(F.l1_loss(recon_mel, target_mel))
+    mel_loss = torch.stack(terms).mean().to(dtype=result_dtype)
+    return {"audio_mel_loss": mel_loss}
+
+
 def _compute_waveform_reconstruction_metrics(
     inputs: torch.Tensor,
     reconstructions: torch.Tensor,
@@ -631,6 +714,7 @@ def _compute_waveform_reconstruction_metrics(
     config: Mapping[str, Any],
     device: torch.device,
     dtype: torch.dtype,
+    compute_visqol: bool = False,
 ) -> dict:
     target = inputs.detach().to(torch.float32)
     recon = reconstructions.detach().to(torch.float32)
@@ -660,7 +744,7 @@ def _compute_waveform_reconstruction_metrics(
         torch.tensor(0.0),
     )
     lsd = logmag_l1.to(torch.float32)
-    return {
+    metrics = {
         "audio_lsd": lsd.to(device=device, dtype=dtype),
         "audio_log_spectral_distance": lsd.to(device=device, dtype=dtype),
         "audio_waveform_mse": waveform_mse.to(device=device, dtype=dtype),
@@ -669,6 +753,68 @@ def _compute_waveform_reconstruction_metrics(
         "audio_logmag_l1": logmag_l1.to(device=device, dtype=dtype),
         "audio_spectral_convergence": spectral_convergence.to(device=device, dtype=dtype),
     }
+    should_compute_visqol = bool(compute_visqol) and (
+        _has_visqol_python_module() or _resolve_visqol_binary() is not None
+    )
+    if should_compute_visqol:
+        visqol_scores = []
+        for idx in range(limit):
+            try:
+                score = _measure_visqol(
+                    target[idx, 0].clamp(-1.0, 1.0),
+                    recon[idx, 0].clamp(-1.0, 1.0),
+                    sample_rate=int(config["sample_rate"]),
+                )
+            except Exception:
+                score = None
+            if score is not None:
+                visqol_scores.append(torch.tensor(float(score), dtype=torch.float32))
+        if visqol_scores:
+            metrics["audio_visqol"] = torch.stack(visqol_scores).mean().to(device=device, dtype=dtype)
+
+    # PESQ + STOI: pip-installable reference-based perceptual metrics, used as the
+    # practical alternative to ViSQOL (which has no wheel and needs a bazel C++
+    # build). Gated by the same val/test `compute_visqol` flag and computed only
+    # when the packages are importable, so train-time and image runs are unaffected.
+    sr = int(config["sample_rate"])
+    if bool(compute_visqol) and _has_pesq() and sr in (8000, 16000):
+        try:
+            from pesq import pesq as _pesq_fn
+
+            mode = "wb" if sr == 16000 else "nb"
+            pesq_scores = []
+            for idx in range(limit):
+                try:
+                    ref = target[idx, 0].clamp(-1.0, 1.0).numpy()
+                    deg = recon[idx, 0].clamp(-1.0, 1.0).numpy()
+                    pesq_scores.append(float(_pesq_fn(sr, ref, deg, mode)))
+                except Exception:
+                    continue
+            if pesq_scores:
+                metrics["audio_pesq"] = torch.tensor(
+                    sum(pesq_scores) / len(pesq_scores), dtype=torch.float32
+                ).to(device=device, dtype=dtype)
+        except Exception:
+            pass
+    if bool(compute_visqol) and _has_stoi():
+        try:
+            from pystoi import stoi as _stoi_fn
+
+            stoi_scores = []
+            for idx in range(limit):
+                try:
+                    ref = target[idx, 0].clamp(-1.0, 1.0).numpy()
+                    deg = recon[idx, 0].clamp(-1.0, 1.0).numpy()
+                    stoi_scores.append(float(_stoi_fn(ref, deg, sr, extended=False)))
+                except Exception:
+                    continue
+            if stoi_scores:
+                metrics["audio_stoi"] = torch.tensor(
+                    sum(stoi_scores) / len(stoi_scores), dtype=torch.float32
+                ).to(device=device, dtype=dtype)
+        except Exception:
+            pass
+    return metrics
 
 
 def compute_audio_reconstruction_metrics(
@@ -695,6 +841,7 @@ def compute_audio_reconstruction_metrics(
             config=config,
             device=inputs.device,
             dtype=dtype,
+            compute_visqol=compute_visqol,
         )
 
     limit = min(int(inputs.size(0)), int(reconstructions.size(0)), len(audio_meta["path"]))
@@ -819,7 +966,7 @@ def compute_audio_generation_metrics(
     audio_meta: Optional[Mapping[str, Any]] = None,
     max_items: int = 16,
 ) -> dict:
-    """Compute a lightweight FAD-style log-mel perceptual proxy for generated VCTK audio."""
+    """Compute lightweight distribution and health metrics for generated audio."""
     config = audio_config_from_source(audio_source)
     if not _dataset_supports_audio_logging(config):
         return {}
@@ -841,6 +988,33 @@ def compute_audio_generation_metrics(
     generated_spec_item = _representative_audio_spec_item(meta, config)
     generated_features = []
     real_features = []
+    generated_rms = []
+    real_rms = []
+    generated_peak = []
+    generated_clip_fraction = []
+    generated_silence = []
+    generated_zcr = []
+    real_zcr = []
+
+    def _waveform_stats(waveform: torch.Tensor) -> dict[str, torch.Tensor]:
+        wave = waveform.to(torch.float32).reshape(-1)
+        if wave.numel() == 0:
+            raise ValueError("empty waveform")
+        rms = wave.pow(2).mean().sqrt()
+        peak = wave.abs().max()
+        clip_fraction = (wave.abs() >= 0.999).to(torch.float32).mean()
+        silence = (rms < 1.0e-4).to(torch.float32)
+        if wave.numel() > 1:
+            zcr = (wave[1:].signbit() != wave[:-1].signbit()).to(torch.float32).mean()
+        else:
+            zcr = wave.new_zeros(())
+        return {
+            "rms": rms,
+            "peak": peak,
+            "clip_fraction": clip_fraction,
+            "silence": silence,
+            "zcr": zcr,
+        }
 
     with torch.no_grad():
         for idx in range(limit):
@@ -861,6 +1035,15 @@ def compute_audio_generation_metrics(
                 real_waveform = _load_cropped_waveform(real_item, config)
                 generated_features.append(_audio_logmel_feature(generated_waveform, config))
                 real_features.append(_audio_logmel_feature(real_waveform, config))
+                gen_stats = _waveform_stats(generated_waveform)
+                real_stats = _waveform_stats(real_waveform)
+                generated_rms.append(gen_stats["rms"])
+                real_rms.append(real_stats["rms"])
+                generated_peak.append(gen_stats["peak"])
+                generated_clip_fraction.append(gen_stats["clip_fraction"])
+                generated_silence.append(gen_stats["silence"])
+                generated_zcr.append(gen_stats["zcr"])
+                real_zcr.append(real_stats["zcr"])
             except Exception:
                 continue
 
@@ -871,9 +1054,21 @@ def compute_audio_generation_metrics(
     real_stack = torch.stack(real_features, dim=0)
     frechet = _diag_frechet_distance(real_stack, generated_stack).to(device=device, dtype=dtype)
     mean_l1 = (real_stack.mean(dim=0) - generated_stack.mean(dim=0)).abs().mean().to(device=device, dtype=dtype)
+    gen_rms = torch.stack(generated_rms).to(device=device, dtype=dtype)
+    ref_rms = torch.stack(real_rms).to(device=device, dtype=dtype)
+    gen_zcr = torch.stack(generated_zcr).to(device=device, dtype=dtype)
+    ref_zcr = torch.stack(real_zcr).to(device=device, dtype=dtype)
     return {
         "audio_generation_logmel_frechet": frechet,
         "audio_generation_logmel_mean_l1": mean_l1,
+        "audio_generation_rms_mean": gen_rms.mean(),
+        "audio_generation_rms_std": gen_rms.std(unbiased=False),
+        "audio_generation_rms_mean_l1": (gen_rms.mean() - ref_rms.mean()).abs(),
+        "audio_generation_peak_mean": torch.stack(generated_peak).to(device=device, dtype=dtype).mean(),
+        "audio_generation_clip_fraction": torch.stack(generated_clip_fraction).to(device=device, dtype=dtype).mean(),
+        "audio_generation_silence_fraction": torch.stack(generated_silence).to(device=device, dtype=dtype).mean(),
+        "audio_generation_zcr_mean": gen_zcr.mean(),
+        "audio_generation_zcr_mean_l1": (gen_zcr.mean() - ref_zcr.mean()).abs(),
     }
 
 
@@ -971,6 +1166,26 @@ def _write_wav_audio_file(root: Path, stem: str, waveform: torch.Tensor, *, samp
     return path
 
 
+def _write_audio_preview_pair(
+    artifact_dir: Any,
+    split: str,
+    basename: str,
+    original_waveform: torch.Tensor,
+    reconstructed_waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+) -> None:
+    if artifact_dir in (None, ""):
+        return
+    try:
+        root = _audio_artifact_root(artifact_dir, split)
+        _write_wav_audio_file(root, f"{basename}_original", original_waveform, sample_rate=sample_rate)
+        _write_wav_audio_file(root, f"{basename}_reconstructed", reconstructed_waveform, sample_rate=sample_rate)
+    except Exception:
+        # W&B media still carries the payload; local WAV export is best-effort.
+        return
+
+
 def _representative_audio_spec_item(audio_meta: Optional[Mapping[str, Any]], config: Mapping[str, Any]) -> dict:
     if isinstance(audio_meta, Mapping) and "spec_min" in audio_meta and "spec_max" in audio_meta:
         spec_min_values = _tensor_1d(audio_meta["spec_min"], dtype=torch.float32)
@@ -1018,6 +1233,17 @@ def _wandb_audio_array(waveform: torch.Tensor) -> np.ndarray:
     return torch.clamp(waveform.detach().cpu().to(torch.float32), -1.0, 1.0).numpy().copy()
 
 
+def normalize_generated_waveform_for_preview(waveform: torch.Tensor, config: Mapping[str, Any]) -> torch.Tensor:
+    """Apply listening-only RMS normalization to generated audio previews."""
+    return _rms_normalize_waveform(
+        waveform.detach().to(torch.float32).reshape(-1).clamp(-1.0, 1.0),
+        enabled=bool(config.get("generated_audio_rms_normalize", config.get("audio_rms_normalize", False))),
+        target_rms=float(config.get("generated_audio_target_rms", config.get("audio_target_rms", 0.12))),
+        max_gain=float(config.get("generated_audio_max_gain", max(float(config.get("audio_max_gain", 8.0)), 64.0))),
+        peak_limit=float(config.get("generated_audio_target_peak", config.get("audio_target_peak", 0.95))),
+    )
+
+
 def _image_media_payload(items: list[np.ndarray], captions: Optional[list[Optional[str]]] = None) -> dict:
     payload = {
         "kind": "image",
@@ -1052,6 +1278,7 @@ def build_generated_audio_log_payload(
     split: str = "generation",
     max_items: int = 4,
     artifact_dir: Any = None,
+    captions: Optional[list[str]] = None,
 ) -> dict:
     config = audio_config_from_source(audio_source)
     if not _dataset_supports_audio_logging(config):
@@ -1085,10 +1312,14 @@ def build_generated_audio_log_payload(
                     length=int(config["audio_num_samples"]),
                     num_iters=int(config["griffin_lim_iters"]),
                 )
+            waveform = normalize_generated_waveform_for_preview(waveform, config)
         except Exception:
             continue
         audio_items.append(_wandb_audio_array(waveform))
-        audio_captions.append(f"generated audio {idx}")
+        if captions is not None and idx < len(captions) and str(captions[idx]).strip():
+            audio_captions.append(str(captions[idx]))
+        else:
+            audio_captions.append(f"generated audio {idx}")
         audio_sample_rates.append(int(config["sample_rate"]))
 
     if not audio_items:
@@ -1226,6 +1457,14 @@ def build_audio_log_payload(
                 ]
             )
             audio_sample_rates.extend([int(config["sample_rate"]), int(config["sample_rate"])])
+            _write_audio_preview_pair(
+                artifact_dir,
+                split,
+                basename,
+                original_waveform,
+                recon_waveform,
+                sample_rate=int(config["sample_rate"]),
+            )
             try:
                 original_mel = _mel_db(original_waveform, config)
                 recon_mel = _mel_db(recon_waveform, config)
@@ -1329,6 +1568,14 @@ def build_audio_log_payload(
                 int(config["sample_rate"]),
                 int(config["sample_rate"]),
             ]
+        )
+        _write_audio_preview_pair(
+            artifact_dir,
+            split,
+            basename,
+            original_waveform,
+            recon_waveform,
+            sample_rate=int(config["sample_rate"]),
         )
 
         original_mel = _mel_db(original_waveform, config)

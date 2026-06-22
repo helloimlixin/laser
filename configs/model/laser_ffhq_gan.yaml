@@ -1,0 +1,100 @@
+# LASER FFHQ-256 variant: PatchGAN + higher-resolution latent at a FIXED stage-2
+# token budget. Launch with:  model=laser_ffhq_gan data=ffhq
+#
+# Rationale (vs the over-smoothed run zdmy0xi3):
+#   * Stage-2 token sequence length = (#bottleneck patches) x sparsity_level.
+#     #patches = (latent_HW / patch_stride)^2.
+#   * zdmy0xi3:    num_downsamples=5 -> 8x8 latent, patch_size/stride=2 -> 4x4 = 16 patches.
+#   * this config: num_downsamples=4 -> 16x16 latent, patch_size/stride=4 -> 4x4 = 16 patches.
+#     => identical token count (16 patches x sparsity 8), but the decoder now
+#     reconstructs from a 2x finer latent grid, so the fidelity ceiling rises.
+#   * PatchGAN adversarial loss restores the high-frequency texture that the
+#     reconstruction-only objective (MSE/L1/edge/LPIPS) averages away. It costs
+#     ZERO extra tokens.
+type: laser
+in_channels: 3
+
+# --- Backbone (attention U-Net, same family as zdmy0xi3) ---
+backbone: vqgan
+num_hiddens: 192
+num_residual_blocks: 4
+num_residual_hiddens: 96
+decoder_extra_residual_layers: 3
+out_tanh: true
+
+# Latent resolution: 256 -> 16x16 (f16) instead of 8x8 (f32). 5 multipliers for 4
+# downsamples. Latent feature-map sizes seen are 256/128/64/32/16, so attention
+# at 16 and 32 covers the low-resolution stages.
+num_downsamples: 4
+channel_multipliers: [1, 1, 2, 2, 4]
+max_ch_mult: 4
+attn_resolutions: [16, 32]
+use_mid_attention: true
+backbone_latent_channels: 512
+dropout: 0.0
+
+# --- Sparse dictionary bottleneck ---
+num_embeddings: 16384
+embedding_dim: 128
+sparsity_level: 8
+commitment_cost: 0.05
+bottleneck_loss_weight: 0.2
+dictionary_loss_weight: null
+dict_learning_rate: 2.5e-4
+coef_max: 8
+
+# Larger latent patch (4x4 over a 16x16 latent) keeps the patch GRID at 4x4 = 16,
+# i.e. the same stage-2 sequence length as zdmy0xi3's 2x2 patches over 8x8.
+# NOTE: each patch now covers 4x more latent cells at fixed sparsity_level; if
+# reconstruction is still patch-limited, raise sparsity_level (this DOES grow the
+# token sequence) or num_embeddings (vocab only, no sequence growth).
+patch_based: true
+patch_size: 4
+patch_stride: 4
+patch_reconstruction: tile
+
+sparsity_reg_weight: 0.01
+
+# --- Reconstruction + perceptual losses (carried over from zdmy0xi3) ---
+recon_mse_weight: 0.2
+recon_l1_weight: 1.0
+recon_edge_weight: 0.35
+perceptual_weight: 0.2
+perceptual_start_step: 0
+perceptual_warmup_steps: 2000
+
+# --- PatchGAN adversarial loss (the main sharpness lever) ---
+adversarial_weight: 0.8
+adversarial_start_step: 5000
+adversarial_warmup_steps: 0
+# Let the autoencoder learn coarse structure before the critic engages.
+disc_start_step: 5000
+disc_num_layers: 3
+disc_channels: 64
+# GroupNorm avoids DDP BatchNorm sync and is robust to small per-GPU batches.
+disc_norm: group
+disc_spectral: false
+disc_loss: hinge
+disc_learning_rate: null
+use_adaptive_disc_weight: true
+disc_factor: 1.0
+disc_weight_max: 10000.0
+
+# --- Dictionary maintenance (unchanged from laser.yaml) ---
+data_init_from_first_batch: false
+separable_dictionary_rank: 0
+separable_dictionary_factor_dims: null
+variational_coeffs: false
+variational_coeff_refine_weight: 0.0
+variational_coeff_target_std: 0.25
+variational_coeff_min_std: 0.01
+bypass_bottleneck: false
+beta: 0.9
+
+# --- Logging / eval ---
+compute_fid: true
+fid_feature: 2048
+log_images_every_n_steps: 200
+diag_log_interval: 0
+enable_val_latent_visuals: true
+codebook_visual_max_vectors: 1024
