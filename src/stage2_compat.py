@@ -125,31 +125,12 @@ def _infer_rq_patch_layout(
 
     if patch_based:
         patch_size = int(metadata.get("patch_size", inferred_patch_size or 8))
-        latent_hw = metadata.get("latent_hw") or token_cache.get("latent_hw")
-        if isinstance(latent_hw, (tuple, list)) and len(latent_hw) == 2:
-            latent_h, latent_w = int(latent_hw[0]), int(latent_hw[1])
-        else:
-            image_size = metadata.get("image_size")
-            if image_size is None:
-                latent_h = latent_w = 0
-            else:
-                latent_side = max(1, int(image_size) // (2 ** max(0, int(num_downsamples))))
-                latent_h = latent_w = latent_side
-        inferred_patch_stride = None
-        shape = token_cache.get("shape")
-        if isinstance(shape, (tuple, list)) and len(shape) == 3 and latent_h > 0 and latent_w > 0:
-            token_h, token_w = int(shape[0]), int(shape[1])
-            stride_h = max(1, math.ceil(latent_h / max(1, token_h)))
-            stride_w = max(1, math.ceil(latent_w / max(1, token_w)))
-            if stride_h == stride_w:
-                inferred_patch_stride = stride_h
-        patch_stride = int(metadata.get("patch_stride", inferred_patch_stride or max(1, patch_size // 2)))
+        patch_stride = int(metadata.get("patch_stride", patch_size))
     else:
         patch_size = int(metadata.get("patch_size", 1))
         patch_stride = int(metadata.get("patch_stride", 1))
 
-    default_recon = "tile" if patch_based and patch_stride == patch_size else "center_crop"
-    patch_reconstruction = str(metadata.get("patch_reconstruction", default_recon))
+    patch_reconstruction = str(metadata.get("patch_reconstruction", "tile"))
     return patch_based, patch_size, patch_stride, patch_reconstruction
 
 
@@ -380,8 +361,8 @@ def _infer_stage1_metadata_defaults(payload, cache: dict) -> dict:
         {
             "patch_based": bool(rq_cfg.get("patch_based", False)),
             "patch_size": int(rq_cfg.get("patch_size", 8)),
-            "patch_stride": int(rq_cfg.get("patch_stride", 4)),
-            "patch_reconstruction": str(rq_cfg.get("patch_reconstruction", "center_crop")),
+            "patch_stride": int(rq_cfg.get("patch_stride", rq_cfg.get("patch_size", 8))),
+            "patch_reconstruction": str(rq_cfg.get("patch_reconstruction", "tile")),
             "variational_coeffs": bool(rq_cfg.get("variational_coeffs", False)),
             "variational_coeff_target_std": float(rq_cfg.get("variational_coeff_target_std", 0.25)),
             "variational_coeff_min_std": float(rq_cfg.get("variational_coeff_min_std", 0.01)),
@@ -603,6 +584,7 @@ def decode_stage2_tokens(
     *,
     device=None,
     latent_hw: Optional[Tuple[int, int]] = None,
+    class_labels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if device is None:
         try:
@@ -629,7 +611,15 @@ def decode_stage2_tokens(
             raise ValueError(f"Expected VQ-VAE tokens with rank 3 or 4, got shape {tuple(tokens.shape)}")
         h_z = int(indices.shape[1])
         w_z = int(indices.shape[2])
-        return bundle.model.decode_from_indices(indices.reshape(indices.size(0), -1), h_z, w_z)
+        speaker_indices = None
+        if class_labels is not None:
+            speaker_indices = torch.as_tensor(class_labels, device=device, dtype=torch.long).reshape(-1)
+        return bundle.model.decode_from_indices(
+            indices.reshape(indices.size(0), -1),
+            h_z,
+            w_z,
+            speaker_indices=speaker_indices,
+        )
 
     target_hw = _resolve_decode_latent_hw(
         bundle,
@@ -708,9 +698,16 @@ def decode_stage2_outputs(
     *,
     device=None,
     latent_hw: Optional[Tuple[int, int]] = None,
+    class_labels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if coeffs is None:
-        return decode_stage2_tokens(bundle, atoms_or_tokens, device=device, latent_hw=latent_hw)
+        return decode_stage2_tokens(
+            bundle,
+            atoms_or_tokens,
+            device=device,
+            latent_hw=latent_hw,
+            class_labels=class_labels,
+        )
     if bundle.kind == "vqvae":
         raise RuntimeError("VQ-VAE stage-2 decoding does not use sparse atom+coefficient outputs.")
 

@@ -91,15 +91,12 @@ ar:
 train_ar:
   batch_size: 256
   max_epochs: 100
-  # Rolling "most-recent epochs" checkpoints (in addition to best-by-val/loss).
-  # These priors overfit (val/loss bottoms early then rises), so the monitored
-  # checkpoint stops updating and late-epoch weights — often the best-looking
-  # samples — never reach disk. Keep the K latest snapshots, saved every N epochs.
-  # Set checkpoint_keep_recent: 0 to disable.
+  # Checkpoint policy is enforced by train_stage2_prior.py:
+  # keep the best 3 monitored checkpoints plus last.ckpt, saved/uploaded each epoch.
   checkpoint_save_top_k: 3
   checkpoint_save_last: true
   checkpoint_keep_recent: 3
-  checkpoint_every_n_epochs: 10
+  checkpoint_every_n_epochs: 1
   accelerator: gpu
   num_nodes: 1
   devices: 1

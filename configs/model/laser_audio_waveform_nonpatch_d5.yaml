@@ -18,9 +18,9 @@ embedding_dim: 128
 sparsity_level: 3
 commitment_cost: 1.0
 bottleneck_loss_weight: 0.75
+dictionary_loss_weight: null
 dict_learning_rate: 1.5e-4
 coef_max: 16.0
-bounded_omp_refine_steps: 16
 data_init_from_first_batch: true
 
 patch_based: false

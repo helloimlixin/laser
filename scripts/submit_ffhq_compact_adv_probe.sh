@@ -122,7 +122,6 @@ cd "$SNAPSHOT_PATH"
   model.patch_stride=1 \\
   model.patch_reconstruction=tile \\
   model.coef_max=8.0 \\
-  model.bounded_omp_refine_steps=16 \\
   model.bottleneck_loss_weight=0.75 \\
   model.commitment_cost=1.0 \\
   model.dict_learning_rate=4e-5 \\

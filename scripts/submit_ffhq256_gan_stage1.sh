@@ -3,10 +3,8 @@
 # stage-2 token budget (configs/model/laser_ffhq_gan.yaml). This is the "do better"
 # follow-up to the over-smoothed run zdmy0xi3.
 #
-# Single-GPU on purpose: the adversarial path uses Lightning MANUAL optimization
-# (two optimizers). Multi-GPU DDP with two backward passes over overlapping graphs
-# needs requires_grad toggling / find_unused_parameters, which is not yet wired —
-# so this launches on one GPU for a robust first run.
+# Single-GPU by default for this probe; the adversarial path now uses standard
+# DDP-compatible manual optimization when launched with multiple GPUs.
 #
 # Usage:
 #   ./scripts/submit_ffhq256_gan_stage1.sh

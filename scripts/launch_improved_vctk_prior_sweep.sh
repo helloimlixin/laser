@@ -195,7 +195,6 @@ submit_vctk_audio() {
     --stage1-override model.bottleneck_loss_weight="$VCTK_BOTTLENECK_LOSS_WEIGHT" \
     --stage1-override model.dict_learning_rate="$VCTK_DICT_LR" \
     --stage1-override model.coef_max="$COEF_MAX" \
-    --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
     --stage1-override model.sparsity_reg_weight=0.0 \
     --stage1-override model.recon_mse_weight=0.5 \
     --stage1-override model.recon_l1_weight=0.5 \

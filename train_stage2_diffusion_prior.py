@@ -30,6 +30,11 @@ from src.stage2_compat import (
 )
 from src.stage2_metrics import build_stage2_metrics_payload
 
+CHECKPOINT_SAVE_TOP_K = 3
+CHECKPOINT_SAVE_LAST = True
+CHECKPOINT_EVERY_N_EPOCHS = 1
+WANDB_LOG_MODEL = "all"
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -257,6 +262,13 @@ def main() -> None:
     print("=" * 64)
     print(f"Token cache: {token_cache_path}")
     print(f"Run dir:     {run_dir}")
+    print(
+        "Checkpoint policy: "
+        f"save_top_k={CHECKPOINT_SAVE_TOP_K}, "
+        f"save_last={CHECKPOINT_SAVE_LAST}, "
+        f"every_n_epochs={CHECKPOINT_EVERY_N_EPOCHS}, "
+        f"wandb_log_model={WANDB_LOG_MODEL if str(args.wandb_project).strip() else 'disabled'}"
+    )
 
     dm = TokenCacheDataModule(
         cache_path=str(token_cache_path),
@@ -329,15 +341,19 @@ def main() -> None:
             filename="{epoch:03d}-{val/loss:.4f}",
             monitor="val/loss",
             mode="min",
-            save_top_k=2,
-            save_last=True,
+            save_top_k=CHECKPOINT_SAVE_TOP_K,
+            save_last=CHECKPOINT_SAVE_LAST,
+            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
         )
     else:
         checkpoint_callback = ModelCheckpoint(
             dirpath=ckpt_dir,
-            filename="{epoch:03d}",
-            save_top_k=-1,
-            save_last=True,
+            filename="{epoch:03d}-{train/loss:.4f}",
+            monitor="train/loss",
+            mode="min",
+            save_top_k=CHECKPOINT_SAVE_TOP_K,
+            save_last=CHECKPOINT_SAVE_LAST,
+            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
         )
     callbacks = [
         checkpoint_callback,
@@ -357,6 +373,7 @@ def main() -> None:
                 name=str(args.wandb_name) or None,
                 group=str(args.wandb_group) or None,
                 save_dir=str(args.wandb_save_dir) or str(run_dir),
+                log_model=WANDB_LOG_MODEL,
             )
         except Exception as exc:  # pragma: no cover - logging is best-effort
             print(f"Warning: could not create W&B logger, continuing without it ({exc})")

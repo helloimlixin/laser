@@ -46,9 +46,9 @@ embedding_dim: 128
 sparsity_level: 16
 commitment_cost: 0.25          # FIX: was 0.05 — pin encoder to the dictionary manifold
 bottleneck_loss_weight: 0.25
+dictionary_loss_weight: null
 dict_learning_rate: 2.5e-4
 coef_max: 16
-bounded_omp_refine_steps: 8
 
 # Variational coefficients off (matches 88qwzymn).
 variational_coeffs: false
@@ -99,4 +99,3 @@ log_images_every_n_steps: 1000
 diag_log_interval: 1000
 enable_val_latent_visuals: true
 codebook_visual_max_vectors: 1024
-coherence_weight: 0.0

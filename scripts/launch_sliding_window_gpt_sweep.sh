@@ -220,7 +220,6 @@ submit_image_dataset() {
     --stage1-override model.patch_based=false \
     --stage1-override model.bottleneck_loss_weight="$BOTTLENECK_LOSS_WEIGHT" \
     --stage1-override model.commitment_cost="$COMMITMENT_COST" \
-    --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
     --stage1-override model.coef_max="$COEF_MAX" \
     --stage1-override model.dict_learning_rate="$STAGE1_DICT_LR" \
     --stage1-override model.num_residual_blocks=3 \

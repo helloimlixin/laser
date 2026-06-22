@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.cache_sort import sort_sparse_pairs, sort_token_pairs
 from src.checkpoint_io import extract_hparams, extract_state_dict, load_lightning_module, load_torch_payload
 from src.data.config import DataConfig
+from src.data.imagenet_labels import class_names_for_dataset, imagenet_synsets_from_names
 from src.models.laser import LASER
 from src.models.vqvae import VQVAE
 from src.stage2_paths import default_token_cache_path, infer_latest_stage1_checkpoint
@@ -146,29 +147,84 @@ def _resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
+def _parse_coeff_max_auto(raw: str) -> tuple[bool, float | None]:
+    value = str(raw).strip().lower()
+    if value in {"auto", "auto_max", "max"}:
+        return True, None
+
+    percentile = None
+    for prefix in ("auto_p", "auto-p", "auto_percentile_", "auto-percentile-", "percentile:", "p"):
+        if value.startswith(prefix):
+            percentile = value[len(prefix):]
+            break
+    if percentile is None:
+        return False, None
+
+    percentile = percentile.replace("p", ".")
+    try:
+        parsed = float(percentile)
+    except ValueError as exc:
+        raise ValueError(f"Invalid coeff-max percentile in {raw!r}") from exc
+    if not math.isfinite(parsed) or parsed <= 0.0 or parsed > 100.0:
+        raise ValueError(f"coeff-max percentile must be in (0, 100], got {parsed}")
+    return True, parsed
+
+
 def _auto_coeff_max(
     model,
     loader: Iterable,
     *,
     device: torch.device,
     max_items: int,
-) -> float:
+    percentile: float | None = None,
+    padding: float = 1.0,
+) -> tuple[float, dict[str, float]]:
     if not isinstance(model, LASER):
-        return 0.0
+        return 0.0, {"observed_max": 0.0, "clip_frac": 0.0}
+    padding = float(padding)
+    if not math.isfinite(padding) or padding <= 0.0:
+        raise ValueError(f"coeff max padding must be finite and > 0, got {padding}")
+
     seen = 0
-    coeff_max = 0.0
+    observed_max = 0.0
+    coeff_abs_parts = [] if percentile is not None and float(percentile) < 100.0 else None
     model.eval()
     with torch.inference_mode():
         for batch in loader:
             images = batch[0] if isinstance(batch, (tuple, list)) else batch
+            keep = int(images.size(0))
+            if max_items > 0:
+                keep = min(keep, max_items - seen)
+                if keep <= 0:
+                    break
+                images = images[:keep]
             images = images.to(device=device, non_blocking=True)
             _, _, sparse_codes = model.encode(images)
-            batch_max = float(sparse_codes.values.abs().max().item())
-            coeff_max = max(coeff_max, batch_max)
-            seen += int(images.size(0))
+            coeff_abs = torch.nan_to_num(sparse_codes.values.detach().abs().to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            batch_max = float(coeff_abs.max().item()) if coeff_abs.numel() > 0 else 0.0
+            observed_max = max(observed_max, batch_max)
+            if coeff_abs_parts is not None:
+                coeff_abs_parts.append(coeff_abs.reshape(-1).cpu())
+            seen += keep
             if max_items > 0 and seen >= max_items:
                 break
-    return max(coeff_max, 1e-6)
+
+    if coeff_abs_parts is None:
+        coeff_max = observed_max
+        clip_frac = 0.0
+    else:
+        coeff_abs_all = torch.cat(coeff_abs_parts, dim=0) if coeff_abs_parts else torch.zeros(0)
+        if coeff_abs_all.numel() == 0:
+            coeff_max = 0.0
+            clip_frac = 0.0
+        else:
+            q = torch.as_tensor(float(percentile) / 100.0, dtype=torch.float32)
+            coeff_max = float(torch.quantile(coeff_abs_all, q).item())
+            coeff_max = min(coeff_max, observed_max)
+            clip_frac = float((coeff_abs_all > coeff_max).to(torch.float32).mean().item())
+
+    coeff_max = max(float(coeff_max) * padding, 1e-6)
+    return coeff_max, {"observed_max": float(observed_max), "clip_frac": float(clip_frac)}
 
 
 def _batch_audio_meta(batch) -> dict | None:
@@ -195,12 +251,38 @@ def _append_audio_meta(store: dict | None, meta: dict | None, keep: int) -> dict
             "spec_min": [],
             "spec_max": [],
             "spec_shape": [],
+            "speaker_id": [],
+            "speaker_index": [],
         }
     store["path"].extend(str(v) for v in list(meta["path"])[:keep])
     for key in ("crop_mode", "crop_offset", "source_num_samples", "spec_min", "spec_max", "spec_shape"):
         value = meta[key]
         tensor = value.detach().cpu() if torch.is_tensor(value) else torch.as_tensor(value)
         store[key].append(tensor[:keep].clone())
+    if "speaker_id" in meta:
+        store["speaker_id"].extend(str(v) for v in list(meta["speaker_id"])[:keep])
+    if "speaker_index" in meta:
+        value = meta["speaker_index"]
+        tensor = value.detach().cpu() if torch.is_tensor(value) else torch.as_tensor(value)
+        store["speaker_index"].append(tensor[:keep].clone())
+    return store
+
+
+def _append_class_labels(store: list[torch.Tensor] | None, batch, keep: int) -> list[torch.Tensor] | None:
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2 or keep <= 0:
+        return store
+    raw_labels = batch[1]
+    if isinstance(raw_labels, dict):
+        return store
+    try:
+        labels = raw_labels.detach().cpu() if torch.is_tensor(raw_labels) else torch.as_tensor(raw_labels)
+    except (TypeError, ValueError):
+        return store
+    if labels.ndim == 0 or int(labels.shape[0]) < int(keep):
+        return store
+    if store is None:
+        store = []
+    store.append(labels[:keep].to(torch.long).reshape(-1).clone())
     return store
 
 
@@ -213,7 +295,66 @@ def _finalize_audio_meta(store: dict | None) -> dict | None:
         if not parts:
             return None
         out[key] = torch.cat(parts, dim=0)
+    if store.get("speaker_id"):
+        out["speaker_id"] = list(store["speaker_id"])
+    if store.get("speaker_index"):
+        out["speaker_index"] = torch.cat(store["speaker_index"], dim=0).to(torch.long)
     return out
+
+
+def _finalize_class_labels(store: list[torch.Tensor] | None, total_items: int) -> torch.Tensor | None:
+    if not store:
+        return None
+    labels = torch.cat(store, dim=0).to(torch.long).reshape(-1).contiguous()
+    if int(labels.numel()) < int(total_items):
+        return None
+    return labels[: int(total_items)].clone()
+
+
+def _speaker_class_names(audio_meta: dict | None, class_labels: torch.Tensor | None) -> list[str]:
+    if not isinstance(audio_meta, dict) or class_labels is None:
+        return []
+    speaker_ids = audio_meta.get("speaker_id")
+    if not speaker_ids:
+        return []
+    labels = class_labels.detach().cpu().to(torch.long).reshape(-1).tolist()
+    names: dict[int, str] = {}
+    for label, speaker in zip(labels, list(speaker_ids)):
+        names.setdefault(int(label), str(speaker))
+    if not names:
+        return []
+    return [names.get(idx, str(idx)) for idx in range(max(names) + 1)]
+
+
+def _dataset_class_names(dataset) -> list[str]:
+    class_to_idx = getattr(dataset, "class_to_idx", None)
+    if isinstance(class_to_idx, dict) and class_to_idx:
+        ordered = sorted(((int(idx), str(name)) for name, idx in class_to_idx.items()), key=lambda item: item[0])
+        return [name for _, name in ordered]
+    classes = getattr(dataset, "classes", None)
+    if isinstance(classes, (list, tuple)) and classes:
+        return [str(item) for item in classes]
+    return []
+
+
+def _attach_class_label_metadata(payload: dict, class_labels: torch.Tensor, *, dataset_name: str, dataset) -> None:
+    if class_labels is None or int(class_labels.numel()) != int(payload["tokens_flat"].size(0)):
+        return
+    raw_names = _dataset_class_names(dataset) if dataset is not None else []
+    display_names = class_names_for_dataset(dataset_name, raw_names)
+    max_label = int(class_labels.max().item()) if int(class_labels.numel()) > 0 else -1
+    num_classes = max(max_label + 1, len(display_names))
+    if num_classes <= 1 and not display_names:
+        return
+
+    payload["class_labels"] = class_labels.to(torch.long).reshape(-1).contiguous()
+    payload["meta"]["num_classes"] = int(num_classes)
+    payload["meta"]["class_label_name"] = "class"
+    if display_names:
+        payload["meta"]["class_names"] = display_names
+    synsets = imagenet_synsets_from_names(dataset_name, raw_names)
+    if synsets:
+        payload["meta"]["class_synsets"] = synsets
 
 
 def _extract_cache(
@@ -239,6 +380,7 @@ def _extract_cache(
         token_shape = None
         latent_hw = None
         audio_meta_chunks = None
+        class_label_chunks = None
         seen = 0
 
         model.eval()
@@ -252,6 +394,7 @@ def _extract_cache(
                         break
                     images = images[:keep]
                 audio_meta_chunks = _append_audio_meta(audio_meta_chunks, _batch_audio_meta(batch), keep)
+                class_label_chunks = _append_class_labels(class_label_chunks, batch, keep)
                 images = images.to(device=device, non_blocking=True)
 
                 indices, h_z, w_z = model.encode_to_indices(images)
@@ -290,6 +433,9 @@ def _extract_cache(
         audio_meta = _finalize_audio_meta(audio_meta_chunks)
         if audio_meta is not None:
             result["audio_meta"] = audio_meta
+        class_labels = _finalize_class_labels(class_label_chunks, int(tokens_flat.size(0)))
+        if class_labels is not None:
+            result["class_labels"] = class_labels
         return result
 
     real_valued = int(coeff_vocab_size) <= 0
@@ -298,6 +444,7 @@ def _extract_cache(
     token_shape = None
     latent_hw = None
     audio_meta_chunks = None
+    class_label_chunks = None
     seen = 0
 
     model.eval()
@@ -311,6 +458,7 @@ def _extract_cache(
                     break
                 images = images[:keep]
             audio_meta_chunks = _append_audio_meta(audio_meta_chunks, _batch_audio_meta(batch), keep)
+            class_label_chunks = _append_class_labels(class_label_chunks, batch, keep)
             images = images.to(device=device, non_blocking=True)
 
             if real_valued:
@@ -368,6 +516,9 @@ def _extract_cache(
     audio_meta = _finalize_audio_meta(audio_meta_chunks)
     if audio_meta is not None:
         result["audio_meta"] = audio_meta
+    class_labels = _finalize_class_labels(class_label_chunks, int(tokens_flat.size(0)))
+    if class_labels is not None:
+        result["class_labels"] = class_labels
     return result
 
 
@@ -520,6 +671,7 @@ def _parse_args() -> argparse.Namespace:
             "celebahq",
             "coco",
             "ffhq",
+            "imagenet",
             "imagenette2",
             "stl10",
             "vctk",
@@ -541,7 +693,16 @@ def _parse_args() -> argparse.Namespace:
         "--coeff-max",
         type=str,
         default="auto",
-        help="Coefficient quantization range. Use 'auto' to scan the chosen split for the max absolute coeff.",
+        help=(
+            "Coefficient range for sparse coeff caches. Use a number, 'auto' for "
+            "the max absolute coeff, or 'auto_p99.9' / 'p99.9' for a robust percentile."
+        ),
+    )
+    parser.add_argument(
+        "--coeff-max-padding",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to inferred auto/percentile coeff ranges.",
     )
     parser.add_argument("--coeff-quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
     parser.add_argument("--coeff-mu", type=float, default=0.0)
@@ -626,16 +787,31 @@ def main():
     model.eval().to(device)
 
     coeff_max_arg = str(args.coeff_max).strip().lower()
+    coeff_max_auto, coeff_max_percentile = _parse_coeff_max_auto(coeff_max_arg)
     if model_type == "vqvae":
         coeff_max = 0.0
-    elif coeff_max_arg == "auto":
-        coeff_max = _auto_coeff_max(
+    elif coeff_max_auto:
+        coeff_max, coeff_stats = _auto_coeff_max(
             model,
             loader,
             device=device,
             max_items=int(args.max_items),
+            percentile=coeff_max_percentile,
+            padding=float(args.coeff_max_padding),
         )
-        print(f"Resolved coeff_max from data: {coeff_max:.6f}")
+        if coeff_max_percentile is None:
+            print(
+                "Resolved coeff_max from data max: "
+                f"{coeff_max:.6f} (observed_abs_max={coeff_stats['observed_max']:.6f})"
+            )
+        else:
+            print(
+                f"Resolved coeff_max from data p{coeff_max_percentile:g}: "
+                f"{coeff_max:.6f} "
+                f"(observed_abs_max={coeff_stats['observed_max']:.6f}, "
+                f"clip_frac_before_padding={coeff_stats['clip_frac']:.6f}, "
+                f"padding={float(args.coeff_max_padding):g})"
+            )
     else:
         coeff_max = float(args.coeff_max)
     args.coeff_max = coeff_max
@@ -678,8 +854,24 @@ def main():
         "shape": shape,
         "meta": meta,
     }
+    if "class_labels" in cache_result:
+        _attach_class_label_metadata(
+            payload,
+            torch.as_tensor(cache_result["class_labels"], dtype=torch.long).reshape(-1).contiguous(),
+            dataset_name=str(config.dataset),
+            dataset=dataset,
+        )
     if "audio_meta" in cache_result:
         payload["audio_meta"] = cache_result["audio_meta"]
+        speaker_index = payload["audio_meta"].get("speaker_index")
+        if speaker_index is not None:
+            class_labels = torch.as_tensor(speaker_index, dtype=torch.long).reshape(-1).contiguous()
+            if int(class_labels.numel()) == int(tokens_flat.size(0)):
+                payload["class_labels"] = class_labels
+                num_classes = int(class_labels.max().item()) + 1 if class_labels.numel() > 0 else 0
+                payload["meta"]["num_classes"] = int(num_classes)
+                payload["meta"]["class_label_name"] = "speaker_index"
+                payload["meta"]["class_names"] = _speaker_class_names(payload["audio_meta"], class_labels)
     if "coeffs_flat" in cache_result:
         payload["coeffs_flat"] = cache_result["coeffs_flat"]
         coeffs_flat = payload["coeffs_flat"]

@@ -173,7 +173,6 @@ submit_laser() {
     --stage1-override model.bottleneck_loss_weight=0.75 \
     --stage1-override model.dict_learning_rate="$VCTK_LASER_DICT_LR" \
     --stage1-override model.coef_max=16.0 \
-    --stage1-override model.bounded_omp_refine_steps=16 \
     --stage1-override model.sparsity_reg_weight=0.0 \
     --stage1-override model.recon_mse_weight=0.5 \
     --stage1-override model.recon_l1_weight=0.5 \

@@ -241,7 +241,6 @@ submit_image_dataset() {
     --stage1-override model.dictionary_usage_grad_scale="$DICTIONARY_USAGE_GRAD_SCALE" \
     --stage1-override model.dictionary_usage_grad_min="$DICTIONARY_USAGE_GRAD_MIN" \
     --stage1-override model.dictionary_usage_grad_max="$DICTIONARY_USAGE_GRAD_MAX" \
-    --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
     --stage1-override model.online_ksvd_enabled="$ONLINE_KSVD_ENABLED" \
     --stage1-override model.online_ksvd_start_step="$ONLINE_KSVD_START_STEP" \
     --stage1-override model.online_ksvd_interval_steps="$ONLINE_KSVD_INTERVAL_STEPS" \
@@ -357,7 +356,6 @@ submit_vctk_audio() {
     --stage1-override model.dictionary_usage_grad_max="$DICTIONARY_USAGE_GRAD_MAX" \
     --stage1-override model.dict_learning_rate="$VCTK_DICT_LR" \
     --stage1-override model.coef_max="$COEF_MAX" \
-    --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
     --stage1-override model.sparsity_reg_weight=0.0 \
     --stage1-override model.recon_mse_weight=0.5 \
     --stage1-override model.recon_l1_weight=0.5 \

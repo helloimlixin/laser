@@ -66,7 +66,7 @@ def test_vqvae_forward_and_index_decode():
     torch.manual_seed(0)
     model = VQVAE(
         in_channels=3,
-        num_hiddens=16,
+        num_hiddens=32,
         num_embeddings=16,
         embedding_dim=4,
         num_residual_blocks=1,
@@ -76,6 +76,7 @@ def test_vqvae_forward_and_index_decode():
         perceptual_weight=0.0,
         learning_rate=1e-3,
         beta=0.9,
+        resolution=16,
         compute_fid=False,
         enable_codebook_visuals=True,
         codebook_visual_max_vectors=4,

@@ -39,9 +39,9 @@ embedding_dim: 128
 sparsity_level: 8
 commitment_cost: 0.05
 bottleneck_loss_weight: 0.2
+dictionary_loss_weight: null
 dict_learning_rate: 2.5e-4
 coef_max: 8
-bounded_omp_refine_steps: 8
 
 # Larger latent patch (4x4 over a 16x16 latent) keeps the patch GRID at 4x4 = 16,
 # i.e. the same stage-2 sequence length as zdmy0xi3's 2x2 patches over 8x8.
@@ -88,7 +88,6 @@ variational_coeffs: false
 variational_coeff_refine_weight: 0.0
 variational_coeff_target_std: 0.25
 variational_coeff_min_std: 0.01
-coherence_weight: 0.0
 bypass_bottleneck: false
 beta: 0.9
 

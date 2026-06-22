@@ -42,28 +42,38 @@ FFHQ_DIR="${FFHQ_DIR:-/cache/home/$USER/datasets/ffhq/images1024x1024_webp}"
 IMAGENET_DIR="${IMAGENET_DIR:-/scratch/$USER/Projects/data/imagenet}"
 
 # Step-bounded so each chained job can reach adversarial continuation, cache
-# extraction, and stage 2 within the allocation on large image folders.
+# extraction, and stage 2 within the allocation on large image folders. ImageNet
+# needs a longer stage-1 path than the face datasets; otherwise the stage-2 cache
+# is built from a sharp but still undertrained adversarial continuation.
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-50}"
 STAGE1_ADV_EPOCHS="${STAGE1_ADV_EPOCHS:-20}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-50}"
+USER_STAGE1_STEPS="${STAGE1_STEPS:-}"
+USER_STAGE1_ADV_STEPS="${STAGE1_ADV_STEPS:-}"
 STAGE1_STEPS="${STAGE1_STEPS:-60000}"
 STAGE1_ADV_STEPS="${STAGE1_ADV_STEPS:-20000}"
+IMAGENET_STAGE1_STEPS="${IMAGENET_STAGE1_STEPS:-${USER_STAGE1_STEPS:-160000}}"
+IMAGENET_STAGE1_ADV_STEPS="${IMAGENET_STAGE1_ADV_STEPS:-${USER_STAGE1_ADV_STEPS:-80000}}"
 STAGE2_STEPS="${STAGE2_STEPS:-120000}"
 
-STAGE1_LR="${STAGE1_LR:-1.0e-4}"
-STAGE1_ADV_LR="${STAGE1_ADV_LR:-7.5e-5}"
-STAGE1_WARMUP_STEPS="${STAGE1_WARMUP_STEPS:-1000}"
+STAGE1_LR="${STAGE1_LR:-7.5e-5}"
+STAGE1_ADV_LR="${STAGE1_ADV_LR:-5.0e-5}"
+STAGE1_WARMUP_STEPS="${STAGE1_WARMUP_STEPS:-5000}"
 STAGE2_LR="${STAGE2_LR:-2.5e-4}"
 STAGE2_WARMUP_STEPS="${STAGE2_WARMUP_STEPS:-1500}"
-MIN_LR_RATIO="${MIN_LR_RATIO:-0.03}"
+MIN_LR_RATIO="${MIN_LR_RATIO:-0.05}"
 
-COEFF_BINS="${COEFF_BINS:-256}"
-COEF_MAX="${COEF_MAX:-16.0}"
+COEFF_BINS="${COEFF_BINS:-128}"
+COEF_MAX="${COEF_MAX:-auto_p99.9}"
+CACHE_COEF_MAX="${CACHE_COEF_MAX:-$COEF_MAX}"
+CACHE_COEFF_MAX_PADDING="${CACHE_COEFF_MAX_PADDING:-1.05}"
+STAGE1_COEF_MAX="${STAGE1_COEF_MAX:-null}"
 SUPPORT_ORDER="${SUPPORT_ORDER:-atom_id}"
 COMMITMENT_COST="${COMMITMENT_COST:-0.25}"
-DICT_LR="${DICT_LR:-2.5e-4}"
+DICT_LR="${DICT_LR:-2.5e-5}"
 BOUNDED_OMP_REFINE_STEPS="${BOUNDED_OMP_REFINE_STEPS:-16}"
 SPARSITY_REG_WEIGHT="${SPARSITY_REG_WEIGHT:-0.0}"
+STAGE1_INIT_CKPT="${STAGE1_INIT_CKPT:-}"
 
 RECON_MSE_WEIGHT="${RECON_MSE_WEIGHT:-0.25}"
 RECON_L1_WEIGHT="${RECON_L1_WEIGHT:-1.0}"
@@ -199,6 +209,8 @@ variant_settings() {
 
 dataset_settings() {
   local dataset="$1"
+  DATASET_STAGE1_STEPS="$STAGE1_STEPS"
+  DATASET_STAGE1_ADV_STEPS="$STAGE1_ADV_STEPS"
   case "$dataset" in
     celebahq)
       DATA_DIR="$CELEBAHQ_DIR"
@@ -226,6 +238,8 @@ dataset_settings() {
       CLASS_CONDITIONAL=true
       NUM_CLASSES=1000
       SAMPLE_CLASS_LABELS="[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]"
+      DATASET_STAGE1_STEPS="$IMAGENET_STAGE1_STEPS"
+      DATASET_STAGE1_ADV_STEPS="$IMAGENET_STAGE1_ADV_STEPS"
       ;;
     *)
       echo "ERROR: unknown dataset '$dataset' (expected celebahq,ffhq,imagenet)" >&2
@@ -236,6 +250,12 @@ dataset_settings() {
     echo "ERROR: required dataset directory not found for $dataset: $DATA_DIR" >&2
     exit 1
   fi
+  if [[ "$dataset" == "imagenet" && "$DATASET_STAGE1_ADV_STEPS" =~ ^[0-9]+$ && "$ADVERSARIAL_WARMUP_STEPS" =~ ^[0-9]+$ ]]; then
+    if (( DATASET_STAGE1_ADV_STEPS <= ADVERSARIAL_WARMUP_STEPS )); then
+      echo "ERROR: imagenet DATASET_STAGE1_ADV_STEPS=$DATASET_STAGE1_ADV_STEPS must exceed ADVERSARIAL_WARMUP_STEPS=$ADVERSARIAL_WARMUP_STEPS before stage2 cache extraction." >&2
+      exit 2
+    fi
+  fi
 }
 
 submit_dataset_variant() {
@@ -244,7 +264,7 @@ submit_dataset_variant() {
   variant_settings "$variant"
   dataset_settings "$dataset"
 
-  local label="${RUN_TAG}-${dataset}-${VARIANT_LABEL}-seq384-s1${STAGE1_STEPS}-adv${STAGE1_ADV_STEPS}-s2${STAGE2_STEPS}"
+  local label="${RUN_TAG}-${dataset}-${VARIANT_LABEL}-seq384-s1${DATASET_STAGE1_STEPS}-adv${DATASET_STAGE1_ADV_STEPS}-s2${STAGE2_STEPS}"
 
   CMD=(
     "$PYTHON_SUBMIT" "$SUBMIT"
@@ -270,9 +290,13 @@ submit_dataset_variant() {
     --cache-arg=--coeff-bins
     --cache-arg "$COEFF_BINS"
     --cache-arg=--coeff-max
-    --cache-arg "$COEF_MAX"
+    --cache-arg "$CACHE_COEF_MAX"
+    --cache-arg=--coeff-max-padding
+    --cache-arg "$CACHE_COEFF_MAX_PADDING"
     --cache-arg=--coeff-quantization
-    --cache-arg uniform
+    --cache-arg mu_law
+    --cache-arg=--coeff-mu
+    --cache-arg 255.0
     --cache-arg=--support-order
     --cache-arg "$SUPPORT_ORDER"
     --cache-arg=--batch-size
@@ -295,7 +319,7 @@ submit_dataset_variant() {
     "data.num_workers=8" \
     "data.augment=$DATA_AUGMENT" \
     "train.max_epochs=$STAGE1_EPOCHS" \
-    "train.max_steps=$STAGE1_STEPS" \
+    "train.max_steps=$DATASET_STAGE1_STEPS" \
     "train.learning_rate=$STAGE1_LR" \
     "train.warmup_steps=$STAGE1_WARMUP_STEPS" \
     "train.min_lr_ratio=$MIN_LR_RATIO" \
@@ -305,8 +329,8 @@ submit_dataset_variant() {
     "train.log_every_n_steps=50" \
     "train.gradient_clip_val=1.0" \
     "train.run_test_after_fit=false" \
-    "checkpoint.save_top_k=1" \
-    "checkpoint.save_last=false" \
+    "checkpoint.save_top_k=3" \
+    "checkpoint.save_last=true" \
     "model.backbone=vqgan" \
     "model.num_downsamples=$NUM_DOWNSAMPLES" \
     "model.channel_multipliers=$CHANNEL_MULTIPLIERS" \
@@ -329,8 +353,7 @@ submit_dataset_variant() {
     "model.commitment_cost=$COMMITMENT_COST" \
     "model.bottleneck_loss_weight=$BOTTLENECK_LOSS_WEIGHT" \
     "model.dict_learning_rate=$DICT_LR" \
-    "model.coef_max=$COEF_MAX" \
-    "model.bounded_omp_refine_steps=$BOUNDED_OMP_REFINE_STEPS" \
+    "model.coef_max=$STAGE1_COEF_MAX" \
     "model.sparsity_reg_weight=$SPARSITY_REG_WEIGHT" \
     "model.data_init_from_first_batch=true" \
     "model.recon_mse_weight=$RECON_MSE_WEIGHT" \
@@ -356,10 +379,13 @@ submit_dataset_variant() {
     "model.codebook_visual_max_vectors=$DICTIONARY_VIS_MAX_VECTORS" \
     "wandb.name=$dataset-$VARIANT_LABEL-stage1-noadv" \
     "wandb.tags=[train,laser,$dataset,stage1,patchgrid384,$variant]"
+  if [[ -n "${STAGE1_INIT_CKPT// }" ]]; then
+    append_overrides --stage1-override "init_ckpt_path=$STAGE1_INIT_CKPT"
+  fi
 
   append_overrides --stage1-adv-override \
     "train.max_epochs=$STAGE1_ADV_EPOCHS" \
-    "train.max_steps=$STAGE1_ADV_STEPS" \
+    "train.max_steps=$DATASET_STAGE1_ADV_STEPS" \
     "train.learning_rate=$STAGE1_ADV_LR" \
     "model.adversarial_weight=$ADVERSARIAL_WEIGHT" \
     "model.adversarial_start_step=0" \
@@ -390,9 +416,9 @@ submit_dataset_variant() {
     "train_ar.gradient_clip_val=1.0" \
     "train_ar.val_check_interval=1.0" \
     "train_ar.log_every_n_steps=20" \
-    "train_ar.checkpoint_save_top_k=1" \
-    "train_ar.checkpoint_save_last=false" \
-    "train_ar.checkpoint_keep_recent=1" \
+    "train_ar.checkpoint_save_top_k=3" \
+    "train_ar.checkpoint_save_last=true" \
+    "train_ar.checkpoint_keep_recent=3" \
     "train_ar.checkpoint_every_n_epochs=1" \
     "train_ar.sample_every_n_epochs=0" \
     "train_ar.sample_every_n_steps=$SAMPLE_EVERY_N_STEPS" \
@@ -410,7 +436,7 @@ submit_dataset_variant() {
     "wandb.tags=[train,laser,$dataset,stage2,transformer,generation,patchgrid384,$variant]"
 
   echo "=========================================================="
-  echo "Submitting $dataset $VARIANT_LABEL: seq=384 patch_dim=$PATCH_DIM atoms=$NUM_EMBEDDINGS embedding_dim=$EMBEDDING_DIM"
+  echo "Submitting $dataset $VARIANT_LABEL: seq=384 patch_dim=$PATCH_DIM atoms=$NUM_EMBEDDINGS embedding_dim=$EMBEDDING_DIM stage1_steps=$DATASET_STAGE1_STEPS stage1_adv_steps=$DATASET_STAGE1_ADV_STEPS"
   "${CMD[@]}"
 }
 

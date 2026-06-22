@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 
@@ -7,6 +8,7 @@ from src.models.bottleneck import (
     VectorQuantizer,
     VectorQuantizerEMA,
 )
+from src.sparse_token_codec import sparse_codes_to_tokens, tokens_to_sparse_codes
 
 
 def test_bottleneck_smoke():
@@ -56,7 +58,12 @@ def test_bottleneck_smoke():
     assert sparse_codes.values.shape == sparse_codes.support.shape
     assert sparse_codes.num_embeddings == dl.num_embeddings
     assert sparse_codes.support.view(expected_n, dl.sparsity_level).dtype == torch.long
-    (dl_out.mean() + dl_loss).backward()
+    assert torch.allclose(dl_loss.detach(), dl._last_bottleneck_loss)
+    assert torch.allclose(
+        dl._last_bottleneck_objective,
+        dl._last_dictionary_loss + dl._last_bottleneck_loss,
+    )
+    (dl_out.mean() + dl._last_bottleneck_objective_for_backward).backward()
     assert dl.dictionary.grad is not None
 
 
@@ -83,53 +90,6 @@ def test_dictionary_learning_normalizes_and_projects_dictionary():
         torch.zeros_like(radial_component),
         atol=1e-5,
     )
-
-
-def test_separable_dictionary_composes_low_rank_patch_dictionary():
-    torch.manual_seed(0)
-    dl = DictionaryLearning(
-        num_embeddings=16,
-        embedding_dim=2,
-        sparsity_level=2,
-        patch_based=True,
-        patch_size=2,
-        patch_stride=2,
-        separable_dictionary_rank=2,
-        separable_dictionary_factor_dims=[2, 2, 4],
-    )
-    dictionary = dl.effective_dictionary()
-
-    assert dl.dictionary.requires_grad is False
-    assert dictionary.shape == (8, 16)
-    assert torch.allclose(dictionary.norm(dim=0), torch.ones(16), atol=1e-5)
-
-    z = torch.randn(1, 2, 4, 4, requires_grad=True)
-    z_out, loss, sparse_codes = dl(z)
-    (z_out.mean() + loss).backward()
-
-    assert z_out.shape == z.shape
-    assert torch.isfinite(loss)
-    assert sparse_codes.support.shape == (1, 2, 2, 2)
-    assert dl.dictionary.grad is None
-    factor_grads = [factor.grad for factor in dl.separable_dictionary_factors]
-    assert all(grad is not None for grad in factor_grads)
-    assert sum(float(grad.abs().sum()) for grad in factor_grads if grad is not None) > 0.0
-
-
-def test_separable_dictionary_auto_factor_dims_multiply_to_vocab_size():
-    dl = DictionaryLearning(
-        num_embeddings=8192,
-        embedding_dim=16,
-        sparsity_level=2,
-        patch_based=True,
-        patch_size=8,
-        patch_stride=8,
-        separable_dictionary_rank=1,
-    )
-
-    factor_dims = dl.separable_dictionary_factor_dims
-    assert factor_dims[0] * factor_dims[1] * factor_dims[2] == dl.num_embeddings
-    assert dl.effective_dictionary().shape == (16 * 8 * 8, 8192)
 
 
 def test_dictionary_data_sampling_jitters_short_batches_instead_of_duplicates():
@@ -180,8 +140,8 @@ def test_ste_keeps_encoder_grad_and_loss_trains_dictionary():
 
     z_out, loss, _ = dl(z)
     # The straight-through estimator routes decoder gradients to the encoder
-    # input, while the dictionary atoms learn from the returned bottleneck loss.
-    (z_out.square().mean() + loss).backward()
+    # input, while the dictionary atoms learn from the full bottleneck objective.
+    (z_out.square().mean() + dl._last_bottleneck_objective_for_backward).backward()
 
     assert z.grad is not None
     assert z.grad.abs().sum() > 0
@@ -189,7 +149,7 @@ def test_ste_keeps_encoder_grad_and_loss_trains_dictionary():
     assert dl.dictionary.grad.abs().sum() > 0
 
 
-def test_one_shot_topk_support_matches_abs_correlations_on_orthogonal_dictionary():
+def test_batch_omp_support_matches_abs_correlations_on_orthogonal_dictionary():
     torch.manual_seed(0)
     dl = DictionaryLearning(
         num_embeddings=4,
@@ -206,7 +166,7 @@ def test_one_shot_topk_support_matches_abs_correlations_on_orthogonal_dictionary
         ]
     )
 
-    support, values = dl.batch_topk_with_support(signals, dictionary)
+    support, values = dl.batch_omp_with_support(signals, dictionary)
 
     assert support.tolist() == [[0, 2], [3, 1]]
     assert torch.allclose(
@@ -221,12 +181,11 @@ def test_one_shot_topk_support_matches_abs_correlations_on_orthogonal_dictionary
     )
 
 
-def test_batch_omp_with_coef_max_hard_bounds_coefficients():
+def test_batch_omp_uses_unclipped_least_squares_coefficients():
     dl = DictionaryLearning(
         num_embeddings=2,
         embedding_dim=2,
         sparsity_level=2,
-        coef_max=1.0,
     )
     dictionary = torch.eye(2)
     signals = torch.tensor([[3.0], [-2.0]], dtype=torch.float32)
@@ -234,8 +193,7 @@ def test_batch_omp_with_coef_max_hard_bounds_coefficients():
     support, values = dl.batch_omp_with_support(signals, dictionary)
 
     assert support.tolist() == [[0, 1]]
-    assert torch.allclose(values, torch.tensor([[1.0, -1.0]]), atol=1e-4)
-    assert float(values.abs().max()) <= 1.0 + 1e-6
+    assert torch.allclose(values, torch.tensor([[3.0, -2.0]]), atol=1e-4)
 
 
 def test_batch_omp_fixed_sparsity_does_not_reselect_atoms_on_zero_ties():
@@ -253,25 +211,7 @@ def test_batch_omp_fixed_sparsity_does_not_reselect_atoms_on_zero_ties():
     assert torch.allclose(values, torch.tensor([[1.0, 0.0, 0.0]]), atol=1e-6)
 
 
-def test_batch_omp_residual_tolerance_stops_per_sample():
-    dl = DictionaryLearning(
-        num_embeddings=2,
-        embedding_dim=2,
-        sparsity_level=2,
-        omp_residual_tolerance=1e-8,
-    )
-    dictionary = torch.eye(2)
-    signals = torch.tensor([[1.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
-
-    support, values = dl.batch_omp_with_support(signals, dictionary)
-
-    assert support[0, 0].item() == 0
-    assert torch.allclose(values[0], torch.tensor([1.0, 0.0]), atol=1e-6)
-    assert support[1].tolist() == [0, 1]
-    assert torch.allclose(values[1], torch.tensor([1.0, 1.0]), atol=1e-6)
-
-
-def test_dictionary_learning_forward_hard_bounds_patch_coefficients():
+def test_dictionary_learning_forward_uses_unclipped_patch_coefficients():
     dl = DictionaryLearning(
         num_embeddings=4,
         embedding_dim=1,
@@ -279,7 +219,6 @@ def test_dictionary_learning_forward_hard_bounds_patch_coefficients():
         patch_based=True,
         patch_size=2,
         patch_stride=2,
-        coef_max=1.0,
     )
     with torch.no_grad():
         dl.dictionary.copy_(torch.eye(4))
@@ -292,32 +231,34 @@ def test_dictionary_learning_forward_hard_bounds_patch_coefficients():
 
     z_out, loss, sparse_codes = dl(z)
 
-    expected = z.clamp(-1.0, 1.0)
     assert torch.isfinite(loss)
-    assert torch.allclose(z_out, expected, atol=1e-4)
-    assert float(sparse_codes.values.abs().max()) <= 1.0 + 1e-6
-    assert float(dl._last_diag["coeff_abs_max"]) <= 1.0 + 1e-6
-    assert float(dl._last_diag["coeff_clip_frac"]) > 0.0
+    assert torch.allclose(z_out, z, atol=1e-4)
+    assert float(sparse_codes.values.abs().max()) > 1.0
 
 
-def test_patch_dictionary_learning_overlap_reconstructs_exact_latent():
-    dl = DictionaryLearning(
-        num_embeddings=4,
-        embedding_dim=1,
-        sparsity_level=4,
-        patch_based=True,
-        patch_size=2,
-        patch_stride=1,
-    )
-    with torch.no_grad():
-        dl.dictionary.copy_(torch.eye(4))
-    z = torch.arange(1, 10, dtype=torch.float32).view(1, 1, 3, 3)
+def test_patch_dictionary_learning_rejects_overlapping_stride():
+    with pytest.raises(ValueError, match="must equal patch_size"):
+        DictionaryLearning(
+            num_embeddings=4,
+            embedding_dim=1,
+            sparsity_level=4,
+            patch_based=True,
+            patch_size=2,
+            patch_stride=1,
+        )
 
-    z_out, loss, sparse_codes = dl(z)
 
-    assert torch.isfinite(loss)
-    assert sparse_codes.support.shape == (1, 3, 3, 4)
-    assert torch.allclose(z_out, z, atol=1e-5)
+def test_patch_dictionary_learning_rejects_overlap_reconstruction_modes():
+    with pytest.raises(ValueError, match="must be 'tile'"):
+        DictionaryLearning(
+            num_embeddings=16,
+            embedding_dim=1,
+            sparsity_level=4,
+            patch_based=True,
+            patch_size=4,
+            patch_stride=4,
+            patch_reconstruction="hann",
+        )
 
 
 def test_patch_dictionary_learning_preserves_latent_shape():
@@ -328,7 +269,7 @@ def test_patch_dictionary_learning_preserves_latent_shape():
         sparsity_level=2,
         patch_based=True,
         patch_size=2,
-        patch_stride=1,
+        patch_stride=2,
     )
     z = torch.randn(2, 4, 4, 4, requires_grad=True)
 
@@ -336,9 +277,9 @@ def test_patch_dictionary_learning_preserves_latent_shape():
 
     assert z_out.shape == z.shape
     assert torch.isfinite(loss)
-    assert sparse_codes.support.shape == (2, 4, 4, 2)
+    assert sparse_codes.support.shape == (2, 2, 2, 2)
     assert sparse_codes.values.shape == sparse_codes.support.shape
-    (z_out.mean() + loss).backward()
+    (z_out.mean() + dl._last_bottleneck_objective_for_backward).backward()
     assert dl.dictionary.grad is not None
 
 
@@ -351,7 +292,6 @@ def test_patch_dictionary_learning_keeps_sparse_solve_finite_for_half_inputs():
         patch_based=True,
         patch_size=2,
         patch_stride=2,
-        coef_max=8.0,
     )
     z = torch.randn(2, 4, 4, 4, dtype=torch.float16, requires_grad=True)
 
@@ -361,12 +301,12 @@ def test_patch_dictionary_learning_keeps_sparse_solve_finite_for_half_inputs():
     assert sparse_codes.values.dtype == torch.float32
     assert torch.isfinite(loss)
     assert torch.isfinite(z_out.float()).all()
-    (z_out.float().mean() + loss).backward()
+    (z_out.float().mean() + dl._last_bottleneck_objective_for_backward).backward()
     assert dl.dictionary.grad is not None
     assert torch.isfinite(dl.dictionary.grad).all()
 
 
-def test_patch_dictionary_learning_hann_reconstructs_exact_signal_with_full_identity_dictionary():
+def test_patch_dictionary_learning_tile_reconstructs_exact_signal_with_full_identity_dictionary():
     torch.manual_seed(0)
     dl = DictionaryLearning(
         num_embeddings=16,
@@ -374,8 +314,8 @@ def test_patch_dictionary_learning_hann_reconstructs_exact_signal_with_full_iden
         sparsity_level=16,
         patch_based=True,
         patch_size=4,
-        patch_stride=2,
-        patch_reconstruction="hann",
+        patch_stride=4,
+        patch_reconstruction="tile",
     )
     with torch.no_grad():
         dl.dictionary.copy_(torch.eye(16))
@@ -403,7 +343,7 @@ def test_ste_keeps_encoder_gradient_path():
     z = torch.randn(1, 4, 2, 2, requires_grad=True)
 
     z_out, loss, _sparse_codes = dl(z)
-    (z_out.sum() + loss).backward()
+    (z_out.sum() + dl._last_bottleneck_objective_for_backward).backward()
 
     assert z.grad is not None
     assert float(z.grad.abs().sum()) > 0.0
@@ -430,7 +370,7 @@ def test_patch_toggle_disables_patch_dictionary_learning_even_with_patch_params(
     assert sparse_codes.support.shape == (2, 4, 4, 2)
 
 
-def test_dictionary_learning_tokens_to_latent_decodes_quantized_per_site_tokens():
+def test_sparse_token_codec_decodes_quantized_per_site_tokens():
     dl = DictionaryLearning(
         num_embeddings=4,
         embedding_dim=4,
@@ -443,33 +383,32 @@ def test_dictionary_learning_tokens_to_latent_decodes_quantized_per_site_tokens(
     tokens = torch.tensor([[[[0, 5, 2, 6]]]], dtype=torch.long)
     coeff_bin_values = torch.tensor([0.0, 2.0, -1.0], dtype=torch.float32)
 
-    z = dl.tokens_to_latent(
+    support, values = tokens_to_sparse_codes(
         tokens,
+        num_embeddings=4,
+        sparsity_level=2,
         atom_vocab_size=4,
         coeff_vocab_size=3,
         coeff_bin_values=coeff_bin_values,
     )
+    z = dl._reconstruct_sparse(support, values, height=1, width=1)
 
     expected = torch.tensor([[[[2.0]], [[0.0]], [[-1.0]], [[0.0]]]])
     assert z.shape == expected.shape
     assert torch.allclose(z, expected, atol=1e-6)
 
 
-def test_dictionary_learning_sparse_codes_to_tokens_quantizes_support_and_values():
-    dl = DictionaryLearning(
-        num_embeddings=4,
-        embedding_dim=4,
-        sparsity_level=2,
-        patch_based=False,
-    )
+def test_sparse_token_codec_quantizes_support_and_values():
     sparse_codes = SparseCodes(
         support=torch.tensor([[[[1, 3]]]], dtype=torch.long),
         values=torch.tensor([[[[-2.0, 1.6]]]], dtype=torch.float32),
         num_embeddings=4,
     )
 
-    tokens, coeff_q = dl.sparse_codes_to_tokens(
+    tokens, coeff_q = sparse_codes_to_tokens(
         sparse_codes,
+        num_embeddings=4,
+        sparsity_level=2,
         coeff_vocab_size=5,
         coeff_max=2.0,
         coeff_quantization="uniform",

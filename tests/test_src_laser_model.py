@@ -269,6 +269,26 @@ def test_logged_sparsity_uses_fixed_support_budget_not_thresholded_coeffs():
     assert recon.shape == x.shape == batch.shape
     assert float(logged["train/sparsity"]) == 0.25
     assert float(logged["train/effective_sparsity"]) == 0.0625
+    assert not any("/diag/" in name for name in logged)
+    removed_metrics = {
+        "train/input_mean",
+        "train/input_std",
+        "train/recon_mean",
+        "train/recon_std",
+        "train/dict_norm_max",
+        "train/dict_norm_min",
+        "train/dict_norm_mean",
+        "train/coeff_abs_max",
+        "train/coeff_abs_mean",
+        "train/coeff_active_abs_mean",
+        "train/coeff_clip_frac",
+        "train/sparsity_reg_loss",
+        "train/weighted_sparsity_reg_loss",
+        "train/bottleneck_objective",
+        "train/e_latent_loss",
+        "train/dl_latent_loss",
+    }
+    assert not (removed_metrics & set(logged))
 
 
 
@@ -339,7 +359,7 @@ def test_laser_lr_schedule_ignores_infinite_batch_estimate():
 
 
 def test_laser_patch_dictionary_learning_runs_end_to_end():
-    model = _build_model(patch_based=True, patch_size=2, patch_stride=1)
+    model = _build_model(patch_based=True, patch_size=2, patch_stride=2)
     batch = torch.randn(2, 3, 16, 16)
 
     loss, recon, x = model.compute_metrics(batch, prefix="train")
@@ -398,12 +418,13 @@ def test_laser_decode_from_tokens_forwards_quantized_decode_args():
     model = _build_model()
     calls = {}
 
-    def _tokens_to_latent(tokens, **kwargs):
-        calls["tokens"] = tokens
-        calls["kwargs"] = kwargs
-        return torch.zeros(tokens.size(0), model.hparams.embedding_dim, 4, 4)
+    def _reconstruct(atom_ids, coeffs, *, latent_hw=None):
+        calls["atom_ids"] = atom_ids
+        calls["coeffs"] = coeffs
+        calls["latent_hw"] = latent_hw
+        return torch.zeros(atom_ids.size(0), model.hparams.embedding_dim, 4, 4)
 
-    model.bottleneck.tokens_to_latent = _tokens_to_latent
+    model.reconstruct_latent_from_atoms_and_coeffs = _reconstruct
     model.decode = lambda z_q: z_q + 1.0
 
     tokens = torch.zeros(2, 3, 3, 2, dtype=torch.long)
@@ -420,12 +441,11 @@ def test_laser_decode_from_tokens_forwards_quantized_decode_args():
 
     assert images.shape == (2, model.hparams.embedding_dim, 4, 4)
     assert torch.allclose(images, torch.ones_like(images))
-    assert calls["tokens"] is tokens
-    assert calls["kwargs"]["latent_hw"] == (4, 4)
-    assert calls["kwargs"]["atom_vocab_size"] == 8
-    assert calls["kwargs"]["coeff_vocab_size"] == 5
-    assert float(calls["kwargs"]["coeff_max"]) == 2.0
-    assert calls["kwargs"]["coeff_quantization"] == "uniform"
+    assert calls["latent_hw"] == (4, 4)
+    assert calls["atom_ids"].shape == (2, 3, 3, 1)
+    assert calls["coeffs"].shape == (2, 3, 3, 1)
+    assert torch.equal(calls["atom_ids"], torch.zeros_like(calls["atom_ids"]))
+    assert torch.allclose(calls["coeffs"], torch.full_like(calls["coeffs"], -1.0))
 
 
 def test_laser_encode_to_tokens_quantizes_sparse_codes():
@@ -502,6 +522,8 @@ def test_laser_init_no_longer_exposes_removed_sparse_coding_knobs():
     assert "fast_omp" not in params
     assert "omp_diag_eps" not in params
     assert "omp_cholesky_eps" not in params
+    assert "omp_residual_tolerance" not in params
+    assert "bounded_omp_refine_steps" not in params
     assert "sparse_coding_scheme" not in params
     assert "lista_steps" not in params
     assert "lista_step_size_init" not in params

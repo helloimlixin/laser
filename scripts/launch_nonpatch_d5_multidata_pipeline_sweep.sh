@@ -30,7 +30,7 @@ IMAGE_CPUS_PER_TASK="${IMAGE_CPUS_PER_TASK:-12}"
 AUDIO_CPUS_PER_TASK="${AUDIO_CPUS_PER_TASK:-12}"
 IMAGE_MEM_MB="${IMAGE_MEM_MB:-240000}"
 AUDIO_MEM_MB="${AUDIO_MEM_MB:-240000}"
-EXCLUDE_NODES="${EXCLUDE_NODES:-gpu018,gpuk[005-018]}"
+EXCLUDE_NODES="${EXCLUDE_NODES:-gpu018,gpu031,gpuk[005-018]}"
 
 # Longer than the earlier 30/150 recipe; each job runs:
 #   stage1 reconstruction -> stage1 adversarial continuation -> token cache -> stage2.
@@ -45,7 +45,36 @@ NUM_EMBEDDINGS="${NUM_EMBEDDINGS:-4096}"
 EMBEDDING_DIM="${EMBEDDING_DIM:-128}"
 SPARSITY_LEVEL="${SPARSITY_LEVEL:-4}"
 COEFF_BINS="${COEFF_BINS:-256}"
-COEF_MAX="${COEF_MAX:-16.0}"
+COEF_MAX="${COEF_MAX:-auto_p99.9}"
+CACHE_COEFF_MAX="${CACHE_COEFF_MAX:-${COEF_MAX}}"
+CACHE_COEFF_MAX_PADDING="${CACHE_COEFF_MAX_PADDING:-1.05}"
+STAGE1_COEF_MAX="${STAGE1_COEF_MAX:-null}"
+CACHE_COEFF_MODE="${CACHE_COEFF_MODE:-quantized}"
+CACHE_COEFF_MODE="$(printf '%s' "${CACHE_COEFF_MODE}" | tr '[:upper:]' '[:lower:]')"
+case "${CACHE_COEFF_MODE}" in
+  quantized|quant|q)
+    CACHE_COEFF_MODE="quantized"
+    CACHE_COEFF_BINS="${CACHE_COEFF_BINS:-${COEFF_BINS}}"
+    CACHE_COEFF_LABEL="q${CACHE_COEFF_BINS}"
+    ;;
+  continuous|real|real_valued|none)
+    CACHE_COEFF_MODE="continuous"
+    CACHE_COEFF_BINS=0
+    CACHE_COEFF_LABEL="realcoeff"
+    ;;
+  *)
+    echo "ERROR: CACHE_COEFF_MODE must be quantized or continuous, got ${CACHE_COEFF_MODE}" >&2
+    exit 2
+    ;;
+esac
+if ! [[ "${CACHE_COEFF_BINS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: CACHE_COEFF_BINS must be a non-negative integer, got ${CACHE_COEFF_BINS}" >&2
+  exit 2
+fi
+if [[ "${CACHE_COEFF_MODE}" == "quantized" && "${CACHE_COEFF_BINS}" -le 0 ]]; then
+  echo "ERROR: quantized cache mode requires CACHE_COEFF_BINS > 0" >&2
+  exit 2
+fi
 COMMITMENT_COST="${COMMITMENT_COST:-0.25}"
 BOTTLENECK_LOSS_WEIGHT="${BOTTLENECK_LOSS_WEIGHT:-0.75}"
 STAGE1_LR="${STAGE1_LR:-1.0e-4}"
@@ -148,9 +177,11 @@ fi
 
 COMMON_CACHE_ARGS=(
   --cache-arg=--coeff-bins
-  --cache-arg="$COEFF_BINS"
+  --cache-arg="$CACHE_COEFF_BINS"
   --cache-arg=--coeff-max
-  --cache-arg="$COEF_MAX"
+  --cache-arg="$CACHE_COEFF_MAX"
+  --cache-arg=--coeff-max-padding
+  --cache-arg="$CACHE_COEFF_MAX_PADDING"
   --cache-arg=--coeff-quantization
   --cache-arg=uniform
 )
@@ -176,7 +207,7 @@ COMMON_STAGE2=(
 )
 
 submit_celebahq() {
-  local recipe_label="site-d5-k${SPARSITY_LEVEL}-a${NUM_EMBEDDINGS}-q${COEFF_BINS}-d${STAGE2_D_MODEL}l${STAGE2_N_LAYERS}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
+  local recipe_label="site-d5-k${SPARSITY_LEVEL}-a${NUM_EMBEDDINGS}-${CACHE_COEFF_LABEL}-d${STAGE2_D_MODEL}l${STAGE2_N_LAYERS}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
   "$PYTHON_SUBMIT" scripts/submit_multimodal_sweep.py \
     "${COMMON_ARGS[@]}" \
     --gpus "$IMAGE_GPUS" \
@@ -225,9 +256,8 @@ submit_celebahq() {
     --stage1-override model.patch_reconstruction=tile \
     --stage1-override model.bottleneck_loss_weight="$BOTTLENECK_LOSS_WEIGHT" \
     --stage1-override model.commitment_cost="$COMMITMENT_COST" \
-    --stage1-override model.coef_max="$COEF_MAX" \
+    --stage1-override model.coef_max="$STAGE1_COEF_MAX" \
     --stage1-override model.dict_learning_rate="$STAGE1_DICT_LR" \
-    --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
     --stage1-override model.num_residual_blocks=3 \
     --stage1-override model.num_residual_hiddens=96 \
     --stage1-override model.decoder_extra_residual_layers=2 \
@@ -263,7 +293,7 @@ submit_celebahq() {
 }
 
 submit_vctk() {
-  local recipe_label="wave-d5site-k${VCTK_SPARSITY_LEVEL}-a${VCTK_NUM_EMBEDDINGS}-q${COEFF_BINS}-d${STAGE2_D_MODEL}l${STAGE2_N_LAYERS}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
+  local recipe_label="wave-d5site-k${VCTK_SPARSITY_LEVEL}-a${VCTK_NUM_EMBEDDINGS}-${CACHE_COEFF_LABEL}-d${STAGE2_D_MODEL}l${STAGE2_N_LAYERS}-s1e${STAGE1_EPOCHS}-adve${STAGE1_ADV_EPOCHS}-s2e${STAGE2_EPOCHS}"
   "$PYTHON_SUBMIT" scripts/submit_multimodal_sweep.py \
     "${COMMON_ARGS[@]}" \
     --gpus "$AUDIO_GPUS" \
@@ -334,8 +364,7 @@ submit_vctk() {
     --stage1-override model.commitment_cost="$VCTK_COMMITMENT_COST" \
     --stage1-override model.bottleneck_loss_weight="$VCTK_BOTTLENECK_LOSS_WEIGHT" \
     --stage1-override model.dict_learning_rate="$VCTK_DICT_LR" \
-    --stage1-override model.coef_max="$COEF_MAX" \
-    --stage1-override model.bounded_omp_refine_steps="$BOUNDED_OMP_REFINE_STEPS" \
+    --stage1-override model.coef_max="$STAGE1_COEF_MAX" \
     --stage1-override model.sparsity_reg_weight=0.0 \
     --stage1-override model.recon_mse_weight=0.5 \
     --stage1-override model.recon_l1_weight=0.5 \
@@ -375,8 +404,9 @@ echo "RUN_TAG=$RUN_TAG"
 echo "CASES=$CASES"
 echo "PARTITION=$PARTITION TIME_LIMIT=$TIME_LIMIT DRY_RUN=$DRY_RUN"
 echo "epochs: stage1=$STAGE1_EPOCHS stage1_adv=$STAGE1_ADV_EPOCHS stage2=$STAGE2_EPOCHS max_steps=$STAGE2_MAX_STEPS"
-echo "image: 256 -> 8x8, nonpatch k${SPARSITY_LEVEL}, atoms=${NUM_EMBEDDINGS}, q=${COEFF_BINS}, transformer d${STAGE2_D_MODEL} l${STAGE2_N_LAYERS}"
-echo "vctk: downsample=$VCTK_DOWNSAMPLE_RATES, nonpatch k${VCTK_SPARSITY_LEVEL}, atoms=${VCTK_NUM_EMBEDDINGS}, q=${COEFF_BINS}"
+echo "coeffs: stage1_coef_max=${STAGE1_COEF_MAX}, cache_mode=${CACHE_COEFF_MODE}, cache_bins=${CACHE_COEFF_BINS}, cache_coef_max=${CACHE_COEFF_MAX}, cache_coef_max_padding=${CACHE_COEFF_MAX_PADDING}"
+echo "image: 256 -> 8x8, nonpatch k${SPARSITY_LEVEL}, atoms=${NUM_EMBEDDINGS}, coeff=${CACHE_COEFF_LABEL}, transformer d${STAGE2_D_MODEL} l${STAGE2_N_LAYERS}"
+echo "vctk: downsample=$VCTK_DOWNSAMPLE_RATES, nonpatch k${VCTK_SPARSITY_LEVEL}, atoms=${VCTK_NUM_EMBEDDINGS}, coeff=${CACHE_COEFF_LABEL}"
 
 case_enabled celebahq && submit_celebahq
 case_enabled vctk && submit_vctk

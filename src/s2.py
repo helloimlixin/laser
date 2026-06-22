@@ -524,6 +524,7 @@ def sample(
                 atom_grid,
                 coeff_grid,
                 device=dev,
+                class_labels=class_slice,
             ).detach().cpu()
             atoms.append(atom_grid.detach().cpu())
             coeffs.append(coeff_grid.detach().cpu())
@@ -533,6 +534,7 @@ def sample(
                 s1,
                 tok_grid,
                 device=dev,
+                class_labels=class_slice,
             ).detach().cpu()
             toks.append(tok_grid.detach().cpu())
         imgs.append(img)

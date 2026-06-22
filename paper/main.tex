@@ -8,13 +8,14 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{multirow}
+\usepackage{placeins}
 \usepackage{url}
 \usepackage{hyperref}
 \usepackage{xcolor}
 
 \graphicspath{{figures/}}
 
-\title{LASER: Sparse Dictionary Latents for Two-Stage Generative Modeling Across Vision and Audio}
+\title{LASER: LAtent Space Embedding Representations for Generative Modeling}
 
 \author{\name Anonymous Authors \email anonymous@example.com \\
       \addr Anonymous Institution}
@@ -28,359 +29,353 @@
 \maketitle
 
 \begin{abstract}
-We study a two-stage generative modeling pipeline in which the first stage learns a sparse dictionary representation and the second stage learns a transformer prior over the resulting sparse codes. The proposed model, LASER, replaces a single nearest-neighbor vector-quantized latent with a small learned set of dictionary atoms and coefficients at each latent site or patch. This gives the autoencoder a compositional bottleneck while retaining a discrete interface for generative modeling through coefficient quantization. Stage 1 uses a VQGAN/DDPM-style convolutional encoder-decoder with bottleneck attention and a straight-through sparse projection. Stage 2 uses a spatial-depth transformer that separates long-range spatial structure from the within-site sparse tuple. We report image experiments on CelebA-HQ and related development runs, including reconstruction, FID, support/coefficient prediction, quantized versus real-valued coefficient ablations, and patch-layout sweeps. We also document an audio extension on VCTK log-spectrograms, including the implemented single-channel data path, audio-domain reconstruction metrics, completed VQ-VAE audio baselines, and partial LASER audio training evidence. The current evidence suggests that sparse dictionary latents can substantially improve image distributional quality relative to a VQ-VAE baseline at similar reconstruction quality, while the audio LASER results require a completed stage-2 run before making final cross-modal claims.
+Effective latent space representations are a crucial component in generative modeling. Two-stage generative models often impose structure on these representations; vector quantization is a common example, discretizing each local latent vector into one learned codebook entry. We contend that discreteness is only one possible structural choice, and that the more general principle is to impose a useful lossy compression geometry on the latent space. We propose LASER, a dictionary-learning approach that compresses latent vectors into sparse linear combinations of learned atoms, inducing a union-of-subspaces structure. To make this continuous sparse representation usable by sequential generative models, we tokenize the sparse supports and coefficient values for transformer priors. The purpose of this paper is not to claim state-of-the-art performance, but to demonstrate that sparse dictionary structure can learn compact latents and support generation. Experiments on CelebA-HQ images and VCTK raw waveform audio show that the same sparse-token interface supports reconstruction, adversarial refinement, coherent image generation, and human-sounding audio generation. These results suggest that classical signal representation ideas can provide useful alternatives to vector quantization for structuring modern generative latents.
 \end{abstract}
 
 \section{Introduction}
 
-Two-stage generative models usually learn an autoencoder first and then train a prior in the learned latent space. Vector-quantized autoencoders make the second stage easy because each latent site is a single discrete token, but they force each site to choose one codebook vector. This paper investigates a different bottleneck: each latent site or patch is reconstructed from a sparse linear combination of learned dictionary atoms. The resulting representation keeps a compact token interface for the prior while allowing each location to combine several reusable parts.
+In generative modeling, the learning algorithm develops internal latent space representations. A common approach is to impose structure on these representations so that the downstream generative model operates on a simpler space than raw data. Vector quantization (VQ)~\citep{oord2017vqvae} is one of the most successful examples: each latent vector is mapped to a finite codebook, and the resulting indices can be modeled as discrete tokens by autoregressive priors~\citep{esser2021vqgan,vaswani2017attention}. Geometrically, VQ assumes that the latent space is well approximated by a finite set of points, inducing a Voronoi tessellation of the encoder output space.
 
-LASER, short for Learnable Adaptive Structured Embedding Representation, is designed around this sparse bottleneck. Stage 1 maps an image or spectrogram to a latent tensor, projects local latent vectors or patches onto a sparse dictionary model, and decodes from the sparse reconstruction. Stage 2 models the sparse support and coefficient representation. For quantized coefficients, both atom ids and coefficient bins become discrete tokens. For real-valued coefficients, atom ids remain discrete and coefficients are modeled with regression or Gaussian heads.
+This lossy compression approach both imposes geometric structure and provides discretization. However, these two roles need not be tied together. The geometric restriction that every latent vector must collapse to a single codebook entry can be too strict: local features cannot share or combine codebook atoms, and the model may require a larger codebook than necessary to express compositional variation. In addition, the hard assignment mechanism can underuse portions of the codebook, reducing the effective capacity of the latent space.
 
-This draft makes three contributions.
+Realizing that quantization might not be the only answer to structuring the latent space, we separate the representation problem from the discretization problem. From a signal representation perspective, the first goal is to find a good lossy approximation to each latent vector; discretization is then an additional step that makes the representation usable by sequential generative models. LASER uses sparse dictionary learning for the first step: each latent vector or patch is represented as a sparse linear combination of learned dictionary atoms. This induces a union-of-subspaces model~\citep{olshausen1997sparse,aharon2006ksvd,tropp2007omp}, relaxing the one-code-per-site structure of VQ while retaining a compact bottleneck.
+
+For generation, LASER converts the sparse representation into finite tokens by representing support indices and coefficient values separately. Atom indices describe which dictionary elements are active, while quantized coefficient bins describe their strengths. A transformer prior can then model these sparse codes sequentially. In this paper we instantiate this idea in a two-stage pipeline: stage 1 learns the sparse dictionary autoencoder, and stage 2 learns a spatial-depth transformer prior following the RQ-Transformer factorization~\citep{lee2022rqvae}. The stage-2 model is intentionally used as a proof of concept for sparse-code generation rather than as an exhaustive search over autoregressive architectures.
+
+This paper makes three contributions.
 
 \begin{itemize}
-    \item We describe a maintained LASER architecture with a VQGAN/DDPM-style stage-1 backbone, normalized sparse dictionary atoms, OMP-style patch coding, coefficient quantization, and a metadata-rich cache interface.
-    \item We describe a stage-2 spatial-depth transformer prior that models spatial layout separately from the sparse tuple at each spatial site.
-    \item We report the current experimental record in both vision and audio modalities. Vision has completed stage-1, stage-2, and coefficient-mode experiments. Audio has a complete VQ-VAE baseline and a working LASER stage-1 path, but the local artifacts do not yet contain a completed LASER audio token cache or stage-2 run.
+    \item A systematic perspective on latent representation learning as lossy compression, leading to a dictionary-learning bottleneck that structures latent vectors as compact sparse combinations of learned atoms.
+    \item A tokenization scheme that turns real-valued sparse codes into finite support and coefficient tokens, enabling sequential generation with transformer priors.
+    \item Empirical evidence on CelebA-HQ images and VCTK raw waveform audio, showing that the same sparse-token interface supports reconstruction, adversarial refinement, and generation across modalities.
 \end{itemize}
 
-\section{Model}
+The primary objective of this paper is to open the door to a wider range of approaches to improving latent space representations, rather than to claim that dictionary learning is the only useful structure or to optimize for state-of-the-art performance. We contend that the main benefit of the VQ approach comes from imposing a useful lossy compression structure on the latent space, not from discretization alone. This suggests that other classical signal representation techniques can also be useful for modern generative modeling.
 
-\subsection{Stage 1: Sparse Dictionary Autoencoder}
+\section{Structuring the Latent Space}
 
-Let $x$ denote an input image or a normalized audio spectrogram. Stage 1 first applies an encoder $E_\theta$ and obtains a dense latent tensor
+We consider a generic autoencoding framework with an encoder, decoder, and compression bottleneck. The encoder maps an input $x$ into a latent field $z_e$, the bottleneck produces a compressed representation $\hat{z}$, and the decoder reconstructs $\hat{x}$ from $\hat{z}$. For any local site or patch $u$, let $h_u=P_u z_e$ denote the latent vector to be compressed. In this view, the role of the bottleneck is two-fold: it should approximate the encoder latents with a simpler representation, and it should optionally discretize that representation for downstream generative modeling.
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.84\linewidth]{generic.png}
+    \caption{Generic autoencoder framework with a compression bottleneck. LASER changes the structure imposed inside this bottleneck: instead of mapping each local latent to one vector-quantized codebook entry, it represents the latent as a sparse combination of dictionary atoms.}
+    \label{fig:generic-autoencoder}
+\end{figure}
+
+\subsection{Prior Approach: Vector Quantization}
+
+Vector quantization compresses the latent space into a discrete set of learned codebook vectors. Given a codebook
 \begin{equation}
-    z_e = E_\theta(x) \in \mathbb{R}^{C \times H \times W}.
+    E = [e_1,\ldots,e_M] \in \mathbb{R}^{m \times M},
 \end{equation}
-The decoder $G_\psi$ maps a sparse reconstructed latent tensor back to data space. In the maintained configuration, $E_\theta$ and $G_\psi$ use a VQGAN/DDPM-style ResNet backbone: a $3 \times 3$ input convolution, residual blocks at each resolution, optional attention at configured resolutions, a middle ResNet-attention-ResNet block at the coarsest resolution, and a mirrored decoder with nearest-neighbor upsampling followed by convolution. Unless otherwise stated, attention is only used in the middle block.
-
-\paragraph{DDPM-style multiscale tower.}
-The stage-1 backbone follows the convolutional U-Net design pattern used by DDPM~\citep{ho2020ddpm} and VQGAN/RQ-VAE models: each resolution level is a stack of residual blocks, spatial resolution changes are learned by explicit downsampling or upsampling operators, and self-attention can be inserted at selected resolutions. In LASER this tower is used as an autoencoder rather than as a diffusion denoiser. There is no timestep embedding and no encoder-decoder skip connection across the sparse bottleneck; all information that reaches the decoder must pass through $z_{\mathrm{dl}}$. Thus the architecture is U-Net-like in its multiscale residual/attention blocks, but not a skip-connected U-Net.
-
-For an input resolution $R$ and channel multiplier schedule $(m_0,\ldots,m_L)$, the encoder has $L$ learned downsampling steps and produces a latent grid of size $R/2^L$. The maintained default for $256 \times 256$ CelebA-HQ runs uses two downsampling steps, producing a $64 \times 64$ latent grid before patch tokenization. Stronger high-resolution sweeps can set an explicit schedule such as $(1,1,2,2,4,4)$, giving a $256 \rightarrow 8 \times 8$ tower with wider low-resolution blocks. Each encoder level first applies residual blocks at the current resolution, then, except for the last level, pads the feature map on the right and bottom and applies a $3 \times 3$ stride-2 convolution. This mirrors the DDPM convention of avoiding pooling-only resolution changes while keeping the downsample operator local and learned.
-
-Each residual block uses GroupNorm, SiLU, a $3 \times 3$ convolution, another GroupNorm-SiLU pair, dropout, and a second $3 \times 3$ convolution, plus an identity or learned $1 \times 1$ shortcut when the channel count changes:
+each local latent vector $h_u$ is assigned to its nearest codebook entry:
 \begin{equation}
-    \mathrm{ResBlock}(h)
+    q(z_u=k \mid x)
     =
-    S(h) + W_2 \phi\!\left(N_2\!\left(W_1 \phi(N_1(h))\right)\right),
+    \begin{cases}
+        1, & k = \operatorname*{arg\,min}_{j}\|h_u-e_j\|_2,\\
+        0, & \text{otherwise.}
+    \end{cases}
+    \label{eq:vq-assignment}
 \end{equation}
-where $N_i$ are GroupNorm layers, $\phi$ is SiLU, and $S$ is either identity or a channel-matching projection. Attention blocks also follow the DDPM/VQGAN template: the feature map is normalized, projected with $1 \times 1$ convolutions to queries, keys, and values, flattened to a sequence of $HW$ spatial positions, mixed with scaled dot-product attention, projected back with a $1 \times 1$ convolution, and added residually:
-\begin{equation}
-    \mathrm{Attn}(h)
-    =
-    h + W_o\!\left(V\,\mathrm{softmax}(QK^\top/\sqrt{C})^\top\right).
-\end{equation}
-The coarsest encoder feature always passes through a middle block
-\begin{equation}
-    \mathrm{ResBlock} \rightarrow \mathrm{AttnBlock} \rightarrow \mathrm{ResBlock}
-\end{equation}
-when \texttt{use\_mid\_attention=true}. Additional attention can be enabled by listing spatial resolutions in \texttt{attn\_resolutions}.
+The compressed latent is therefore $\hat{h}_u=e_k$ for the selected index $k$. This construction is powerful because it immediately yields integer tokens for transformer priors, but it also assumes that every local latent vector should be represented by a single prototype. LASER keeps the benefits of a compressive latent bottleneck while replacing the finite-point geometry of VQ with a union of low-dimensional subspaces.
 
-\paragraph{Decoder.}
-The decoder reverses the same design. It first maps the sparse latent tensor to the deepest channel width with a $3 \times 3$ convolution, applies the same middle ResBlock-AttnBlock-ResBlock module, then walks back through the channel multiplier schedule from coarse to fine. Each decoder level uses residual blocks at the current resolution; non-final levels upsample by nearest-neighbor interpolation followed by a $3 \times 3$ convolution. The decoder can use one extra residual block per level, matching common VQGAN/RQ-VAE decoder practice where the generative path receives slightly more capacity than the encoder. A final GroupNorm-SiLU-$3 \times 3$ convolution maps the last feature map to RGB for images or one log-spectrogram channel for audio.
+\subsection{Our Approach: Structuring with Dictionary Learning}
 
-For each latent unit $u$, the bottleneck constructs a vector $h_u$. In per-site mode, $h_u \in \mathbb{R}^{C}$ is one latent vector. In patch mode, $h_u \in \mathbb{R}^{C p^2}$ is an unfolded $p \times p$ latent patch. LASER learns a dictionary
+Let $x \sim p_{\mathrm{data}}$ denote an image or waveform, and let an encoder produce a latent field
+\begin{equation}
+    z_e = E_\theta(x).
+\end{equation}
+We index local latent units by $u \in \mathcal{U}$. A unit can be a single latent site or a local patch, written abstractly as
+\begin{equation}
+    h_u = P_u z_e \in \mathbb{R}^{m},
+\end{equation}
+where $P_u$ extracts the local vector to be represented. LASER replaces nearest-neighbor vector quantization with a sparse dictionary code. Given normalized atoms
 \begin{equation}
     D = [d_1,\ldots,d_M] \in \mathbb{R}^{m \times M}, \qquad \|d_j\|_2 = 1,
 \end{equation}
-and approximates each $h_u$ by solving
+each local vector is represented by a support $S_u \subset \{1,\ldots,M\}$ and coefficients $c_u \in \mathbb{R}^{|S_u|}$:
 \begin{equation}
-    a_u^\star \approx \operatorname*{arg\,min}_{a \in \mathbb{R}^{M}}
-    \frac{1}{2}\|h_u - D a\|_2^2
-    \quad \mathrm{s.t.} \quad
-    \|a\|_0 \leq K .
+    (S_u,c_u)
+    \in
+    \operatorname*{arg\,min}_{S,c}
+    \frac{1}{2}\|h_u - D_S c\|_2^2
+    \quad \mathrm{s.t.} \quad |S| \le K .
+    \label{eq:sparse-code}
 \end{equation}
-The implementation uses top-$K$ correlation selection followed by a regularized least-squares solve in per-site mode and batched Orthogonal Matching Pursuit in patch mode. Patch reconstructions are stitched back to the latent grid using center-crop, tiling, or Hann overlap-add. When patch stride equals patch size, tiling is used automatically.
+The sparse latent reconstruction is obtained by placing $D_{S_u}c_u$ back into the latent field:
+\begin{equation}
+    z_{\mathrm{sp}} = \mathcal{R}\bigl(\{D_{S_u}c_u\}_{u \in \mathcal{U}}\bigr),
+\end{equation}
+and the decoder models $\hat{x}=G_\psi(z_{\mathrm{sp}})$.
 
-The sparse reconstruction is
+This bottleneck can be viewed as a union-of-subspaces generalization of a vector-quantized latent. A one-code-per-site VQ model chooses among $M$ local prototypes. LASER instead chooses one of $\sum_{k=0}^{K} {M \choose k}$ supports and then positions the vector within the selected low-dimensional subspace through $c_u$:
 \begin{equation}
-    z_{\mathrm{dl}} = \mathcal{R}(\{D a_u^\star\}_u),
+    D_{S_u}c_u \in \mathcal{Z}
+    =
+    \bigcup_{\substack{S \subseteq \{1,\ldots,M\}\\ |S|\le K}}
+    \mathrm{span}\{d_j:j\in S\}.
 \end{equation}
-where $\mathcal{R}$ denotes the inverse layout operation from sites or patches to the latent tensor. Training uses a straight-through replacement
-\begin{equation}
-    z_{\mathrm{st}} = z_e + \mathrm{sg}(z_{\mathrm{dl}} - z_e),
-\end{equation}
-so the decoder receives the sparse latent but the encoder still receives gradient signal through the identity branch.
+The model therefore separates \emph{which} reusable factors are active from \emph{how strongly} they are expressed. Coefficient quantization preserves this compositional structure while producing discrete tokens for a second-stage prior.
 
-The stage-1 objective is
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.76\linewidth]{dl-internal.png}
+    \caption{Dictionary-learning compression bottleneck. The encoder output is sparsely coded over a learned dictionary, producing support/coefficient values that reconstruct the latent vector and can later be tokenized for generative modeling.}
+    \label{fig:dictionary-bottleneck}
+\end{figure}
+
+\subsection{Training Objective}
+
+Stage 1 is trained as an autoencoder with a sparse bottleneck. The objective is
 \begin{align}
     \mathcal{L}_{\mathrm{s1}}
-    &=
-    \mathcal{L}_{\mathrm{rec}}(x,\hat{x})
-    + \lambda_{\mathrm{bn}}\mathcal{L}_{\mathrm{bn}}
-    + \lambda_{\mathrm{perc}}\mathcal{L}_{\mathrm{perc}}
-    + \lambda_{\mathrm{coh}}\mathcal{L}_{\mathrm{coh}}, \\
-    \mathcal{L}_{\mathrm{bn}}
-    &=
-    \|z_{\mathrm{dl}} - \mathrm{sg}(z_e)\|_2^2
-    + \beta\|\mathrm{sg}(z_{\mathrm{dl}})-z_e\|_2^2 .
+    =
+    \mathbb{E}_{x \sim p_{\mathrm{data}}}
+    \Big[
+        \ell_{\mathrm{rec}}(x,\hat{x})
+        + \lambda_{\mathrm{sp}}
+          \sum_{u \in \mathcal{U}}\|P_u z_e - D_{S_u}c_u\|_2^2
+        + \lambda_{\mathrm{coh}}\mathcal{C}(D)
+    \Big],
+    \label{eq:stage1-objective}
 \end{align}
-For images, $\mathcal{L}_{\mathrm{rec}}$ is pixel MSE in normalized image space and $\mathcal{L}_{\mathrm{perc}}$ is LPIPS when enabled. For audio spectrograms, $\mathcal{L}_{\mathrm{perc}}$ is disabled and the model can add an audio-energy matching term that compares frame-level and global log energy reconstructed from the spectrogram.
+where $\ell_{\mathrm{rec}}$ is a modality-appropriate reconstruction loss and $\mathcal{C}(D)$ discourages degenerate dictionaries. The sparse projection is non-smooth because the support changes discretely. During autoencoder training, gradients are passed through the latent bottleneck with a straight-through estimator, so the decoder is trained on sparse latents while the encoder receives reconstruction signal.
 
-\subsection{Token Cache}
+For images, $\ell_{\mathrm{rec}}$ combines pixel and perceptual reconstruction terms when enabled. For raw waveform audio, it combines waveform and spectral reconstruction terms. These choices affect the metric surface but not the latent variable factorization in Eq.~\ref{eq:sparse-code}.
 
-The token cache is the explicit contract between stage 1 and stage 2. It stores sparse supports, coefficients, latent shape metadata, patch layout, coefficient quantization settings, and enough stage-1 backbone metadata to decode samples later.
+As in adversarial autoencoding and VQGAN-style training, the reconstruction objective can be augmented with a discriminator loss to improve perceptual sharpness. In that case, the encoder, dictionary bottleneck, and decoder define the generator, while a patch discriminator distinguishes real samples from reconstructions. This adversarial extension changes the training signal but leaves the sparse latent representation and tokenization unchanged.
 
-For quantized sparse codes, each sparse slot contributes an atom token and a coefficient-bin token:
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.88\linewidth]{dlgan-arch.png}
+    \caption{Adversarial extension of the dictionary-learning autoencoder. A patch discriminator supplies an additional perceptual training signal while the compression bottleneck remains the sparse dictionary representation.}
+    \label{fig:dlgan-arch}
+\end{figure}
+
+\subsection{Tokenization}
+
+For generative modeling, each sparse code must be converted into a sequence. The unordered support in Eq.~\ref{eq:sparse-code} is first canonicalized by sorting atom ids. With $K$ active slots and quantized coefficients, the token tuple for unit $u$ is
 \begin{equation}
-    y_{u} = [i_{u,1}, b_{u,1}, i_{u,2}, b_{u,2}, \ldots, i_{u,K}, b_{u,K}],
+    y_u =
+    [i_{u,1}, b_{u,1}, i_{u,2}, b_{u,2}, \ldots, i_{u,K}, b_{u,K}],
+    \label{eq:sparse-token}
 \end{equation}
-where $i_{u,k} \in \{0,\ldots,M-1\}$ and $b_{u,k}$ is offset by $M$ in the shared vocabulary. The cache depth is therefore $D_t=2K$. For real-valued sparse codes, the cache stores atom ids in the token tensor and coefficients in a separate floating-point tensor, so $D_t=K$.
-
-The cache writer canonicalizes sparse pairs by sorting supports by atom id. This matters because the sparse approximation is an unordered set, while the transformer consumes an ordered sequence.
-
-\subsection{Stage 2: Spatial-Depth Prior}
-
-The default prior is a spatial-depth transformer. It models a sparse token grid $Y \in \mathbb{Z}^{H_c \times W_c \times D_t}$ in raster spatial order and depth order within each site. Conceptually,
+where $i_{u,k}$ is an atom id and $b_{u,k}=Q(c_{u,k})$ is a coefficient-bin id. Let $\tilde{c}_u$ denote the dequantized coefficient vector recovered from these bins. If the coefficient quantizer has step size $\Delta$, the local quantization perturbation satisfies
 \begin{equation}
-    p(Y) =
-    \prod_{s=1}^{H_c W_c}
+    \|D_{S_u}(c_u-\tilde{c}_u)\|_2
+    \le
+    \|D_{S_u}\|_2 \frac{\sqrt{K}\Delta}{2}.
+\end{equation}
+Thus coefficient resolution controls a direct bound on local latent distortion, while the support controls the discrete combinatorial part of the representation.
+
+The resulting sparse-token grid is denoted
+\begin{equation}
+    Y \in \{1,\ldots,V\}^{H_c \times W_c \times D_t},
+\end{equation}
+where $D_t=2K$ for quantized coefficients. In real-valued variants, atom ids remain discrete while coefficients are modeled as continuous values; the experiments in this paper use quantized coefficients.
+
+\subsection{Prior Modeling with a Spatial-Depth Transformer}
+
+The second stage follows the theoretical factorization of RQ-Transformer~\citep{lee2022rqvae}, adapted from residual-quantized code stacks to LASER sparse-token tuples. Let $T=H_cW_c$ and rearrange the spatial indices of $Y$ in raster-scan order to obtain
+\begin{equation}
+    S \in \{1,\ldots,V\}^{T \times D_t},
+    \qquad
+    S_t=(S_{t,1},\ldots,S_{t,D_t}),
+\end{equation}
+where $S_t$ is the ordered support/coefficient token stack at spatial position $t$. The autoregressive prior is factorized as
+\begin{equation}
+    p(S)
+    =
+    \prod_{s=1}^{T}
     \prod_{d=1}^{D_t}
-    p(y_{s,d} \mid Y_{<s}, y_{s,<d}).
+    p(S_{s,d} \mid S_{<s}, S_{s,<d}),
+    \label{eq:spatial-depth}
 \end{equation}
-The implementation decomposes this into two modules. A spatial transformer computes contextual features for spatial sites. A depth transformer predicts the ordered sparse tuple at each site using the spatial context and previous depth tokens. For quantized caches, the depth head predicts the shared atom-plus-coefficient vocabulary. For real-valued caches, it predicts atom logits and either direct coefficient values or Gaussian coefficient parameters.
+where $S_{<s}$ denotes all token stacks at earlier raster positions and $S_{s,<d}$ denotes earlier tokens in the current stack. This matches the RQ-Transformer view that generation should predict the next stack of local latent codes rather than flattening the entire $T D_t$ grid into an undifferentiated sequence.
 
-This design preserves the distinction between where a code occurs and which sparse atom-coefficient pair fills a slot. It also supports patch-based caches where the cache grid differs from the full latent grid; the stage-2 decoder uses cache metadata to reconstruct the latent before calling the stage-1 decoder.
-
-\subsection{Audio Adaptation}
-
-For VCTK audio, the data module converts waveform clips to normalized single-channel log-power spectrograms. Each clip is resampled to 16 kHz, cropped or zero-padded to 32,768 samples, transformed with an STFT using $n_{\mathrm{fft}}=1024$ and hop length 256, log-compressed, resized to $128 \times 128$, and normalized with mean and standard deviation 0.5. Evaluation reconstructs audio-domain quantities from the predicted spectrogram and reports log-spectral distance (LSD), log-magnitude MSE/L1, spectral convergence, log-mel L1, and optional ViSQOL when available. In the local VCTK runs reported here, ViSQOL was not available.
-
-Given reference magnitude $A$ and reconstructed magnitude $\hat{A}$, the reported spectral convergence is
+The spatial transformer summarizes information from previous positions. Let $e(\cdot)$ be a learned token embedding and $p^{\mathrm{sp}}_t$ be a spatial positional embedding. We embed the previous sparse-token stack as
 \begin{equation}
-    \mathrm{SC}(A,\hat{A}) = \frac{\|A-\hat{A}\|_F}{\|A\|_F},
+    u_t = p^{\mathrm{sp}}_t + \sum_{d=1}^{D_t} e(S_{t-1,d}), \qquad t>1,
 \end{equation}
-and LSD is computed as an RMS distance between log magnitudes over time-frequency bins. For qualitative logging, Griffin-Lim reconstruction is used to invert predicted magnitudes to waveform clips. These audio metrics are only used for audio batches; image metrics such as PSNR and FID are suppressed for VCTK.
+with $u_1$ represented by a learned start embedding. A causal spatial transformer maps $(u_1,\ldots,u_t)$ to a context vector $h_t$ that encodes $S_{<t}$.
+
+Given $h_t$, the depth transformer predicts the tokens inside the current sparse tuple. With depth positional embeddings $p^{\mathrm{dep}}_d$, its inputs are
+\begin{equation}
+    v_{t,1}=p^{\mathrm{dep}}_1+h_t,\qquad
+    v_{t,d}=p^{\mathrm{dep}}_d+\sum_{d'=1}^{d-1}e(S_{t,d'}),\quad d>1.
+\end{equation}
+A causal depth transformer over $(v_{t,1},\ldots,v_{t,d})$ outputs the conditional distribution
+\begin{equation}
+    p_{t,d}(\cdot)
+    =
+    p(S_{t,d}=\cdot \mid S_{<t},S_{t,<d}),
+\end{equation}
+and the stage-2 objective is the negative log-likelihood
+\begin{equation}
+    \mathcal{L}_{\mathrm{AR}}
+    =
+    \mathbb{E}_{S}\left[
+    -\sum_{t=1}^{T}\sum_{d=1}^{D_t}
+    \log p(S_{t,d}\mid S_{<t},S_{t,<d})
+    \right].
+\end{equation}
+
+This decomposition matches the semantics of the LASER latent code: spatial positions carry global image or audio arrangement, while depth positions describe the local sparse mixture through support and coefficient tokens. It also inherits the computational motivation of RQ-Transformer. A naive transformer over a length-$TD_t$ sequence has attention cost quadratic in $TD_t$, whereas separating the spatial and depth transformers gives costs governed by a length-$T$ spatial sequence and length-$D_t$ depth sequences.
+
+\subsection{Cross-Modal View}
+
+The same construction applies to image and waveform data. Images use local two-dimensional latent patches. Audio uses temporal latent patches produced from raw waveform segments. The decoder and reconstruction loss are modality-specific, but the latent variable in Eq.~\ref{eq:sparse-code}, the tokenization in Eq.~\ref{eq:sparse-token}, and the prior factorization in Eq.~\ref{eq:spatial-depth} are shared.
+
+\FloatBarrier
 
 \section{Experiments}
 
-\subsection{Experimental Protocol}
+\subsection{Detailed Experimental Setup}
 
-Unless otherwise specified, image experiments use CelebA-HQ at $256 \times 256$, a VQGAN-style stage-1 backbone, coefficient bound 8.0, 256 coefficient bins for quantized LASER caches, AdamW/Adam optimization through PyTorch Lightning, and a spatial-depth stage-2 prior with $d_{\mathrm{model}}=512$, 8 attention heads, 6 transformer layers, feed-forward width 2048, and dropout 0.1. Audio experiments use VCTK at $128 \times 128$ spectrogram resolution.
+The experiments focus on one image setting and one audio setting. The image setting is CelebA-HQ at $256 \times 256$ with non-overlapping $2 \times 2$ latent patches, sparsity $K=4$, and 256 coefficient bins. The audio setting is VCTK raw waveform modeling with the same patch size, stride, sparsity, and coefficient quantization. In both settings, stage 1 learns the sparse dictionary autoencoder and stage 2 learns the spatial-depth prior over the resulting sparse-token grid.
 
-The tables distinguish completed runs from partial or interrupted runs. This is important for audio: the local repository contains completed VQ-VAE audio stage-1 and stage-2 runs, but the available LASER audio runs were interrupted before token-cache extraction and stage-2 training.
+\subsection{CelebA-HQ Image Results}
 
-\subsection{Vision Stage-1 Reconstruction and Distributional Quality}
+Table~\ref{tab:celeb-stage1} reports CelebA-HQ stage-1 reconstruction FID for the non-adversarial checkpoint and the adversarial continuation. The adversarial continuation improves rFID from 29 to 16.
 
-Table~\ref{tab:vision-stage1} compares completed CelebA-HQ stage-1 autoencoders. The VQ-VAE baseline obtains the best pixel reconstruction MSE and PSNR. LASER, especially the wider $M=4096,K=24,C=32$ variant, improves FID substantially while retaining similar SSIM. This is the key empirical tradeoff observed in the current results: sparse dictionary latents sacrifice some pixel distortion but improve distributional reconstruction quality.
-
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \small
-\caption{Completed CelebA-HQ $256 \times 256$ stage-1 results. Lower is better for loss, reconstruction loss, and FID; higher is better for PSNR and SSIM. LASER loss includes the weighted bottleneck term, so reconstruction loss is the cleaner distortion comparison.}
-\label{tab:vision-stage1}
-\begin{tabular}{lrrrrrrr}
+\caption{CelebA-HQ $256 \times 256$ stage-1 reconstruction FID for the reported LASER instance. Lower is better.}
+\label{tab:celeb-stage1}
+\begin{tabular}{lr}
 \toprule
-Model & Atoms & $K$ & Test loss & Recon. & PSNR & SSIM & FID \\
+Checkpoint & rFID \\
 \midrule
-VQ-VAE & 512 & 1 & 0.0026 & 0.0021 & 32.884 & 0.615 & 24.50 \\
-LASER & 4096 & 16 & 0.3895 & 0.0036 & 30.534 & 0.588 & 8.44 \\
-LASER & 4096 & 24 & 0.4465 & 0.0028 & 31.629 & 0.616 & 6.88 \\
+Non-adversarial & 29 \\
+Adversarial & 16 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{figure}[t]
+The stage-1 media in Figures~\ref{fig:celebahq-stage1-noadv-grid},~\ref{fig:celebahq-stage1-adv-grid}, and~\ref{fig:celebahq-stage1-helpers} show validation reconstructions and sparse-code diagnostics for both the non-adversarial checkpoint and the adversarial continuation.
+
+\begin{figure}[!htbp]
     \centering
-    \includegraphics[width=0.48\linewidth]{originals.png}
-    \includegraphics[width=0.48\linewidth]{recons.png}
-    \caption{Stage-1 CelebA qualitative reconstruction grid. Left: held-out original images. Right: corresponding reconstructions decoded from the sparse dictionary latent produced by the stage-1 autoencoder.}
-    \label{fig:stage1-originals-recons}
+    \includegraphics[width=0.82\linewidth]{celebahq_stage1_noadv_validation_grid.png}
+    \caption{CelebA-HQ non-adversarial stage-1 validation diagnostics for four examples. Rows are original images, reconstructions, sparse heatmaps, latent RGB helpers, and reconstruction error maps.}
+    \label{fig:celebahq-stage1-noadv-grid}
 \end{figure}
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
     \centering
-    \includegraphics[width=0.92\linewidth]{reconstruction_comparison.png}
-    \caption{Representative reconstruction comparison generated by the repository visualization suite. The current paper draft uses the existing local figure assets; final submission should replace this with a figure from the exact runs in Table~\ref{tab:vision-stage1}.}
-    \label{fig:recon}
+    \includegraphics[width=0.82\linewidth]{celebahq_stage1_adv_validation_grid.png}
+    \caption{CelebA-HQ adversarial stage-1 validation diagnostics for the same four examples. Rows are original images, reconstructions, sparse heatmaps, latent RGB helpers, and reconstruction error maps.}
+    \label{fig:celebahq-stage1-adv-grid}
 \end{figure}
 
-\subsection{Vision Stage-2 Sparse Prior}
-
-Table~\ref{tab:vision-stage2} summarizes the CelebA-HQ stage-2 prior evidence available in the local artifacts. LASER stage-2 training produced checkpoints and samples before the jobs were cancelled by the scheduler. The smaller depth configuration reached validation CE 2.3485 by epoch 15, while the wider depth configuration reached validation CE 2.5643 by epoch 9. In contrast, the VQ-VAE CelebA-HQ prior over a $64 \times 64$ grid ran out of memory after the initial validation pass, where CE was 6.388. These numbers are not a final generative benchmark, but they support the design goal: moving from a dense $64 \times 64 \times 1$ VQ grid to a $32 \times 32 \times D_t$ sparse grid makes stage-2 training more tractable for this setup.
-
-\begin{table}[t]
-\centering
-\small
-\caption{CelebA-HQ stage-2 prior status. LASER results are best validation checkpoint values before scheduler cancellation. VQ-VAE stage 2 encountered CUDA OOM during training after initial validation.}
-\label{tab:vision-stage2}
-\begin{tabular}{lllrrl}
-\toprule
-Stage-1 model & Cache shape & Params & Epochs observed & Best val. loss & Status \\
-\midrule
-LASER $M=4096,K=16,C=16$ & $32 \times 32 \times 24$ & 39.2M & 15 & 2.3485 & partial \\
-LASER $M=4096,K=24,C=32$ & $32 \times 32 \times 32$ & 41.3M & 9 & 2.5643 & partial \\
-VQ-VAE $M=512$ & $64 \times 64 \times 1$ & 29.2M & 0 & 6.3880 & OOM \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{figure}[t]
+\begin{figure}[!htbp]
     \centering
-    \includegraphics[width=0.98\linewidth]{samples1.png}\\[0.35em]
-    \includegraphics[width=0.98\linewidth]{samples2.png}\\[0.35em]
-    \includegraphics[width=0.98\linewidth]{samples3.png}
-    \caption{Stage-2 CelebA vision samples from the sparse-token prior. Each row shows a local sample grid decoded through the stage-1 autoencoder from tokens generated by the stage-2 model. These samples are qualitative evidence for the partial CelebA stage-2 runs in Table~\ref{tab:vision-stage2}.}
-    \label{fig:celeb-stage2-samples}
+    \small
+    \begin{tabular}{cc}
+        Latent RGB & Dictionary scatter \\
+        \includegraphics[width=0.28\linewidth]{celebahq_stage1_noadv_latent_rgb.png} &
+        \includegraphics[width=0.58\linewidth]{celebahq_stage1_noadv_dictionary_scatter.png} \\
+        \multicolumn{2}{c}{Non-adversarial stage 1} \\
+        \includegraphics[width=0.28\linewidth]{celebahq_stage1_adv_latent_rgb.png} &
+        \includegraphics[width=0.58\linewidth]{celebahq_stage1_adv_dictionary_scatter.png} \\
+        \multicolumn{2}{c}{Adversarial stage 1}
+    \end{tabular}
+    \caption{Additional CelebA-HQ stage-1 helper visualizations for the selected non-adversarial and adversarial checkpoints.}
+    \label{fig:celebahq-stage1-helpers}
 \end{figure}
 
-\subsection{Coefficient Quantization and Patch Capacity}
+The corresponding stage-2 prior is trained on the quantized sparse-token grid from this setting. We report its output qualitatively through decoded sample crops, since the central question is whether the sparse-token prior can produce coherent face samples through the learned dictionary decoder.
 
-Table~\ref{tab:coeff-compare} reports a completed $256 \times 256$ CelebA-HQ coefficient-mode comparison. All runs used patch size 4, patch stride 2, 10 stage-1 epochs, 10 stage-2 epochs, batch size 6, and stage-2 batch size 6. Quantized coefficient runs use 512 coefficient bins with coefficient range 4.0. Real-valued runs store coefficients separately and train a regression-style coefficient path.
-
-The main finding is consistent: quantized coefficients improve stage-1 validation loss in all matched atom/sparsity pairs and avoid the real-valued coefficient instability observed at $M=6144,K=24$. Increasing sparsity from 16 to 24 helps reconstruction in both coefficient modes. The best reconstruction in this sweep is the quantized $M=6144,K=24$ run; the best stage-2 loss is the quantized $M=4096,K=24$ run.
-
-\begin{table}[t]
-\centering
-\small
-\caption{Completed CelebA-HQ $256 \times 256$ coefficient-mode comparison. ``Coeff.'' is the weighted coefficient term used by each mode; cross-mode coefficient losses are not directly comparable.}
-\label{tab:coeff-compare}
-\begin{tabular}{lrrrrrrr}
-\toprule
-Mode & Atoms & $K$ & Val. loss & PSNR & SSIM & Stage-2 loss & Coeff. \\
-\midrule
-Quantized & 4096 & 16 & 0.0205 & 25.493 & 0.7567 & 4.8576 & 2.7814 \\
-Quantized & 4096 & 24 & 0.0171 & 26.262 & 0.7715 & 4.5779 & 2.5510 \\
-Quantized & 6144 & 16 & 0.0193 & 25.725 & 0.7624 & 4.8954 & 2.7505 \\
-Quantized & 6144 & 24 & 0.0150 & 26.606 & 0.7809 & 4.8179 & 2.5355 \\
-Real-valued & 4096 & 16 & 0.0368 & 23.908 & 0.7135 & 5.6761 & 0.1271 \\
-Real-valued & 4096 & 24 & 0.0239 & 25.322 & 0.7487 & 5.6255 & 0.6690 \\
-Real-valued & 6144 & 16 & 0.0310 & 24.332 & 0.7240 & 5.7835 & 0.2884 \\
-Real-valued & 6144 & 24 & 0.0202 & 25.784 & 0.7576 & 7.9556 & 5.1074 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Development Runs at $128 \times 128$}
-
-Earlier completed CelebA development runs are summarized in Table~\ref{tab:dev128}. These runs are useful because they compare quantized and deterministic real-valued coefficient paths under a faster setup. Quantization leaves stage-1 reconstruction essentially unchanged but lowers stage-2 loss from 5.1810 to 3.7303. The overlapping-patch reference has slightly worse validation loss but comparable SSIM and a moderate stage-2 loss.
-
-\begin{table}[t]
-\centering
-\small
-\caption{Completed $128 \times 128$ CelebA development baselines.}
-\label{tab:dev128}
-\begin{tabular}{lrrrr}
-\toprule
-Run family & Stage-1 val. loss & PSNR & SSIM & Stage-2 epoch loss \\
-\midrule
-LASER fast100, quantized & 0.0044 & 30.291 & 0.8875 & 3.7303 \\
-LASER fast100, real-valued & 0.0044 & 30.313 & 0.8873 & 5.1810 \\
-LASER patch100 & 0.0087 & 29.410 & 0.8902 & 4.9717 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Audio Experiments}
-
-Table~\ref{tab:audio} reports the current VCTK evidence. The completed VQ-VAE audio baseline trains both stages for 20 epochs. Stage 1 reconstructs log-spectrograms with test LSD 0.4456 and test log-mel L1 0.2019; stage 2 reaches test CE 4.0762 and token accuracy 14.54 percent. The LASER audio stage-1 path is implemented and runs on the same VCTK preprocessing. A wider LASER configuration with $M=4096,K=24,C=32$ reached validation LSD 0.422 by epoch 2 before the job was cancelled. A later media-fix run reached epoch 8 but did not complete. No local artifact contains a completed LASER audio token cache or LASER audio stage-2 checkpoint, so the table marks those entries as partial rather than final.
-
-\begin{table}[t]
-\centering
-\small
-\caption{VCTK audio status. VQ-VAE numbers are completed test metrics. LASER numbers are best observed validation metrics before interruption; no completed LASER audio stage-2 run was present in the local artifacts.}
-\label{tab:audio}
-\begin{tabular}{llrrrrrr}
-\toprule
-Model & Status & Stage-1 loss & LSD & Logmag MSE & Logmel L1 & Stage-2 CE & Acc. \\
-\midrule
-VQ-VAE & complete & 0.00756 & 0.4456 & 0.2040 & 0.2019 & 4.0762 & 0.1454 \\
-LASER $M=4096,K=24,C=32$ & partial val. & 0.057--0.058 & 0.422 & -- & -- & -- & -- \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{figure}[t]
+\begin{figure}[!htbp]
     \centering
-    \includegraphics[width=0.98\linewidth]{audio_mels.png}\\[0.35em]
-    \includegraphics[width=0.98\linewidth]{audio_waveforms.png}
-    \caption{VCTK audio qualitative diagnostics. Top: mel-spectrogram visualizations from the audio reconstruction logging path. Bottom: corresponding waveform visualizations after magnitude-to-waveform reconstruction for listening-oriented inspection.}
-    \label{fig:vctk-audio-mels-waveforms}
+    \begin{tabular}{cc}
+        \includegraphics[width=0.47\linewidth]{celebahq_powerlong_stage2_samples_4x4_01.png} &
+        \includegraphics[width=0.47\linewidth]{celebahq_powerlong_stage2_samples_4x4_02.png} \\
+        \includegraphics[width=0.47\linewidth]{celebahq_powerlong_stage2_samples_4x4_03.png} &
+        \includegraphics[width=0.47\linewidth]{celebahq_powerlong_stage2_samples_4x4_04.png}
+    \end{tabular}
+    \caption{Four $4 \times 4$ CelebA-HQ sample crops from the reported stage-2 prior.}
+    \label{fig:celebahq-powerlong-samples}
 \end{figure}
 
-\subsection{Qualitative Diagnostics}
+\FloatBarrier
 
-The repository includes visual diagnostics for dictionary usage, code heatmaps, VQ codebook usage, and patch-latent reconstruction. These plots are not a replacement for final sample quality metrics, but they are valuable for debugging sparse collapse and support concentration.
+\subsection{VCTK Waveform Audio Results}
 
-\begin{figure}[t]
+The VCTK setting models raw waveform segments with the sparse dictionary bottleneck described above. Mel loss is disabled, so this experiment tests whether the sparse-token interface can support waveform reconstruction and generation without relying on mel-domain supervision. We report the audio results qualitatively through waveform traces, mel-spectrogram diagnostics, and generated waveform samples.
+
+The non-adversarial and adversarial stage-1 variants both preserve the temporal structure of validation speech clips after sparse dictionary compression and decoding. The corresponding audio stage-2 transformer generates waveform clips from sparse-token sequences decoded through the learned waveform autoencoder. Qualitatively, these generated clips are human-sounding and have speech-like waveform envelopes.
+
+\begin{figure}[!htbp]
     \centering
-    \includegraphics[width=0.48\linewidth]{dictionary_atom_usage.png}
-    \includegraphics[width=0.48\linewidth]{code_heatmaps.png}
-    \caption{Local diagnostics for dictionary atom usage and sparse-code spatial activity. These help detect atom collapse and highly concentrated sparse supports.}
-    \label{fig:diagnostics}
+    \includegraphics[width=0.88\linewidth]{vctk_laser_val_waveforms.png}
+    \caption{VCTK validation waveform comparisons from the non-adversarial LASER waveform model. Blue traces are source waveforms and orange traces are stage-1 reconstructions.}
+    \label{fig:vctk-waveform-comparisons}
 \end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.98\linewidth]{vctk_laser_val_mels.png}
+    \caption{VCTK validation mel-spectrogram diagnostics from the non-adversarial LASER waveform model. Each row shows original mel, reconstructed mel, and absolute difference.}
+    \label{fig:vctk-mel-comparisons}
+\end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.98\linewidth]{vctk_laser_generated_waveforms.png}
+    \caption{Generated VCTK waveform samples from the LASER stage-2 prior. The samples are generated from sparse-token sequences and decoded through the waveform stage-1 model.}
+    \label{fig:vctk-generated-waveforms}
+\end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.88\linewidth]{vctk_laser_adv_val_waveforms.png}
+    \caption{VCTK validation waveform comparisons from the adversarial LASER waveform model. Blue traces are source waveforms and orange traces are reconstructions.}
+    \label{fig:vctk-adv-waveform-comparisons}
+\end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.98\linewidth]{vctk_laser_adv_val_mels.png}
+    \caption{VCTK validation mel-spectrogram diagnostics from the adversarial LASER waveform model. Each row shows original mel, reconstructed mel, and absolute difference.}
+    \label{fig:vctk-adv-mel-comparisons}
+\end{figure}
+
+\FloatBarrier
 
 \section{Discussion}
 
-The vision results show a clear difference between pixel distortion and distributional quality. VQ-VAE has lower reconstruction loss and higher PSNR than LASER in the completed CelebA-HQ comparison, but LASER has much lower FID. This suggests that the sparse dictionary bottleneck changes the reconstruction errors in a way that is less harmful to distributional statistics, possibly because the latent must be composed from reusable atoms rather than selected from a single nearest code.
+The experiments support the central claim of the paper: useful generative latents do not have to be structured as one discrete codebook entry per site. LASER imposes a sparse dictionary structure instead, so each local latent is represented by a compact combination of learned atoms. The CelebA-HQ reconstruction and helper visualizations show that this bottleneck can preserve meaningful image structure while producing sparse, interpretable latent activity. The adversarial stage-1 continuation further improves the reconstruction distribution measured by rFID, and the stage-2 samples show that the resulting sparse-token representation can be modeled by an autoregressive prior.
 
-The coefficient comparison supports quantized coefficients for the current stage-2 design. Quantization improves reconstruction in the completed $256 \times 256$ sweep and gives the prior a clean discrete likelihood. The real-valued coefficient path remains useful for analysis, but it needs a more explicit probabilistic coefficient model before it should be treated as a final generative likelihood.
+The VCTK waveform results reinforce the same point in a different modality. The model uses the same sparse-token interface for raw audio, with modality-specific encoder, decoder, and reconstruction terms. The waveform and mel-spectrogram diagnostics indicate that the dictionary bottleneck preserves speech structure, and the generated stage-2 clips are human-sounding in qualitative listening inspection. This suggests that the sparse representation is not merely an image-specific construction, but a general way to impose compressive structure on latent spaces.
 
-The audio path is promising but incomplete. The spectrogram data module, metrics, logging, and single-channel model configs are implemented and tested. The completed VQ-VAE audio baseline provides a reference. LASER audio stage 1 runs and can reach competitive validation LSD early, but the current artifact set does not support a final LASER audio claim because no completed token cache or stage-2 run is available.
+More broadly, these results suggest that the success of VQ-style generative modeling should not be attributed only to discreteness. Discretization is important for token-based priors, but it is only one part of the modeling story. The latent space must first be organized into a useful compressed representation. Dictionary learning provides one such organization by replacing a finite set of isolated prototypes with a union of low-dimensional subspaces. This gives the model a compositional latent geometry while still allowing the sparse codes to be quantized for sequential generation.
 
 \section{Limitations}
 
-The current paper draft has four limitations. First, several stage-2 vision jobs were interrupted by the scheduler and are reported as partial validation evidence, not final test results. Second, final sample quality metrics for generated images are not yet reported. Third, the audio LASER experiment is not complete. Fourth, the theoretical sparse-recovery story is intentionally modest: the implementation uses normalized dictionaries and projected gradients, but it does not enforce coherence conditions strong enough for classical OMP recovery guarantees at the maintained defaults.
+The goal of this paper is to propose and validate an idea for structuring latent spaces, not to claim state-of-the-art performance. Sparse dictionary learning is one effective compressive structure, but it is not the only possible one. Other lossy compression mechanisms may induce different latent geometries with different tradeoffs, and exploring this broader design space is a natural direction for future work.
+
+The reported transformer prior is also intentionally simple. Its role is to demonstrate that tokenized sparse codes can support sequential generation after the dictionary bottleneck has learned a compact representation. A more heavily optimized autoregressive model, sampling scheme, or likelihood objective may improve generation quality, but that architecture search is separate from the latent-structure claim. Finally, the sparse-coding step introduces some computational overhead and relies on a fixed sparsity choice; these are practical tradeoffs of using a union-of-subspaces bottleneck rather than a single nearest-neighbor codebook assignment.
 
 \section{Related Work}
 
-LASER is related to vector-quantized autoencoders such as VQ-VAE~\citep{oord2017vqvae} and VQGAN~\citep{esser2021vqgan}, which provide discrete latent spaces for autoregressive priors. It differs by replacing one-code-per-site quantization with a sparse dictionary model. The sparse bottleneck is connected to dictionary learning and sparse coding~\citep{olshausen1997sparse,aharon2006ksvd,tropp2007omp}, but it is trained as part of a deep straight-through autoencoder rather than as a standalone sparse coding objective. The second stage follows the broad recipe of latent generative modeling with transformers~\citep{vaswani2017attention}, but uses a spatial-depth factorization tailored to sparse tuples rather than a flat pixel or token sequence. The audio experiments connect to neural audio compression and spectrogram autoencoding, where reconstruction quality is often assessed with log-spectral and perceptual metrics rather than image metrics.
+\paragraph{VQ-family models.}
+Variational autoencoders with a discretization bottleneck, including VQ-VAE~\citep{oord2017vqvae} and VQGAN~\citep{esser2021vqgan}, provide compressed latent spaces that can be modeled by autoregressive priors. These models demonstrate that a learned compression bottleneck can be highly effective for generation. LASER follows the same broad two-stage philosophy, but replaces the finite-codebook geometry with sparse dictionary learning.
 
-\section{Reproducibility}
+\paragraph{Sparse coding and dictionary learning.}
+Sparse dictionary learning has a long history as a signal representation technique~\citep{olshausen1997sparse,aharon2006ksvd,tropp2007omp}. The main difference in LASER is that the dictionary is learned as part of a deep generative autoencoder, and the resulting sparse codes are explicitly tokenized for a second-stage prior. In this sense, LASER is not only a reconstruction model but also a latent-tokenization mechanism for generative modeling.
 
-The maintained code paths are \texttt{train_stage1_autoencoder.py} for stage-1 autoencoder training, \texttt{cache.py} for token-cache extraction, \texttt{train_stage2_prior.py} for stage-2 prior training, and \texttt{sample.py} for generation. Important implementation files are \texttt{src/models/laser.py}, \texttt{src/models/bottleneck.py}, \texttt{src/models/spatial_prior.py}, \texttt{src/data/vctk.py}, and \texttt{src/audio\_logging.py}. The paper source was written from the local run notes and artifacts under \texttt{/scratch/xl598/runs} and from the documented repo configs.
+\paragraph{Transformer priors.}
+Autoregressive transformers~\citep{vaswani2017attention} are a natural choice for modeling discrete latent tokens. VQ models typically provide one token per latent site, while RQ-Transformer~\citep{lee2022rqvae} models residual-quantized code stacks with a spatial-depth factorization. LASER adopts the same factorization for sparse support/coefficient token stacks, separating spatial context from the local sparse tuple at each site.
 
 \section{Conclusion}
 
-LASER replaces a single discrete latent code with a sparse dictionary representation and trains a transformer prior over the resulting support/coefficient tokens. The current vision experiments show that this representation can improve distributional reconstruction quality and produce tractable stage-2 sparse-token training. The audio extension is implemented and has a completed VQ-VAE reference, but a final LASER audio stage-2 experiment remains necessary before making strong cross-modal claims.
+In this paper, we have examined the effectiveness of structuring latent spaces with sparse dictionary learning. LASER replaces a single discrete latent code with a sparse dictionary representation and then tokenizes the support and coefficient values for transformer-based generation. The CelebA-HQ results show strong image reconstruction and sparse-prior training behavior for a working instance of the model. The VCTK results show that the same two-stage sparse-token interface extends to raw waveform audio. These results suggest that discretization is not the only route to effective latent representations, and that lossy compression methods from signal representation can provide useful structure for modern generative models.
 
 \bibliography{refs}
 \bibliographystyle{tmlr}
-
-\appendix
-
-\section{Representative Commands}
-
-\paragraph{Stage 1.}
-\begin{verbatim}
-python train_stage1_autoencoder.py model=laser data=celebahq \
-  data.image_size=256 train.max_epochs=20 \
-  model.num_embeddings=4096 model.embedding_dim=32 \
-  model.sparsity_level=24 model.patch_based=true \
-  model.patch_size=4 model.patch_stride=2
-\end{verbatim}
-
-\paragraph{Token cache.}
-\begin{verbatim}
-python cache.py --dataset celebahq --image-size 256 \
-  --coeff-bins 256 --coeff-max auto
-\end{verbatim}
-
-\paragraph{Stage 2.}
-\begin{verbatim}
-python train_stage2_prior.py token_cache_path=/path/to/token_cache.pt \
-  ar.type=sparse_spatial_depth ar.d_model=512 \
-  ar.n_heads=8 ar.n_layers=6 ar.d_ff=2048
-\end{verbatim}
-
-\paragraph{Audio stage 1.}
-\begin{verbatim}
-python train_stage1_autoencoder.py model=laser_audio data=vctk \
-  data.image_size=128 data.sample_rate=16000 \
-  data.audio_num_samples=32768
-\end{verbatim}
-
-\section{Artifact Status}
-
-The following local artifact status was used when drafting the experiments.
-
-\begin{itemize}
-    \item Completed vision stage-1 LASER and VQ-VAE runs: \texttt{/scratch/xl598/runs/laser\_train} and \texttt{/scratch/xl598/runs/vqvae\_train}.
-    \item Completed coefficient comparison: \texttt{/scratch/xl598/runs/celebahq256\_patch\_coeff\_compare}.
-    \item Completed VQ-VAE VCTK stage-1 and stage-2 runs: \texttt{/scratch/xl598/runs/vqvae\_train/vqvae-train-20260423\_091543/vctk}.
-    \item Partial LASER VCTK stage-1 runs: \texttt{/scratch/xl598/runs/laser\_train/laser-train-cap\_wide4k\_vctk\_audiofix-20260423\_200143} and \texttt{/scratch/xl598/runs/laser\_train/laser-train-cap\_wide4k\_vctk\_mediafix\_2gpu-20260424\_084922}.
-\end{itemize}
 
 \end{document}

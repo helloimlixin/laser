@@ -18,6 +18,7 @@ from src.audio_logging import (
     build_generated_audio_log_payload,
     normalize_generated_waveform_for_preview,
 )
+from src.data.imagenet_labels import class_names_for_dataset, imagenet_synsets_from_names, ordered_class_names
 from src.data.token_cache import load_token_cache
 from src.s2 import pick_nrow, sample as sample_s2, sample_slide, save_grid
 from src.stage2_compat import (
@@ -227,30 +228,74 @@ _DEFAULT_CLASS_NAMES = {
 def _class_names_from_cache(cache: Optional[dict]) -> list[str]:
     meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
     raw = meta.get("class_names")
-    if isinstance(raw, dict):
-        ordered = sorted(((int(value), str(key)) for key, value in raw.items()), key=lambda item: item[0])
-        if ordered:
-            return [name for _, name in ordered]
-    if isinstance(raw, (list, tuple)):
-        names = [str(item) for item in raw]
-        if names:
-            return names
     dataset = str(meta.get("dataset", "")).strip().lower()
+    names = class_names_for_dataset(dataset, raw)
+    if names:
+        return names
     return list(_DEFAULT_CLASS_NAMES.get(dataset, []))
+
+
+def _class_synsets_from_cache(cache: Optional[dict]) -> list[str]:
+    meta = cache.get("meta", {}) if isinstance(cache, dict) else {}
+    raw = meta.get("class_synsets")
+    synsets = ordered_class_names(raw)
+    if synsets:
+        return synsets
+    dataset = str(meta.get("dataset", "")).strip().lower()
+    return imagenet_synsets_from_names(dataset, meta.get("class_names"))
+
+
+def _class_name_for_label(cache: Optional[dict], label: int) -> str:
+    names = _class_names_from_cache(cache)
+    if 0 <= int(label) < len(names):
+        return str(names[int(label)])
+    return ""
+
+
+def _class_label_display(cache: Optional[dict], label: int) -> str:
+    name = _class_name_for_label(cache, label)
+    class_label_name = ""
+    if isinstance(cache, dict):
+        meta = cache.get("meta", {}) or {}
+        class_label_name = str(meta.get("class_label_name") or "").strip().lower()
+    if name:
+        if "speaker" in class_label_name:
+            return f"{name} (speaker {int(label)})"
+        return f"{name} (class {int(label)})"
+    if "speaker" in class_label_name:
+        return f"speaker {int(label)}"
+    return f"class {int(label)}"
 
 
 def _class_label_texts(cache: Optional[dict], labels: Optional[torch.Tensor]) -> list[str]:
     if labels is None:
         return []
     label_list = [int(label) for label in labels.detach().cpu().reshape(-1).tolist()]
-    names = _class_names_from_cache(cache)
-    texts = []
-    for label in label_list:
-        if 0 <= label < len(names):
-            texts.append(f"{label}: {names[label]}")
-        else:
-            texts.append(str(label))
-    return texts
+    return [_class_label_display(cache, label) for label in label_list]
+
+
+def _class_label_caption(cache: Optional[dict], label: int) -> str:
+    return _class_label_display(cache, label)
+
+
+def _conditioning_captions(
+    cache: Optional[dict],
+    labels: Optional[torch.Tensor],
+    prompts: Optional[list[str]] = None,
+    *,
+    n: int,
+) -> list[str]:
+    prompts = list(prompts or [])
+    label_list = [] if labels is None else [int(label) for label in labels.detach().cpu().reshape(-1).tolist()]
+    captions: list[str] = []
+    for idx in range(max(0, int(n))):
+        parts = [f"generated audio {idx}"]
+        if idx < len(label_list):
+            parts.append(f"conditioned on {_class_label_caption(cache, label_list[idx])}")
+        if idx < len(prompts) and str(prompts[idx]).strip():
+            parts.append(f"text={str(prompts[idx]).strip()}")
+        captions.append(" | ".join(parts))
+    return captions
 
 
 def _to_uint8_pil(image: torch.Tensor) -> Image.Image:
@@ -333,12 +378,19 @@ def _write_class_label_manifest(path: Path, labels: Optional[torch.Tensor], cach
     if labels is None or not label_texts:
         return
     label_list = [int(label) for label in labels.detach().cpu().reshape(-1).tolist()]
+    synsets = _class_synsets_from_cache(cache)
+    wav_files = []
+    if path.is_dir():
+        wav_files = sorted(item.name for item in path.glob("*.wav"))
     entries = [
         {
             "index": int(idx),
+            "file": wav_files[idx] if idx < len(wav_files) else "",
             "class_id": int(label),
-            "class_name": text.split(": ", 1)[1] if ": " in text else "",
+            "class_name": _class_name_for_label(cache, int(label)),
+            "class_synset": synsets[int(label)] if 0 <= int(label) < len(synsets) else "",
             "label": text,
+            "caption": _class_label_caption(cache, int(label)),
         }
         for idx, (label, text) in enumerate(zip(label_list, label_texts))
     ]
@@ -352,9 +404,12 @@ def _write_class_label_manifest(path: Path, labels: Optional[torch.Tensor], cach
         json_path = path.with_suffix(".class_labels.json")
     txt_path.write_text("\n".join(label_texts) + "\n", encoding="utf-8")
     tsv_path.write_text(
-        "index\tclass_id\tclass_name\tlabel\n"
+        "index\tfile\tclass_id\tclass_name\tclass_synset\tlabel\tcaption\n"
         + "\n".join(
-            f"{entry['index']}\t{entry['class_id']}\t{entry['class_name']}\t{entry['label']}"
+            "\t".join(
+                str(entry[key])
+                for key in ("index", "file", "class_id", "class_name", "class_synset", "label", "caption")
+            )
             for entry in entries
         )
         + "\n",
@@ -739,9 +794,17 @@ class Stage2SamplePreviewCallback(pl.Callback):
         tokens, mask, normalized = encode_prompts_from_cache(prompts, cache=cache, n=n, device=dev)
         return tokens, mask, normalized
 
-    def _class_condition(self, dev: torch.device, n: int):
+    def _class_condition(self, dev: torch.device, n: int, model: Optional[pl.LightningModule] = None):
         if not self.class_labels:
-            return None
+            prior = getattr(model, "prior", None)
+            is_class_conditional = bool(getattr(prior, "class_conditional", False))
+            if not is_class_conditional and getattr(prior, "class_emb", None) is None:
+                return None
+            cache_meta = self._cache.get("meta", {}) if isinstance(self._cache, dict) else {}
+            num_classes = int(getattr(prior, "num_classes", 0) or cache_meta.get("num_classes", 0) or 0)
+            if num_classes <= 0:
+                return None
+            return torch.randint(0, num_classes, (int(n),), device=dev, dtype=torch.long)
         labels = torch.as_tensor(self.class_labels, device=dev, dtype=torch.long).reshape(-1)
         if int(labels.numel()) <= 0:
             return None
@@ -862,7 +925,7 @@ class Stage2SamplePreviewCallback(pl.Callback):
         stem = f"s{step:07d}" if epoch is None else f"e{epoch:03d}_s{step:07d}"
         saved_paths: list[Path] = []
         try:
-            class_labels = self._class_condition(dev, self.n)
+            class_labels = self._class_condition(dev, self.n, model=mod)
             text_tokens, text_mask, text_prompts = self._text_condition(dev, self.n)
             for variant in self.sample_variants:
                 variant_name = str(variant["name"])
@@ -896,6 +959,8 @@ class Stage2SamplePreviewCallback(pl.Callback):
                     )
                     if text_prompts:
                         _write_text_prompt_manifest(direct, stem=variant_stem, prompts=text_prompts)
+                    if class_labels is not None:
+                        _write_class_label_manifest(direct, class_labels, self._cache)
                 else:
                     nrow = pick_nrow(int(batch.imgs.size(0)), None)
                     direct = save_grid(batch.imgs, self.out_dir, stem=variant_stem)
@@ -933,7 +998,12 @@ class Stage2SamplePreviewCallback(pl.Callback):
                     epoch=epoch,
                     direct=log_direct or direct,
                     batch=batch,
-                    text_prompts=text_prompts,
+                    text_prompts=_conditioning_captions(
+                        self._cache,
+                        class_labels,
+                        text_prompts,
+                        n=min(int(batch.imgs.size(0)), self.n),
+                    ),
                     variant_name=variant_name,
                 )
                 saved_paths.append(direct)
@@ -1009,7 +1079,7 @@ def save_final_generation_preview(
     was_training = bool(mod.training)
     mod.eval()
     try:
-        labels = saver._class_condition(mod.device, saver.n)
+        labels = saver._class_condition(mod.device, saver.n, model=mod)
         text_tokens, text_mask, normalized_prompts = saver._text_condition(mod.device, saver.n)
         batch = _sample_for_preview(
             mod,
@@ -1074,7 +1144,12 @@ def save_final_generation_preview(
         epoch=None,
         direct=log_direct or direct,
         batch=batch,
-        text_prompts=normalized_prompts,
+        text_prompts=_conditioning_captions(
+            saver._cache,
+            labels,
+            normalized_prompts,
+            n=min(int(batch.imgs.size(0)), saver.n),
+        ),
     )
     if return_batch:
         return direct, batch, saver._cache

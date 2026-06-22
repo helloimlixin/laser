@@ -42,19 +42,24 @@ num_embeddings: 512
 # Higher values = more expressive atoms, better reconstruction quality
 embedding_dim: 64
 
-# Sparsity level (max number of non-zero coefficients per latent location)
+# Sparse support per latent site. This is the bottleneck-specific analogue to
+# one VQ-VAE codebook index per latent site.
 # Must be < num_embeddings
 # Typical range: 4-32
 # Lower = more sparse (better generalization, lower quality)
 # Higher = less sparse (better quality, risk of overfitting)
+sparsity_level: 8
+
+# Weight applied to encoder-facing bottleneck losses inside total loss.
 bottleneck_loss_weight: 1.0
+
+# Optional separate weight for dictionary/codebook fitting loss. null preserves
+# the historical objective by using bottleneck_loss_weight for this term too.
+dictionary_loss_weight: null
+
 recon_mse_weight: 1.0
 recon_l1_weight: 0.0
 recon_edge_weight: 0.0
-
-# Sparse support per latent site. This is the bottleneck-specific analogue to
-# one VQ-VAE codebook index per latent site.
-sparsity_level: 8
 
 # Number of residual blocks in encoder/decoder
 # Typical range: 2-6
@@ -70,18 +75,14 @@ num_residual_hiddens: 64
 # Higher = encoder forced to match dictionary reconstruction more closely
 commitment_cost: 0.25
 
-# Weight applied to bottleneck loss inside total loss
-# Lower to prevent bottleneck term from dominating total objective
-
 # Optional dictionary-specific learning rate.
 # Keep dictionary updates a bit below the encoder/decoder LR for the VQ-VAE
 # matched f4 profile.
 dict_learning_rate: 2.5e-4
 
 # Optional hard bound on sparse coefficients for downstream quantization.
-# null keeps the previous unconstrained least-squares updates.
+# null leaves stage-2 cache extraction to choose its coefficient range.
 coef_max: null
-bounded_omp_refine_steps: 8
 
 # Optional variational posterior over continuous sparse coefficients.
 # This keeps the support depth fixed while giving stage 2 a Gaussian
@@ -216,8 +217,3 @@ enable_val_latent_visuals: true
 # Large dictionaries are sampled for PCA scatter/GIF logging to keep W&B media
 # and end-of-fit rendering manageable.
 codebook_visual_max_vectors: 1024
-
-# Optional dictionary coherence penalty.
-# Proto.py keeps this disabled by default and relies on normalized atoms plus
-# projected gradients for the main dictionary-learning behavior.
-coherence_weight: 0.0

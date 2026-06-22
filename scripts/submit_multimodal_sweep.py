@@ -570,6 +570,7 @@ def write_job_files(
     stage2_epochs: int,
     stage2_kind: str,
     num_gpus: int,
+    stage1_checkpoint: Optional[Path] = None,
     stage1_only: bool = False,
     extra_cache_args: tuple[str, ...] = (),
     extra_stage1_overrides: tuple[str, ...] = (),
@@ -781,6 +782,44 @@ def write_job_files(
     cache_args.extend(case.extra_cache_args)
     cache_args.extend(extra_cache_args)
 
+    supplied_ckpt = str(stage1_checkpoint.expanduser().resolve()) if stage1_checkpoint is not None else ""
+    stage1_block = f"""CKPT={shlex.quote(supplied_ckpt)}
+if [[ ! -f "$CKPT" ]]; then
+  echo "Supplied stage-1 checkpoint not found: $CKPT" >&2
+  exit 1
+fi
+echo "=== Using supplied stage-1 checkpoint ({case.name}): $CKPT ==="
+""" if supplied_ckpt else f"""STAGE1_ARGS=(
+{_bash_array(stage1_overrides)}
+)
+
+echo "=== Stage 1: autoencoder training ({case.name}) ==="
+"$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ARGS[@]}}"
+
+CKPT="$(select_stage1_checkpoint "{stage1_dir}")"
+if [[ -z "$CKPT" ]]; then
+  echo "No stage-1 checkpoint found under {stage1_dir}" >&2
+  exit 1
+fi
+
+if [[ "{'1' if int(stage1_adv_epochs) > 0 else '0'}" == "1" ]]; then
+  RECON_CKPT="$CKPT"
+  STAGE1_ADV_ARGS=(
+{_bash_array(stage1_adv_overrides)}
+    "init_ckpt_path=${{RECON_CKPT}}"
+  )
+
+  echo "=== Stage 1 adversarial continuation ({case.name}) ==="
+  "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ADV_ARGS[@]}}"
+
+  CKPT="$(select_stage1_checkpoint "{stage1_adv_dir}")"
+  if [[ -z "$CKPT" ]]; then
+    echo "No adversarial stage-1 checkpoint found under {stage1_adv_dir}" >&2
+    exit 1
+  fi
+fi
+"""
+
     run_script.write_text(
         f"""#!/bin/bash
 set -euo pipefail
@@ -887,35 +926,7 @@ select_stage1_checkpoint() {{
 
 cd "{snapshot_path}"
 
-STAGE1_ARGS=(
-{_bash_array(stage1_overrides)}
-)
-
-echo "=== Stage 1: autoencoder training ({case.name}) ==="
-"$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ARGS[@]}}"
-
-CKPT="$(select_stage1_checkpoint "{stage1_dir}")"
-if [[ -z "$CKPT" ]]; then
-  echo "No stage-1 checkpoint found under {stage1_dir}" >&2
-  exit 1
-fi
-
-if [[ "{'1' if int(stage1_adv_epochs) > 0 else '0'}" == "1" ]]; then
-  RECON_CKPT="$CKPT"
-  STAGE1_ADV_ARGS=(
-{_bash_array(stage1_adv_overrides)}
-    "init_ckpt_path=${{RECON_CKPT}}"
-  )
-
-  echo "=== Stage 1 adversarial continuation ({case.name}) ==="
-  "$PYTHON_BIN" train_stage1_autoencoder.py "${{STAGE1_ADV_ARGS[@]}}"
-
-  CKPT="$(select_stage1_checkpoint "{stage1_adv_dir}")"
-  if [[ -z "$CKPT" ]]; then
-    echo "No adversarial stage-1 checkpoint found under {stage1_adv_dir}" >&2
-    exit 1
-  fi
-fi
+{stage1_block}
 
 if [[ "{'1' if stage1_only else '0'}" == "1" ]]; then
   echo "=== Stage 1 only requested; skipping token cache and stage 2 ({case.name}) ==="
@@ -1089,6 +1100,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stage2-epochs", type=int, default=None, help="Stage-2 prior epochs.")
     parser.add_argument(
+        "--stage1-checkpoint",
+        type=Path,
+        default=None,
+        help="Existing stage-1 checkpoint to use for cache extraction; skips stage-1 training.",
+    )
+    parser.add_argument(
         "--stage2-kind",
         choices=("transformer", "diffusion"),
         default="transformer",
@@ -1142,6 +1159,9 @@ def main() -> int:
         raise SystemExit("--nodes must be >= 1.")
     if int(args.gpus) < 1:
         raise SystemExit("--gpus must be >= 1.")
+    stage1_checkpoint = Path(args.stage1_checkpoint).expanduser().resolve() if args.stage1_checkpoint else None
+    if stage1_checkpoint is not None and not stage1_checkpoint.is_file():
+        raise SystemExit(f"--stage1-checkpoint not found: {stage1_checkpoint}")
     if num_nodes > 1 and not stage1_only and stage2_kind != "transformer":
         raise SystemExit("--nodes > 1 full-pipeline orchestration is currently supported only for transformer stage 2.")
     stage1_epochs = int(args.stage1_epochs if args.stage1_epochs is not None else (10 if full_training else 1))
@@ -1225,6 +1245,7 @@ def main() -> int:
             stage2_kind=stage2_kind,
             num_gpus=int(args.gpus),
             num_nodes=num_nodes,
+            stage1_checkpoint=stage1_checkpoint,
             stage1_only=stage1_only,
             extra_cache_args=tuple(str(v) for v in args.cache_arg),
             extra_stage1_overrides=tuple(str(v) for v in args.stage1_override),
