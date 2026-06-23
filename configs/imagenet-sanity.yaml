@@ -1,0 +1,161 @@
+# Extended full-pipeline sanity config.
+# Run with:
+#   python train.py --config configs/sanity.yaml
+#
+# This keeps adversarial stage-1 training and stage-2 sampling enabled, while
+# still staying smaller than the full exp1 run.
+
+stage: pipeline
+mode: direct
+
+stage1:
+  overrides:
+    - model=laser
+    - data=imagenet
+
+  output_dir: outputs/sanity/stage1
+
+  wandb:
+    project: laser
+    name: imagenet-sanity-stage1
+    group: sanity
+    tags: [stage1, imagenet, laser, sanity]
+    append_timestamp: false
+    save_dir: outputs/sanity/stage1/wandb
+
+  train:
+    accelerator: gpu
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    max_epochs: 500
+    max_steps: 4000
+    limit_train_batches: 1.0
+    limit_val_batches: 32
+    limit_test_batches: 0
+    val_check_interval: 1000
+    run_test_after_fit: false
+    learning_rate: 4.2e-3
+    warmup_steps: 20
+    min_lr_ratio: 0.1
+
+  data:
+    batch_size: 128
+    num_workers: 0
+    train_crop_size: 128
+
+  model:
+    sparsity_level: 3
+    patch_based: false
+    patch_size: 4
+    patch_stride: 4
+    dict_learning_rate: 1.0e-4
+    compute_fid: false
+    log_images_every_n_steps: 500
+    enable_val_latent_visuals: false
+    adversarial_weight: 0.05
+    adversarial_start_step: 300
+    adversarial_warmup_steps: 100
+    disc_start_step: 300
+    disc_learning_rate: 1.0e-4
+    use_adaptive_disc_weight: true
+
+stage2:
+  output_dir: outputs/sanity/stage2
+  token_cache_path: outputs/sanity/stage2/token_cache/imagenet__train__img256__cb16_quantile_p99p5.pt
+  ckpt_path: null
+
+  token_cache:
+    build: true
+    force: false
+    stage1_checkpoint: null
+    stage1_output_root: outputs/sanity/stage1
+    output: outputs/sanity/stage2/token_cache/imagenet__train__img256__cb16_quantile_p99p5.pt
+    split: train
+    cache_mode: quantized
+    coeff_vocab_size: 16
+    coeff_max: auto
+    coeff_quantization: quantile
+    coeff_calibration_percentile: 99.5
+    coeff_mu: 0.0
+    batch_size: 128
+    num_workers: 0
+    max_items: 16384
+    device: auto
+
+  data:
+    dataset: imagenet
+    data_dir: ${oc.env:imagenet_DIR,${oc.env:CELEBA_HQ_DIR,../data/imagenet}}
+    batch_size: 8
+    num_workers: 8
+    image_size: 256
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+
+  ar:
+    type: sparse_spatial_depth
+    vocab_size: null
+    atom_vocab_size: null
+    coeff_vocab_size: null
+    window_sites: 0
+    n_global_spatial_tokens: 8
+    autoregressive_coeffs: true
+    class_conditional: true
+    num_classes: 1000
+    d_model: 256
+    n_heads: 4
+    n_layers: 4
+    d_ff: 1024
+    dropout: 0.1
+    learning_rate: 3.0e-4
+    weight_decay: 0.01
+    warmup_steps: 250
+    max_steps: 6000
+    min_lr_ratio: 0.01
+    atom_loss_weight: 1.0
+    coeff_loss_weight: 1.0
+    coeff_depth_weighting: none
+    coeff_focal_gamma: 0.0
+    atom_label_smoothing: 0.0
+    atom_coverage_weight: 0.0
+    coeff_loss_type: auto
+    coeff_huber_delta: 0.5
+
+  train_ar:
+    batch_size: 64
+    max_epochs: 40
+    accelerator: gpu
+    num_nodes: 1
+    devices: 1
+    strategy: auto
+    precision: 16-mixed
+    gradient_clip_val: 1.0
+    log_every_n_steps: 10
+    limit_train_batches: 1.0
+    limit_val_batches: 32
+    limit_test_batches: 0
+    val_check_interval: 1000
+    validation_split: 0.05
+    test_split: 0.05
+    max_items: 16384
+    crop_h_sites: 0
+    crop_w_sites: 0
+    sample_every_n_steps: 3000
+    sample_every_n_epochs: 10
+    sample_num_images: 8
+    sample_class_labels: [0, 1, 2, 3, 4, 5, 6, 7]
+    sample_temperature: 1.0
+    sample_top_k: 0
+    sample_log_to_wandb: true
+    compute_generation_fid: false
+    generation_metric_num_samples: 0
+    run_test_after_fit: false
+    save_final_samples_after_fit: true
+
+  wandb:
+    project: laser-ar
+    name: imagenet-sanity-stage2
+    group: sanity
+    tags: [stage2, imagenet, laser, sparse_spatial_depth, class_conditional, sanity]
+    append_timestamp: false
+    save_dir: outputs/sanity/stage2/wandb
