@@ -54,6 +54,19 @@ def _handle_storage_error(context: str, exc: BaseException, *, disable_media: bo
     return True
 
 
+def _monotonic_wandb_step(logger: Any, step: Optional[int]) -> Optional[int]:
+    if step is None:
+        return None
+    experiment = getattr(logger, "experiment", None)
+    current = getattr(experiment, "step", None)
+    try:
+        if current is not None and int(step) < int(current):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return int(step)
+
+
 def _wandb_media_tmp_parent(logger: Any) -> Optional[Path]:
     for candidate in (
         getattr(logger, "save_dir", None),
@@ -111,9 +124,10 @@ def log_wandb_metrics(
     filtered = {str(key): value for key, value in dict(metrics).items() if value is not None}
     if not filtered or logger is None:
         return
+    log_step = _monotonic_wandb_step(logger, step)
     if hasattr(logger, "log_metrics"):
         try:
-            logger.log_metrics(filtered, step=step)
+            logger.log_metrics(filtered, step=log_step)
         except Exception as exc:
             if _handle_storage_error("metrics log", exc):
                 return
@@ -126,7 +140,10 @@ def log_wandb_metrics(
     if step is not None:
         payload.setdefault("trainer/global_step", int(step))
     try:
-        experiment.log(payload)
+        if log_step is None:
+            experiment.log(payload)
+        else:
+            experiment.log(payload, step=log_step)
     except Exception as exc:
         if _handle_storage_error("metrics log", exc):
             return
@@ -158,18 +175,23 @@ def log_wandb_images(
 
     _configure_wandb_media_tmp(wandb, logger)
 
-    payload = {
-        str(key): [
-            wandb.Image(image, caption=None if caption_list is None else caption_list[idx])
-            for idx, image in enumerate(image_list)
-        ]
-    }
+    wandb_images = [
+        wandb.Image(image, caption=None if caption_list is None else caption_list[idx])
+        for idx, image in enumerate(image_list)
+    ]
+    payload = {str(key): wandb_images[0] if len(wandb_images) == 1 else wandb_images}
     if step is not None:
         payload["trainer/global_step"] = int(step)
     experiment = getattr(logger, "experiment", None)
     if experiment is not None and hasattr(experiment, "log"):
+        log_step = _monotonic_wandb_step(logger, step)
+        if step is not None and log_step is None:
+            return
         try:
-            experiment.log(payload)
+            if log_step is None:
+                experiment.log(payload)
+            else:
+                experiment.log(payload, step=log_step)
         except Exception as exc:
             if _handle_storage_error(f"image log for {key}", exc, disable_media=True):
                 return
@@ -216,8 +238,14 @@ def log_wandb_audio(
         payload["trainer/global_step"] = int(step)
     experiment = getattr(logger, "experiment", None)
     if experiment is not None and hasattr(experiment, "log"):
+        log_step = _monotonic_wandb_step(logger, step)
+        if step is not None and log_step is None:
+            return
         try:
-            experiment.log(payload)
+            if log_step is None:
+                experiment.log(payload)
+            else:
+                experiment.log(payload, step=log_step)
         except Exception as exc:
             if _handle_storage_error(f"audio log for {key}", exc, disable_media=True):
                 return
@@ -269,8 +297,14 @@ def log_wandb_video(
         payload["trainer/global_step"] = int(step)
     experiment = getattr(logger, "experiment", None)
     if experiment is not None and hasattr(experiment, "log"):
+        log_step = _monotonic_wandb_step(logger, step)
+        if step is not None and log_step is None:
+            return
         try:
-            experiment.log(payload)
+            if log_step is None:
+                experiment.log(payload)
+            else:
+                experiment.log(payload, step=log_step)
         except Exception as exc:
             if _handle_storage_error(f"video log for {key}", exc, disable_media=True):
                 return

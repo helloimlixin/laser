@@ -8,6 +8,27 @@
 token_cache_path: null
 ckpt_path: null
 
+# Optional stage-2 bootstrap: build a sparse-token cache from a stage-1
+# checkpoint before constructing the transformer datamodule.
+token_cache:
+  build: false
+  force: false
+  stage1_checkpoint: null
+  # Used when stage1_checkpoint is null. For exp1-style layouts this should
+  # point at the stage-1 output_dir containing checkpoints/run_*/laser/*.ckpt.
+  stage1_output_root: null
+  output: null
+  split: train
+  cache_mode: quantized
+  coeff_vocab_size: 16
+  coeff_max: 3.0
+  coeff_quantization: uniform
+  coeff_mu: 0.0
+  batch_size: 64
+  num_workers: 4
+  max_items: 0
+  device: auto
+
 # =============================================================================
 # General Settings
 # =============================================================================

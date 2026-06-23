@@ -102,7 +102,7 @@ cd "$SNAPSHOT_PATH"
   train.strategy=auto \\
   train.precision=bf16-mixed \\
   train.accelerator=gpu \\
-  model.backbone=vqgan \\
+  model.backbone=ddpm \\
   model.num_downsamples=4 \\
   model.channel_multipliers=[1,1,2,2,4] \\
   model.attn_resolutions=[] \\
@@ -112,8 +112,6 @@ cd "$SNAPSHOT_PATH"
   model.num_residual_blocks=2 \\
   model.num_residual_hiddens=64 \\
   model.backbone_latent_channels=256 \\
-  model.max_ch_mult=4 \\
-  model.out_tanh=false \\
   model.embedding_dim=64 \\
   model.num_embeddings=8192 \\
   model.sparsity_level=$SPARSITY_LEVEL \\

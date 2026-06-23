@@ -50,7 +50,6 @@ COMMON_STAGE1=(
   --stage1-override train.gradient_clip_val=1.0
   --stage1-override train.val_check_interval=1.0
   --stage1-override model.compute_fid=true
-  --stage1-override model.out_tanh=true
   --stage1-override data.num_workers=8
 )
 
@@ -59,7 +58,7 @@ COMMON_STAGE1=(
   --run-label "coco-stage1-bneck-cap-laser-f32-k32768-z256-s4-c1-bw05-coef16-s1-${STAGE1_EPOCHS}" \
   "${COMMON_STAGE1[@]}" \
   --stage1-override data.batch_size=1 \
-  --stage1-override model.backbone=vqgan \
+  --stage1-override model.backbone=ddpm \
   --stage1-override model.num_downsamples=5 \
   --stage1-override model.channel_multipliers=[1,1,2,2,4,4] \
   --stage1-override model.num_hiddens=128 \
@@ -90,7 +89,7 @@ COMMON_STAGE1=(
   --run-label "coco-stage1-bneck-control-laser-f16-k16384-z256-s4-c025-bw025-s1-${STAGE1_EPOCHS}" \
   "${COMMON_STAGE1[@]}" \
   --stage1-override data.batch_size=1 \
-  --stage1-override model.backbone=vqgan \
+  --stage1-override model.backbone=ddpm \
   --stage1-override model.num_downsamples=4 \
   --stage1-override model.channel_multipliers=[1,1,2,2,4] \
   --stage1-override model.num_hiddens=128 \

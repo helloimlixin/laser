@@ -578,7 +578,7 @@ def _sample_gpt_site_from_window(
     seq = prompt_flat.clone()
     bos = torch.full((batch_size, 1), int(prior.bos_token_id), device=device, dtype=torch.long)
     if int(getattr(prior, "n_global_spatial_tokens", 0)) != 0:
-        raise ValueError("VQGAN-style sliding-window sampling expects no global prefix tokens.")
+        raise ValueError("DDPM-style sliding-window sampling expects no global prefix tokens.")
 
     if target_start > 0:
         prefix = torch.cat([bos, prompt_flat[:, :target_start]], dim=1)

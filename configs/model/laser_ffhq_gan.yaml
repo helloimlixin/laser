@@ -15,19 +15,17 @@ type: laser
 in_channels: 3
 
 # --- Backbone (attention U-Net, same family as zdmy0xi3) ---
-backbone: vqgan
+backbone: ddpm
 num_hiddens: 192
 num_residual_blocks: 4
 num_residual_hiddens: 96
 decoder_extra_residual_layers: 3
-out_tanh: true
 
 # Latent resolution: 256 -> 16x16 (f16) instead of 8x8 (f32). 5 multipliers for 4
 # downsamples. Latent feature-map sizes seen are 256/128/64/32/16, so attention
 # at 16 and 32 covers the low-resolution stages.
 num_downsamples: 4
 channel_multipliers: [1, 1, 2, 2, 4]
-max_ch_mult: 4
 attn_resolutions: [16, 32]
 use_mid_attention: true
 backbone_latent_channels: 512

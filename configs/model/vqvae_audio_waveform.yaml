@@ -21,4 +21,3 @@ audio_multires_stft_loss_weight: 1.0
 audio_multires_stft_fft_sizes: [512, 1024, 2048]
 codebook_init: true
 dead_code_threshold: 1.0
-out_tanh: true

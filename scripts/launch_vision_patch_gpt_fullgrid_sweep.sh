@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full-grid local-window GPT stage-2 sweep for the patch VQGAN-style LASER setup.
+# Full-grid local-window GPT stage-2 sweep for the patch DDPM-style LASER setup.
 #
 # This is the corrected variant of the FFHQ p8 GPT run that trained on 4x4
 # token crops. Here stage 2 trains on the full token grid, while ar.window_sites
@@ -63,10 +63,9 @@ ARGS=(
   --stage1-override train.learning_rate=5.0e-5
   --stage1-override train.precision=bf16-mixed
   --stage1-override model.compute_fid=false
-  --stage1-override model.out_tanh=true
   --stage1-override model.log_images_every_n_steps=0
   --stage1-override model.enable_val_latent_visuals=true
-  --stage1-override model.backbone=vqgan
+  --stage1-override model.backbone=ddpm
   --stage1-override model.num_downsamples=2
   --stage1-override 'model.channel_multipliers=[1,1,2]'
   --stage1-override model.num_hiddens=160

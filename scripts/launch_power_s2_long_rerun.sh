@@ -172,12 +172,11 @@ echo "stage1=$STAGE1_EPOCHS ep (eff b16) + adv=$STAGE1_ADV_EPOCHS ep; stage2 max
   --stage1-override checkpoint.save_top_k=0 \
   --stage1-override checkpoint.save_last=false \
   --stage1-override model=laser \
-  --stage1-override model.backbone=vqgan \
+  --stage1-override model.backbone=ddpm \
   --stage1-override model.num_hiddens=128 \
   --stage1-override model.num_downsamples=4 \
   --stage1-override model.channel_multipliers=[1,1,2,2,4] \
   --stage1-override model.backbone_latent_channels=512 \
-  --stage1-override model.max_ch_mult=4 \
   --stage1-override model.embedding_dim=128 \
   --stage1-override model.num_embeddings=4096 \
   --stage1-override model.sparsity_level="$SPARSITY_LEVEL" \
@@ -195,7 +194,6 @@ echo "stage1=$STAGE1_EPOCHS ep (eff b16) + adv=$STAGE1_ADV_EPOCHS ep; stage2 max
   --stage1-override model.use_mid_attention=true \
   --stage1-override model.attn_resolutions=[16,32] \
   --stage1-override model.data_init_from_first_batch=true \
-  --stage1-override model.out_tanh=true \
   --stage1-override model.recon_mse_weight=0.25 \
   --stage1-override model.recon_l1_weight=1.0 \
   --stage1-override model.recon_edge_weight=0.50 \

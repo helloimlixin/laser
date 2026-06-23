@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sweep: CelebA-HQ 256x256 with VQGAN-level encoder/decoder capacity.
+# Sweep: CelebA-HQ 256x256 with DDPM-style encoder/decoder capacity.
 #
 # Based on the promising CIFAR-10 run f70yglfn (src_pf_p4s4_k16_d4k_stage2),
 # scaled up for 256x256 images with increased encoder/decoder capacity.
@@ -16,9 +16,9 @@
 #   - Encoder/decoder capacity: high (h=256/res=4/rh=128), medium (h=192/res=3/rh=96)
 #
 # Usage:
-#   ./scripts/sweep_celebahq256_vqgan_cap.sh
-#   CASE_FILTER=p4s4_k16_d4k ./scripts/sweep_celebahq256_vqgan_cap.sh
-#   DRY_RUN=1 ./scripts/sweep_celebahq256_vqgan_cap.sh
+#   ./scripts/sweep_celebahq256_ddpm_cap.sh
+#   CASE_FILTER=p4s4_k16_d4k ./scripts/sweep_celebahq256_ddpm_cap.sh
+#   DRY_RUN=1 ./scripts/sweep_celebahq256_ddpm_cap.sh
 
 set -euo pipefail
 
@@ -75,7 +75,7 @@ AR_N_LAYERS="${AR_N_LAYERS:-12}"
 AR_D_FF="${AR_D_FF:-1024}"
 
 # -- Output / logging -------------------------------------------------------
-OUT_ROOT="${OUT_ROOT:-/scratch/$USER/runs/celebahq256_vqgan_cap_sweep}"
+OUT_ROOT="${OUT_ROOT:-/scratch/$USER/runs/celebahq256_ddpm_cap_sweep}"
 WANDB_PROJECT="${WANDB_PROJECT:-laser}"
 WANDB_MODE="${WANDB_MODE:-online}"
 RUN_PREFIX="${RUN_PREFIX:-chq256_vc}"

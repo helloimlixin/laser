@@ -4,7 +4,7 @@ The reconstruction-only objective (MSE + L1 + edge + LPIPS) used by the LASER
 autoencoder produces over-smoothed images: it has no term that rewards
 high-frequency texture, so the decoder regresses toward the conditional mean.
 A PatchGAN discriminator with a hinge adversarial loss is the standard remedy
-(VQGAN / taming-transformers); it pushes the decoder to synthesize plausible
+(taming-transformers style); it pushes the decoder to synthesize plausible
 fine detail without changing the latent/token budget at all.
 
 This module is intentionally self-contained and has no LASER dependency, so it
@@ -32,7 +32,7 @@ def weights_init(module: nn.Module) -> None:
 
 
 class NLayerDiscriminator(nn.Module):
-    """PatchGAN discriminator (Pix2Pix / VQGAN style).
+    """PatchGAN discriminator (Pix2Pix / taming-transformers style).
 
     Outputs a map of real/fake logits, one per overlapping receptive-field
     patch, rather than a single image-level score. This keeps the adversarial

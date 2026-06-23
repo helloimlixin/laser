@@ -8,7 +8,8 @@ import torch.nn.functional as F
 import lightning as pl
 import torchvision
 
-from .unet import Encoder, Decoder
+from .decoder import Decoder
+from .encoder import Encoder
 from .audio_codec import AudioDecoder, AudioEncoder, canonical_int_tuple
 from .bottleneck import VectorQuantizerEMA
 from .lpips import LPIPS
@@ -58,12 +59,10 @@ class VQVAE(pl.LightningModule):
             audio_waveform_l1_weight=0.0,
             codebook_init=False,
             dead_code_threshold=0.0,
-            out_tanh=False,
             num_downsamples=2,
             resolution=None,
             channel_multipliers=None,
             backbone_latent_channels=None,
-            max_ch_mult=2,
             attn_resolutions=(),
             dropout=0.0,
             use_mid_attention=True,
@@ -120,9 +119,8 @@ class VQVAE(pl.LightningModule):
         self.audio_waveform_l1_weight = float(audio_waveform_l1_weight)
         self.codebook_init = bool(codebook_init)
         self.dead_code_threshold = float(dead_code_threshold)
-        self.out_tanh = bool(out_tanh)
         self.num_downsamples = int(num_downsamples)
-        # Attention U-Net (VQGAN/DDPM-style) backbone params, shared with LASER.
+        # Attention U-Net (DDPM-style) backbone params, shared with LASER.
         self.resolution = None if resolution is None else int(resolution)
         self.channel_multipliers = (
             None if channel_multipliers is None else tuple(int(m) for m in channel_multipliers)
@@ -130,7 +128,6 @@ class VQVAE(pl.LightningModule):
         self.backbone_latent_channels = (
             None if backbone_latent_channels is None else int(backbone_latent_channels)
         )
-        self.max_ch_mult = int(max_ch_mult)
         self.attn_resolutions = tuple(int(a) for a in attn_resolutions) if attn_resolutions else ()
         self.dropout = float(dropout)
         self.use_mid_attention = bool(use_mid_attention)
@@ -163,11 +160,8 @@ class VQVAE(pl.LightningModule):
             if self.resolution is None or self.resolution <= 0:
                 raise ValueError("resolution must be a positive integer for the U-Net backbone")
             if self.channel_multipliers is None:
-                self.channel_multipliers = tuple(
-                    min(2 ** i, self.max_ch_mult) for i in range(self.num_downsamples + 1)
-                )
-            else:
-                self.num_downsamples = len(self.channel_multipliers) - 1
+                raise ValueError("channel_multipliers must be set explicitly")
+            self.num_downsamples = len(self.channel_multipliers) - 1
             if self.backbone_latent_channels is None:
                 self.backbone_latent_channels = int(embedding_dim)
             enc_dec_kwargs = dict(
@@ -327,11 +321,6 @@ class VQVAE(pl.LightningModule):
             return z_q.squeeze(2), loss, perplexity, encodings
         return self.vector_quantizer(z)
 
-    def _apply_output_activation(self, x_recon: torch.Tensor) -> torch.Tensor:
-        if self.out_tanh:
-            return torch.tanh(x_recon)
-        return x_recon
-
     def _speaker_indices_from_audio_meta(
         self,
         audio_meta,
@@ -415,7 +404,7 @@ class VQVAE(pl.LightningModule):
             z_q = z_q_flat.view(B, H_z, W_z, -1).permute(0, 3, 1, 2).contiguous()  # [B, D, H_z, W_z]
         z_q = self.post_bottleneck(z_q)
         z_q = self._condition_decoder_input(z_q, speaker_indices)
-        recon = self._apply_output_activation(self.decoder(z_q))
+        recon = self.decoder(z_q)
         return recon
 
     def encode(self, x):
@@ -444,8 +433,7 @@ class VQVAE(pl.LightningModule):
         """
         z_q = self.post_bottleneck(z_q)
         z_q = self._condition_decoder_input(z_q, speaker_indices)
-        x_recon = self.decoder(z_q)
-        return self._apply_output_activation(x_recon)
+        return self.decoder(z_q)
 
     def forward(self, x, speaker_indices=None):
         _, z_q, vq_loss, perplexity, _ = self._encode_quantized(x)

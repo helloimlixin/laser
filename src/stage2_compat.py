@@ -229,7 +229,6 @@ def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
             if meta_backbone_latent_channels is not None
             else inferred_backbone_latent_channels
         ),
-        "max_ch_mult": int(metadata.get("max_ch_mult", max(1, encoder_norm_channels // max(1, num_hiddens)))),
         "decoder_extra_residual_layers": int(
             metadata.get("decoder_extra_residual_layers", max(0, decoder_blocks_per_level - num_residual_layers))
         ),
@@ -242,7 +241,6 @@ def _infer_rq_stage1_config(state_dict: dict, token_cache: dict) -> dict:
         "coef_max": max(1e-6, coef_max),
         "coef_quantization": coef_quantization,
         "coef_mu": coef_mu,
-        "out_tanh": True,
         "quantize_sparse_coeffs": bool(quantize_sparse_coeffs),
         "patch_based": patch_based,
         "patch_size": patch_size,

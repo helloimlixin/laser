@@ -6,7 +6,7 @@ defaults:
 # 32768 samples -> 64 latent sites with one sparse code per site.
 type: laser
 in_channels: 1
-backbone: simple
+backbone: ddpm
 audio_backbone: waveform
 audio_downsample_rates: [4, 4, 4, 2, 2]
 
@@ -36,7 +36,6 @@ perceptual_weight: 0.0
 audio_waveform_l1_weight: 1.0
 audio_multires_stft_loss_weight: 1.0
 audio_multires_stft_fft_sizes: [512, 1024, 2048]
-out_tanh: true
 compute_fid: false
 
 adversarial_weight: 0.0

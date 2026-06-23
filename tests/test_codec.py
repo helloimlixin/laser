@@ -29,6 +29,40 @@ OUT.mkdir(parents=True, exist_ok=True)
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
+def encoder_kwargs(image_size: int = 256) -> dict:
+    return dict(
+        ch=32,
+        out_ch=3,
+        ch_mult=(1, 2, 4),
+        num_res_blocks=1,
+        attn_resolutions=(),
+        dropout=0.0,
+        resamp_with_conv=True,
+        in_channels=3,
+        resolution=image_size,
+        z_channels=32,
+        double_z=False,
+        use_mid_attention=False,
+    )
+
+
+def decoder_kwargs(image_size: int = 256) -> dict:
+    return dict(
+        ch=32,
+        out_ch=3,
+        ch_mult=(1, 2, 4),
+        num_res_blocks=1,
+        attn_resolutions=(),
+        dropout=0.0,
+        resamp_with_conv=True,
+        in_channels=3,
+        resolution=image_size,
+        z_channels=32,
+        use_mid_attention=False,
+        extra_res_blocks=0,
+    )
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -116,18 +150,18 @@ def train_vqvae(model, imgs: torch.Tensor, steps: int = 25):
 
 def test_encoder():
     """Check encoder output shape and gradients."""
-    enc = Encoder(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32)
+    enc = Encoder(**encoder_kwargs())
     x = torch.randn(2, 3, 256, 256, requires_grad=True)
     y = enc(x)
-    assert y.shape == (2, 128, 64, 64), f"Bad shape: {y.shape}"
+    assert y.shape == (2, 32, 64, 64), f"Bad shape: {y.shape}"
     y.mean().backward()
     assert x.grad is not None and x.grad.abs().sum() > 0
 
 
 def test_decoder():
     """Check decoder output shape and gradients."""
-    dec = Decoder(in_channels=128, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32)
-    z = torch.randn(2, 128, 64, 64, requires_grad=True)
+    dec = Decoder(**decoder_kwargs())
+    z = torch.randn(2, 32, 64, 64, requires_grad=True)
     y = dec(z)
     assert y.shape == (2, 3, 256, 256), f"Bad shape: {y.shape}"
     y.mean().backward()
@@ -140,7 +174,7 @@ def test_decoder():
 
 def test_encoder_random():
     """Visualize encoder activations on random noise."""
-    enc = Encoder(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32)
+    enc = Encoder(**encoder_kwargs())
     enc.eval()
     x = torch.randn(1, 3, 256, 256)
     with torch.no_grad():
@@ -153,9 +187,9 @@ def test_encoder_random():
 
 def test_decoder_random():
     """Visualize decoder output on random latent."""
-    dec = Decoder(in_channels=128, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32)
+    dec = Decoder(**decoder_kwargs())
     dec.eval()
-    z = torch.randn(1, 128, 64, 64)
+    z = torch.randn(1, 32, 64, 64)
     with torch.no_grad():
         y = dec(z)
     out = OUT / "decoder" / "random"
@@ -179,7 +213,7 @@ def test_encoder_dataset(name: str, size: int):
         pytest.skip("CUDA required")
 
     device = torch.device("cuda")
-    enc = Encoder(in_channels=3, num_hiddens=128, num_residual_blocks=2, num_residual_hiddens=32).to(device).eval()
+    enc = Encoder(**encoder_kwargs(size)).to(device).eval()
     loader = make_loader(path, size)
 
     out = OUT / "encoder" / name

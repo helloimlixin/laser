@@ -2,10 +2,12 @@
 """Build a maintained sparse-token cache from a stage-1 LASER checkpoint."""
 
 import argparse
+import math
 from pathlib import Path
 import sys
 
 import torch
+from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -42,7 +44,7 @@ def _build_datamodule(args):
         return CIFAR10DataModule(data_cfg)
     if args.dataset == "imagenette2":
         return Imagenette2DataModule(data_cfg)
-    if args.dataset == "celeba":
+    if args.dataset in {"celeba", "celebahq"}:
         return CelebADataModule(data_cfg)
     raise ValueError(f"Unsupported dataset: {args.dataset}")
 
@@ -57,6 +59,16 @@ def _resolve_loader(datamodule, split: str):
     if split == "test":
         return datamodule.test_dataloader()
     raise ValueError(f"Unsupported split: {split!r}")
+
+
+def _progress_total(loader, max_items: int) -> int | None:
+    try:
+        dataset_size = len(loader.dataset)
+    except Exception:
+        dataset_size = 0
+    if max_items > 0:
+        return min(max_items, dataset_size) if dataset_size > 0 else max_items
+    return dataset_size if dataset_size > 0 else None
 
 
 def _default_output_path(args):
@@ -81,7 +93,12 @@ def _default_output_path(args):
 def main():
     parser = argparse.ArgumentParser(description="Build a maintained sparse-token cache from a stage-1 checkpoint.")
     parser.add_argument("--stage1_checkpoint", type=Path, required=True, help="Maintained stage-1 Lightning checkpoint.")
-    parser.add_argument("--dataset", type=str, default="celeba", choices=["cifar10", "imagenette2", "celeba"])
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="celeba",
+        choices=["cifar10", "imagenette2", "celeba", "celebahq"],
+    )
     parser.add_argument("--data_dir", type=str, required=True, help="Dataset root directory.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
     parser.add_argument(
@@ -154,9 +171,27 @@ def main():
     seen = 0
     token_shape = None
     observed_coeff_abs_max = 0.0
+    max_items = int(args.max_items)
+    progress_total = _progress_total(loader, max_items)
+    progress_batches = len(loader)
+    if progress_total is not None and max_items > 0:
+        batch_size = int(getattr(loader, "batch_size", 0) or int(args.batch_size))
+        progress_batches = int(math.ceil(progress_total / max(1, batch_size)))
     with torch.no_grad():
-        for batch in loader:
+        progress = tqdm(
+            loader,
+            total=progress_batches,
+            desc=f"Building token cache ({args.split})",
+            unit="batch",
+            dynamic_ncols=True,
+        )
+        for batch in progress:
             x = batch[0] if isinstance(batch, (tuple, list)) else batch
+            remaining = max_items - seen if max_items > 0 else x.size(0)
+            if max_items > 0 and remaining <= 0:
+                break
+            if max_items > 0 and x.size(0) > remaining:
+                x = x[:remaining]
             x = x.to(device, non_blocking=True)
             if quantized_cache:
                 tokens, current_latent_hw = model.encode_to_tokens(
@@ -186,7 +221,11 @@ def main():
                 if coeff_flat.numel() > 0:
                     observed_coeff_abs_max = max(observed_coeff_abs_max, float(coeff_flat.abs().max().item()))
             seen += flat.size(0)
-            if int(args.max_items) > 0 and seen >= int(args.max_items):
+            item_suffix = f"{seen}"
+            if progress_total is not None:
+                item_suffix = f"{seen}/{progress_total}"
+            progress.set_postfix_str(f"images={item_suffix}", refresh=False)
+            if max_items > 0 and seen >= max_items:
                 break
 
     if not all_tokens:

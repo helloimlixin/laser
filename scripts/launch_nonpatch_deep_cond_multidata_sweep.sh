@@ -597,13 +597,12 @@ submit_image_dataset() {
     --stage1-override train.run_test_after_fit=false \
     --stage1-override checkpoint.save_top_k=1 \
     --stage1-override model=laser \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_hiddens="$hidden" \
     --stage1-override model.num_downsamples="$downsample" \
     --stage1-override model.dropout="$IMAGE_DROPOUT" \
     --stage1-override model.channel_multipliers="$channels" \
     --stage1-override model.backbone_latent_channels="$backbone_latent_channels" \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$embedding_dim" \
     --stage1-override model.num_embeddings="$num_embeddings" \
     --stage1-override model.sparsity_level="$sparsity" \
@@ -621,7 +620,6 @@ submit_image_dataset() {
     --stage1-override model.use_mid_attention="$IMAGE_USE_MID_ATTENTION" \
     --stage1-override model.attn_resolutions="$attn" \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.recon_mse_weight=0.25 \
     --stage1-override model.recon_l1_weight=1.0 \
     --stage1-override model.recon_edge_weight=0.50 \
@@ -770,7 +768,6 @@ submit_vctk() {
     --stage1-override model.audio_multires_stft_loss_weight=1.0 \
     --stage1-override model.audio_multires_stft_fft_sizes=[512,1024,2048] \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.compute_fid=false \
     --stage1-override model.perceptual_weight=0.0 \
     --stage1-override model.adversarial_weight=0.0 \

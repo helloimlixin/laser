@@ -7,18 +7,16 @@ defaults:
 type: laser
 in_channels: 3
 
-backbone: vqgan
+backbone: ddpm
 num_hiddens: 128
 num_residual_blocks: 3
 num_residual_hiddens: 96
 decoder_extra_residual_layers: 2
-out_tanh: true
 dropout: 0.0
 
 num_downsamples: 5
 channel_multipliers: [1, 1, 2, 2, 4, 4]
 backbone_latent_channels: 512
-max_ch_mult: 4
 attn_resolutions: [8, 16]
 use_mid_attention: true
 bypass_bottleneck: false

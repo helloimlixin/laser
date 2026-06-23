@@ -60,7 +60,6 @@ COMMON_STAGE1=(
   --stage1-override train.warmup_steps=1000
   --stage1-override train.min_lr_ratio=0.05
   --stage1-override model.compute_fid=true
-  --stage1-override model.out_tanh=true
 )
 
 COMMON_STAGE2=(
@@ -363,7 +362,7 @@ submit_vision_laser() {
     --stage1-override data.train_crop_size="$train_crop" \
     --stage1-override data.num_workers="$workers" \
     --stage1-override train.warmup_steps="$stage1_warmup" \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples="$downsamples" \
     --stage1-override "model.channel_multipliers=${ch_mult}" \
     --stage1-override model.num_hiddens=160 \

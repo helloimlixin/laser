@@ -4,7 +4,7 @@
 # The goal is to keep the sparse token depth fixed at 4 while making the
 # bottleneck easier to fit and giving the encoder/decoder more capacity:
 # - lower sparse embedding dim (64/128 instead of 256+) so k=4 OMP is viable;
-# - keep a wide VQGAN-style backbone around the bottleneck via 1x1 projections;
+# - keep a wide DDPM-style backbone around the bottleneck via 1x1 projections;
 # - use per-GPU batch size 1 to avoid OMP and activation OOMs on 512x512 images.
 
 set -euo pipefail
@@ -58,8 +58,7 @@ COMMON_STAGE1=(
   --stage1-override train.warmup_steps=1000
   --stage1-override train.min_lr_ratio=0.05
   --stage1-override model.compute_fid=true
-  --stage1-override model.out_tanh=true
-  --stage1-override model.backbone=vqgan
+  --stage1-override model.backbone=ddpm
   --stage1-override model.sparsity_level=4
   --stage1-override model.sparsity_reg_weight=0.0
   --stage1-override model.coef_max=16.0
@@ -70,7 +69,6 @@ COMMON_STAGE1=(
   --stage1-override model.perceptual_start_step=0
   --stage1-override model.perceptual_warmup_steps=1000
   --stage1-override model.use_mid_attention=true
-  --stage1-override model.max_ch_mult=4
   --stage1-override model.log_images_every_n_steps=500
   --stage1-override data.batch_size=1
   --stage1-override data.num_workers=8

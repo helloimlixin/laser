@@ -1,219 +1,108 @@
-# Model type: laser (Dictionary Learning VAE)
-# Other options: vqvae
-type: laser
+# LASER stage-1 autoencoder: convolutional encoder/decoder with a sparse
+# dictionary-learning bottleneck.
 
-# Number of input image channels
-# Options: 3 (RGB), 1 (grayscale)
+type: laser
 in_channels: 3
 
-# Number of hidden units in encoder/decoder
-# Typical range: 32-256
-# Higher = more capacity, slower training
+# Encoder / decoder
 num_hiddens: 128
-
-# Encoder/decoder backbone.
-# Keep the default aligned with the VQ-VAE baseline so LASER vs VQ-VAE sweeps
-# compare bottlenecks instead of unrelated image autoencoder architectures.
-# Use `vqgan` only for explicit RQ-AE/VQGAN architecture experiments.
-backbone: simple
-
-# Encoder/decoder knobs.
-# Match the default VQ-VAE image config: 256x256 inputs become 64x64 latents.
-num_downsamples: 2
-attn_resolutions: []
-dropout: 0.0
-# VQGAN-only width schedule. Ignored by the default simple VQ-VAE-style stack.
-channel_multipliers: [1, 1, 2, 2, 4]
-backbone_latent_channels: 512
-max_ch_mult: 4
-decoder_extra_residual_layers: 1
-use_mid_attention: false
-out_tanh: false
-bypass_bottleneck: false
-
-# Dictionary size (number of atoms/embeddings)
-# Typical range: 128-1024
-# Higher = more expressive, slower sparse coding
-# For an overcomplete dictionary, choose more atoms than embedding channels.
-num_embeddings: 512
-
-# Channel dimension of encoder output
-# Typical range: 16-512
-# Higher values = more expressive atoms, better reconstruction quality
-embedding_dim: 64
-
-# Sparse support per latent site. This is the bottleneck-specific analogue to
-# one VQ-VAE codebook index per latent site.
-# Must be < num_embeddings
-# Typical range: 4-32
-# Lower = more sparse (better generalization, lower quality)
-# Higher = less sparse (better quality, risk of overfitting)
-sparsity_level: 8
-
-# Weight applied to encoder-facing bottleneck losses inside total loss.
-bottleneck_loss_weight: 1.0
-
-# Optional separate weight for dictionary/codebook fitting loss. null preserves
-# the historical objective by using bottleneck_loss_weight for this term too.
-dictionary_loss_weight: null
-
-recon_mse_weight: 1.0
-recon_l1_weight: 0.0
-recon_edge_weight: 0.0
-
-# Number of residual blocks in encoder/decoder
-# Typical range: 2-6
-# Higher = more capacity, deeper network
 num_residual_blocks: 2
-
-# Number of hidden units in residual blocks
-# Typical range: 16-128
 num_residual_hiddens: 64
 
-# Commitment cost (weight for encoder loss term)
-# Typical range: 0.1-1.0
-# Higher = encoder forced to match dictionary reconstruction more closely
+# Image backbone:
+# - `ddpm`: modular ResNet/U-Net style path. Use `attn_resolutions`,
+#   `use_mid_attention`, `channel_multipliers`, and
+#   `decoder_extra_residual_layers` to decide how much machinery to include.
+# - `simple`: lightweight VQ-VAE-style Conv/ResStack encoder-decoder.
+backbone: simple
+num_downsamples: 5
+attn_resolutions: [16]
+dropout: 0.0
+channel_multipliers: [1, 1, 2, 2, 4, 4]
+backbone_latent_channels: 128
+decoder_extra_residual_layers: 1
+use_mid_attention: true
+
+# Sparse dictionary bottleneck
+bypass_bottleneck: false
+num_embeddings: 512
+embedding_dim: 64
+sparsity_level: 3
 commitment_cost: 0.25
+dict_learning_rate: 1e-4
+data_init_from_first_batch: true
 
-# Optional dictionary-specific learning rate.
-# Keep dictionary updates a bit below the encoder/decoder LR for the VQ-VAE
-# matched f4 profile.
-dict_learning_rate: 2.5e-4
-
-# Optional hard bound on sparse coefficients for downstream quantization.
-# null leaves stage-2 cache extraction to choose its coefficient range.
+# Optional hard bound for stage-2 coefficient quantization.
 coef_max: null
 
-# Optional variational posterior over continuous sparse coefficients.
-# This keeps the support depth fixed while giving stage 2 a Gaussian
-# coefficient target when caches are extracted with coeff_bins=0.
-#
-# Note (May 2026, A3): the historical "KL" term here is a Gaussian KL whose
-# reference mean is the data-dependent OMP coefficient, so it acts as an L2
-# refinement-around-OMP regularizer rather than a KL to a fixed prior. Keys
-# were renamed for honesty: variational_coeff_kl_weight ->
-# variational_coeff_refine_weight, variational_coeff_prior_std ->
-# variational_coeff_target_std. Old configs/checkpoints will raise a
-# TypeError directing you here.
-variational_coeffs: false
-variational_coeff_refine_weight: 0.0
-variational_coeff_target_std: 0.25
-variational_coeff_min_std: 0.01
-
-# Initialize dictionary atoms from the first batch's encoder latents before the
-# first OMP solve.
-data_init_from_first_batch: false
-
-# Low-separation-rank dictionary parameterization. Disabled by default.
-# When rank > 0, the dense patch dictionary is composed as a sum of rank many
-# separable Kronecker terms across (channels, patch_y, patch_x). Leave factor
-# dims null to auto-factor num_embeddings across those three modes.
+# Optional low-rank separable dictionary parameterization.
 separable_dictionary_rank: 0
 separable_dictionary_factor_dims: null
 
-# Latent patch sparse coding.
-# Keep this disabled for the RQ-AE encoder/decoder stack while reconstruction
-# quality is being validated. The sparse bottleneck operates per 16x16 latent
-# site instead of extracting/stitching latent patches.
+# Latent patch sparse coding. With `patch_based: false`, LASER sparse-codes each
+# latent site independently and `patch_size` / `patch_stride` are ignored.
 patch_based: false
-patch_size: 2
-patch_stride: 2
+patch_size: 4
+patch_stride: 4
 patch_reconstruction: tile
 
-# L1 regularization weight on sparse coefficients
-# Typical range: 0.0-0.1
-# 0.0 = no regularization
-# 0.01 = mild regularization (recommended)
-# 0.05-0.1 = strong regularization (max sparsity)
-# Increase this if the sparse codes are still too dense.
-sparsity_reg_weight: 0.01 # Reduced - overlapping patches provide implicit regularization
+# Reconstruction and bottleneck losses
+recon_mse_weight: 1.0
+recon_l1_weight: 0.1
+recon_edge_weight: 0.05
+bottleneck_loss_weight: 0.5
+dictionary_loss_weight: 0.5
+sparsity_reg_weight: 0.002
 
-# Perceptual loss weight (LPIPS)
-# Keep disabled while validating reconstruction capacity. The scratch reference
-# trains stage 1 with MSE reconstruction only.
-perceptual_weight: 0.0
-perceptual_start_step: 0
-perceptual_warmup_steps: 0
+# Image perceptual loss (LPIPS). Disabled by default.
+perceptual_weight: 0.15
+perceptual_start_step: 1000
+perceptual_warmup_steps: 3000
 
-# --- PatchGAN adversarial loss (VQGAN-style) ---
-# The reconstruction-only objective (MSE/L1/edge/LPIPS) regresses toward the
-# conditional mean and produces over-smoothed images. A PatchGAN critic with a
-# hinge loss rewards plausible high-frequency texture WITHOUT changing the
-# latent/token budget. Default 0.0 keeps the discriminator off and preserves the
-# legacy single-optimizer (automatic optimization) training path exactly.
-# Set >0 (e.g. 0.8) to enable; this switches stage-1 to manual optimization.
+# Image PatchGAN adversarial loss. Disabled by default.
 adversarial_weight: 0.0
 adversarial_start_step: 0
 adversarial_warmup_steps: 0
-# Autoencoder warmup (in training batches) before the critic starts. Below this
-# step training is pure reconstruction so the critic does not fight an untrained
-# decoder. Tie roughly to perceptual_start_step.
+adversarial_start_recon_mse: null
+adversarial_quality_ema_decay: 0.99
+
 disc_start_step: 0
-# PatchGAN depth / width and normalization. 'group' or spectral norm are safer
-# than 'batch' for small per-GPU batches and DDP.
 disc_num_layers: 3
 disc_channels: 64
 disc_norm: batch
 disc_spectral: false
-# Critic objective: 'hinge' (default) or 'vanilla' (BCE/softplus).
 disc_loss: hinge
-# Optional separate LR for the critic (null -> use the autoencoder learning_rate).
 disc_learning_rate: null
-# Raw waveform audio uses a HiFi-GAN-style multi-period/multi-scale critic
-# instead of the 2D image PatchGAN.
-audio_adversarial_type: hifigan
-audio_disc_periods: [2, 3, 5, 7, 11]
-audio_disc_num_scales: 3
-audio_disc_max_channels: 512
-# Optional DAC/Encodec-style complex-STFT critics (empty = MPD/MSD only).
-audio_disc_stft_fft_sizes: []
-# HiFi-GAN feature-matching loss (L1 between critic intermediate features for
-# real vs generated audio) — the core perceptual GAN signal. 0.0 = off.
-audio_feature_matching_weight: 0.0
-# Multi-scale log-mel L1 reconstruction loss (DAC/HiFi-GAN). 0.0 = off.
-audio_mel_loss_weight: 0.0
-audio_mel_fft_sizes: [512, 1024, 2048]
-audio_mel_n_mels: 80
-# VQGAN adaptive weight: balances recon vs adversarial gradients at the decoder
-# output layer so the GAN term neither vanishes nor dominates.
 use_adaptive_disc_weight: true
 disc_factor: 1.0
 disc_weight_max: 10000.0
-# Optional quality gate for adversarial training. When set, PatchGAN generator
-# and discriminator updates stay disabled until the train reconstruction-MSE
-# EMA is <= this threshold.
-adversarial_start_recon_mse: null
-adversarial_quality_ema_decay: 0.99
+
+# Legacy discriminator aliases still consumed by the stage-1 setup path.
 discriminator_learning_rate: null
 discriminator_beta1: 0.5
 discriminator_beta2: 0.9
 discriminator_channels: 64
 discriminator_layers: 3
 
-# Beta1 parameter for Adam/AdamW optimizer
-# Typical range: 0.5-0.99
-# 0.9 = standard default
+# Raw-waveform adversarial / perceptual audio options. These are inert for image
+# datasets but kept here because the LASER module accepts the shared schema.
+audio_adversarial_type: hifigan
+audio_disc_periods: [2, 3, 5, 7, 11]
+audio_disc_num_scales: 3
+audio_disc_max_channels: 512
+audio_disc_stft_fft_sizes: []
+audio_feature_matching_weight: 0.0
+audio_mel_loss_weight: 0.0
+audio_mel_fft_sizes: [512, 1024, 2048]
+audio_mel_n_mels: 80
+
+# Optimizer
 beta: 0.9
 
-# Compute reconstruction FID (rFID) during validation/test.
-# This logs `val/rfid` to W&B from stage 1.
+# Validation / logging
 compute_fid: true
 fid_feature: 2048
-
-# Log reconstruction images to W&B every N steps
-# Typical range: 100-1000
-# Lower = more frequent logging, larger logs
 log_images_every_n_steps: 500
-
-# Extra train-only diagnostics; 0 disables them.
 diag_log_interval: 0
-
-# Run an extra validation forward pass for W&B latent visuals:
-# - val/sparse_heatmap
-# - val/dictionary_scatter
-# - val/dictionary_atom_trajectories at fit end
 enable_val_latent_visuals: true
-
-# Large dictionaries are sampled for PCA scatter/GIF logging to keep W&B media
-# and end-of-fit rendering manageable.
 codebook_visual_max_vectors: 1024

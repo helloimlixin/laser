@@ -9,7 +9,6 @@ Utilities in this directory:
 - `smoke_e2e.py`
 - `cache.py`
 - `compute_rfid.py`
-- `extract_sparse_codes.py`
 - `kmeans_quantize_sparse_codes.py`
 - `prune_runs.py`
 - `laser_sanity.py`

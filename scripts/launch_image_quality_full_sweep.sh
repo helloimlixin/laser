@@ -82,7 +82,6 @@ COMMON_STAGE1=(
   --stage1-override train.gradient_clip_val=1.0
   --stage1-override train.val_check_interval=1.0
   --stage1-override model.compute_fid=false
-  --stage1-override model.out_tanh=true
 )
 
 COMMON_STAGE2=(
@@ -189,7 +188,7 @@ submit_laser_f32() {
     "${COMMON_STAGE2[@]}" \
     --stage1-override data.num_workers="$workers" \
     --stage1-override data.batch_size="$batch" \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples=5 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4,4] \
     --stage1-override model.num_hiddens=128 \
@@ -243,7 +242,7 @@ submit_laser_f16() {
     "${COMMON_STAGE2[@]}" \
     --stage1-override data.num_workers="$workers" \
     --stage1-override data.batch_size="$batch" \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples=4 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4] \
     --stage1-override model.num_hiddens=128 \

@@ -174,11 +174,10 @@ submit_celebahq_image() {
     --stage1-override train.limit_val_batches=1.0 \
     --stage1-override train.limit_test_batches=1.0 \
     --stage1-override train.run_test_after_fit=false \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples=4 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4] \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$IMAGE_EMBEDDING_DIM" \
     --stage1-override model.num_embeddings="$IMAGE_NUM_EMBEDDINGS" \
     --stage1-override model.sparsity_level="$IMAGE_SPARSITY_LEVEL" \
@@ -199,7 +198,6 @@ submit_celebahq_image() {
     --stage1-override model.recon_edge_weight=0.5 \
     --stage1-override model.perceptual_weight=0.1 \
     --stage1-override model.compute_fid=false \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.adversarial_weight=0.0 \
     --stage1-adv-override model.adversarial_weight="$IMAGE_ADV_WEIGHT" \
     --stage1-adv-override model.adversarial_start_step=0 \
@@ -280,7 +278,6 @@ submit_vctk_audio() {
     --stage1-override model.audio_waveform_l1_weight=1.0 \
     --stage1-override model.audio_multires_stft_loss_weight=1.0 \
     --stage1-override model.audio_multires_stft_fft_sizes=[512,1024,2048] \
-    --stage1-override model.out_tanh=true \
     --stage1-override data.audio_dc_remove=true \
     --stage1-override data.audio_peak_normalize=true \
     --stage1-override data.audio_target_peak=0.95 \

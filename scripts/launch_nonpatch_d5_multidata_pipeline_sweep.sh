@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full-pipeline LASER sweep for per-site dictionary learning with a 5-downsample
-# VQGAN/RQ-VAE-style stage-1 backbone.  The CelebA-HQ stage-2 defaults mirror
+# DDPM/RQ-VAE-style stage-1 backbone.  The CelebA-HQ stage-2 defaults mirror
 # the successful W&B run helloimlixin-rutgers/laser/rq3ivx3d: 8x8 spatial sites,
 # sparse depth 8, q256 coefficients, and a d768/l18/h12 transformer.
 
@@ -241,12 +241,11 @@ submit_celebahq() {
     --stage1-override train.run_test_after_fit=false \
     --stage1-override checkpoint.save_top_k=1 \
     --stage1-override model=laser \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_hiddens=128 \
     --stage1-override model.num_downsamples=5 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4,4] \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$EMBEDDING_DIM" \
     --stage1-override model.num_embeddings="$NUM_EMBEDDINGS" \
     --stage1-override model.sparsity_level="$SPARSITY_LEVEL" \
@@ -264,7 +263,6 @@ submit_celebahq() {
     --stage1-override model.use_mid_attention=true \
     --stage1-override model.attn_resolutions=[8,16] \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.recon_mse_weight=0.25 \
     --stage1-override model.recon_l1_weight=1.0 \
     --stage1-override model.recon_edge_weight=0.50 \
@@ -373,7 +371,6 @@ submit_vctk() {
     --stage1-override model.audio_multires_stft_loss_weight=1.0 \
     --stage1-override model.audio_multires_stft_fft_sizes=[512,1024,2048] \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.compute_fid=false \
     --stage1-override model.perceptual_weight=0.0 \
     --stage1-override model.adversarial_weight=0.0 \

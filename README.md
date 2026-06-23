@@ -2,13 +2,13 @@
 
 This repository provides autoencoder models with dictionary learning for image reconstruction:
 
-- **LASER (Learnable Adaptive Structured Embedding Representation)** — Sparse dictionary autoencoder with OMP-based latent coding, a VQGAN/DDPM-style stage-1 backbone, and maintained stage-2 sparse-token priors.
+- **LASER (Learnable Adaptive Structured Embedding Representation)** — Sparse dictionary autoencoder with OMP-based latent coding, a DDPM-style stage-1 backbone, and maintained stage-2 sparse-token priors.
 - **VQ-VAE (Vector Quantized VAE)** — Baseline model with discrete latent codes and a learnable codebook.
 
 ## Features
 
 - 🚀 OMP-based dictionary learning with configurable sparsity
-- 🧠 VQGAN/DDPM-style ResNet+attention encoder/decoder for stage 1
+- 🧠 DDPM-style ResNet+attention encoder/decoder for stage 1
 - ⚡ GPU-friendly implementation with AMP-aware sparse coding
 - 📊 Comprehensive metrics: MSE, PSNR, SSIM, LPIPS, FID
 - 🔧 Modular architecture powered by PyTorch Lightning and Hydra
@@ -343,7 +343,10 @@ python train.py stage1 model=laser data=celeba train.max_epochs=100 model.sparsi
 # Tune sparse coding capacity
 python train.py stage1 model=laser model.sparsity_level=10 model.num_embeddings=1024
 
-# Switch to the legacy simple backbone
+# Use the maintained DDPM-style attention U-Net backbone
+python train.py stage1 model=laser model.backbone=ddpm
+
+# Switch to the lightweight Conv/ResStack backbone
 python train.py stage1 model=laser model.backbone=simple
 ```
 
@@ -398,12 +401,11 @@ The current default config in [configs/model/laser.yaml](configs/model/laser.yam
 ```yaml
 model:
   type: laser
-  backbone: vqgan
+  backbone: ddpm
   num_hiddens: 128
   num_downsamples: 2
   num_residual_blocks: 2
   num_residual_hiddens: 32
-  max_ch_mult: 2
   decoder_extra_residual_layers: 1
   use_mid_attention: true
   attn_resolutions: []
@@ -416,7 +418,6 @@ model:
   patch_reconstruction: hann
 ```
 
-At `128x128`, `num_downsamples=2` produces a `32x32` latent grid. With `num_hiddens=128` and `max_ch_mult=2`, the default channel schedule is effectively:
 
 ```text
 128x128x3
@@ -429,7 +430,7 @@ At `128x128`, `num_downsamples=2` produces a `32x32` latent grid. With `num_hidd
 
 #### Encoder Backbone
 
-The default `backbone: vqgan` reuses the maintained DDPM/VQGAN-style encoder from [src/models/rq_ae.py](src/models/rq_ae.py):
+The default `backbone: ddpm` uses the maintained DDPM-style encoder from [src/models/encoder.py](src/models/encoder.py):
 
 - `conv_in`: a `3x3` convolution lifts RGB into the base channel width.
 - Resolution levels: each level applies `num_residual_blocks` ResNet blocks, optional self-attention at configured resolutions, and a learned downsample except at the last level.
@@ -440,11 +441,11 @@ Important details:
 
 - `attn_resolutions: []` does **not** mean “no attention anywhere”. With `use_mid_attention: true`, the model still keeps a middle attention block at the coarsest latent resolution.
 - This is the main mechanism used to inject longer-range spatial mixing into stage 1 without paying the cost of attention at every resolution.
-- The older compatibility backbone still exists as `backbone: simple`, but the maintained default is now `vqgan`.
+- `backbone: simple` uses the lightweight VQ-VAE-style Conv/ResStack encoder instead.
 
 #### Decoder Backbone
 
-The decoder mirrors the encoder, again using the maintained implementation in [src/models/rq_ae.py](src/models/rq_ae.py):
+The decoder mirrors the encoder, using the maintained implementation in [src/models/decoder.py](src/models/decoder.py):
 
 - `conv_in` maps the latent tensor back to the decoder width.
 - Middle block: `ResnetBlock -> AttnBlock -> ResnetBlock`.
@@ -452,7 +453,7 @@ The decoder mirrors the encoder, again using the maintained implementation in [s
 - `decoder_extra_residual_layers` adds extra residual capacity on the decoder side without changing the latent resolution.
 - Final projection: `GroupNorm -> SiLU -> 3x3 conv` back to RGB.
 
-For the `vqgan` backbone, [src/models/laser.py](src/models/laser.py) sets `pre_bottleneck` and `post_bottleneck` to identity layers, because the encoder already emits `embedding_dim` channels and the decoder already consumes them directly. The older `simple` backbone still uses explicit `1x1` and `3x3` projections around the bottleneck.
+When the backbone latent width matches `embedding_dim`, [src/models/laser.py](src/models/laser.py) sets `pre_bottleneck` and `post_bottleneck` to identity layers. If the backbone is wider than the sparse bottleneck, the model uses learned `1x1` projections around the bottleneck.
 
 #### Sparse Dictionary Bottleneck
 
@@ -548,7 +549,6 @@ Every maintained cache also stores metadata such as:
 - `latent_hw` for the full latent spatial size
 - patch layout settings
 - coefficient quantization settings
-- stage-1 backbone settings such as `backbone`, `num_downsamples`, `attn_resolutions`, `max_ch_mult`, and `use_mid_attention`
 
 That metadata is important because patch-based token grids and latent grids are not always the same shape. Stage-2 decoding uses the stored `latent_hw` and patch layout to reconstruct the correct latent tensor before calling the decoder.
 
@@ -603,7 +603,7 @@ Tradeoff:
 
 ### Why the Model Is Structured This Way
 
-- The stage-1 VQGAN/DDPM-style backbone gives the autoencoder a stronger inductive bias for images than the older plain CNN stack.
+- The stage-1 DDPM-style backbone gives the autoencoder a stronger inductive bias for images than the older plain CNN stack.
 - Middle attention adds a global mixing step at the bottleneck scale, which is a cheap way to improve long-range coherence.
 - The sparse dictionary bottleneck forces the latent space to be compositional: each latent site or patch is reconstructed from a small subset of atoms.
 - Patch-based sparse coding lets atoms represent larger local structures than a single latent pixel and supports overlap-aware reconstruction.
@@ -612,7 +612,7 @@ Tradeoff:
 
 ### Practical Defaults and Interpretation
 
-- The current maintained stage-1 default is `backbone: vqgan`.
+- The current maintained stage-1 default is `backbone: ddpm`.
 - The current maintained stage-2 default is `ar.type: sparse_spatial_depth`.
 - `attn_resolutions: []` with `use_mid_attention: true` means the model keeps bottleneck attention but avoids expensive higher-resolution attention by default.
 - `patch_based: true`, `patch_size: 4`, `patch_stride: 2`, and `patch_reconstruction: hann` are the default maintained sparse-latent settings.
@@ -621,7 +621,7 @@ Tradeoff:
 ### Key Files
 
 - [src/models/laser.py](src/models/laser.py): stage-1 LightningModule, training losses, logging, and backbone selection
-- [src/models/rq_ae.py](src/models/rq_ae.py): VQGAN/DDPM-style encoder and decoder reused by the maintained LASER path
+- [src/models/encoder.py](src/models/encoder.py) and [src/models/decoder.py](src/models/decoder.py): modular image encoder/decoder implementations for both `ddpm` and `simple` backbones
 - [src/models/bottleneck.py](src/models/bottleneck.py): sparse dictionary bottleneck, patch extraction, OMP, coefficient quantization, and latent reconstruction
 - [cache.py](cache.py): stage-1 to stage-2 interface and cache metadata emission
 - [src/models/spatial_prior.py](src/models/spatial_prior.py): default spatial-depth stage-2 prior
@@ -643,10 +643,9 @@ model = LASER(
     sparsity_level=8,
     num_residual_blocks=2,
     num_residual_hiddens=32,
-    backbone="vqgan",
+    backbone="ddpm",
     resolution=128,
     num_downsamples=2,
-    max_ch_mult=2,
     decoder_extra_residual_layers=1,
     use_mid_attention=True,
     patch_based=True,
@@ -1232,50 +1231,18 @@ assert 0.8 < gap < 1.2
 assert metrics['train/sparsity_loss'] > 0
 ```
 
-## AR Pipeline: Extracting Sparse Codes and K-means Quantization
+## Stage-2 Token Cache Pipeline
 
-To prepare data for AR/ImageGPT training using LASER:
+Use the maintained cache builder to produce the sparse-token cache consumed by
+stage-2 training. This keeps encoder, bottleneck, decoder, and metadata handling
+tied to the stage-1 checkpoint instead of relying on separate encoder-only
+extraction scripts.
 
-1. **Extract Sparse Codes from LASER Encoder/Bottleneck**
-
-Run the following script to extract and save sparse codes for each image:
-
-```bash
-python scripts/extract_sparse_codes.py \
-  --encoder_ckpt path/to/encoder.pth \
-  --bottleneck_ckpt path/to/bottleneck.pth \
-  --data_dir path/to/images \
-  --output_dir outputs/sparse_codes/celeba/ \
-  --batch_size 32 \
-  --num_workers 4 \
-  --device cuda
-```
-- This will save a `.pt` file of sparse codes for each image in the output directory.
-
-2. **Run K-means Quantization on Sparse Codes**
-
-After extracting all sparse codes, run k-means to assign a discrete token to each patch:
-
-```bash
-python scripts/kmeans_quantize_sparse_codes.py \
-  --sparse_codes_dir outputs/sparse_codes/celeba/ \
-  --output_dir outputs/ar_tokens/celeba/ \
-  --num_clusters 2048
-```
-- This will save a `_tokens.pt` file for each image, containing the cluster index (token) for each patch.
-
-3. **Use Token Files for AR Training**
-
-- Use the generated token files in `outputs/ar_tokens/celeba/` as input for AR/ImageGPT training.
-- During VAE/LASER training, quantization is disabled; only use sparse codes for reconstruction.
-
-4. **Train AR/ImageGPT Model Using K-means Quantized Tokens**
-
-After generating the token files, launch AR/ImageGPT training with:
+After building a cache, launch stage-2 training with:
 
 ```bash
 python train.py stage2 \
-  token_cache_path=outputs/ar_tokens/celeba/tokens_cache.pt \
+  token_cache_path=outputs/ar/celeba/token_cache.pt \
   data.dataset=celeba
 ```
 - Replace the cache path with your actual sparse-token cache artifact.

@@ -112,7 +112,7 @@ echo "STAGE2_AR_TYPE=${STAGE2_AR_TYPE}  STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE}  
 echo "STAGE2_COEFF_BINS=${STAGE2_COEFF_BINS}  STAGE2_COEFF_MAX=${STAGE2_COEFF_MAX}  STAGE2_COEFF_QUANTIZATION=${STAGE2_COEFF_QUANTIZATION}  STAGE2_COEFF_MU=${STAGE2_COEFF_MU}" | tee -a "${LOG}"
 echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPLE_NUM_IMAGES=${STAGE2_SAMPLE_NUM_IMAGES}  STAGE2_SAMPLE_TOP_K=${STAGE2_SAMPLE_TOP_K}" | tee -a "${LOG}"
 
-# Stage 1: autoencoder. VQGAN-style backbone with four downsampling stages.
+# Stage 1: autoencoder. DDPM-style backbone with four downsampling stages.
 "${PYTHON_BIN}" train.py stage1 \
   output_dir="${STAGE1_DIR}" \
   hydra.run.dir="${STAGE1_DIR}/hydra" \
@@ -132,12 +132,10 @@ echo "STAGE2_SAMPLE_EVERY_N_EPOCHS=${STAGE2_SAMPLE_EVERY_N_EPOCHS}  STAGE2_SAMPL
   train.learning_rate="${STAGE1_LR}" \
   train.log_every_n_steps=20 \
   checkpoint.save_top_k=1 \
-  model.backbone=vqgan \
+  model.backbone=ddpm \
   model.num_hiddens="${STAGE1_NUM_HIDDENS}" \
   model.num_downsamples=4 \
   "model.channel_multipliers=[1,2,4,4,4]" \
-  model.max_ch_mult=4 \
-  model.out_tanh=true \
   model.embedding_dim="${BOTTLENECK_EMBEDDING_DIM}" \
   model.num_embeddings="${BOTTLENECK_NUM_EMBEDDINGS}" \
   model.sparsity_level="${SPARSITY_LEVEL}" \

@@ -164,14 +164,16 @@ def _batched_omp_with_support(
     )
 
 
-from .unet import (
-    AttnBlock,
+from .decoder import (
     Decoder,
+    Upsample,
+)
+from .encoder import (
+    AttnBlock,
     Downsample,
     Encoder,
     Normalize,
     ResnetBlock,
-    Upsample,
     nonlinearity,
 )
 
@@ -1388,7 +1390,6 @@ class LASER(nn.Module):
         attn_resolutions: tuple = (),
         dropout: float = 0.0,
         channel_multipliers=None,
-        max_ch_mult: int = 2,
         decoder_extra_residual_layers: int = 1,
         use_mid_attention: bool = True,
         embedding_dim: int = 16,
@@ -1399,7 +1400,6 @@ class LASER(nn.Module):
         coef_max: float = 3.0,
         coef_quantization: str = "uniform",
         coef_mu: float = 50.0,
-        out_tanh: bool = True,
         quantize_sparse_coeffs: bool = False,
         patch_based: bool = False,
         patch_size: int = 8,
@@ -1411,27 +1411,18 @@ class LASER(nn.Module):
         variational_coeff_min_std: float = 0.01,
     ):
         super().__init__()
-        self.out_tanh = bool(out_tanh)
         self.channel_multipliers = _canonical_channel_multipliers(channel_multipliers)
-        self.max_ch_mult = int(max_ch_mult)
         self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.use_mid_attention = bool(use_mid_attention)
 
-        if self.max_ch_mult <= 0:
-            raise ValueError(f"max_ch_mult must be positive, got {self.max_ch_mult}")
         if self.decoder_extra_residual_layers < 0:
             raise ValueError(
                 f"decoder_extra_residual_layers must be non-negative, got {self.decoder_extra_residual_layers}"
             )
 
-        # ch_mult controls the channel multiplier at each resolution level;
-        # len(ch_mult) - 1 equals the number of spatial downsampling steps.
-        # Cap multipliers to keep the max width bounded without changing the
-        # number of encoder or decoder stages.
         if self.channel_multipliers is None:
-            ch_mult = tuple(min(2 ** i, self.max_ch_mult) for i in range(num_downsamples + 1))
-        else:
-            ch_mult = self.channel_multipliers
+            raise ValueError("channel_multipliers must be set explicitly")
+        ch_mult = self.channel_multipliers
 
         enc_dec_kwargs = dict(
             ch=num_hiddens,
@@ -1505,8 +1496,6 @@ class LASER(nn.Module):
         with bottleneck_ctx:
             z_q, b_loss, tokens = self.bottleneck(z.float())
         recon = self.decoder(z_q)
-        if self.out_tanh:
-            recon = torch.tanh(recon)
         return recon, b_loss, tokens
 
     @torch.no_grad()
@@ -1543,8 +1532,6 @@ class LASER(nn.Module):
         else:
             z_q = self.bottleneck.tokens_to_latent(tokens)
         recon = self.decoder(z_q)
-        if self.out_tanh:
-            recon = torch.tanh(recon)
         return recon
 
     @torch.no_grad()
@@ -1566,8 +1553,6 @@ class LASER(nn.Module):
         else:
             z_q = self.bottleneck._reconstruct_sparse(atoms, coeffs)
         recon = self.decoder(z_q)
-        if self.out_tanh:
-            recon = torch.tanh(recon)
         return recon
 
 

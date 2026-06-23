@@ -75,7 +75,6 @@ COMMON_STAGE1=(
   --stage1-override train.warmup_steps="$FFHQ512_STAGE1_WARMUP_STEPS"
   --stage1-override train.min_lr_ratio="$FFHQ512_MIN_LR_RATIO"
   --stage1-override model.compute_fid=false
-  --stage1-override model.out_tanh=true
 )
 
 COMMON_STAGE2=(
@@ -185,7 +184,7 @@ submit_laser() {
     --stage1-override data.batch_size="$per_gpu_batch" \
     --stage1-override data.eval_batch_size="$per_gpu_eval_batch" \
     --stage1-override data.train_crop_size="$FFHQ512_TRAIN_CROP_SIZE" \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples=2 \
     --stage1-override model.channel_multipliers=[1,1,2] \
     --stage1-override model.num_hiddens="$hidden" \

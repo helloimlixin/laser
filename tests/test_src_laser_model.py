@@ -28,7 +28,7 @@ def _build_model(**overrides):
         # Attention U-Net backbone params (tiny config for 16x16 test inputs).
         "resolution": 16,
         "num_downsamples": 1,
-        "max_ch_mult": 1,
+        "channel_multipliers": (1, 1),
         "commitment_cost": 0.25,
         "learning_rate": 1e-3,
         "beta": 0.9,
@@ -378,14 +378,14 @@ def test_laser_patch_toggle_can_fall_back_to_per_site_dictionary_learning():
     assert recon.shape == x.shape == batch.shape
 
 
-def test_laser_vqgan_backbone_runs_end_to_end():
+def test_laser_ddpm_backbone_runs_end_to_end():
     model = _build_model(
-        backbone="vqgan",
+        backbone="ddpm",
         resolution=16,
         num_hiddens=32,
         num_residual_blocks=1,
         num_downsamples=1,
-        max_ch_mult=1,
+        channel_multipliers=(1, 1),
         use_mid_attention=True,
         patch_based=False,
     )
@@ -400,18 +400,18 @@ def test_laser_vqgan_backbone_runs_end_to_end():
     assert model.infer_latent_hw((16, 16)) == (8, 8)
 
 
-def test_laser_ddpm_alias_selects_vqgan_backbone():
+def test_laser_unet_alias_selects_ddpm_backbone():
     model = _build_model(
-        backbone="ddpm",
+        backbone="unet",
         resolution=16,
         num_hiddens=32,
         num_residual_blocks=1,
         num_downsamples=1,
-        max_ch_mult=1,
+        channel_multipliers=(1, 1),
         patch_based=False,
     )
 
-    assert model.backbone == "vqgan"
+    assert model.backbone == "ddpm"
 
 
 def test_laser_decode_from_tokens_forwards_quantized_decode_args():

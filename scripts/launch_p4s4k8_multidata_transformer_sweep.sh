@@ -222,12 +222,11 @@ submit_image_dataset() {
     --stage1-override train.run_test_after_fit=false \
     --stage1-override checkpoint.save_top_k=1 \
     --stage1-override model=laser \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_hiddens=128 \
     --stage1-override model.num_downsamples=4 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4] \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$EMBEDDING_DIM" \
     --stage1-override model.num_embeddings="$NUM_EMBEDDINGS" \
     --stage1-override model.sparsity_level="$SPARSITY_LEVEL" \
@@ -258,7 +257,6 @@ submit_image_dataset() {
     --stage1-override model.dictionary_through_decoder=true \
     --stage1-override model.dead_atom_revival_steps="$DEAD_ATOM_REVIVAL_STEPS" \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.recon_mse_weight=0.25 \
     --stage1-override model.recon_l1_weight=1.0 \
     --stage1-override model.recon_edge_weight=0.50 \
@@ -373,7 +371,6 @@ submit_vctk_audio() {
     --stage1-override model.dictionary_through_decoder=true \
     --stage1-override model.dead_atom_revival_steps="$DEAD_ATOM_REVIVAL_STEPS" \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.compute_fid=false \
     --stage1-override model.perceptual_weight=0.0 \
     --stage1-override model.adversarial_weight=0.0 \

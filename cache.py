@@ -628,7 +628,6 @@ def _token_cache_meta(
         "dropout": float(getattr(model, "dropout", getattr(model.hparams, "dropout", 0.0))),
         "channel_multipliers": channel_multipliers,
         "backbone_latent_channels": backbone_latent_channels,
-        "max_ch_mult": int(getattr(model, "max_ch_mult", getattr(model.hparams, "max_ch_mult", 2))),
         "decoder_extra_residual_layers": int(
             getattr(
                 model,

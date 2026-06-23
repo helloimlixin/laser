@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CelebA-HQ p2s2/k4 quantized-token pipeline.
 #
-# This keeps the sharper d4 VQGAN stage-1 setup, but uses non-overlapping
+# This keeps the sharper d4 DDPM-style stage-1 setup, but uses non-overlapping
 # 2x2 latent patches with k=4 sparse entries, half the p4s4 dictionary size,
 # and 256 quantized coefficient bins. For a 16x16 latent grid, stage 2 models
 # an 8x8x8 interleaved atom/coeff token grid.
@@ -199,12 +199,11 @@ if [[ -z "${STAGE1_CKPT}" ]]; then
     train.gradient_clip_val=1.0 \
     train.log_every_n_steps=20 \
     checkpoint.save_top_k=1 \
-    model.backbone=vqgan \
+    model.backbone=ddpm \
     model.num_hiddens="${NUM_HIDDENS}" \
     model.num_downsamples="${STAGE1_DOWNSAMPLES}" \
     "model.channel_multipliers=${STAGE1_CHANNEL_MULTIPLIERS}" \
     model.backbone_latent_channels="${BACKBONE_LATENT_CHANNELS}" \
-    model.max_ch_mult=4 \
     model.embedding_dim="${EMBEDDING_DIM}" \
     model.num_embeddings="${NUM_EMBEDDINGS}" \
     model.sparsity_level="${SPARSITY_LEVEL}" \
@@ -231,7 +230,6 @@ if [[ -z "${STAGE1_CKPT}" ]]; then
     +model.dictionary_through_decoder=true \
     +model.dead_atom_revival_steps=100 \
     +model.data_init_from_first_batch=true \
-    model.out_tanh=true \
     model.recon_mse_weight="${RECON_MSE_WEIGHT}" \
     model.recon_l1_weight="${RECON_L1_WEIGHT}" \
     model.recon_edge_weight="${RECON_EDGE_WEIGHT}" \

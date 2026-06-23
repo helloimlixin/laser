@@ -2,7 +2,7 @@
 # Launch the successful CelebA-HQ p4/s4 k8 adversarial recipe across:
 #   ImageNet-256, FFHQ-256, CelebA-HQ-256, and VCTK waveform audio.
 #
-# Image jobs use the VQGAN f16 + PatchGAN recipe from W&B runs:
+# Image jobs use the DDPM-style f16 + PatchGAN recipe from W&B runs:
 #   5pg37gcs, wvickawc, ovti3vg2
 # VCTK uses the same sparse-code/stage-2 recipe family with a waveform
 # encoder/decoder and a HiFi-GAN-style multi-period/multi-scale discriminator.
@@ -44,7 +44,7 @@ STAGE2_EPOCHS="${STAGE2_EPOCHS:-150}"
 STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-120000}"
 
 # Successful image recipe from W&B run knmu7amb:
-# VQGAN f16 encoder/decoder, p4/s4 k4 sparse bottleneck, LPIPS, and delayed GAN.
+# DDPM-style f16 encoder/decoder, p4/s4 k4 sparse bottleneck, LPIPS, and delayed GAN.
 NUM_EMBEDDINGS="${NUM_EMBEDDINGS:-2048}"
 EMBEDDING_DIM="${EMBEDDING_DIM:-128}"
 SPARSITY_LEVEL="${SPARSITY_LEVEL:-4}"
@@ -223,12 +223,11 @@ submit_image_dataset() {
     --stage1-override train.run_test_after_fit=false \
     --stage1-override checkpoint.save_top_k=1 \
     --stage1-override model=laser \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_hiddens=128 \
     --stage1-override model.num_downsamples=4 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4] \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$EMBEDDING_DIM" \
     --stage1-override model.num_embeddings="$NUM_EMBEDDINGS" \
     --stage1-override model.sparsity_level="$SPARSITY_LEVEL" \
@@ -255,7 +254,6 @@ submit_image_dataset() {
     --stage1-override model.dictionary_through_decoder=true \
     --stage1-override model.dead_atom_revival_steps=100 \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.recon_mse_weight=0.25 \
     --stage1-override model.recon_l1_weight=1.0 \
     --stage1-override model.recon_edge_weight=0.50 \
@@ -358,7 +356,6 @@ submit_vctk_audio() {
     --stage1-override model.dictionary_through_decoder=true \
     --stage1-override model.dead_atom_revival_steps=100 \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.compute_fid=false \
     --stage1-override model.perceptual_weight=0.0 \
     --stage1-override model.adversarial_weight="$VCTK_ADVERSARIAL_WEIGHT" \

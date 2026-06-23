@@ -78,7 +78,6 @@ COMMON_ARGS=(
   --stage1-override model.audio_waveform_l1_weight=1.0
   --stage1-override model.audio_multires_stft_loss_weight=1.0
   --stage1-override model.audio_multires_stft_fft_sizes=[512,1024,2048]
-  --stage1-override model.out_tanh=true
   --stage1-override data.audio_dc_remove=true
   --stage1-override data.audio_peak_normalize=true
   --stage1-override data.audio_target_peak=0.95

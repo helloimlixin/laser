@@ -664,7 +664,6 @@ def write_job_files(
                     "model.recon_mse_weight=1.0",
                     "model.recon_l1_weight=0.0",
                     "model.recon_edge_weight=0.0",
-                    "model.out_tanh=false",
                     "train.learning_rate=1.0e-3",
                 )
             )

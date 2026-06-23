@@ -15,7 +15,9 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import subprocess
 import shlex
 import sys
 from dataclasses import dataclass
@@ -41,6 +43,9 @@ STAGE_TOKEN_ALIASES = {
     "2": "2",
     "stage2": "2",
     "stage-2": "2",
+    "pipeline": "pipeline",
+    "full": "pipeline",
+    "full-pipeline": "pipeline",
 }
 FACADE_FLAGS = {
     "--config",
@@ -165,7 +170,7 @@ def _stage(raw: str) -> str:
     value = str(raw).strip().lower()
     if value in STAGE_TOKEN_ALIASES:
         return STAGE_TOKEN_ALIASES[value]
-    raise argparse.ArgumentTypeError("stage must be 1 or 2")
+    raise argparse.ArgumentTypeError("stage must be 1, 2, or pipeline")
 
 
 def _stage_token(raw: str) -> str | None:
@@ -320,11 +325,13 @@ def _config_mode(config: dict[str, Any]) -> str:
 def _config_stage(config: dict[str, Any]) -> str:
     _, raw_stage = _config_lookup(config, "stage")
     if raw_stage is None:
-        raise SystemExit("YAML config requires a stage: stage1 or stage2.")
+        raise SystemExit("YAML config requires a stage: stage1, stage2, or pipeline.")
     try:
         stage = _stage(str(raw_stage))
     except argparse.ArgumentTypeError as exc:
         raise SystemExit(str(exc)) from exc
+    if stage == "pipeline":
+        return "pipeline"
     return "stage1" if stage == "1" else "stage2"
 
 
@@ -372,9 +379,42 @@ def _config_direct_argv(config: dict[str, Any]) -> list[str]:
     return argv
 
 
+def _config_pipeline_argv(path: str | Path, config: dict[str, Any]) -> list[str]:
+    _, dry_run = _config_lookup(config, "dry_run")
+    argv = ["pipeline", "--pipeline-config", str(path)]
+    if bool(dry_run):
+        argv.append("--dry-run")
+    return argv
+
+
+def _nested_stage_argv(config: dict[str, Any], key: str, stage: str) -> list[str]:
+    section = config.get(key)
+    if not isinstance(section, dict):
+        raise SystemExit(f"pipeline config requires a '{key}:' YAML mapping.")
+    nested = dict(section)
+    nested.setdefault("mode", "direct")
+    nested["stage"] = stage
+    return _config_direct_argv(nested)
+
+
+def _pipeline_commands(config_path: str | Path) -> tuple[list[str], list[str], bool]:
+    path = Path(config_path)
+    config = _merge_launcher_config(_load_yaml_config(path))
+    if _config_stage(config) != "pipeline":
+        raise SystemExit(f"{config_path} is not a pipeline config.")
+    _, dry_run = _config_lookup(config, "dry_run")
+    stage1_argv = _nested_stage_argv(config, "stage1", "stage1")
+    stage2_argv = _nested_stage_argv(config, "stage2", "stage2")
+    cmd1 = [sys.executable, str(Path(__file__).resolve()), *stage1_argv]
+    cmd2 = [sys.executable, str(Path(__file__).resolve()), *stage2_argv]
+    return cmd1, cmd2, bool(dry_run)
+
+
 def _argv_from_config(path: str | Path) -> tuple[list[str], bool]:
     config = _merge_launcher_config(_load_yaml_config(path))
     mode = _config_mode(config)
+    if _config_stage(config) == "pipeline":
+        return _config_pipeline_argv(path, config), True
     if mode == "direct":
         return _config_direct_argv(config), True
     return _config_facade_argv(config), False
@@ -614,6 +654,167 @@ def _tags(args: argparse.Namespace) -> str:
     return "[" + ",".join(tags) + "]"
 
 
+def _dedupe_tags(tags: Iterable[str]) -> list[str]:
+    seen = set()
+    out = []
+    for tag in tags:
+        text = str(tag).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _selected_checkpoint_paths(checkpoint_callback) -> list[Path]:
+    """Return monitored top-k checkpoints plus last.ckpt, preserving order."""
+    paths: list[Path] = []
+    best_k = getattr(checkpoint_callback, "best_k_models", None) or {}
+    if best_k:
+        mode = str(getattr(checkpoint_callback, "mode", "min") or "min").lower()
+
+        def _score(item):
+            score = item[1]
+            detach = getattr(score, "detach", None)
+            if callable(detach):
+                score = detach()
+            cpu = getattr(score, "cpu", None)
+            if callable(cpu):
+                score = cpu()
+            item_method = getattr(score, "item", None)
+            if callable(item_method):
+                return float(item_method())
+            return float(score)
+
+        paths.extend(
+            Path(path)
+            for path, _ in sorted(
+                best_k.items(),
+                key=_score,
+                reverse=(mode == "max"),
+            )
+        )
+    best_model_path = str(getattr(checkpoint_callback, "best_model_path", "") or "").strip()
+    if best_model_path:
+        paths.append(Path(best_model_path))
+    last_model_path = str(getattr(checkpoint_callback, "last_model_path", "") or "").strip()
+    if last_model_path:
+        paths.append(Path(last_model_path))
+
+    selected: list[Path] = []
+    seen = set()
+    for path in paths:
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        selected.append(resolved)
+    return selected
+
+
+def _make_selected_checkpoint_artifact_callback(callback_base):
+    class SelectedCheckpointArtifactCallback(callback_base):
+        """Upload top-k model checkpoints plus last.ckpt as one W&B artifact."""
+
+        def __init__(
+            self,
+            checkpoint_callback,
+            *,
+            artifact_prefix: str = "model",
+            every_n_epochs: int = 1,
+        ):
+            super().__init__()
+            self.checkpoint_callback = checkpoint_callback
+            self.artifact_prefix = str(artifact_prefix or "model")
+            self.every_n_epochs = max(1, int(every_n_epochs or 1))
+            self._last_signature = None
+
+        def _file_digest(self, path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        def _signature(self, paths: list[Path]) -> tuple:
+            return tuple((path.name, path.stat().st_size, self._file_digest(path)) for path in paths)
+
+        def _upload(self, trainer, *, reason: str) -> None:
+            if not bool(getattr(trainer, "is_global_zero", True)):
+                return
+            logger = getattr(trainer, "logger", None)
+            experiment = getattr(logger, "experiment", None)
+            if experiment is None or not hasattr(experiment, "log_artifact"):
+                return
+            paths = _selected_checkpoint_paths(self.checkpoint_callback)
+            if not paths:
+                return
+            signature = self._signature(paths)
+            if signature == self._last_signature:
+                return
+
+            import wandb
+
+            run_id = str(getattr(experiment, "id", "") or getattr(logger, "version", "") or "run")
+            artifact = wandb.Artifact(
+                name=f"{self.artifact_prefix}-{run_id}-selected-checkpoints",
+                type="model",
+                description="Automatically uploaded selected checkpoints: monitored top-k plus last.ckpt.",
+                metadata={
+                    "reason": reason,
+                    "epoch": int(getattr(trainer, "current_epoch", -1)),
+                    "global_step": int(getattr(trainer, "global_step", -1)),
+                    "monitor": str(getattr(self.checkpoint_callback, "monitor", "") or ""),
+                    "mode": str(getattr(self.checkpoint_callback, "mode", "") or ""),
+                    "save_top_k": int(getattr(self.checkpoint_callback, "save_top_k", -1)),
+                    "save_last": bool(getattr(self.checkpoint_callback, "save_last", False)),
+                    "checkpoint_paths": [str(path) for path in paths],
+                },
+            )
+            for path in paths:
+                artifact.add_file(str(path), name=path.name)
+            epoch = int(getattr(trainer, "current_epoch", 0))
+            aliases = ["latest", "best-plus-last", f"epoch-{epoch:03d}"]
+            experiment.log_artifact(artifact, aliases=aliases)
+            self._last_signature = signature
+
+        def on_validation_end(self, trainer, pl_module) -> None:
+            if bool(getattr(trainer, "sanity_checking", False)):
+                return
+            epoch = int(getattr(trainer, "current_epoch", 0))
+            if (epoch + 1) % self.every_n_epochs != 0:
+                return
+            self._upload(trainer, reason="validation_end")
+
+        def on_train_end(self, trainer, pl_module) -> None:
+            self._upload(trainer, reason="train_end")
+
+    return SelectedCheckpointArtifactCallback
+
+
+def _stage1_wandb_tags(cfg) -> list[str]:
+    model_cfg = cfg.model
+    backbone = str(getattr(model_cfg, "backbone", "") or "unknown").strip().lower()
+    channel_multipliers = getattr(model_cfg, "channel_multipliers", None)
+    if backbone == "ddpm" and channel_multipliers:
+        num_downsamples = max(0, len(channel_multipliers) - 1)
+    else:
+        num_downsamples = int(getattr(model_cfg, "num_downsamples", 0) or 0)
+
+    patch_based = bool(getattr(model_cfg, "patch_based", False))
+    tags = [
+        f"backbone={backbone}",
+        f"downsamples={num_downsamples}",
+        f"sparsity={int(getattr(model_cfg, 'sparsity_level', 0) or 0)}",
+        f"patch_based={str(patch_based).lower()}",
+    ]
+    if patch_based:
+        tags.append(f"patch_size={int(getattr(model_cfg, 'patch_size', 0) or 0)}")
+    return tags
+
+
 def _validate(args: argparse.Namespace) -> None:
     if not args.stage:
         raise SystemExit("Specify a stage with stage1/stage2, --stage, or a YAML config containing stage.")
@@ -811,6 +1012,7 @@ def _load_stage_entrypoints():
     """Train the maintained stage-1 autoencoder."""
 
     import os
+    import subprocess
     import sys
     import warnings
 
@@ -840,7 +1042,13 @@ def _load_stage_entrypoints():
 
     register_lightning_warning_filters()
     import lightning as pl
-    from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping, RichProgressBar
+    from lightning.pytorch.callbacks import (
+        Callback,
+        EarlyStopping,
+        LearningRateMonitor,
+        ModelCheckpoint,
+        RichProgressBar,
+    )
     from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.plugins.environments import LightningEnvironment
@@ -882,7 +1090,8 @@ def _load_stage_entrypoints():
     CHECKPOINT_SAVE_TOP_K = 3
     CHECKPOINT_SAVE_LAST = True
     CHECKPOINT_EVERY_N_EPOCHS = 1
-    WANDB_LOG_MODEL = "all"
+    CHECKPOINT_UPLOAD_TO_WANDB = True
+    CHECKPOINT_UPLOAD_EVERY_N_EPOCHS = 1
 
 
     def _default_stage1_run_name(model_type: str) -> str:
@@ -984,7 +1193,6 @@ def _load_stage_entrypoints():
                     "Backbone Latent Channels: "
                     f"{getattr(cfg.model, 'backbone_latent_channels', cfg.model.embedding_dim)}"
                 )
-                print(f"Max Channel Multiplier: {getattr(cfg.model, 'max_ch_mult', 2)}")
         elif cfg.model.type == "vqvae":
             print(f"Number of Embeddings: {cfg.model.num_embeddings}")
         else:
@@ -1038,9 +1246,18 @@ def _load_stage_entrypoints():
             monitor_key = "val/loss"
         monitor_mode = getattr(cfg.checkpoint, "mode", "min")
         filename_template = getattr(cfg.checkpoint, "filename", f"{cfg.model.type}-{{epoch:03d}}")
+        checkpoint_upload_to_wandb = bool(
+            getattr(cfg.checkpoint, "upload_to_wandb", CHECKPOINT_UPLOAD_TO_WANDB)
+        )
+        checkpoint_upload_every_n_epochs = max(
+            1,
+            int(getattr(cfg.checkpoint, "upload_every_n_epochs", CHECKPOINT_UPLOAD_EVERY_N_EPOCHS) or 1),
+        )
         with open_dict(cfg):
             cfg.checkpoint.save_top_k = CHECKPOINT_SAVE_TOP_K
             cfg.checkpoint.save_last = CHECKPOINT_SAVE_LAST
+            cfg.checkpoint.upload_to_wandb = checkpoint_upload_to_wandb
+            cfg.checkpoint.upload_every_n_epochs = checkpoint_upload_every_n_epochs
 
         print("\nCheckpoint Configuration:")
         print(f"Base Save Directory: {base_ckpt_dir}")
@@ -1050,7 +1267,8 @@ def _load_stage_entrypoints():
         print(f"Save Top K:          {cfg.checkpoint.save_top_k}")
         print(f"Save Last:           {cfg.checkpoint.save_last}")
         print(f"Every N Epochs:      {CHECKPOINT_EVERY_N_EPOCHS}")
-        print(f"W&B Checkpoint Upload: {WANDB_LOG_MODEL}")
+        print(f"W&B Selected Checkpoint Upload: {checkpoint_upload_to_wandb}")
+        print(f"W&B Upload Every N Epochs:      {checkpoint_upload_every_n_epochs}")
         print("=" * 60 + "\n")
 
         # Set random seed for reproducibility
@@ -1115,7 +1333,7 @@ def _load_stage_entrypoints():
         else:
             run_name = base_run_name
         run_group = str(getattr(cfg.wandb, "group", "") or "").strip() or None
-        run_tags = list(getattr(cfg.wandb, "tags", []) or [])
+        run_tags = _dedupe_tags([*(getattr(cfg.wandb, "tags", []) or []), *_stage1_wandb_tags(cfg)])
         devices_cfg = cfg.train.devices
         try:
             num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
@@ -1129,7 +1347,7 @@ def _load_stage_entrypoints():
             save_dir=cfg.wandb.save_dir,
             group=run_group,
             tags=run_tags if run_tags else None,
-            log_model=WANDB_LOG_MODEL,
+            log_model=False,
         )
         wandb_logger.log_hyperparams(
             {
@@ -1143,19 +1361,29 @@ def _load_stage_entrypoints():
         )
 
         # Initialize callbacks
-        callbacks = [
-            ModelCheckpoint(
-                dirpath=run_ckpt_dir,
-                filename=filename_template,
-                save_top_k=CHECKPOINT_SAVE_TOP_K,
-                monitor=monitor_key,
-                mode=monitor_mode,
-                save_last=CHECKPOINT_SAVE_LAST,
-                every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
-            ),
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=run_ckpt_dir,
+            filename=filename_template,
+            save_top_k=CHECKPOINT_SAVE_TOP_K,
+            monitor=monitor_key,
+            mode=monitor_mode,
+            save_last=CHECKPOINT_SAVE_LAST,
+            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
+        )
+        callbacks = [checkpoint_callback]
+        if checkpoint_upload_to_wandb:
+            SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
+            callbacks.append(
+                SelectedCheckpointArtifactCallback(
+                    checkpoint_callback,
+                    artifact_prefix="model",
+                    every_n_epochs=checkpoint_upload_every_n_epochs,
+                )
+            )
+        callbacks.extend([
             LearningRateMonitor(logging_interval='step'),
-            progress_bar
-        ]
+            progress_bar,
+        ])
         # Add EarlyStopping only if configured
         if getattr(cfg.train, "early_stopping_patience", None):
             callbacks.insert(1, EarlyStopping(
@@ -1288,7 +1516,7 @@ def _load_stage_entrypoints():
     import lightning as pl
     import torch
     import wandb
-    from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
+    from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint, RichProgressBar
     from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.plugins.environments import LightningEnvironment
@@ -1303,7 +1531,11 @@ def _load_stage_entrypoints():
     from src.pl_trainer_util import resolve_val_check_interval
     from src.stage2_compat import ensure_stage2_cache_metadata as add_cache_meta
     from src.stage2_metrics import build_stage2_metrics_payload
-    from src.stage2_paths import infer_latest_token_cache as pick_cache
+    from src.stage2_paths import (
+        default_token_cache_path,
+        infer_latest_stage1_checkpoint,
+        infer_latest_token_cache as pick_cache,
+    )
     from src.stage2_preview import (
         Stage2SamplePreviewCallback,
         save_final_generation_preview,
@@ -1315,7 +1547,8 @@ def _load_stage_entrypoints():
     CHECKPOINT_SAVE_TOP_K = 3
     CHECKPOINT_SAVE_LAST = True
     CHECKPOINT_EVERY_N_EPOCHS = 1
-    WANDB_LOG_MODEL = "all"
+    CHECKPOINT_UPLOAD_TO_WANDB = True
+    CHECKPOINT_UPLOAD_EVERY_N_EPOCHS = 1
 
     bar = RichProgressBar(
         theme=RichProgressBarTheme(
@@ -1363,6 +1596,123 @@ def _load_stage_entrypoints():
         if text in {"mingpt", "gpt"}:
             return "gpt"
         raise ValueError(f"Unsupported stage-2 architecture: {raw!r}")
+
+
+    def _cfg_value(section, key: str, default=None):
+        if section is None:
+            return default
+        value = getattr(section, key, default)
+        if value is None:
+            return default
+        return value
+
+
+    def _float_sequence(value, *, fallback):
+        if value is None:
+            value = fallback
+        if OmegaConf.is_config(value):
+            value = OmegaConf.to_container(value, resolve=True)
+        return [str(float(v)) for v in value]
+
+
+    def _resolve_token_cache_output(cfg, cache_cfg) -> Path:
+        explicit = str(_cfg_value(cache_cfg, "output", "") or "").strip()
+        if explicit:
+            return Path(explicit).expanduser().resolve()
+        current = str(getattr(cfg, "token_cache_path", "") or "").strip()
+        if current:
+            return Path(current).expanduser().resolve()
+        return default_token_cache_path(
+            ar_output_dir=cfg.output_dir,
+            dataset=str(_cfg_value(cfg.data, "dataset", "celeba")),
+            split=str(_cfg_value(cache_cfg, "split", "train")),
+            image_size=int(_cfg_value(cfg.data, "image_size", 128)),
+            coeff_bins=int(_cfg_value(cache_cfg, "coeff_vocab_size", 16)),
+            coeff_quantization=str(_cfg_value(cache_cfg, "coeff_quantization", "uniform")),
+            coeff_mu=float(_cfg_value(cache_cfg, "coeff_mu", 0.0)),
+        ).resolve()
+
+
+    def _maybe_build_token_cache(cfg) -> None:
+        cache_cfg = getattr(cfg, "token_cache", None)
+        if cache_cfg is None or not bool(_cfg_value(cache_cfg, "build", False)):
+            return
+
+        output_path = _resolve_token_cache_output(cfg, cache_cfg)
+        force = bool(_cfg_value(cache_cfg, "force", False))
+        if output_path.is_file() and not force:
+            cfg.token_cache_path = str(output_path)
+            print(f"Using existing token cache: {output_path}")
+            return
+
+        stage1_checkpoint = str(_cfg_value(cache_cfg, "stage1_checkpoint", "") or "").strip()
+        if stage1_checkpoint:
+            stage1_checkpoint_path = Path(stage1_checkpoint).expanduser().resolve()
+        else:
+            stage1_root = _cfg_value(cache_cfg, "stage1_output_root", None)
+            if stage1_root is None:
+                stage1_root = Path(str(cfg.output_dir)).expanduser().resolve().parent / "stage1"
+            stage1_checkpoint_path = infer_latest_stage1_checkpoint(
+                output_root=stage1_root,
+                model_type="laser",
+            )
+            if stage1_checkpoint_path is None:
+                raise FileNotFoundError(
+                    "Could not infer a stage-1 checkpoint for token cache extraction. "
+                    "Set token_cache.stage1_checkpoint or token_cache.stage1_output_root."
+                )
+        if not stage1_checkpoint_path.is_file():
+            raise FileNotFoundError(f"Stage-1 checkpoint not found: {stage1_checkpoint_path}")
+
+        dataset = str(_cfg_value(cfg.data, "dataset", "celeba")).strip().lower()
+        data_dir = str(_cfg_value(cfg.data, "data_dir", "") or "").strip()
+        if not data_dir:
+            raise ValueError("token_cache.build=true requires data.data_dir")
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve().parent / "scripts" / "tools" / "build_token_cache.py"),
+            "--stage1_checkpoint",
+            str(stage1_checkpoint_path),
+            "--dataset",
+            dataset,
+            "--data_dir",
+            data_dir,
+            "--split",
+            str(_cfg_value(cache_cfg, "split", "train")),
+            "--cache_mode",
+            str(_cfg_value(cache_cfg, "cache_mode", "quantized")),
+            "--image_size",
+            str(int(_cfg_value(cfg.data, "image_size", 128))),
+            "--batch_size",
+            str(int(_cfg_value(cache_cfg, "batch_size", _cfg_value(cfg.data, "batch_size", 64)))),
+            "--num_workers",
+            str(int(_cfg_value(cache_cfg, "num_workers", _cfg_value(cfg.data, "num_workers", 4)))),
+            "--mean",
+            *_float_sequence(_cfg_value(cfg.data, "mean", None), fallback=(0.5, 0.5, 0.5)),
+            "--std",
+            *_float_sequence(_cfg_value(cfg.data, "std", None), fallback=(0.5, 0.5, 0.5)),
+            "--coeff_vocab_size",
+            str(int(_cfg_value(cache_cfg, "coeff_vocab_size", 16))),
+            "--coeff_quantization",
+            str(_cfg_value(cache_cfg, "coeff_quantization", "uniform")),
+            "--coeff_mu",
+            str(float(_cfg_value(cache_cfg, "coeff_mu", 0.0))),
+            "--output",
+            str(output_path),
+            "--max_items",
+            str(int(_cfg_value(cache_cfg, "max_items", 0))),
+            "--device",
+            str(_cfg_value(cache_cfg, "device", "auto")),
+        ]
+        coeff_max = _cfg_value(cache_cfg, "coeff_max", None)
+        if coeff_max is not None:
+            cmd.extend(["--coeff_max", str(float(coeff_max))])
+
+        print("Building token cache before stage 2:")
+        print("  Stage-1 checkpoint:", stage1_checkpoint_path)
+        print("  Output cache:", output_path)
+        subprocess.run(cmd, check=True)
+        cfg.token_cache_path = str(output_path)
 
 
     def _preferred_module_device(module: torch.nn.Module) -> torch.device:
@@ -1535,6 +1885,7 @@ def _load_stage_entrypoints():
     def train_stage2(cfg: DictConfig):
         mode = arch_name(getattr(cfg.ar, "type", "sparse_spatial_depth"))
         cfg.ar.type = mode
+        _maybe_build_token_cache(cfg)
 
         print("\n" + "=" * 60)
         print(STAGE2_TITLE)
@@ -1605,7 +1956,8 @@ def _load_stage_entrypoints():
             f"save_top_k={CHECKPOINT_SAVE_TOP_K}, "
             f"save_last={CHECKPOINT_SAVE_LAST}, "
             f"every_n_epochs={CHECKPOINT_EVERY_N_EPOCHS}, "
-            f"wandb_log_model={WANDB_LOG_MODEL}"
+            f"wandb_selected_checkpoint_upload={CHECKPOINT_UPLOAD_TO_WANDB}, "
+            f"wandb_upload_every_n_epochs={CHECKPOINT_UPLOAD_EVERY_N_EPOCHS}"
         )
 
         base_run = str(getattr(cfg.wandb, "name", "") or "").strip() or _default_stage2_run_name()
@@ -1634,7 +1986,7 @@ def _load_stage_entrypoints():
             group=run_group,
             tags=run_tags if run_tags else None,
             id=wandb_id,
-            log_model=WANDB_LOG_MODEL,
+            log_model=False,
             **wandb_kwargs,
         )
         step_every = int(getattr(cfg.train_ar, "sample_every_n_steps", 0) or 0)
@@ -1669,19 +2021,29 @@ def _load_stage_entrypoints():
             }
         )
 
-        cbs = [
-            ModelCheckpoint(
-                dirpath=ckpt_dir,
-                filename="s2-{epoch:03d}-{val/loss:.4f}",
-                save_top_k=CHECKPOINT_SAVE_TOP_K,
-                monitor="val/loss",
-                mode="min",
-                save_last=CHECKPOINT_SAVE_LAST,
-                every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
-            ),
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="s2-{epoch:03d}-{val/loss:.4f}",
+            save_top_k=CHECKPOINT_SAVE_TOP_K,
+            monitor="val/loss",
+            mode="min",
+            save_last=CHECKPOINT_SAVE_LAST,
+            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
+        )
+        cbs = [checkpoint_callback]
+        if CHECKPOINT_UPLOAD_TO_WANDB:
+            SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
+            cbs.append(
+                SelectedCheckpointArtifactCallback(
+                    checkpoint_callback,
+                    artifact_prefix="model-stage2",
+                    every_n_epochs=CHECKPOINT_UPLOAD_EVERY_N_EPOCHS,
+                )
+            )
+        cbs.extend([
             LearningRateMonitor(logging_interval="step"),
             bar,
-        ]
+        ])
         if step_every > 0 or epoch_every > 0:
             cbs.append(
                 Stage2SamplePreviewCallback(
@@ -1828,7 +2190,22 @@ def main(argv: list[str] | None = None) -> int:
         direct_argv, dry_run = _strip_direct_dry_run(expanded)
         stage = _stage_token(direct_argv[0]) if direct_argv else None
         if not stage:
-            raise SystemExit("Direct YAML config requires stage: stage1 or stage2.")
+            raise SystemExit("Direct YAML config requires stage: stage1, stage2, or pipeline.")
+        if stage == "pipeline":
+            try:
+                config_idx = direct_argv.index("--pipeline-config")
+                config_path = direct_argv[config_idx + 1]
+            except (ValueError, IndexError) as exc:
+                raise SystemExit("Pipeline config dispatch requires --pipeline-config PATH.") from exc
+            cmd1, cmd2, config_dry_run = _pipeline_commands(config_path)
+            dry_run = dry_run or config_dry_run
+            print("Launching stage 1:", shlex.join(cmd1), flush=True)
+            print("Launching stage 2:", shlex.join(cmd2), flush=True)
+            if dry_run:
+                return 0
+            subprocess.run(cmd1, check=True)
+            subprocess.run(cmd2, check=True)
+            return 0
         cmd = [sys.executable, str(Path(__file__).resolve()), *direct_argv]
         if dry_run:
             print("Launching:", shlex.join(cmd), flush=True)
@@ -1836,6 +2213,8 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch_stage(stage, direct_argv[1:])
 
     stage = _stage_token(expanded[0]) if expanded else None
+    if stage == "pipeline":
+        raise SystemExit("Pipeline runs are supported through YAML configs: python train.py --config configs/exp1.yaml")
     if stage and not _looks_like_facade_args(raw_argv[1:]):
         return _dispatch_stage(stage, expanded[1:])
 

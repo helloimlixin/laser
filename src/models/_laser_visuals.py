@@ -272,7 +272,7 @@ class VisualsMixin:
         )
         log_wandb_images(
             logger,
-            f"{prefix}/images",
+            f"{prefix}/reconstruction_grid",
             [combined],
             step=step,
             captions=["Originals (top) / Reconstructions (bottom)"],
@@ -381,7 +381,7 @@ class VisualsMixin:
                 z = self.pre_bottleneck(z)
                 with self._bottleneck_autocast_context(z):
                     z_dl, _, sparse_codes = self.bottleneck(z.float())
-                recon = self._apply_output_activation(self.decoder(self.post_bottleneck(z_dl)))
+                recon = self.decoder(self.post_bottleneck(z_dl))
                 image_hw = (x.shape[2], x.shape[3])
                 latent_rgb = self._latent_rgb_projection(z_dl)
                 sparse_heat = self._sparse_heatmaps(sparse_codes, image_hw)

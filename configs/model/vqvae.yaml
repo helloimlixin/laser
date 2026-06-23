@@ -14,7 +14,6 @@ compute_fid: true
 fid_feature: 2048
 codebook_init: false
 dead_code_threshold: 0.0
-out_tanh: false
 
 # W&B codebook visuals:
 # - val/vq_codebook_scatter

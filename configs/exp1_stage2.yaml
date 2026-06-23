@@ -1,0 +1,104 @@
+# Example direct Hydra stage-2 config paired with configs/exp1.yaml.
+# Run after or during a completed-enough stage-1 run:
+#   python train.py --config configs/exp1_stage2.yaml
+#
+# Stage 2 will first build the sparse-token cache if it does not already exist,
+# then train the transformer prior from that cache.
+
+stage: stage2
+mode: direct
+
+output_dir: outputs/exp1/stage2
+token_cache_path: outputs/exp1/stage2/token_cache/celebahq__train__img256__cb16.pt
+ckpt_path: null
+
+token_cache:
+  build: true
+  force: false
+  stage1_checkpoint: null
+  stage1_output_root: outputs/exp1/stage1
+  output: outputs/exp1/stage2/token_cache/celebahq__train__img256__cb16.pt
+  split: train
+  cache_mode: quantized
+  coeff_vocab_size: 16
+  coeff_max: 3.0
+  coeff_quantization: uniform
+  coeff_mu: 0.0
+  batch_size: 64
+  num_workers: 4
+  max_items: 0
+  device: auto
+
+data:
+  dataset: celebahq
+  data_dir: ${oc.env:CELEBAHQ_DIR,${oc.env:CELEBA_HQ_DIR,../data/celebahq}}
+  batch_size: 4
+  num_workers: 8
+  image_size: 256
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+
+ar:
+  type: sparse_spatial_depth
+  vocab_size: null
+  atom_vocab_size: null
+  coeff_vocab_size: null
+  window_sites: 0
+  n_global_spatial_tokens: 8
+  autoregressive_coeffs: true
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  d_ff: 2048
+  dropout: 0.1
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 50000
+  min_lr_ratio: 0.01
+  atom_loss_weight: 1.0
+  coeff_loss_weight: 1.0
+  coeff_depth_weighting: none
+  coeff_focal_gamma: 0.0
+  atom_label_smoothing: 0.0
+  atom_coverage_weight: 0.0
+  coeff_loss_type: auto
+  coeff_huber_delta: 0.5
+
+train_ar:
+  batch_size: 256
+  max_epochs: 100
+  accelerator: gpu
+  num_nodes: 1
+  devices: 1
+  strategy: auto
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+  limit_test_batches: 1.0
+  val_check_interval: 0.25
+  validation_split: 0.05
+  test_split: 0.05
+  max_items: 0
+  crop_h_sites: 0
+  crop_w_sites: 0
+  sample_every_n_steps: 0
+  sample_every_n_epochs: 1
+  sample_num_images: 4
+  sample_temperature: 1.0
+  sample_top_k: 0
+  sample_log_to_wandb: true
+  compute_generation_fid: false
+  generation_metric_num_samples: 0
+  run_test_after_fit: false
+  save_final_samples_after_fit: true
+
+wandb:
+  project: laser-ar
+  name: celebahq-exp1-stage2
+  group: exp1
+  tags: [stage2, celebahq, laser, sparse_spatial_depth]
+  append_timestamp: false
+  save_dir: outputs/exp1/stage2/wandb

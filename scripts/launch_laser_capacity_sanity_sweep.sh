@@ -79,7 +79,6 @@ COMMON_STAGE1_OVERRIDES=(
   --stage1-override model.compute_fid=false
   --stage1-override model.perceptual_weight=0.0
   --stage1-override model.patch_based=false
-  --stage1-override model.out_tanh=true
 )
 
 COMMON_STAGE2_OVERRIDES=(
@@ -210,11 +209,10 @@ submit_coco() {
     "${COMMON_CACHE_ARGS[@]}" \
     --stage1-override data.num_workers=4 \
     --stage1-override data.batch_size=1 \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples=5 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4,4] \
     --stage1-override model.backbone_latent_channels=768 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.decoder_extra_residual_layers=2 \
     --stage1-override model.use_mid_attention=false \
     --stage1-override model.num_hiddens=192 \
@@ -279,11 +277,10 @@ submit_celebahq() {
     --stage1-override data.data_dir="$CELEBAHQ_DIR" \
     --stage1-override data.num_workers=0 \
     --stage1-override data.batch_size=4 \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples=4 \
     --stage1-override model.channel_multipliers=[1,1,2,2,4] \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.decoder_extra_residual_layers=2 \
     --stage1-override model.use_mid_attention=false \
     --stage1-override model.num_hiddens=192 \

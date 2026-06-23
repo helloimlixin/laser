@@ -218,12 +218,11 @@ submit_image_dataset() {
     --stage1-override train.run_test_after_fit=false \
     --stage1-override checkpoint.save_top_k=1 \
     --stage1-override model=laser \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_hiddens=128 \
     --stage1-override model.num_downsamples="$NUM_DOWNSAMPLES" \
     --stage1-override model.channel_multipliers="$CHANNEL_MULTIPLIERS" \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.embedding_dim="$EMBEDDING_DIM" \
     --stage1-override model.num_embeddings="$NUM_EMBEDDINGS" \
     --stage1-override model.sparsity_level="$SPARSITY_LEVEL" \
@@ -241,7 +240,6 @@ submit_image_dataset() {
     --stage1-override model.use_mid_attention=true \
     --stage1-override model.attn_resolutions=[16,32] \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.recon_mse_weight=0.25 \
     --stage1-override model.recon_l1_weight=1.0 \
     --stage1-override model.recon_edge_weight=0.50 \

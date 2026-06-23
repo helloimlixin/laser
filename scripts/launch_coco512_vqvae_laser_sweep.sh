@@ -105,7 +105,6 @@ submit_vqvae() {
     --stage1-override model.embedding_dim=128 \
     --stage1-override model.decay=0.99 \
     --stage1-override model.commitment_cost=0.25 \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.codebook_init=true \
     --stage1-override model.dead_code_threshold=1.0 \
     --stage1-override train.learning_rate=1.0e-4 \
@@ -119,11 +118,10 @@ submit_laser() {
     --model-family laser \
     --run-label "coco512-laser-ds${COCO_LASER_DOWNSAMPLES}-a${COCO_LASER_NUM_EMBEDDINGS}-d${COCO_LASER_EMBEDDING_DIM}-s${COCO_LASER_SPARSITY}-b${COCO_LASER_STAGE1_BATCH}-s1-${STAGE1_EPOCHS}-s2-${STAGE2_EPOCHS}" \
     --stage1-override data.batch_size="$COCO_LASER_STAGE1_BATCH" \
-    --stage1-override model.backbone=vqgan \
+    --stage1-override model.backbone=ddpm \
     --stage1-override model.num_downsamples="$COCO_LASER_DOWNSAMPLES" \
     --stage1-override "model.channel_multipliers=$COCO_LASER_CHANNEL_MULTIPLIERS" \
     --stage1-override model.backbone_latent_channels=512 \
-    --stage1-override model.max_ch_mult=4 \
     --stage1-override model.decoder_extra_residual_layers=1 \
     --stage1-override model.use_mid_attention=false \
     --stage1-override model.num_hiddens=128 \

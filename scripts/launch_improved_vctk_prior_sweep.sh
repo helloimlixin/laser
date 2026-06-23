@@ -203,7 +203,6 @@ submit_vctk_audio() {
     --stage1-override model.audio_multires_stft_loss_weight=1.0 \
     --stage1-override model.audio_multires_stft_fft_sizes=[512,1024,2048] \
     --stage1-override model.data_init_from_first_batch=true \
-    --stage1-override model.out_tanh=true \
     --stage1-override model.compute_fid=false \
     --stage1-override model.perceptual_weight=0.0 \
     --stage1-override model.adversarial_weight=0.0 \

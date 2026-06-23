@@ -25,8 +25,10 @@ from .discriminator import (
 )
 from .lpips import LPIPS
 from .audio_codec import AudioDecoder, AudioEncoder, canonical_int_tuple
-from .unet import Decoder as VQGANDecoder
-from .unet import Encoder as VQGANEncoder
+from .decoder import Decoder as DDPMDecoder
+from .decoder import SimpleDecoder
+from .encoder import Encoder as DDPMEncoder
+from .encoder import SimpleEncoder
 from .utils import fid_has_enough_samples
 from ._laser_visuals import VisualsMixin
 
@@ -53,10 +55,12 @@ from src.wandb_media import log_wandb_images, log_wandb_payload, log_wandb_video
 
 
 def _canonical_backbone(raw) -> str:
-    # The attention U-Net (VQGAN/DDPM-style) is the only stage-1 backbone.
-    # Legacy aliases ("simple", "scratch_vqvae", ...) are accepted and routed to
-    # the U-Net so older configs and checkpoints keep loading.
-    return "vqgan"
+    value = str(raw or "ddpm").strip().lower()
+    if value in {"simple", "vqvae", "scratch", "scratch_vqvae", "conv"}:
+        return "simple"
+    if value in {"ddpm", "unet", "attention", "attention_unet"}:
+        return "ddpm"
+    raise ValueError(f"Unsupported LASER backbone {raw!r}; expected 'ddpm' or 'simple'")
 
 
 def _canonical_attn_resolutions(values) -> Tuple[int, ...]:
@@ -101,14 +105,13 @@ class LASER(VisualsMixin, pl.LightningModule):
             commitment_cost,
             learning_rate,
             beta,
-            backbone="simple",
+            backbone="ddpm",
             resolution=None,
             num_downsamples=4,
             attn_resolutions=(),
             dropout=0.0,
             channel_multipliers=None,
             backbone_latent_channels=None,
-            max_ch_mult=4,
             decoder_extra_residual_layers=1,
             use_mid_attention=True,
             bottleneck_loss_weight=0.5,
@@ -166,7 +169,6 @@ class LASER(VisualsMixin, pl.LightningModule):
             audio_multires_stft_loss_weight=0.0,
             audio_multires_stft_fft_sizes=(512, 1024, 2048),
             audio_waveform_l1_weight=0.0,
-            out_tanh=True,
             bypass_bottleneck=False,
             warmup_steps=0,
             min_lr_ratio=0.01,
@@ -193,18 +195,17 @@ class LASER(VisualsMixin, pl.LightningModule):
             sparsity_level: Number of non-zero coefficients in sparse coding
             num_residual_blocks: Number of residual blocks
             num_residual_hiddens: Number of hidden units in residual blocks
-            backbone: encoder/decoder family: 'simple', 'scratch_vqvae', or VQGAN/DDPM-style aliases
-            resolution: input image resolution for the VQGAN-style backbone
+            backbone: image encoder/decoder family, either 'ddpm' or 'simple'
+            resolution: input image resolution for the DDPM-style backbone
             num_downsamples: number of spatial downsampling stages for variable-depth backbones
             attn_resolutions: spatial resolutions that should include self-attention blocks
-            dropout: residual-block dropout for the VQGAN-style backbone
+            dropout: residual-block dropout for the DDPM-style backbone
             channel_multipliers: optional explicit per-level width schedule for the
-                VQGAN-style backbone; overrides max_ch_mult and sets the number of
-                downsampling stages to len(channel_multipliers) - 1
-            backbone_latent_channels: width of the continuous VQGAN/DDPM latent
+                DDPM-style backbone; sets the number of downsampling stages to
+                len(channel_multipliers) - 1
+            backbone_latent_channels: width of the continuous DDPM latent
                 before projecting into the sparse bottleneck embedding_dim
-            max_ch_mult: cap on channel multipliers for the VQGAN-style backbone
-            decoder_extra_residual_layers: extra decoder residual blocks per level for the VQGAN-style backbone
+            decoder_extra_residual_layers: extra decoder residual blocks per level for the DDPM-style backbone
             use_mid_attention: whether to keep the bottleneck self-attention block enabled
             commitment_cost: Commitment cost for bottleneck
             learning_rate: Learning rate for encoder/decoder
@@ -259,7 +260,6 @@ class LASER(VisualsMixin, pl.LightningModule):
             audio_multires_stft_loss_weight: weight for raw-waveform multi-resolution STFT loss
             audio_multires_stft_fft_sizes: FFT sizes for raw-waveform multi-resolution STFT loss
             audio_waveform_l1_weight: additional raw-waveform L1 loss weight
-            out_tanh: whether to bound decoder output to the normalized target range [-1, 1]
             bypass_bottleneck: diagnostic mode that trains encoder/decoder without sparse coding
             adversarial_weight: base weight for the PatchGAN generator loss. 0 (default)
                 disables the discriminator and keeps the legacy single-optimizer
@@ -275,7 +275,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             disc_spectral: wrap discriminator convs in spectral norm for a stabler critic
             disc_loss: adversarial objective, 'hinge' (default) or 'vanilla'
             disc_learning_rate: optional LR for the discriminator (defaults to learning_rate)
-            use_adaptive_disc_weight: scale the generator loss by the VQGAN adaptive weight
+            use_adaptive_disc_weight: scale the generator loss by an adaptive discriminator weight
                 (ratio of recon-grad to adv-grad norms at the decoder output layer)
             disc_factor: post-warmup multiplier applied to both adversarial losses
             disc_weight_max: clamp on the adaptive discriminator weight
@@ -423,7 +423,6 @@ class LASER(VisualsMixin, pl.LightningModule):
             default=(512, 1024, 2048),
         )
         self.audio_waveform_l1_weight = float(audio_waveform_l1_weight)
-        self.out_tanh = bool(out_tanh)
         self.bypass_bottleneck = bool(bypass_bottleneck)
         self.enable_val_latent_visuals = bool(enable_val_latent_visuals)
         self.codebook_visual_max_vectors = max(1, int(codebook_visual_max_vectors))
@@ -457,15 +456,12 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.backbone_latent_channels = (
             None if backbone_latent_channels is None else int(backbone_latent_channels)
         )
-        self.max_ch_mult = int(max_ch_mult)
         self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.use_mid_attention = bool(use_mid_attention)
         if dict_learning_rate is not None and float(dict_learning_rate) <= 0.0:
             dict_learning_rate = None
         if self.num_downsamples < 0:
             raise ValueError(f"num_downsamples must be non-negative, got {self.num_downsamples}")
-        if self.max_ch_mult <= 0:
-            raise ValueError(f"max_ch_mult must be positive, got {self.max_ch_mult}")
         if self.backbone_latent_channels is not None and self.backbone_latent_channels <= 0:
             raise ValueError(
                 "backbone_latent_channels must be positive when provided, got "
@@ -480,19 +476,19 @@ class LASER(VisualsMixin, pl.LightningModule):
         if self.audio_backbone == "waveform" and int(in_channels) != 1:
             raise ValueError("LASER waveform audio backbone expects in_channels=1")
 
-        if not self.is_waveform_audio:
+        if not self.is_waveform_audio and self.backbone == "ddpm":
             # The attention U-Net backbone needs a positive input resolution and a
             # channel-multiplier schedule (waveform audio uses the 1D AudioEncoder).
             if self.resolution is None or self.resolution <= 0:
                 raise ValueError("resolution must be a positive integer for the U-Net backbone")
             if self.channel_multipliers is None:
-                self.channel_multipliers = tuple(
-                    min(2 ** i, self.max_ch_mult) for i in range(self.num_downsamples + 1)
-                )
-            else:
-                self.num_downsamples = len(self.channel_multipliers) - 1
+                raise ValueError("channel_multipliers must be set explicitly for backbone='ddpm'")
+            self.num_downsamples = len(self.channel_multipliers) - 1
             if self.backbone_latent_channels is None:
                 self.backbone_latent_channels = int(embedding_dim)
+        elif not self.is_waveform_audio:
+            self.channel_multipliers = ()
+            self.backbone_latent_channels = int(num_hiddens)
         else:
             self.channel_multipliers = ()
             self.backbone_latent_channels = int(embedding_dim)
@@ -528,7 +524,7 @@ class LASER(VisualsMixin, pl.LightningModule):
                 upsample_rates=self.audio_downsample_rates,
                 dilation_cycle=self.audio_dilation_cycle,
             )
-        else:
+        elif self.backbone == "ddpm":
             enc_dec_kwargs = dict(
                 ch=num_hiddens,
                 out_ch=in_channels,
@@ -543,7 +539,7 @@ class LASER(VisualsMixin, pl.LightningModule):
                 double_z=False,
                 use_mid_attention=self.use_mid_attention,
             )
-            self.encoder = VQGANEncoder(**enc_dec_kwargs)
+            self.encoder = DDPMEncoder(**enc_dec_kwargs)
             if self.backbone_latent_channels == int(embedding_dim):
                 self.pre_bottleneck = nn.Identity()
                 self.post_bottleneck = nn.Identity()
@@ -563,8 +559,37 @@ class LASER(VisualsMixin, pl.LightningModule):
                     kernel_size=1,
                     stride=1,
                 )
-            self.decoder = VQGANDecoder(
+            self.decoder = DDPMDecoder(
                 **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
+            )
+        else:
+            self.encoder = SimpleEncoder(
+                in_channels=in_channels,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                num_downsamples=self.num_downsamples,
+            )
+            self.pre_bottleneck = nn.Conv2d(
+                in_channels=num_hiddens,
+                out_channels=embedding_dim,
+                kernel_size=1,
+                stride=1,
+            )
+            self.post_bottleneck = nn.Conv2d(
+                in_channels=embedding_dim,
+                out_channels=num_hiddens,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            )
+            self.decoder = SimpleDecoder(
+                in_channels=num_hiddens,
+                num_hiddens=num_hiddens,
+                num_residual_layers=num_residual_blocks,
+                num_residual_hiddens=num_residual_hiddens,
+                out_channels=in_channels,
+                num_upsamples=self.num_downsamples,
             )
 
         # Bottleneck: OMP dictionary learning, or kakaobrain-style residual quantization.
@@ -702,7 +727,6 @@ class LASER(VisualsMixin, pl.LightningModule):
         dropout = self.dropout
         channel_multipliers = self.channel_multipliers
         backbone_latent_channels = self.backbone_latent_channels
-        max_ch_mult = self.max_ch_mult
         decoder_extra_residual_layers = self.decoder_extra_residual_layers
         use_mid_attention = self.use_mid_attention
         self.save_hyperparameters()
@@ -1010,11 +1034,6 @@ class LASER(VisualsMixin, pl.LightningModule):
         z_dl = self._from_bottleneck_output(z_dl)
         z_dl = self.post_bottleneck(z_dl)
         x_recon = self.decoder(z_dl)
-        return self._apply_output_activation(x_recon)
-
-    def _apply_output_activation(self, x_recon: torch.Tensor) -> torch.Tensor:
-        if self.out_tanh:
-            return torch.tanh(x_recon)
         return x_recon
 
     def _image_to_unit_range(self, x: torch.Tensor, *, clamp: bool = True) -> torch.Tensor:
@@ -1399,10 +1418,23 @@ class LASER(VisualsMixin, pl.LightningModule):
 
     def _get_last_layer_weight(self) -> torch.Tensor:
         """Decoder output-conv weight, used for the adaptive adversarial weight."""
-        return self.decoder.conv_out.weight
+        conv_out = getattr(self.decoder, "conv_out", None)
+        if conv_out is not None and hasattr(conv_out, "weight"):
+            return conv_out.weight
+
+        up_layers = getattr(self.decoder, "up", None)
+        if up_layers:
+            last = up_layers[-1]
+            if hasattr(last, "weight"):
+                return last.weight
+
+        raise AttributeError(
+            f"{type(self.decoder).__name__} does not expose an output layer weight "
+            "for adaptive discriminator weighting"
+        )
 
     def _adaptive_disc_weight(self, reference_loss, g_loss) -> torch.Tensor:
-        """VQGAN adaptive weight: balance recon vs adversarial gradients at the
+        """Adaptive discriminator weight: balance recon vs adversarial gradients at the
         decoder output layer so neither term dominates as training proceeds."""
         last = self._get_last_layer_weight()
         ref_grad = torch.autograd.grad(reference_loss, last, retain_graph=True, allow_unused=True)[0]

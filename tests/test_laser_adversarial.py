@@ -24,7 +24,7 @@ def _tiny_model(**overrides):
         commitment_cost=0.05,
         learning_rate=1e-3,
         beta=0.9,
-        backbone="vqgan",
+        backbone="ddpm",
         resolution=32,
         num_downsamples=2,
         channel_multipliers=[1, 2, 2],

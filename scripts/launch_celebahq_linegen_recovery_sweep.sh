@@ -42,7 +42,7 @@ COMMON_ARGS=(
   --run-root-base "$RUN_ROOT_BASE"
   --snapshot-root "$SNAPSHOT_ROOT"
   --stage1-override data.num_workers=0
-  --stage1-override model.backbone=scratch_vqvae
+  --stage1-override model.backbone=ddpm
   --stage1-override model.num_downsamples=4
   --stage1-override model.num_hiddens=128
   --stage1-override model.num_residual_blocks=2
