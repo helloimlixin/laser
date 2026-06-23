@@ -46,7 +46,7 @@ stage1:
 
 stage2:
   output_dir: outputs/exp1/stage2
-  token_cache_path: outputs/exp1/stage2/token_cache/celebahq__train__img256__cb16.pt
+  token_cache_path: outputs/exp1/stage2/token_cache/celebahq__train__img256__cb16_quantile_p99p5.pt
   ckpt_path: null
 
   token_cache:
@@ -54,12 +54,13 @@ stage2:
     force: false
     stage1_checkpoint: null
     stage1_output_root: outputs/exp1/stage1
-    output: outputs/exp1/stage2/token_cache/celebahq__train__img256__cb16.pt
+    output: outputs/exp1/stage2/token_cache/celebahq__train__img256__cb16_quantile_p99p5.pt
     split: train
     cache_mode: quantized
     coeff_vocab_size: 16
-    coeff_max: 3.0
-    coeff_quantization: uniform
+    coeff_max: auto
+    coeff_quantization: quantile
+    coeff_calibration_percentile: 99.5
     coeff_mu: 0.0
     batch_size: 64
     num_workers: 4

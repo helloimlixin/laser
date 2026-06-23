@@ -21,8 +21,9 @@ token_cache:
   split: train
   cache_mode: quantized
   coeff_vocab_size: 16
-  coeff_max: 3.0
-  coeff_quantization: uniform
+  coeff_max: auto
+  coeff_quantization: quantile
+  coeff_calibration_percentile: 99.5
   coeff_mu: 0.0
   batch_size: 64
   num_workers: 4

@@ -1697,6 +1697,8 @@ def _load_stage_entrypoints():
             str(_cfg_value(cache_cfg, "coeff_quantization", "uniform")),
             "--coeff_mu",
             str(float(_cfg_value(cache_cfg, "coeff_mu", 0.0))),
+            "--coeff_calibration_percentile",
+            str(float(_cfg_value(cache_cfg, "coeff_calibration_percentile", 99.5))),
             "--output",
             str(output_path),
             "--max_items",
@@ -1706,7 +1708,7 @@ def _load_stage_entrypoints():
         ]
         coeff_max = _cfg_value(cache_cfg, "coeff_max", None)
         if coeff_max is not None:
-            cmd.extend(["--coeff_max", str(float(coeff_max))])
+            cmd.extend(["--coeff_max", str(coeff_max)])
 
         print("Building token cache before stage 2:")
         print("  Stage-1 checkpoint:", stage1_checkpoint_path)

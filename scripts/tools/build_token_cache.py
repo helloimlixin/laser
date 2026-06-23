@@ -71,6 +71,94 @@ def _progress_total(loader, max_items: int) -> int | None:
     return dataset_size if dataset_size > 0 else None
 
 
+def _parse_optional_coeff_max(raw) -> float | None:
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in {"", "none", "null", "auto"}:
+        return None
+    return float(text)
+
+
+def _auto_coeff_absmax(coeffs: torch.Tensor, percentile: float) -> float:
+    coeffs = coeffs.detach().reshape(-1).to(torch.float32)
+    finite = coeffs[torch.isfinite(coeffs)]
+    if finite.numel() <= 0:
+        return 1.0
+    pct = min(max(float(percentile), 0.0), 100.0) / 100.0
+    value = finite.abs().max() if pct >= 1.0 else torch.quantile(finite.abs(), pct)
+    out = float(value.item())
+    return out if math.isfinite(out) and out > 0.0 else 1.0
+
+
+def _adaptive_coeff_bin_values(
+    coeffs: torch.Tensor,
+    *,
+    coeff_vocab_size: int,
+    coeff_max: float,
+    coeff_quantization: str,
+    coeff_mu: float,
+) -> torch.Tensor:
+    coeff_vocab_size = int(coeff_vocab_size)
+    coeff_max = float(coeff_max)
+    coeff_quantization = str(coeff_quantization).strip().lower()
+    if coeff_quantization in {"uniform", "mu_law"}:
+        return build_coeff_bin_values(
+            coeff_vocab_size=coeff_vocab_size,
+            coeff_max=coeff_max,
+            coeff_quantization=coeff_quantization,
+            coeff_mu=float(coeff_mu),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).cpu()
+    if coeff_quantization != "quantile":
+        raise ValueError(f"Unsupported coeff_quantization: {coeff_quantization!r}")
+
+    finite = coeffs.detach().reshape(-1).to(torch.float32)
+    finite = finite[torch.isfinite(finite)]
+    if finite.numel() <= 0:
+        return torch.linspace(-coeff_max, coeff_max, steps=coeff_vocab_size, dtype=torch.float32)
+    clipped = finite.clamp(-coeff_max, coeff_max)
+    if coeff_vocab_size == 1:
+        return clipped.median().reshape(1).cpu()
+    qs = torch.linspace(0.0, 1.0, steps=coeff_vocab_size, dtype=torch.float32, device=clipped.device)
+    bins = torch.quantile(clipped, qs).to(torch.float32).cpu()
+    eps = max(float(coeff_max), 1.0) * 1e-6
+    for idx in range(1, int(bins.numel())):
+        if bins[idx] <= bins[idx - 1]:
+            bins[idx] = bins[idx - 1] + eps
+    if bins[-1] > coeff_max:
+        return torch.linspace(-coeff_max, coeff_max, steps=coeff_vocab_size, dtype=torch.float32)
+    return bins
+
+
+def _quantize_with_bin_values(coeffs: torch.Tensor, bin_values: torch.Tensor) -> torch.Tensor:
+    bins = bin_values.to(device=coeffs.device, dtype=torch.float32).reshape(-1)
+    if bins.numel() <= 0:
+        raise ValueError("coeff bin values must be non-empty")
+    coeffs = coeffs.to(torch.float32).clamp(float(bins.min().item()), float(bins.max().item()))
+    if bins.numel() == 1:
+        return torch.zeros_like(coeffs, dtype=torch.long)
+    boundaries = ((bins[:-1] + bins[1:]) * 0.5).contiguous()
+    return torch.bucketize(coeffs.contiguous(), boundaries).to(torch.long)
+
+
+def _interleave_atom_coeff_tokens(
+    atom_ids: torch.Tensor,
+    coeffs: torch.Tensor,
+    *,
+    coeff_bin_values: torch.Tensor,
+    atom_vocab_size: int,
+) -> torch.Tensor:
+    if tuple(atom_ids.shape) != tuple(coeffs.shape):
+        raise ValueError(f"atom_ids/coeffs shape mismatch: {tuple(atom_ids.shape)} vs {tuple(coeffs.shape)}")
+    bin_idx = _quantize_with_bin_values(coeffs, coeff_bin_values)
+    tokens = torch.empty(*atom_ids.shape[:-1], int(atom_ids.shape[-1]) * 2, dtype=torch.long)
+    tokens[..., 0::2] = atom_ids.to(torch.long).cpu()
+    tokens[..., 1::2] = bin_idx.cpu() + int(atom_vocab_size)
+    return tokens
+
+
 def _default_output_path(args):
     cache_mode = str(args.cache_mode).strip().lower()
     if cache_mode == "quantized":
@@ -116,11 +204,20 @@ def main():
     parser.add_argument("--coeff_vocab_size", type=int, default=16, help="Number of coefficient bins.")
     parser.add_argument(
         "--coeff_max",
-        type=float,
+        type=str,
         default=None,
-        help="Absolute coefficient clip. Quantized caches default to 3.0 when omitted; real-valued caches infer from data when omitted.",
+        help=(
+            "Absolute coefficient clip. Use 'auto' or omit with quantized caches "
+            "to infer from coefficient percentiles."
+        ),
     )
-    parser.add_argument("--coeff_quantization", type=str, default="uniform", choices=["uniform", "mu_law"])
+    parser.add_argument("--coeff_quantization", type=str, default="uniform", choices=["uniform", "mu_law", "quantile"])
+    parser.add_argument(
+        "--coeff_calibration_percentile",
+        type=float,
+        default=99.5,
+        help="Absolute coefficient percentile used when coeff_max is auto/omitted.",
+    )
     parser.add_argument("--coeff_mu", type=float, default=0.0, help="Mu parameter when coeff_quantization=mu_law.")
     parser.add_argument("--output", type=Path, default=None, help="Output token cache path.")
     parser.add_argument("--ar_output_dir", type=Path, default=Path("outputs/ar"), help="Default root for token caches.")
@@ -147,19 +244,22 @@ def main():
     loader = _resolve_loader(datamodule, args.split)
     cache_mode = str(args.cache_mode).strip().lower()
     quantized_cache = cache_mode == "quantized"
-    coeff_max = args.coeff_max
-    if coeff_max is None:
-        coeff_max = 3.0 if quantized_cache else 0.0
-    coeff_max = float(coeff_max)
-    if quantized_cache and coeff_max <= 0.0:
+    coeff_quantization = str(args.coeff_quantization).strip().lower()
+    coeff_max = _parse_optional_coeff_max(args.coeff_max)
+    adaptive_quantized_cache = quantized_cache and (
+        coeff_max is None or coeff_quantization == "quantile"
+    )
+    if not quantized_cache and coeff_max is None:
+        coeff_max = 0.0
+    if quantized_cache and coeff_max is not None and coeff_max <= 0.0:
         raise ValueError("Quantized token caches require coeff_max > 0.")
 
     coeff_bin_values = None
-    if quantized_cache:
+    if quantized_cache and not adaptive_quantized_cache:
         coeff_bin_values = build_coeff_bin_values(
             coeff_vocab_size=int(args.coeff_vocab_size),
             coeff_max=float(coeff_max),
-            coeff_quantization=str(args.coeff_quantization),
+            coeff_quantization=coeff_quantization,
             coeff_mu=float(args.coeff_mu),
             device=torch.device("cpu"),
             dtype=torch.float32,
@@ -193,12 +293,12 @@ def main():
             if max_items > 0 and x.size(0) > remaining:
                 x = x[:remaining]
             x = x.to(device, non_blocking=True)
-            if quantized_cache:
+            if quantized_cache and not adaptive_quantized_cache:
                 tokens, current_latent_hw = model.encode_to_tokens(
                     x,
                     coeff_vocab_size=int(args.coeff_vocab_size),
                     coeff_max=float(coeff_max),
-                    coeff_quantization=str(args.coeff_quantization),
+                    coeff_quantization=coeff_quantization,
                     coeff_mu=float(args.coeff_mu),
                 )
                 tokens = sort_token_pairs(tokens)
@@ -240,7 +340,34 @@ def main():
         if coeffs_flat is not None:
             coeffs_flat = coeffs_flat[: int(args.max_items)]
 
-    if (not quantized_cache) and coeff_max <= 0.0:
+    if quantized_cache and adaptive_quantized_cache:
+        if coeffs_flat is None:
+            raise RuntimeError("Adaptive quantized cache expected collected sparse coefficients.")
+        if coeff_max is None:
+            coeff_max = _auto_coeff_absmax(
+                coeffs_flat,
+                percentile=float(args.coeff_calibration_percentile),
+            )
+        coeff_bin_values = _adaptive_coeff_bin_values(
+            coeffs_flat,
+            coeff_vocab_size=int(args.coeff_vocab_size),
+            coeff_max=float(coeff_max),
+            coeff_quantization=coeff_quantization,
+            coeff_mu=float(args.coeff_mu),
+        )
+        token_h, token_w, token_depth = token_shape
+        atom_grid = tokens_flat.view(tokens_flat.size(0), int(token_h), int(token_w), int(token_depth))
+        coeff_grid = coeffs_flat.view(coeffs_flat.size(0), int(token_h), int(token_w), int(token_depth))
+        token_grid = _interleave_atom_coeff_tokens(
+            atom_grid,
+            coeff_grid,
+            coeff_bin_values=coeff_bin_values,
+            atom_vocab_size=int(model.bottleneck.num_embeddings),
+        )
+        tokens_flat = token_grid.view(token_grid.size(0), -1).to(torch.int32).cpu()
+        coeffs_flat = None
+        token_shape = tuple(int(dim) for dim in token_grid.shape[1:])
+    elif (not quantized_cache) and coeff_max <= 0.0:
         coeff_max = max(1.0, float(observed_coeff_abs_max))
 
     token_h, token_w, token_depth = token_shape
@@ -271,8 +398,11 @@ def main():
                 "coeff_vocab_size": int(args.coeff_vocab_size),
                 "n_bins": int(args.coeff_vocab_size),
                 "coeff_bin_values": coeff_bin_values,
-                "coeff_quantization": str(args.coeff_quantization),
+                "coeff_quantization": coeff_quantization,
+                "coef_quantization": coeff_quantization,
                 "coeff_mu": float(args.coeff_mu),
+                "coef_mu": float(args.coeff_mu),
+                "coeff_calibration_percentile": float(args.coeff_calibration_percentile),
             }
         )
     cache = {
