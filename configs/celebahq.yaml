@@ -1,0 +1,272 @@
+# Full-scale CelebA-HQ-256 pipeline config.
+# Run with:
+#   python train.py --config configs/celebahq.yaml
+#
+# This trains a d5 site-level LASER autoencoder, runs an adversarial fine-tune,
+# builds a full train-split token cache, then trains an unconditional stage-2
+# sparse-token prior over the full cache.
+
+stage: pipeline
+mode: direct
+
+stage1:
+  overrides:
+    - model=laser_image_nonpatch_d5
+    - data=celebahq
+
+  output_dir: outputs/celebahq-full/stage1
+
+  wandb:
+    project: laser
+    name: celebahq-full-stage1
+    group: celebahq-full
+    tags: [stage1, celebahq, laser, full]
+    append_timestamp: false
+    save_dir: outputs/celebahq-full/stage1/wandb
+
+  train:
+    accelerator: gpu
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    max_epochs: 75
+    max_steps: -1
+    limit_train_batches: 1.0
+    limit_val_batches: 256
+    limit_test_batches: 0
+    val_check_interval: 0.25
+    run_test_after_fit: false
+    compute_rfid_after_fit: true
+    rfid_split: val
+    rfid_batch_size: 100
+    rfid_num_workers: 8
+    rfid_max_samples: 0
+    rfid_device: auto
+    rfid_feature: 2048
+    learning_rate: 1.0e-4
+    warmup_steps: 500
+    min_lr_ratio: 0.03
+    gradient_clip_val: 1.0
+    log_every_n_steps: 20
+
+  data:
+    batch_size: 3
+    num_workers: 4
+    image_size: 256
+    augment: true
+
+  model:
+    num_embeddings: 4096
+    embedding_dim: 128
+    sparsity_level: 4
+    commitment_cost: 0.25
+    bottleneck_loss_weight: 0.75
+    dictionary_loss_weight: null
+    dict_learning_rate: 2.5e-4
+    coef_max: null
+    patch_based: false
+    patch_size: 1
+    patch_stride: 1
+    patch_reconstruction: tile
+    data_init_from_first_batch: true
+    recon_mse_weight: 0.25
+    recon_l1_weight: 1.0
+    recon_edge_weight: 0.5
+    perceptual_weight: 0.2
+    perceptual_start_step: 1000
+    perceptual_warmup_steps: 2000
+    adversarial_weight: 0.0
+    adversarial_start_step: 1000000000
+    adversarial_warmup_steps: 0
+    disc_start_step: 1000000000
+    compute_fid: true
+    log_images_every_n_steps: 100
+    diag_log_interval: 100
+    enable_val_latent_visuals: true
+    codebook_visual_max_vectors: 4096
+
+stage1_adv:
+  overrides:
+    - model=laser_image_nonpatch_d5
+    - data=celebahq
+
+  output_dir: outputs/celebahq-full/stage1_adv
+
+  wandb:
+    project: laser
+    name: celebahq-full-stage1-adv
+    group: celebahq-full
+    tags: [stage1, celebahq, laser, full, adversarial]
+    append_timestamp: false
+    save_dir: outputs/celebahq-full/stage1_adv/wandb
+
+  train:
+    accelerator: gpu
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    max_epochs: 25
+    max_steps: -1
+    limit_train_batches: 1.0
+    limit_val_batches: 256
+    limit_test_batches: 0
+    val_check_interval: 0.25
+    run_test_after_fit: false
+    compute_rfid_after_fit: true
+    rfid_split: val
+    rfid_batch_size: 100
+    rfid_num_workers: 8
+    rfid_max_samples: 0
+    rfid_device: auto
+    rfid_feature: 2048
+    learning_rate: 1.0e-4
+    warmup_steps: 500
+    min_lr_ratio: 0.03
+    gradient_clip_val: 1.0
+    log_every_n_steps: 20
+
+  data:
+    batch_size: 3
+    num_workers: 4
+    image_size: 256
+    augment: true
+
+  model:
+    num_embeddings: 4096
+    embedding_dim: 128
+    sparsity_level: 4
+    commitment_cost: 0.25
+    bottleneck_loss_weight: 0.75
+    dictionary_loss_weight: null
+    dict_learning_rate: 2.5e-4
+    coef_max: null
+    patch_based: false
+    patch_size: 1
+    patch_stride: 1
+    patch_reconstruction: tile
+    data_init_from_first_batch: true
+    recon_mse_weight: 0.25
+    recon_l1_weight: 1.0
+    recon_edge_weight: 0.5
+    perceptual_weight: 0.2
+    perceptual_start_step: 1000
+    perceptual_warmup_steps: 2000
+    adversarial_weight: 0.05
+    adversarial_start_step: 0
+    adversarial_warmup_steps: 0
+    disc_start_step: 0
+    disc_learning_rate: 5.0e-5
+    disc_channels: 64
+    disc_num_layers: 3
+    disc_norm: group
+    disc_loss: hinge
+    use_adaptive_disc_weight: true
+    compute_fid: true
+    log_images_every_n_steps: 100
+    diag_log_interval: 100
+    enable_val_latent_visuals: true
+    codebook_visual_max_vectors: 4096
+
+stage2:
+  output_dir: outputs/celebahq-full/stage2
+  token_cache_path: outputs/celebahq-full/stage2/token_cache/celebahq__train__img256__cb256_quantile_p99p5.pt
+  ckpt_path: null
+
+  token_cache:
+    build: true
+    force: false
+    stage1_checkpoint: null
+    stage1_output_root: outputs/celebahq-full/stage1_adv
+    output: outputs/celebahq-full/stage2/token_cache/celebahq__train__img256__cb256_quantile_p99p5.pt
+    split: train
+    cache_mode: quantized
+    coeff_vocab_size: 256
+    coeff_max: auto
+    coeff_quantization: quantile
+    coeff_calibration_percentile: 99.5
+    coeff_mu: 0.0
+    batch_size: 8
+    num_workers: 4
+    max_items: 0
+    device: auto
+
+  data:
+    dataset: celebahq
+    data_dir: ${oc.env:CELEBAHQ_DIR,${oc.env:CELEBA_HQ_DIR,../data/celebahq}}
+    batch_size: 4
+    num_workers: 4
+    image_size: 256
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+
+  ar:
+    type: sparse_spatial_depth
+    vocab_size: null
+    atom_vocab_size: null
+    coeff_vocab_size: null
+    window_sites: 0
+    n_global_spatial_tokens: 16
+    autoregressive_coeffs: true
+    class_conditional: false
+    num_classes: 0
+    d_model: 768
+    n_heads: 12
+    n_layers: 18
+    d_ff: 3072
+    dropout: 0.1
+    learning_rate: 2.5e-4
+    weight_decay: 0.01
+    warmup_steps: 1500
+    max_steps: 300000
+    min_lr_ratio: 0.03
+    atom_loss_weight: 1.0
+    coeff_loss_weight: 1.0
+    coeff_depth_weighting: none
+    coeff_focal_gamma: 0.0
+    atom_label_smoothing: 0.0
+    atom_coverage_weight: 0.0
+    coeff_loss_type: auto
+    coeff_huber_delta: 0.25
+
+  train_ar:
+    batch_size: 4
+    max_epochs: 300
+    checkpoint_save_top_k: 1
+    checkpoint_save_last: true
+    checkpoint_keep_recent: 3
+    checkpoint_every_n_epochs: 1
+    accelerator: gpu
+    num_nodes: 1
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    gradient_clip_val: 1.0
+    log_every_n_steps: 10
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    limit_test_batches: 0
+    val_check_interval: 1.0
+    validation_split: 0.05
+    test_split: 0.05
+    max_items: 0
+    crop_h_sites: 0
+    crop_w_sites: 0
+    sample_every_n_steps: 0
+    sample_every_n_epochs: 2
+    sample_num_images: 8
+    sample_temperature: 0.7
+    sample_top_k: 0
+    sample_log_to_wandb: true
+    compute_generation_fid: false
+    compute_audio_generation_metrics: false
+    generation_metric_num_samples: 32
+    run_test_after_fit: false
+    save_final_samples_after_fit: true
+
+  wandb:
+    project: laser-ar
+    name: celebahq-full-stage2
+    group: celebahq-full
+    tags: [stage2, celebahq, laser, sparse_spatial_depth, unconditional, full]
+    append_timestamp: false
+    save_dir: outputs/celebahq-full/stage2/wandb
