@@ -15,13 +15,23 @@ if str(ROOT) not in sys.path:
 
 from src.cache_sort import sort_sparse_pairs, sort_token_pairs
 from src.checkpoint_io import load_lightning_module
-from src.data.celeba import CelebADataModule
-from src.data.cifar10 import CIFAR10DataModule
-from src.data.config import DataConfig
-from src.data.imagenette2 import Imagenette2DataModule
+from src.data.imagenet_labels import class_names_for_dataset, imagenet_synsets_from_names
 from src.models.laser import LASER
 from src.sparse_token_codec import build_coeff_bin_values
+from src.stage1_setup import build_stage1_datamodule, data_config_from_overrides
 from src.stage2_paths import default_token_cache_path
+
+
+IMAGE_TOKEN_CACHE_DATASETS = [
+    "cifar10",
+    "celeba",
+    "celebahq",
+    "coco",
+    "ffhq",
+    "imagenet",
+    "imagenette2",
+    "stl10",
+]
 
 
 def _resolve_device(device_arg: str) -> torch.device:
@@ -31,7 +41,7 @@ def _resolve_device(device_arg: str) -> torch.device:
 
 
 def _build_datamodule(args):
-    data_cfg = DataConfig(
+    data_cfg = data_config_from_overrides(
         dataset=args.dataset,
         data_dir=str(Path(args.data_dir).expanduser().resolve()),
         batch_size=int(args.batch_size),
@@ -39,14 +49,9 @@ def _build_datamodule(args):
         image_size=int(args.image_size),
         mean=tuple(float(x) for x in args.mean),
         std=tuple(float(x) for x in args.std),
+        augment=False,
     )
-    if args.dataset == "cifar10":
-        return CIFAR10DataModule(data_cfg)
-    if args.dataset == "imagenette2":
-        return Imagenette2DataModule(data_cfg)
-    if args.dataset in {"celeba", "celebahq"}:
-        return CelebADataModule(data_cfg)
-    raise ValueError(f"Unsupported dataset: {args.dataset}")
+    return build_stage1_datamodule(data_cfg)
 
 
 def _resolve_loader(datamodule, split: str):
@@ -159,6 +164,63 @@ def _interleave_atom_coeff_tokens(
     return tokens
 
 
+def _batch_class_labels(batch, keep: int) -> torch.Tensor | None:
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        return None
+    labels = batch[1]
+    if torch.is_tensor(labels):
+        labels = labels[:keep]
+    else:
+        try:
+            labels = torch.as_tensor(list(labels)[:keep])
+        except (TypeError, ValueError):
+            return None
+    labels = labels.to(torch.long).reshape(-1)
+    if int(labels.numel()) < int(keep):
+        return None
+    return labels[:keep].cpu().contiguous()
+
+
+def _finalize_class_labels(chunks: list[torch.Tensor], total_items: int) -> torch.Tensor | None:
+    if not chunks:
+        return None
+    labels = torch.cat(chunks, dim=0).to(torch.long).reshape(-1).contiguous()
+    if int(labels.numel()) < int(total_items):
+        return None
+    return labels[: int(total_items)].clone()
+
+
+def _dataset_class_names(dataset) -> list[str]:
+    class_to_idx = getattr(dataset, "class_to_idx", None)
+    if isinstance(class_to_idx, dict) and class_to_idx:
+        ordered = sorted(((int(idx), str(name)) for name, idx in class_to_idx.items()), key=lambda item: item[0])
+        return [name for _, name in ordered]
+    classes = getattr(dataset, "classes", None)
+    if isinstance(classes, (list, tuple)) and classes:
+        return [str(item) for item in classes]
+    return []
+
+
+def _attach_class_label_metadata(payload: dict, class_labels: torch.Tensor, *, dataset_name: str, dataset) -> None:
+    if class_labels is None or int(class_labels.numel()) != int(payload["tokens_flat"].size(0)):
+        return
+    raw_names = _dataset_class_names(dataset) if dataset is not None else []
+    display_names = class_names_for_dataset(dataset_name, raw_names)
+    max_label = int(class_labels.max().item()) if int(class_labels.numel()) > 0 else -1
+    num_classes = max(max_label + 1, len(display_names))
+    if num_classes <= 1 and not display_names:
+        return
+
+    payload["class_labels"] = class_labels.to(torch.long).reshape(-1).contiguous()
+    payload["meta"]["num_classes"] = int(num_classes)
+    payload["meta"]["class_label_name"] = "class"
+    if display_names:
+        payload["meta"]["class_names"] = display_names
+    synsets = imagenet_synsets_from_names(dataset_name, raw_names)
+    if synsets:
+        payload["meta"]["class_synsets"] = synsets
+
+
 def _default_output_path(args):
     cache_mode = str(args.cache_mode).strip().lower()
     if cache_mode == "quantized":
@@ -185,7 +247,7 @@ def main():
         "--dataset",
         type=str,
         default="celeba",
-        choices=["cifar10", "imagenette2", "celeba", "celebahq"],
+        choices=IMAGE_TOKEN_CACHE_DATASETS,
     )
     parser.add_argument("--data_dir", type=str, required=True, help="Dataset root directory.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
@@ -268,6 +330,7 @@ def main():
 
     all_tokens = []
     all_coeffs = []
+    all_class_labels = []
     seen = 0
     token_shape = None
     observed_coeff_abs_max = 0.0
@@ -292,6 +355,9 @@ def main():
                 break
             if max_items > 0 and x.size(0) > remaining:
                 x = x[:remaining]
+            class_labels = _batch_class_labels(batch, int(x.size(0)))
+            if class_labels is not None:
+                all_class_labels.append(class_labels)
             x = x.to(device, non_blocking=True)
             if quantized_cache and not adaptive_quantized_cache:
                 tokens, current_latent_hw = model.encode_to_tokens(
@@ -339,6 +405,7 @@ def main():
         tokens_flat = tokens_flat[: int(args.max_items)]
         if coeffs_flat is not None:
             coeffs_flat = coeffs_flat[: int(args.max_items)]
+    class_labels = _finalize_class_labels(all_class_labels, int(tokens_flat.size(0)))
 
     if quantized_cache and adaptive_quantized_cache:
         if coeffs_flat is None:
@@ -412,6 +479,13 @@ def main():
     }
     if coeffs_flat is not None:
         cache["coeffs_flat"] = coeffs_flat
+    if class_labels is not None:
+        _attach_class_label_metadata(
+            cache,
+            class_labels,
+            dataset_name=str(args.dataset),
+            dataset=getattr(loader, "dataset", None),
+        )
 
     output_path = args.output
     if output_path is None:

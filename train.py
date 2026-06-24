@@ -397,7 +397,7 @@ def _nested_stage_argv(config: dict[str, Any], key: str, stage: str) -> list[str
     return _config_direct_argv(nested)
 
 
-def _pipeline_commands(config_path: str | Path) -> tuple[list[str], list[str], bool]:
+def _pipeline_commands(config_path: str | Path) -> tuple[list[tuple[str, list[str]]], dict[str, Any], bool]:
     path = Path(config_path)
     config = _merge_launcher_config(_load_yaml_config(path))
     if _config_stage(config) != "pipeline":
@@ -405,9 +405,49 @@ def _pipeline_commands(config_path: str | Path) -> tuple[list[str], list[str], b
     _, dry_run = _config_lookup(config, "dry_run")
     stage1_argv = _nested_stage_argv(config, "stage1", "stage1")
     stage2_argv = _nested_stage_argv(config, "stage2", "stage2")
-    cmd1 = [sys.executable, str(Path(__file__).resolve()), *stage1_argv]
-    cmd2 = [sys.executable, str(Path(__file__).resolve()), *stage2_argv]
-    return cmd1, cmd2, bool(dry_run)
+    commands: list[tuple[str, list[str]]] = [
+        ("stage 1", [sys.executable, str(Path(__file__).resolve()), *stage1_argv]),
+    ]
+    if isinstance(config.get("stage1_adv"), dict):
+        stage1_adv_argv = _nested_stage_argv(config, "stage1_adv", "stage1")
+        commands.append(
+            (
+                "stage 1 adversarial",
+                [sys.executable, str(Path(__file__).resolve()), *stage1_adv_argv],
+            )
+        )
+    commands.append(("stage 2", [sys.executable, str(Path(__file__).resolve()), *stage2_argv]))
+    return commands, config, bool(dry_run)
+
+
+def _pipeline_has_stage1_init(cmd: list[str]) -> bool:
+    return any(arg.startswith("init_ckpt_path=") or arg.startswith("ckpt_path=") for arg in cmd)
+
+
+def _pipeline_section_model_type(section: dict[str, Any]) -> str:
+    model = section.get("model")
+    if isinstance(model, dict):
+        model_type = model.get("type")
+        if model_type:
+            return str(model_type).strip().lower()
+    for override in _coerce_hydra_overrides(section.get("overrides"), source="overrides"):
+        if override.startswith("model.type="):
+            return override.split("=", 1)[1].strip().lower()
+    return "laser"
+
+
+def _pipeline_latest_stage1_checkpoint(config: dict[str, Any]) -> Path:
+    section = config.get("stage1")
+    if not isinstance(section, dict):
+        raise SystemExit("pipeline config requires a 'stage1:' YAML mapping.")
+    output_root = section.get("output_dir", "outputs")
+    model_type = _pipeline_section_model_type(section)
+    from src.stage2_paths import infer_latest_stage1_checkpoint
+
+    checkpoint = infer_latest_stage1_checkpoint(output_root=output_root, model_type=model_type)
+    if checkpoint is None:
+        raise SystemExit(f"No stage-1 checkpoint found under {output_root!r} for model type {model_type!r}.")
+    return checkpoint
 
 
 def _argv_from_config(path: str | Path) -> tuple[list[str], bool]:
@@ -1136,6 +1176,12 @@ def _load_stage_entrypoints():
         if ckpt_path:
             ckpt_path = _resolve_ckpt_file(ckpt_path)
             print(f"\nResume checkpoint: {ckpt_path}")
+        init_ckpt_path = getattr(cfg, "init_ckpt_path", None)
+        if init_ckpt_path:
+            init_ckpt_path = _resolve_ckpt_file(init_ckpt_path)
+            print(f"\nInitialize weights from checkpoint: {init_ckpt_path}")
+        if ckpt_path and init_ckpt_path:
+            raise ValueError("Use ckpt_path to resume training or init_ckpt_path to initialize weights, not both.")
         deterministic = bool(getattr(cfg.train, "deterministic", False))
         resolved_in_channels = infer_data_channels(cfg.data)
         torch.use_deterministic_algorithms(deterministic, warn_only=True)
@@ -1310,6 +1356,24 @@ def _load_stage_entrypoints():
             )
     
         model = build_stage1_model(cfg.model, cfg.train, cfg.data)
+        if init_ckpt_path:
+            from src.checkpoint_io import extract_state_dict, load_torch_payload
+
+            payload = load_torch_payload(init_ckpt_path, map_location="cpu")
+            state_dict = extract_state_dict(payload)
+            if not isinstance(state_dict, dict):
+                raise RuntimeError(f"Checkpoint payload does not contain a state_dict: {init_ckpt_path}")
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            bottleneck = getattr(model, "bottleneck", None)
+            data_initialized = getattr(bottleneck, "_data_initialized", None)
+            if data_initialized is not None and hasattr(data_initialized, "fill_"):
+                data_initialized.fill_(True)
+            missing = len(getattr(incompatible, "missing_keys", ()) or ())
+            unexpected = len(getattr(incompatible, "unexpected_keys", ()) or ())
+            print(
+                "Initialized stage-1 model weights "
+                f"from {init_ckpt_path} (missing={missing}, unexpected={unexpected})."
+            )
         trainer_gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 0.0) or 0.0)
         uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
         if uses_manual_opt:
@@ -2199,14 +2263,21 @@ def main(argv: list[str] | None = None) -> int:
                 config_path = direct_argv[config_idx + 1]
             except (ValueError, IndexError) as exc:
                 raise SystemExit("Pipeline config dispatch requires --pipeline-config PATH.") from exc
-            cmd1, cmd2, config_dry_run = _pipeline_commands(config_path)
+            commands, pipeline_config, config_dry_run = _pipeline_commands(config_path)
             dry_run = dry_run or config_dry_run
-            print("Launching stage 1:", shlex.join(cmd1), flush=True)
-            print("Launching stage 2:", shlex.join(cmd2), flush=True)
+            for label, cmd in commands:
+                printable = cmd
+                if label == "stage 1 adversarial" and not _pipeline_has_stage1_init(cmd):
+                    printable = [*cmd, "init_ckpt_path=<latest stage-1 checkpoint>"]
+                print(f"Launching {label}:", shlex.join(printable), flush=True)
             if dry_run:
                 return 0
-            subprocess.run(cmd1, check=True)
-            subprocess.run(cmd2, check=True)
+            for label, cmd in commands:
+                if label == "stage 1 adversarial" and not _pipeline_has_stage1_init(cmd):
+                    checkpoint = _pipeline_latest_stage1_checkpoint(pipeline_config)
+                    cmd = [*cmd, f"init_ckpt_path={checkpoint}"]
+                    print(f"Initializing stage 1 adversarial from: {checkpoint}", flush=True)
+                subprocess.run(cmd, check=True)
             return 0
         cmd = [sys.executable, str(Path(__file__).resolve()), *direct_argv]
         if dry_run:

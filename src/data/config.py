@@ -9,6 +9,8 @@ class DataConfig:
     batch_size: int = 128
     eval_batch_size: Optional[int] = None
     num_workers: int = 8
+    pin_memory: bool = False
+    prefetch_factor: Optional[int] = 2
     image_size: Union[int, Tuple[int, int]] = 32
     train_crop_size: Optional[Union[int, Tuple[int, int]]] = None
     seed: int = 42

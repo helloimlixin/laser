@@ -1,0 +1,240 @@
+# Full-scale ImageNet-256 pipeline config.
+# Run with:
+#   python train.py --config configs/imagenet.yaml
+#
+# Trains the ImageNet site-level LASER autoencoder, builds a full train-split
+# token cache, then trains the class-conditional stage-2 sparse-token prior over
+# the full cache.
+
+stage: pipeline
+mode: direct
+
+stage1:
+  overrides:
+    - model=laser_image_nonpatch_d5
+    - data=imagenet
+
+  output_dir: outputs/imagenet-full/stage1
+  # Bootstrap the full-scale ImageNet run from an existing reconstruction
+  # checkpoint. STAGE1_INIT_CKPT matches the existing sweep launcher convention.
+  init_ckpt_path: ${oc.env:IMAGENET_FULL_STAGE1_INIT_CKPT,${oc.env:STAGE1_INIT_CKPT,null}}
+
+  wandb:
+    project: laser
+    name: imagenet-full-stage1
+    group: imagenet-full
+    tags: [stage1, imagenet, laser, full]
+    append_timestamp: false
+    save_dir: outputs/imagenet-full/stage1/wandb
+
+  train:
+    accelerator: gpu
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    max_epochs: 3
+    max_steps: -1
+    limit_train_batches: 1.0
+    limit_val_batches: 256
+    limit_test_batches: 0
+    val_check_interval: 5000
+    run_test_after_fit: false
+    learning_rate: 2.0e-3
+    warmup_steps: 4000
+    min_lr_ratio: 0.05
+
+  data:
+    batch_size: 256
+    num_workers: 24
+    pin_memory: true
+    prefetch_factor: 4
+    train_crop_size: null
+
+  model:
+    backbone: simple
+    num_downsamples: 5
+    num_hiddens: 160
+    num_residual_blocks: 3
+    num_residual_hiddens: 112
+    num_embeddings: 8192
+    embedding_dim: 128
+    sparsity_level: 3
+    patch_based: false
+    patch_size: 1
+    patch_stride: 1
+    dict_learning_rate: 1.0e-4
+    compute_fid: true
+    log_images_every_n_steps: 0
+    enable_val_latent_visuals: false
+    # Full ImageNet train split at batch_size=256 is ceil(1281167 / 256)=5005
+    # steps/epoch, so epoch 3 starts after two epochs.
+    perceptual_start_step: 10010
+    perceptual_warmup_steps: 2000
+    adversarial_weight: 0.0
+
+stage1_adv:
+  overrides:
+    - model=laser_image_nonpatch_d5
+    - data=imagenet
+
+  output_dir: outputs/imagenet-full/stage1_adv
+
+  wandb:
+    project: laser
+    name: imagenet-full-stage1-adv
+    group: imagenet-full
+    tags: [stage1, imagenet, laser, full, adversarial]
+    append_timestamp: false
+    save_dir: outputs/imagenet-full/stage1_adv/wandb
+
+  train:
+    accelerator: gpu
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    max_epochs: 2
+    max_steps: -1
+    limit_train_batches: 1.0
+    limit_val_batches: 256
+    limit_test_batches: 0
+    val_check_interval: 5000
+    run_test_after_fit: false
+    learning_rate: 2.0e-3
+    warmup_steps: 4000
+    min_lr_ratio: 0.05
+
+  data:
+    batch_size: 256
+    num_workers: 24
+    pin_memory: true
+    prefetch_factor: 4
+    train_crop_size: null
+
+  model:
+    backbone: simple
+    num_downsamples: 5
+    num_hiddens: 160
+    num_residual_blocks: 3
+    num_residual_hiddens: 112
+    num_embeddings: 8192
+    embedding_dim: 128
+    sparsity_level: 3
+    patch_based: false
+    patch_size: 1
+    patch_stride: 1
+    dict_learning_rate: 1.0e-4
+    compute_fid: true
+    log_images_every_n_steps: 0
+    enable_val_latent_visuals: false
+    perceptual_start_step: 0
+    perceptual_warmup_steps: 0
+    adversarial_weight: 0.05
+    adversarial_start_step: 0
+    adversarial_warmup_steps: 0
+    disc_start_step: 0
+    disc_learning_rate: 1.0e-4
+    use_adaptive_disc_weight: true
+
+stage2:
+  output_dir: outputs/imagenet-full/stage2
+  token_cache_path: outputs/imagenet-full/stage2/token_cache/imagenet__train__img256__cb256_quantile_p99p5.pt
+  ckpt_path: null
+
+  token_cache:
+    build: true
+    force: false
+    stage1_checkpoint: null
+    stage1_output_root: outputs/imagenet-full/stage1_adv
+    output: outputs/imagenet-full/stage2/token_cache/imagenet__train__img256__cb256_quantile_p99p5.pt
+    split: train
+    cache_mode: quantized
+    coeff_vocab_size: 256
+    coeff_max: auto
+    coeff_quantization: quantile
+    coeff_calibration_percentile: 99.5
+    coeff_mu: 0.0
+    batch_size: 512
+    num_workers: 24
+    max_items: 0
+    device: auto
+
+  data:
+    dataset: imagenet
+    data_dir: ${oc.env:IMAGENET_DIR,${oc.env:DATA_DIR,../data}/imagenet}
+    batch_size: 128
+    num_workers: 24
+    image_size: 256
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+
+  ar:
+    type: sparse_spatial_depth
+    vocab_size: null
+    atom_vocab_size: null
+    coeff_vocab_size: null
+    window_sites: 0
+    n_global_spatial_tokens: 16
+    autoregressive_coeffs: true
+    class_conditional: true
+    num_classes: 1000
+    d_model: 512
+    n_heads: 8
+    n_layers: 12
+    d_ff: 2048
+    dropout: 0.1
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+    warmup_steps: 3000
+    max_steps: 80000
+    min_lr_ratio: 0.05
+    atom_loss_weight: 1.0
+    coeff_loss_weight: 1.0
+    coeff_depth_weighting: none
+    coeff_focal_gamma: 0.0
+    atom_label_smoothing: 0.0
+    atom_coverage_weight: 0.0
+    coeff_loss_type: auto
+    coeff_huber_delta: 0.25
+
+  train_ar:
+    batch_size: 128
+    max_epochs: 80
+    checkpoint_save_top_k: 1
+    checkpoint_save_last: false
+    checkpoint_keep_recent: 1
+    checkpoint_every_n_epochs: 1
+    accelerator: gpu
+    num_nodes: 1
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    gradient_clip_val: 1.0
+    log_every_n_steps: 20
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    limit_test_batches: 0
+    val_check_interval: 1.0
+    validation_split: 0.05
+    test_split: 0.05
+    max_items: 0
+    crop_h_sites: 0
+    crop_w_sites: 0
+    sample_every_n_steps: 5000
+    sample_every_n_epochs: 0
+    sample_num_images: 16
+    sample_class_labels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    sample_temperature: 0.8
+    sample_top_k: 0
+    sample_log_to_wandb: false
+    compute_generation_fid: false
+    generation_metric_num_samples: 0
+    run_test_after_fit: false
+    save_final_samples_after_fit: true
+
+  wandb:
+    project: laser-ar
+    name: imagenet-full-stage2
+    group: imagenet-full
+    tags: [stage2, imagenet, laser, sparse_spatial_depth, class_conditional, full]
+    append_timestamp: false
+    save_dir: outputs/imagenet-full/stage2/wandb

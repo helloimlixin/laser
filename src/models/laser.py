@@ -1065,6 +1065,25 @@ class LASER(VisualsMixin, pl.LightningModule):
         progress = (step - self.perceptual_start_step) / float(max(1, self.perceptual_warmup_steps))
         return float(self.perceptual_weight) * max(0.0, min(1.0, progress))
 
+    def _adversarial_schedule_factor_at_step(self, step: int, start_step: int) -> float:
+        if step < start_step:
+            return 0.0
+        if not self._adversarial_quality_ready():
+            return 0.0
+        if self.adversarial_warmup_steps <= 0:
+            return 1.0
+        progress = (step - start_step) / float(max(1, self.adversarial_warmup_steps))
+        return max(0.0, min(1.0, progress))
+
+    def _effective_adversarial_weight_at_step(self, prefix: str, step: int) -> float:
+        if prefix != "train" or self.adversarial_weight <= 0 or self.discriminator is None:
+            return 0.0
+        factor = self._adversarial_schedule_factor_at_step(
+            int(step),
+            self.adversarial_start_step,
+        )
+        return float(self.adversarial_weight) * factor
+
     def _distributed_mean_detached(self, value: torch.Tensor) -> torch.Tensor:
         value = value.detach().to(dtype=torch.float32)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -1095,17 +1114,8 @@ class LASER(VisualsMixin, pl.LightningModule):
         return float(ema.detach().cpu().item()) <= float(self.adversarial_start_recon_mse)
 
     def _effective_adversarial_weight(self, prefix: str) -> float:
-        if prefix != "train" or self.adversarial_weight <= 0 or self.discriminator is None:
-            return 0.0
         step = int(getattr(self, "global_step", 0))
-        if step < self.adversarial_start_step:
-            return 0.0
-        if not self._adversarial_quality_ready():
-            return 0.0
-        if self.adversarial_warmup_steps <= 0:
-            return float(self.adversarial_weight)
-        progress = (step - self.adversarial_start_step) / float(max(1, self.adversarial_warmup_steps))
-        return float(self.adversarial_weight) * max(0.0, min(1.0, progress))
+        return self._effective_adversarial_weight_at_step(prefix, step)
 
     def _adversarial_generator_loss(self, recon: torch.Tensor) -> torch.Tensor:
         if self.discriminator is None:
@@ -1667,10 +1677,14 @@ class LASER(VisualsMixin, pl.LightningModule):
         disc_weight = recon_raw.new_zeros(())
         if include_adversarial and self._adversarial_enabled and self.discriminator is not None:
             step = int(self._manual_train_step)
-            active = step >= self.disc_start_step
-            factor = adopt_weight(self.disc_factor, step, self.disc_start_step)
-            if active:
-                adversarial_weight = float(self.adversarial_weight) * float(factor)
+            disc_factor = adopt_weight(self.disc_factor, step, self.disc_start_step)
+            scheduled_factor = self._adversarial_schedule_factor_at_step(
+                step,
+                self.adversarial_start_step,
+            )
+            scheduled_weight = float(self.adversarial_weight) * scheduled_factor
+            adversarial_weight = scheduled_weight * float(disc_factor)
+            active = adversarial_weight > 0.0
             # Feature matching is the core HiFi-GAN signal: only available for the
             # waveform critics (which expose intermediate features) and when its
             # weight is on. The image PatchGAN path keeps the logits-only behavior.
@@ -1698,7 +1712,7 @@ class LASER(VisualsMixin, pl.LightningModule):
                     disc_weight = self._adaptive_disc_weight(reference_loss, adv_g_loss)
                 else:
                     disc_weight = recon_raw.new_tensor(1.0)
-                weighted_adv = self.adversarial_weight * disc_weight * factor * adv_g_loss
+                weighted_adv = adversarial_weight * disc_weight * adv_g_loss
                 total_loss = total_loss + weighted_adv
                 self.log(f'{prefix}/weighted_adv_g_loss', weighted_adv, **log_kwargs)
                 if want_fm:
@@ -1707,7 +1721,7 @@ class LASER(VisualsMixin, pl.LightningModule):
                     with torch.no_grad():
                         _, feats_real = self.discriminator(x, return_features=True)
                     fm_loss = feature_matching_loss(feats_real, feats_fake)
-                    weighted_fm = self.audio_feature_matching_weight * factor * fm_loss
+                    weighted_fm = self.audio_feature_matching_weight * scheduled_factor * float(disc_factor) * fm_loss
                     total_loss = total_loss + weighted_fm
                     self.log(f'{prefix}/audio_feature_matching_loss', fm_loss, **log_kwargs)
                     self.log(f'{prefix}/weighted_audio_feature_matching_loss', weighted_fm, **log_kwargs)
@@ -1851,15 +1865,19 @@ class LASER(VisualsMixin, pl.LightningModule):
 
         weighted_d_loss = loss.new_zeros(())
         logits_real = logits_fake = loss.new_zeros(())
-        disc_should_step = step >= self.disc_start_step
+        disc_factor = adopt_weight(self.disc_factor, step, self.disc_start_step)
+        disc_schedule_factor = self._adversarial_schedule_factor_at_step(
+            step,
+            self.disc_start_step,
+        )
+        disc_should_step = disc_schedule_factor > 0.0 and float(disc_factor) > 0.0
         if disc_should_step:
             self._apply_scheduled_lrs(opt_disc, step=step, base_lrs=self._disc_lr_base_lrs)
             d_loss, logits_real, logits_fake = self._discriminator_loss(
                 x.detach(),
                 recon.detach(),
             )
-            factor = adopt_weight(self.disc_factor, step, self.disc_start_step)
-            weighted_d_loss = float(factor) * d_loss
+            weighted_d_loss = float(disc_factor) * disc_schedule_factor * d_loss
         else:
             weighted_d_loss = self._zero_discriminator_loss_like(loss)
 

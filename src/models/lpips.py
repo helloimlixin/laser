@@ -1,14 +1,37 @@
+from collections import namedtuple
+import os
 from pathlib import Path
+
 import torch
 import torch.nn as nn
-from torchvision.models import vgg16, VGG16_Weights
-from collections import namedtuple
+from torchvision.models import vgg16
 
 CKPT_MAP = {
     "vgg_lpips": "vgg.pth"
 }
 
 BUNDLED_CKPT_ROOT = Path(__file__).resolve().parents[2] / "vgg_lpips"
+VGG16_CKPT_CANDIDATES = (
+    "vgg16_features.pth",
+    "vgg16-397923af.pth",
+    "vgg16.pth",
+)
+
+
+def _torch_load(path):
+    try:
+        return torch.load(path, map_location=torch.device("cpu"), weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=torch.device("cpu"))
+
+
+def _checkpoint_state_dict(path):
+    checkpoint = _torch_load(path)
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("state_dict"), dict):
+        return checkpoint["state_dict"]
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise ValueError(f"Checkpoint at {path} did not contain a state dict")
 
 
 def get_ckpt_path(name):
@@ -21,6 +44,61 @@ def get_ckpt_path(name):
         f"Bundled LPIPS checkpoint not found at {bundled_path}. "
         "Expected the repo-local vgg_lpips/vgg.pth checkpoint."
     )
+
+
+def _candidate_vgg16_weight_paths():
+    explicit = str(os.environ.get("LASER_VGG16_WEIGHTS", "") or "").strip()
+    if explicit:
+        yield Path(explicit).expanduser()
+    for filename in VGG16_CKPT_CANDIDATES:
+        yield BUNDLED_CKPT_ROOT / filename
+    try:
+        hub_dir = Path(torch.hub.get_dir()).expanduser() / "checkpoints"
+    except Exception:
+        return
+    yield hub_dir / "vgg16-397923af.pth"
+
+
+def get_vgg16_weights_path():
+    for candidate in _candidate_vgg16_weight_paths():
+        if candidate.is_file():
+            return candidate.resolve()
+    tried = ", ".join(str(path) for path in _candidate_vgg16_weight_paths())
+    raise FileNotFoundError(
+        "Local VGG16 feature weights not found. LPIPS is offline-only here: "
+        "vgg_lpips/vgg.pth contains the LPIPS linear calibration layers, "
+        "but VGG16 convolution weights are also required. Place vgg16-397923af.pth "
+        "or vgg16_features.pth under vgg_lpips/, or set LASER_VGG16_WEIGHTS. "
+        f"No online download was attempted. Tried: {tried}"
+    )
+
+
+def _normalize_key(key: str) -> str:
+    for prefix in ("module.", "model."):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+    return key
+
+
+def _vgg_features_state_dict(checkpoint_path, features: nn.Module):
+    state_dict = _checkpoint_state_dict(checkpoint_path)
+    feature_keys = set(features.state_dict().keys())
+    out = {}
+    for raw_key, value in state_dict.items():
+        key = _normalize_key(str(raw_key))
+        if key.startswith("features."):
+            key = key[len("features."):]
+        if key in feature_keys:
+            out[key] = value
+    missing = sorted(feature_keys.difference(out))
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = "" if len(missing) <= 5 else f", ... ({len(missing)} total)"
+        raise RuntimeError(
+            f"VGG16 checkpoint {checkpoint_path} is missing feature weights: {preview}{suffix}"
+        )
+    return out
+
 
 class LPIPS(nn.Module):
     def __init__(self):
@@ -45,7 +123,12 @@ class LPIPS(nn.Module):
 
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(name)
-        self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"), weights_only=True), strict=False)
+        state_dict = _checkpoint_state_dict(ckpt)
+        incompatible = self.load_state_dict(state_dict, strict=False)
+        expected = {f"lin{i}.model.1.weight" for i in range(5)}
+        missing = sorted(expected.intersection(incompatible.missing_keys))
+        if missing:
+            raise RuntimeError(f"LPIPS checkpoint {ckpt} is missing weights: {missing}")
 
     def forward(self, real_x, fake_x):
         outs_real = self.vgg(self.scaling_layer(real_x))
@@ -82,9 +165,15 @@ class NetLinLayer(nn.Module):
 
 
 class VGG16(nn.Module):
-    def __init__(self):
+    def __init__(self, weights_path=None):
         super(VGG16, self).__init__()
-        vgg_pretrained_features = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+        vgg_pretrained_features = vgg16(weights=None).features
+        weights_path = Path(weights_path).expanduser().resolve() if weights_path is not None else get_vgg16_weights_path()
+        vgg_pretrained_features.load_state_dict(
+            _vgg_features_state_dict(weights_path, vgg_pretrained_features),
+            strict=True,
+        )
+        self.weights_path = str(weights_path)
         self.slice1 = nn.Sequential()
         self.slice2 = nn.Sequential()
         self.slice3 = nn.Sequential()

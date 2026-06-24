@@ -215,16 +215,23 @@ class ImageFolderDataModule(pl.LightningDataModule):
         if dataset is None:
             return None
         num_workers = int(self.config.num_workers)
+        pin_memory = bool(getattr(self.config, "pin_memory", False))
+        prefetch_factor = getattr(self.config, "prefetch_factor", 2)
         kwargs = dict(
             dataset=dataset,
             batch_size=int(batch_size),
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=False,
+            pin_memory=pin_memory,
             persistent_workers=(num_workers > 0),
             generator=self._loader_generator(seed_offset),
             timeout=0,
         )
         if num_workers > 0:
-            kwargs["prefetch_factor"] = 2
+            try:
+                prefetch_factor = int(prefetch_factor)
+            except (TypeError, ValueError):
+                prefetch_factor = 2
+            if prefetch_factor > 0:
+                kwargs["prefetch_factor"] = prefetch_factor
         return DataLoader(**kwargs)

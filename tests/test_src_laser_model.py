@@ -121,6 +121,21 @@ def test_laser_adversarial_quality_gate_waits_for_reconstruction_mse():
     assert model._effective_adversarial_weight("train") == 0.05
 
 
+def test_laser_adversarial_warmup_uses_configured_steps():
+    model = _build_model(
+        adversarial_weight=0.05,
+        adversarial_start_step=10,
+        adversarial_warmup_steps=10,
+        discriminator_channels=8,
+        discriminator_layers=1,
+    )
+
+    assert model._effective_adversarial_weight_at_step("train", 9) == 0.0
+    assert model._effective_adversarial_weight_at_step("train", 10) == 0.0
+    assert abs(model._effective_adversarial_weight_at_step("train", 15) - 0.025) < 1.0e-8
+    assert abs(model._effective_adversarial_weight_at_step("train", 20) - 0.05) < 1.0e-8
+
+
 def test_manual_optimizer_clipping_uses_model_side_clip_value():
     model = _build_model(
         adversarial_weight=0.05,
