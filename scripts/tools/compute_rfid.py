@@ -101,11 +101,42 @@ def infer_model_type(hparams: dict[str, Any], config_type: Optional[str], explic
     raise ValueError("Could not infer model type from checkpoint. Pass --model laser or --model vqvae.")
 
 
+def normalize_dataset_name(dataset: str) -> str:
+    return str(dataset).strip().lower().replace("-", "_")
+
+
 def _default_stats(dataset: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-    name = str(dataset).strip().lower()
+    name = normalize_dataset_name(dataset)
     if name == "cifar10":
         return (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
     return (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+
+
+def _first_int(*values: Any) -> int:
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, str) and "${" in value:
+            continue
+        return int(value)
+    raise ValueError("Expected at least one integer-compatible value.")
+
+
+_CELEBA_DATASETS = {"celeba", "celebahq"}
+_IMAGE_FOLDER_DATASETS = {"ffhq", "imagenet", "lsun_bedroom", "lsun_church", "lsun_cat"}
+
+
+def datamodule_kind_for_dataset(dataset: str) -> str:
+    name = normalize_dataset_name(dataset)
+    if name == "cifar10":
+        return "cifar10"
+    if name in _CELEBA_DATASETS:
+        return "celeba"
+    if name == "imagenette2":
+        return "imagenette2"
+    if name in _IMAGE_FOLDER_DATASETS:
+        return "image_folder"
+    raise ValueError(f"Unsupported dataset for rFID: {dataset!r}")
 
 
 @dataclass
@@ -122,7 +153,7 @@ class DataArgs:
 
 def build_data_args(args: argparse.Namespace, cfg_dict: Optional[dict[str, Any]]) -> DataArgs:
     data_cfg = dict((cfg_dict or {}).get("data") or {})
-    dataset = str(args.dataset or data_cfg.get("dataset") or "").strip().lower()
+    dataset = normalize_dataset_name(args.dataset or data_cfg.get("dataset") or "")
     if not dataset:
         raise ValueError("Need a dataset name. Pass --dataset or provide a config with data.dataset.")
 
@@ -140,7 +171,7 @@ def build_data_args(args: argparse.Namespace, cfg_dict: Optional[dict[str, Any]]
 
     batch_size = int(args.batch_size if args.batch_size > 0 else (data_cfg.get("batch_size") or 100))
     num_workers = int(args.num_workers if args.num_workers >= 0 else (data_cfg.get("num_workers") or 4))
-    seed = int(data_cfg.get("seed") or (cfg_dict or {}).get("seed") or 42)
+    seed = _first_int(data_cfg.get("seed"), (cfg_dict or {}).get("seed"), 42)
 
     default_mean, default_std = _default_stats(dataset)
     mean_raw = tuple(args.mean) if args.mean is not None else tuple(data_cfg.get("mean") or default_mean)
@@ -168,7 +199,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--split", choices=["train", "val", "valid", "test"], default="val", help="Dataset split.")
     p.add_argument("--batch-size", type=int, default=100, help="Eval batch size.")
     p.add_argument("--num-workers", type=int, default=-1, help="Dataloader workers override.")
-    p.add_argument("--max-samples", type=int, default=0, help="Optional cap on evaluated images; 0 uses full split.")
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Optional debug cap on evaluated images; 0 uses the full split for paper-comparable rFID.",
+    )
     p.add_argument("--device", type=str, default="auto", help="'auto', 'cpu', or CUDA device like 'cuda:0'.")
     p.add_argument("--feature", type=int, default=2048, help="Inception feature size for FID.")
     p.add_argument("--dataset", type=str, default=None, help="Dataset override when config inference is unavailable.")
@@ -210,6 +246,7 @@ def main() -> None:
     from src.data.celeba import CelebADataModule
     from src.data.cifar10 import CIFAR10DataModule
     from src.data.config import DataConfig
+    from src.data.image_folder import ImageFolderDataModule
     from src.data.imagenette2 import Imagenette2DataModule
     from src.models.laser import LASER
     from src.models.vqvae import VQVAE
@@ -287,14 +324,17 @@ def main() -> None:
         std=data_args.std,
         augment=False,
     )
-    if data_args.dataset == "cifar10":
+    datamodule_kind = datamodule_kind_for_dataset(data_args.dataset)
+    if datamodule_kind == "cifar10":
         dm = CIFAR10DataModule(dm_cfg)
-    elif data_args.dataset == "celeba":
+    elif datamodule_kind == "celeba":
         dm = CelebADataModule(dm_cfg)
-    elif data_args.dataset == "imagenette2":
+    elif datamodule_kind == "imagenette2":
         dm = Imagenette2DataModule(OmegaConf.create(dm_cfg.__dict__))
+    elif datamodule_kind == "image_folder":
+        dm = ImageFolderDataModule(dm_cfg)
     else:
-        raise ValueError(f"Unsupported dataset for rFID: {data_args.dataset!r}")
+        raise AssertionError(f"Unhandled rFID datamodule kind: {datamodule_kind!r}")
     dm.setup(None)
 
     split = str(args.split).strip().lower()

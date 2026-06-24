@@ -19,6 +19,16 @@ limit_test_batches: 1.0
 # 1.0 = validate once at the end of every epoch.
 val_check_interval: 1.0
 run_test_after_fit: true
+# Post-hoc paper-style reconstruction FID. This runs after final.ckpt is saved and
+# uses the full validation split by default; keep it separate from model.compute_fid
+# so training-time validation can stay cheap.
+compute_rfid_after_fit: false
+rfid_split: val
+rfid_batch_size: 100
+rfid_num_workers: null
+rfid_max_samples: 0
+rfid_device: auto
+rfid_feature: 2048
 # Cosine LR schedule with warmup (0 = no warmup)
 warmup_steps: 0
 min_lr_ratio: 0.01

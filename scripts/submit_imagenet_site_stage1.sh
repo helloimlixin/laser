@@ -42,6 +42,12 @@ MAX_STEPS="${MAX_STEPS:-150000}"
 STAGE1_LR="${STAGE1_LR:-1.0e-4}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-30000}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-256}"
+COMPUTE_RFID_AFTER_FIT="${COMPUTE_RFID_AFTER_FIT:-true}"
+RFID_BATCH_SIZE="${RFID_BATCH_SIZE:-100}"
+RFID_NUM_WORKERS="${RFID_NUM_WORKERS:-$NUM_WORKERS}"
+RFID_MAX_SAMPLES="${RFID_MAX_SAMPLES:-0}"
+RFID_SPLIT="${RFID_SPLIT:-val}"
+RFID_DEVICE="${RFID_DEVICE:-auto}"
 SAVE_TOP_K="${SAVE_TOP_K:-0}"
 SAVE_LAST="${SAVE_LAST:-false}"
 EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
@@ -73,6 +79,7 @@ echo "  run_name=$RUN_NAME"
 echo "  partition=$PARTITION nodes=$NODES gpus_per_node=$GPUS_PER_NODE world_size=$WORLD_SIZE cpus_per_node=$CPUS mem=${MEM_MB} batch_per_gpu=$BATCH_SIZE max_steps=$MAX_STEPS"
 echo "  out=$RUN_DIR"
 echo "  wandb=$WANDB_PROJECT (mode=$WANDB_MODE media_disabled=$LASER_DISABLE_WANDB_MEDIA)"
+echo "  post_fit_rfid=$COMPUTE_RFID_AFTER_FIT split=$RFID_SPLIT max_samples=$RFID_MAX_SAMPLES batch=$RFID_BATCH_SIZE workers=$RFID_NUM_WORKERS"
 [[ -n "$EXTRA_OVERRIDES" ]] && echo "  extra=$EXTRA_OVERRIDES"
 
 # -- Inner runner (executed inside the container) ----------------------------
@@ -126,6 +133,13 @@ python train.py stage1 \\
   train.precision=bf16-mixed \\
   train.log_every_n_steps=50 \\
   train.run_test_after_fit=false \\
+  train.compute_rfid_after_fit=$COMPUTE_RFID_AFTER_FIT \\
+  train.rfid_split=$RFID_SPLIT \\
+  train.rfid_batch_size=$RFID_BATCH_SIZE \\
+  train.rfid_num_workers=$RFID_NUM_WORKERS \\
+  train.rfid_max_samples=$RFID_MAX_SAMPLES \\
+  train.rfid_device=$RFID_DEVICE \\
+  train.rfid_feature=2048 \\
   checkpoint.save_top_k=$SAVE_TOP_K \\
   checkpoint.save_last=$SAVE_LAST \\
   model.log_images_every_n_steps=$LOG_IMAGES_EVERY \\

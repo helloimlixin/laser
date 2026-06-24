@@ -89,6 +89,9 @@ def test_stage1_imagenet_class_command_maps_to_nonpatch_d5_ddp():
     assert "model.patch_based=false" in cmd
     assert "model.sparsity_level=3" in cmd
     assert "model.adversarial_weight=0.05" in cmd
+    assert "train.compute_rfid_after_fit=true" in cmd
+    assert "train.rfid_max_samples=0" in cmd
+    assert "train.rfid_split=val" in cmd
 
 
 def test_stage1_vctk_text_command_maps_to_audio_waveform_preset():
@@ -114,6 +117,7 @@ def test_stage1_vctk_text_command_maps_to_audio_waveform_preset():
     assert "data.audio_representation=waveform" in cmd
     assert "model.patch_based=false" in cmd
     assert "model.adversarial_weight=0.03" in cmd
+    assert "train.compute_rfid_after_fit=true" not in cmd
 
 
 def test_stage2_command_uses_train_py_stage2_selector():

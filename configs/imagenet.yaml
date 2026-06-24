@@ -32,13 +32,20 @@ stage1:
     devices: 1
     strategy: auto
     precision: bf16-mixed
-    max_epochs: 3
+    max_epochs: 1
     max_steps: -1
     limit_train_batches: 1.0
     limit_val_batches: 256
     limit_test_batches: 0
     val_check_interval: 5000
-    run_test_after_fit: false
+    run_test_after_fit: true
+    compute_rfid_after_fit: true
+    rfid_split: val
+    rfid_batch_size: 100
+    rfid_num_workers: 8
+    rfid_max_samples: 0
+    rfid_device: auto
+    rfid_feature: 2048
     learning_rate: 2.0e-3
     warmup_steps: 4000
     min_lr_ratio: 0.05
@@ -92,13 +99,20 @@ stage1_adv:
     devices: 1
     strategy: auto
     precision: bf16-mixed
-    max_epochs: 2
+    max_epochs: 1
     max_steps: -1
     limit_train_batches: 1.0
     limit_val_batches: 256
     limit_test_batches: 0
     val_check_interval: 5000
     run_test_after_fit: false
+    compute_rfid_after_fit: true
+    rfid_split: val
+    rfid_batch_size: 100
+    rfid_num_workers: 8
+    rfid_max_samples: 0
+    rfid_device: auto
+    rfid_feature: 2048
     learning_rate: 2.0e-3
     warmup_steps: 4000
     min_lr_ratio: 0.05

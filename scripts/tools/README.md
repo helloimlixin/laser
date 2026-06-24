@@ -8,7 +8,7 @@ Maintained launch entrypoints:
 Utilities in this directory:
 - `smoke_e2e.py`
 - `cache.py`
-- `compute_rfid.py`
+- `compute_rfid.py` - post-hoc paper-style rFID: full validation split by default (`--max-samples 0`); supports ImageNet/image-folder datasets.
 - `kmeans_quantize_sparse_codes.py`
 - `prune_runs.py`
 - `laser_sanity.py`

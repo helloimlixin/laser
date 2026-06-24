@@ -35,7 +35,24 @@ IMAGE_DATASETS = {
     "imagenette2",
     "stl10",
 }
+POST_FIT_RFID_DATASETS = {
+    "celeba",
+    "celebahq",
+    "cifar10",
+    "ffhq",
+    "imagenet",
+    "imagenette2",
+    "lsun_bedroom",
+    "lsun_church",
+    "lsun_cat",
+}
 AUDIO_DATASETS = {"vctk", "maestro"}
+
+
+def _dataset_key(name: object) -> str:
+    return str(name or "").strip().lower().replace("-", "_")
+
+
 STAGE_TOKEN_ALIASES = {
     "1": "1",
     "stage1": "1",
@@ -960,6 +977,16 @@ def _stage1_command(args: argparse.Namespace, resources: ResourcePlan, extra: li
     ]
     if args.modality == "image":
         overrides.extend(["train.warmup_steps=500", "train.val_check_interval=0.25"])
+        if _dataset_key(args.dataset) in POST_FIT_RFID_DATASETS:
+            overrides.extend([
+                "train.compute_rfid_after_fit=true",
+                "train.rfid_split=val",
+                "train.rfid_batch_size=100",
+                "train.rfid_num_workers=8",
+                "train.rfid_max_samples=0",
+                "train.rfid_device=auto",
+                "train.rfid_feature=2048",
+            ])
         if args.dataset.strip().lower() == "imagenet":
             overrides.extend(["train.limit_val_batches=512", "train.limit_test_batches=512"])
         else:
@@ -1163,6 +1190,96 @@ def _load_stage_entrypoints():
             raise FileNotFoundError(f"No checkpoint file found under directory: {path}")
         return path
 
+    def _scalar_image_size(value: object) -> int:
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError("data.image_size cannot be empty for post-fit rFID")
+            return int(value[0])
+        return int(value)
+
+
+    def _stat_override_values(value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_values = [part.strip() for part in value.strip("[]() ").split(",") if part.strip()]
+        else:
+            try:
+                raw_values = list(value)  # type: ignore[arg-type]
+            except TypeError:
+                raw_values = [value]
+        if len(raw_values) != 3:
+            return []
+        return [str(float(v)) for v in raw_values]
+
+
+    def _run_post_fit_rfid(final_ckpt_path: str, cfg: DictConfig, resolved_in_channels: int) -> None:
+        if not bool(getattr(cfg.train, "compute_rfid_after_fit", False)):
+            return
+
+        dataset = _dataset_key(getattr(cfg.data, "dataset", ""))
+        if resolved_in_channels != 3:
+            print("\nSkipping post-fit rFID: rFID is only defined for RGB image datasets.")
+            return
+        if dataset not in POST_FIT_RFID_DATASETS:
+            print(f"\nSkipping post-fit rFID: dataset {dataset!r} is not supported by compute_rfid.py.")
+            return
+
+        data_dir = str(getattr(cfg.data, "data_dir", "") or "").strip()
+        if not data_dir:
+            raise ValueError("Post-fit rFID requires data.data_dir to be set.")
+
+        rfid_batch_size = int(getattr(cfg.train, "rfid_batch_size", 100) or 100)
+        rfid_num_workers_raw = getattr(cfg.train, "rfid_num_workers", None)
+        if rfid_num_workers_raw is None:
+            rfid_num_workers_raw = getattr(cfg.data, "num_workers", 4)
+        rfid_num_workers = int(rfid_num_workers_raw or 0)
+        rfid_max_samples = int(getattr(cfg.train, "rfid_max_samples", 0) or 0)
+        rfid_split = str(getattr(cfg.train, "rfid_split", "val") or "val")
+        rfid_device = str(getattr(cfg.train, "rfid_device", "auto") or "auto")
+        rfid_feature = int(getattr(cfg.train, "rfid_feature", 2048) or 2048)
+
+        script_path = Path(__file__).resolve().parent / "compute_rfid.py"
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--ckpt",
+            str(final_ckpt_path),
+            "--dataset",
+            dataset,
+            "--data-dir",
+            data_dir,
+            "--image-size",
+            str(_scalar_image_size(getattr(cfg.data, "image_size", 256))),
+            "--split",
+            rfid_split,
+            "--batch-size",
+            str(rfid_batch_size),
+            "--num-workers",
+            str(rfid_num_workers),
+            "--max-samples",
+            str(rfid_max_samples),
+            "--device",
+            rfid_device,
+            "--feature",
+            str(rfid_feature),
+        ]
+
+        mean_values = _stat_override_values(getattr(cfg.data, "mean", None))
+        std_values = _stat_override_values(getattr(cfg.data, "std", None))
+        if mean_values:
+            cmd.extend(["--mean", *mean_values])
+        if std_values:
+            cmd.extend(["--std", *std_values])
+
+        if rfid_max_samples <= 0:
+            print("\nRunning post-fit paper-style rFID on the full validation split...")
+        else:
+            print("\nRunning post-fit debug rFID...")
+        print(shlex.join(cmd))
+        subprocess.run(cmd, check=True, cwd=str(Path(__file__).resolve().parent))
+        print("Post-fit rFID complete. See rfid.log next to the evaluated checkpoint.")
+
 
     @hydra.main(config_path="configs", config_name="config", version_base="1.2")
     def train_stage1(cfg: DictConfig):
@@ -1272,6 +1389,9 @@ def _load_stage_entrypoints():
         print(f"Limit Val Batches: {getattr(cfg.train, 'limit_val_batches', 1.0)}")
         print(f"Limit Test Batches: {getattr(cfg.train, 'limit_test_batches', 1.0)}")
         print(f"Run Test After Fit: {bool(getattr(cfg.train, 'run_test_after_fit', False))}")
+        print(f"Compute Post-Fit rFID: {bool(getattr(cfg.train, 'compute_rfid_after_fit', False))}")
+        print(f"Post-Fit rFID Split: {getattr(cfg.train, 'rfid_split', 'val')}")
+        print(f"Post-Fit rFID Max Samples: {int(getattr(cfg.train, 'rfid_max_samples', 0) or 0)}")
     
         print("\nWandB Configuration:")
         print(f"Project: {cfg.wandb.project}")
@@ -1515,7 +1635,19 @@ def _load_stage_entrypoints():
         if trainer.is_global_zero:
             print(f"Saved final stage-1 checkpoint: {final_ckpt_path}")
 
+        def _run_post_fit_rfid_if_requested() -> None:
+            if not trainer.is_global_zero or not bool(getattr(cfg.train, "compute_rfid_after_fit", False)):
+                return
+            try:
+                model.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as exc:
+                print(f"Warning: could not move model to CPU before post-fit rFID: {exc}")
+            _run_post_fit_rfid(final_ckpt_path, cfg, resolved_in_channels)
+
         if not bool(getattr(cfg.train, "run_test_after_fit", False)):
+            _run_post_fit_rfid_if_requested()
             return
 
         # Keep DDP test evaluation distributed. Launching a new single-rank trainer
@@ -1527,6 +1659,7 @@ def _load_stage_entrypoints():
             trainer.test(model, datamodule=datamodule)
             if trainer.is_global_zero:
                 print("\nAutoencoder evaluation complete.")
+            _run_post_fit_rfid_if_requested()
             return
 
         if not trainer.is_global_zero:
@@ -1545,6 +1678,7 @@ def _load_stage_entrypoints():
         )
         test_trainer.test(model, datamodule=datamodule)
         print("\nAutoencoder evaluation complete.")
+        _run_post_fit_rfid_if_requested()
 
     # -----------------------------------------------------------------------------
     # Stage 2 Hydra implementation

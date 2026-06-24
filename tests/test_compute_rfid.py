@@ -2,7 +2,12 @@ import argparse
 from pathlib import Path
 
 
-from compute_rfid import build_data_args, infer_config_path, infer_model_type
+from compute_rfid import (
+    build_data_args,
+    datamodule_kind_for_dataset,
+    infer_config_path,
+    infer_model_type,
+)
 
 
 def test_infer_config_path_prefers_matching_run_timestamp(tmp_path: Path):
@@ -66,3 +71,64 @@ def test_build_data_args_uses_defaults_and_cli_overrides():
     assert data_args.data_dir == "/tmp/data"
     assert data_args.mean == (0.1, 0.2, 0.3)
     assert data_args.std == (0.9, 0.8, 0.7)
+
+
+def test_datamodule_kind_routes_paper_image_folder_datasets():
+    assert datamodule_kind_for_dataset("imagenet") == "image_folder"
+    assert datamodule_kind_for_dataset("lsun-church") == "image_folder"
+    assert datamodule_kind_for_dataset("ffhq") == "image_folder"
+    assert datamodule_kind_for_dataset("celebahq") == "celeba"
+
+
+def test_build_data_args_normalizes_paper_image_folder_dataset_names():
+    args = argparse.Namespace(
+        dataset=None,
+        data_dir=None,
+        image_size=0,
+        batch_size=0,
+        num_workers=-1,
+        mean=None,
+        std=None,
+    )
+    cfg = {
+        "seed": 11,
+        "data": {
+            "dataset": "lsun-church",
+            "data_dir": "/data/lsun/church",
+            "image_size": 256,
+            "batch_size": 64,
+        },
+    }
+
+    data_args = build_data_args(args, cfg)
+
+    assert data_args.dataset == "lsun_church"
+    assert data_args.batch_size == 64
+    assert data_args.mean == (0.5, 0.5, 0.5)
+    assert data_args.std == (0.5, 0.5, 0.5)
+    assert datamodule_kind_for_dataset(data_args.dataset) == "image_folder"
+
+
+def test_build_data_args_falls_back_from_unresolved_seed_interpolation():
+    args = argparse.Namespace(
+        dataset="imagenet",
+        data_dir="/data/imagenet",
+        image_size=256,
+        batch_size=100,
+        num_workers=8,
+        mean=[0.5, 0.5, 0.5],
+        std=[0.5, 0.5, 0.5],
+    )
+    cfg = {
+        "seed": 42,
+        "data": {
+            "dataset": "imagenet",
+            "data_dir": "${oc.env:IMAGENET_DIR}/imagenet",
+            "image_size": 256,
+            "seed": "${seed}",
+        },
+    }
+
+    data_args = build_data_args(args, cfg)
+
+    assert data_args.seed == 42
