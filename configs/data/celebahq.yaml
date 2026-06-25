@@ -1,9 +1,13 @@
 dataset: celebahq
 data_dir: ${oc.env:CELEBAHQ_DIR,${oc.env:CELEBA_HQ_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/celebahq}}
-batch_size: 8
-num_workers: 8
+batch_size: ${oc.env:CELEBAHQ_BATCH_SIZE,32}
+eval_batch_size: ${oc.env:CELEBAHQ_EVAL_BATCH_SIZE,32}
+num_workers: ${oc.env:CELEBAHQ_NUM_WORKERS,8}
+pin_memory: true
+prefetch_factor: 4
 image_size: 256
+train_crop_size: null
 seed: ${seed}
 mean: [0.5, 0.5, 0.5]
 std: [0.5, 0.5, 0.5]
-augment: false
+augment: true
