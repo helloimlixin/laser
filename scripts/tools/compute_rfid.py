@@ -207,6 +207,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--device", type=str, default="auto", help="'auto', 'cpu', or CUDA device like 'cuda:0'.")
     p.add_argument("--feature", type=int, default=2048, help="Inception feature size for FID.")
+    p.add_argument(
+        "--fid-debug-mode",
+        choices=["recon", "real_identity", "real_split"],
+        default="recon",
+        help="FID input mode: normal reconstruction rFID, real-vs-real identity, or real split-vs-split.",
+    )
     p.add_argument("--dataset", type=str, default=None, help="Dataset override when config inference is unavailable.")
     p.add_argument("--data-dir", type=str, default=None, help="Dataset root override.")
     p.add_argument("--image-size", type=int, default=0, help="Image size override.")
@@ -284,6 +290,7 @@ def main() -> None:
     logger.info("Model: %s", model_type)
     logger.info("Split: %s", args.split)
     logger.info("Feature dim: %d", int(args.feature))
+    logger.info("FID debug mode: %s", args.fid_debug_mode)
     logger.info("Log file: %s", log_path)
     logger.info(
         "Data: dataset=%s data_dir=%s image_size=%s batch_size=%s workers=%s",
@@ -347,6 +354,10 @@ def main() -> None:
 
     metric = FrechetInceptionDistance(feature=int(args.feature), normalize=True).to(device)
     metric.eval()
+    real_split_metric = None
+    if args.fid_debug_mode == "recon":
+        real_split_metric = FrechetInceptionDistance(feature=int(args.feature), normalize=True).to(device)
+        real_split_metric.eval()
 
     mean = torch.tensor(data_args.mean, device=device, dtype=torch.float32).view(1, -1, 1, 1)
     std = torch.tensor(data_args.std, device=device, dtype=torch.float32).view(1, -1, 1, 1)
@@ -359,8 +370,20 @@ def main() -> None:
         x = x * std + mean
         return torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
+    def _print_tensor_stats(label: str, x: torch.Tensor) -> None:
+        x = x.detach()
+        print(
+            label,
+            x.min().item(),
+            x.max().item(),
+            x.mean().item(),
+            x.std().item(),
+            flush=True,
+        )
+
     max_samples = int(args.max_samples)
     seen = 0
+    real_split_seen = 0
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
             imgs = _images_only(batch)
@@ -372,29 +395,53 @@ def main() -> None:
             imgs = imgs.to(device, non_blocking=True)
             recon = model(imgs)[0]
 
+            if batch_idx == 0:
+                _print_tensor_stats("RAW imgs:", imgs)
+                _print_tensor_stats("RAW recon:", recon)
+
             real = _to_unit_range(imgs)
             fake = _to_unit_range(recon)
-            metric.update(real, real=True)
-            metric.update(fake, real=False)
+
+            if batch_idx == 0:
+                _print_tensor_stats("UNIT real:", real)
+                _print_tensor_stats("UNIT fake:", fake)
+
+            if args.fid_debug_mode == "real_identity":
+                metric.update(real, real=True)
+                metric.update(real, real=False)
+            elif args.fid_debug_mode == "real_split":
+                half = int(real.shape[0]) // 2
+                if half > 0:
+                    metric.update(real[:half], real=True)
+                    metric.update(real[half : 2 * half], real=False)
+            else:
+                metric.update(real, real=True)
+                metric.update(fake, real=False)
+                half = int(real.shape[0]) // 2
+                if half > 0 and real_split_metric is not None:
+                    real_split_metric.update(real[:half], real=True)
+                    real_split_metric.update(real[half : 2 * half], real=False)
+                    real_split_seen += half * 2
 
             seen += int(real.size(0))
-            if batch_idx == 0:
-                logger.info(
-                    "Batch0 stats: real[min=%.4f max=%.4f mean=%.4f] recon[min=%.4f max=%.4f mean=%.4f]",
-                    float(real.min().item()),
-                    float(real.max().item()),
-                    float(real.mean().item()),
-                    float(fake.min().item()),
-                    float(fake.max().item()),
-                    float(fake.mean().item()),
-                )
 
     if seen <= 0:
         raise RuntimeError("No samples were processed for rFID.")
 
     score = float(metric.compute().item())
     logger.info("Processed samples: %d", seen)
-    logger.info("rFID: %.4f", score)
+    if args.fid_debug_mode == "recon" and real_split_metric is not None:
+        if real_split_seen <= 0:
+            logger.info("rFID: %.4f", score)
+            logger.warning("Could not compute adjusted_rFID: real_split baseline received no samples.")
+        else:
+            real_split_score = float(real_split_metric.compute().item())
+            adjusted_score = score - real_split_score
+            logger.info("rFID: %.4f", score)
+            logger.info("real_split_FID: %.4f", real_split_score)
+            logger.info("adjusted_rFID: %.4f", adjusted_score)
+    else:
+        logger.info("rFID: %.4f", score)
 
 
 if __name__ == "__main__":

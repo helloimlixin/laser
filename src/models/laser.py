@@ -105,6 +105,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             commitment_cost,
             learning_rate,
             beta,
+            beta2=0.999,
             backbone="ddpm",
             resolution=None,
             num_downsamples=4,
@@ -209,7 +210,8 @@ class LASER(VisualsMixin, pl.LightningModule):
             use_mid_attention: whether to keep the bottleneck self-attention block enabled
             commitment_cost: Commitment cost for bottleneck
             learning_rate: Learning rate for encoder/decoder
-            beta: Beta parameter for Adam optimizer
+            beta: Adam beta1 parameter
+            beta2: Adam beta2 parameter
             bottleneck_loss_weight: Weight for encoder-facing bottleneck loss term in total loss
             dictionary_loss_weight: Optional separate weight for dictionary/codebook fitting loss.
                 Defaults to bottleneck_loss_weight to preserve historical objective scaling.
@@ -310,7 +312,8 @@ class LASER(VisualsMixin, pl.LightningModule):
 
         # Store parameters
         self.learning_rate = learning_rate
-        self.beta = beta
+        self.beta = float(beta)
+        self.beta2 = float(beta2)
         self.perceptual_weight = perceptual_weight
         self.perceptual_start_step = max(int(perceptual_start_step), 0)
         self.perceptual_warmup_steps = max(int(perceptual_warmup_steps), 0)
@@ -898,6 +901,8 @@ class LASER(VisualsMixin, pl.LightningModule):
         warmup = min(self.warmup_steps, max(0, total_steps - 1))
         step = max(0, int(step))
         if warmup > 0 and step < warmup:
+            if self.min_lr_ratio >= 1.0:
+                return max(0.01, step / float(max(1, warmup)))
             return max(self.min_lr_ratio, step / float(max(1, warmup)))
         progress = (step - warmup) / float(max(1, total_steps - warmup))
         progress = min(max(progress, 0.0), 1.0)
@@ -1979,7 +1984,7 @@ class LASER(VisualsMixin, pl.LightningModule):
 
         optimizer = torch.optim.Adam(
             param_groups,
-            betas=(self.beta, 0.999),
+            betas=(self.beta, self.beta2),
         )
         trainer = self._trainer_ref()
         total_steps, source = self._resolve_lr_total_steps(trainer)
@@ -1995,7 +2000,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         disc_optimizer = torch.optim.Adam(
             self.discriminator.parameters(),
             lr=disc_lr,
-            betas=(self.beta, 0.999),
+            betas=(self.discriminator_beta1, self.discriminator_beta2),
         )
         self._disc_lr_base_lrs = tuple(float(group["lr"]) for group in disc_optimizer.param_groups)
         return [optimizer, disc_optimizer]

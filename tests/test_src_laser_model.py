@@ -333,6 +333,24 @@ def test_laser_manual_lr_schedule_applies_first_step_without_scheduler():
     assert optimizer.param_groups[0]["lr"] == 1e-5
 
 
+def test_laser_lr_schedule_supports_warmup_without_decay():
+    model = _build_model(learning_rate=1e-3, warmup_steps=10, min_lr_ratio=1.0)
+    model.__dict__["_trainer"] = type("TrainerStub", (), {"estimated_stepping_batches": 100})()
+
+    optimizer = model.configure_optimizers()
+    model._apply_scheduled_lrs(optimizer, step=0)
+    assert optimizer.param_groups[0]["lr"] == 1e-5
+
+    model._apply_scheduled_lrs(optimizer, step=5)
+    assert optimizer.param_groups[0]["lr"] == 5e-4
+
+    model._apply_scheduled_lrs(optimizer, step=10)
+    assert optimizer.param_groups[0]["lr"] == 1e-3
+
+    model._apply_scheduled_lrs(optimizer, step=99)
+    assert optimizer.param_groups[0]["lr"] == 1e-3
+
+
 def test_laser_lr_schedule_does_not_force_lightning_step_estimate_property():
     model = _build_model(learning_rate=1e-3, warmup_steps=10, min_lr_ratio=0.01)
 

@@ -1,6 +1,7 @@
 # configs/trainer/default.yaml
 learning_rate: 1e-4
 beta: 0.9
+beta2: 0.999
 max_epochs: 1
 accelerator: "gpu"
 num_nodes: 1
@@ -9,6 +10,7 @@ strategy: "ddp"
 precision: 32
 gradient_clip_val: 1.0
 deterministic: true
+accumulate_grad_batches: 1
 log_every_n_steps: 100
 early_stopping_patience: null # Disable early stopping by default to run full max_epochs
 max_steps: -1

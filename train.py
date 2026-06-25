@@ -1300,6 +1300,7 @@ def _load_stage_entrypoints():
         if ckpt_path and init_ckpt_path:
             raise ValueError("Use ckpt_path to resume training or init_ckpt_path to initialize weights, not both.")
         deterministic = bool(getattr(cfg.train, "deterministic", False))
+        accumulate_grad_batches = max(1, int(getattr(cfg.train, "accumulate_grad_batches", 1) or 1))
         resolved_in_channels = infer_data_channels(cfg.data)
         torch.use_deterministic_algorithms(deterministic, warn_only=True)
         if torch.cuda.is_available():
@@ -1383,6 +1384,7 @@ def _load_stage_entrypoints():
         print(f"Num Nodes: {getattr(cfg.train, 'num_nodes', 1)}")
         print(f"Devices: {cfg.train.devices}")
         print(f"Precision: {cfg.train.precision}")
+        print(f"Accumulate Grad Batches: {accumulate_grad_batches}")
         print(f"Gradient Clip Value: {cfg.train.gradient_clip_val}")
         print(f"Deterministic: {deterministic}")
         print(f"Limit Train Batches: {getattr(cfg.train, 'limit_train_batches', 1.0)}")
@@ -1610,6 +1612,7 @@ def _load_stage_entrypoints():
             logger=wandb_logger,
             callbacks=callbacks,
             precision=cfg.train.precision,
+            accumulate_grad_batches=accumulate_grad_batches,
             gradient_clip_val=trainer_gradient_clip_val,
             log_every_n_steps=cfg.train.log_every_n_steps,
             val_check_interval=val_check_interval,
@@ -2085,6 +2088,36 @@ def _load_stage_entrypoints():
     def train_stage2(cfg: DictConfig):
         mode = arch_name(getattr(cfg.ar, "type", "sparse_spatial_depth"))
         cfg.ar.type = mode
+        deterministic = bool(getattr(cfg.train_ar, "deterministic", True))
+        accumulate_grad_batches = max(1, int(getattr(cfg.train_ar, "accumulate_grad_batches", 1) or 1))
+        checkpoint_save_top_k = int(
+            getattr(cfg.train_ar, "checkpoint_save_top_k", CHECKPOINT_SAVE_TOP_K)
+        )
+        checkpoint_save_last = bool(
+            getattr(cfg.train_ar, "checkpoint_save_last", CHECKPOINT_SAVE_LAST)
+        )
+        checkpoint_every_n_epochs = max(
+            1,
+            int(getattr(cfg.train_ar, "checkpoint_every_n_epochs", CHECKPOINT_EVERY_N_EPOCHS) or 1),
+        )
+        checkpoint_upload_to_wandb = bool(
+            getattr(cfg.train_ar, "checkpoint_upload_to_wandb", CHECKPOINT_UPLOAD_TO_WANDB)
+        )
+        checkpoint_upload_every_n_epochs = max(
+            1,
+            int(
+                getattr(
+                    cfg.train_ar,
+                    "checkpoint_upload_every_n_epochs",
+                    checkpoint_every_n_epochs,
+                )
+                or 1
+            ),
+        )
+        torch.use_deterministic_algorithms(deterministic, warn_only=True)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = deterministic
+            torch.backends.cudnn.benchmark = not deterministic
         _maybe_build_token_cache(cfg)
 
         print("\n" + "=" * 60)
@@ -2113,7 +2146,9 @@ def _load_stage_entrypoints():
         print(f"  Max Steps: {cfg.ar.max_steps}")
         print(f"  Num Nodes: {getattr(cfg.train_ar, 'num_nodes', 1)}")
         print(f"  Batch Size: {cfg.train_ar.batch_size}")
+        print(f"  Accumulate Grad Batches: {accumulate_grad_batches}")
         print(f"  Max Epochs: {cfg.train_ar.max_epochs}")
+        print(f"  Deterministic: {deterministic}")
         print(f"  Limit Train Batches: {getattr(cfg.train_ar, 'limit_train_batches', 1.0)}")
         print(f"  Limit Val Batches: {getattr(cfg.train_ar, 'limit_val_batches', 1.0)}")
         print(f"  Limit Test Batches: {getattr(cfg.train_ar, 'limit_test_batches', 1.0)}")
@@ -2153,11 +2188,11 @@ def _load_stage_entrypoints():
         print(f"\nCheckpoint dir: {ckpt_dir}")
         print(
             "Checkpoint policy: "
-            f"save_top_k={CHECKPOINT_SAVE_TOP_K}, "
-            f"save_last={CHECKPOINT_SAVE_LAST}, "
-            f"every_n_epochs={CHECKPOINT_EVERY_N_EPOCHS}, "
-            f"wandb_selected_checkpoint_upload={CHECKPOINT_UPLOAD_TO_WANDB}, "
-            f"wandb_upload_every_n_epochs={CHECKPOINT_UPLOAD_EVERY_N_EPOCHS}"
+            f"save_top_k={checkpoint_save_top_k}, "
+            f"save_last={checkpoint_save_last}, "
+            f"every_n_epochs={checkpoint_every_n_epochs}, "
+            f"wandb_selected_checkpoint_upload={checkpoint_upload_to_wandb}, "
+            f"wandb_upload_every_n_epochs={checkpoint_upload_every_n_epochs}"
         )
 
         base_run = str(getattr(cfg.wandb, "name", "") or "").strip() or _default_stage2_run_name()
@@ -2224,20 +2259,20 @@ def _load_stage_entrypoints():
         checkpoint_callback = ModelCheckpoint(
             dirpath=ckpt_dir,
             filename="s2-{epoch:03d}-{val/loss:.4f}",
-            save_top_k=CHECKPOINT_SAVE_TOP_K,
+            save_top_k=checkpoint_save_top_k,
             monitor="val/loss",
             mode="min",
-            save_last=CHECKPOINT_SAVE_LAST,
-            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
+            save_last=checkpoint_save_last,
+            every_n_epochs=checkpoint_every_n_epochs,
         )
         cbs = [checkpoint_callback]
-        if CHECKPOINT_UPLOAD_TO_WANDB:
+        if checkpoint_upload_to_wandb:
             SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
             cbs.append(
                 SelectedCheckpointArtifactCallback(
                     checkpoint_callback,
                     artifact_prefix="model-stage2",
-                    every_n_epochs=CHECKPOINT_UPLOAD_EVERY_N_EPOCHS,
+                    every_n_epochs=checkpoint_upload_every_n_epochs,
                 )
             )
         cbs.extend([
@@ -2282,13 +2317,14 @@ def _load_stage_entrypoints():
             logger=wb,
             callbacks=cbs,
             precision=cfg.train_ar.precision,
+            accumulate_grad_batches=accumulate_grad_batches,
             gradient_clip_val=cfg.train_ar.gradient_clip_val,
             log_every_n_steps=cfg.train_ar.log_every_n_steps,
             val_check_interval=val_every,
             limit_train_batches=getattr(cfg.train_ar, "limit_train_batches", 1.0),
             limit_val_batches=getattr(cfg.train_ar, "limit_val_batches", 1.0),
             limit_test_batches=getattr(cfg.train_ar, "limit_test_batches", 1.0),
-            deterministic=True,
+            deterministic=deterministic,
             enable_progress_bar=True,
             num_sanity_val_steps=2,
         )

@@ -1,10 +1,10 @@
-# Full-scale FFHQ-256 pipeline config.
+# Full-scale FFHQ-256 LASER pipeline config.
 # Run with:
-#   python train.py --config configs/ffhq.yaml
+#   FFHQ_DIR=/workspace/Projects/data/ffhq python train.py --config configs/ffhq.yaml
 #
-# This trains a d5 site-level LASER autoencoder, runs an adversarial fine-tune,
-# builds a full train-split token cache, then trains an unconditional stage-2
-# sparse-token prior over the full cache.
+# This keeps the LASER sparse dictionary bottleneck. The first 150 epochs train
+# only reconstruction/perceptual losses; PatchGAN starts only in stage1_adv from
+# the stage-1 checkpoint.
 
 stage: pipeline
 mode: direct
@@ -14,49 +14,60 @@ stage1:
     - model=laser_image_nonpatch_d5
     - data=ffhq
 
-  output_dir: outputs/ffhq-full/stage1
+  output_dir: outputs/ffhq-laser-paper/stage1
 
   wandb:
     project: laser
-    name: ffhq-full-stage1
-    group: ffhq-full
-    tags: [stage1, ffhq, laser, full]
+    name: ffhq-laser-paper-stage1
+    group: ffhq-laser-paper
+    tags: [stage1, ffhq, laser, dictionary, no-adversarial]
     append_timestamp: false
-    save_dir: outputs/ffhq-full/stage1/wandb
+    save_dir: outputs/ffhq-laser-paper/stage1/wandb
 
   train:
     accelerator: gpu
     devices: 1
     strategy: auto
     precision: bf16-mixed
-    max_epochs: 75
-    max_steps: -1
+    deterministic: false
+    accumulate_grad_batches: 1
+    max_epochs: ${oc.env:FFHQ_STAGE1_MAX_EPOCHS,150}
+    max_steps: ${oc.env:FFHQ_STAGE1_MAX_STEPS,-1}
     limit_train_batches: 1.0
-    limit_val_batches: 256
+    limit_val_batches: 1.0
     limit_test_batches: 0
-    val_check_interval: 0.25
+    val_check_interval: 1.0
     run_test_after_fit: false
     compute_rfid_after_fit: true
     rfid_split: val
-    rfid_batch_size: 100
-    rfid_num_workers: 8
+    rfid_batch_size: ${oc.env:FFHQ_RFID_BATCH_SIZE,32}
+    rfid_num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}
     rfid_max_samples: 0
     rfid_device: auto
     rfid_feature: 2048
-    learning_rate: 1.0e-4
-    warmup_steps: 500
-    min_lr_ratio: 0.03
+    learning_rate: ${oc.env:FFHQ_STAGE1_LR,4.0e-5}
+    beta: 0.5
+    beta2: 0.9
+    # Flat FFHQ is split 90/5/5 locally: 63,001 train images. Batch 32 gives
+    # five warm-up epochs as ceil(63001 / 32) * 5 = 9,845 optimizer steps.
+    warmup_steps: ${oc.env:FFHQ_STAGE1_WARMUP_STEPS,9845}
+    min_lr_ratio: 1.0
     gradient_clip_val: 1.0
     log_every_n_steps: 20
 
   data:
-    batch_size: 3
-    num_workers: 4
+    batch_size: ${oc.env:FFHQ_STAGE1_BATCH_SIZE,32}
+    eval_batch_size: ${oc.env:FFHQ_STAGE1_EVAL_BATCH_SIZE,32}
+    num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}
+    pin_memory: true
+    prefetch_factor: 6
     image_size: 256
     train_crop_size: null
     augment: true
 
   model:
+    bottleneck_type: dictionary
+    dropout: 0.0
     num_embeddings: 4096
     embedding_dim: 128
     sparsity_level: 4
@@ -70,19 +81,19 @@ stage1:
     patch_stride: 1
     patch_reconstruction: tile
     data_init_from_first_batch: true
-    recon_mse_weight: 0.25
-    recon_l1_weight: 1.0
-    recon_edge_weight: 0.5
-    perceptual_weight: 0.2
-    perceptual_start_step: 1000
-    perceptual_warmup_steps: 2000
+    recon_mse_weight: 1.0
+    recon_l1_weight: 0.0
+    recon_edge_weight: 0.0
+    perceptual_weight: 1.0
+    perceptual_start_step: 0
+    perceptual_warmup_steps: 0
     adversarial_weight: 0.0
     adversarial_start_step: 1000000000
     adversarial_warmup_steps: 0
     disc_start_step: 1000000000
     compute_fid: true
-    log_images_every_n_steps: 100
-    diag_log_interval: 100
+    log_images_every_n_steps: 250
+    diag_log_interval: 250
     enable_val_latent_visuals: true
     codebook_visual_max_vectors: 4096
 
@@ -91,49 +102,58 @@ stage1_adv:
     - model=laser_image_nonpatch_d5
     - data=ffhq
 
-  output_dir: outputs/ffhq-full/stage1_adv
+  output_dir: outputs/ffhq-laser-paper/stage1_adv
 
   wandb:
     project: laser
-    name: ffhq-full-stage1-adv
-    group: ffhq-full
-    tags: [stage1, ffhq, laser, full, adversarial]
+    name: ffhq-laser-paper-stage1-adv
+    group: ffhq-laser-paper
+    tags: [stage1, ffhq, laser, dictionary, adversarial]
     append_timestamp: false
-    save_dir: outputs/ffhq-full/stage1_adv/wandb
+    save_dir: outputs/ffhq-laser-paper/stage1_adv/wandb
 
   train:
     accelerator: gpu
     devices: 1
     strategy: auto
     precision: bf16-mixed
-    max_epochs: 25
-    max_steps: -1
+    deterministic: false
+    accumulate_grad_batches: 1
+    max_epochs: ${oc.env:FFHQ_STAGE1_ADV_MAX_EPOCHS,25}
+    max_steps: ${oc.env:FFHQ_STAGE1_ADV_MAX_STEPS,-1}
     limit_train_batches: 1.0
-    limit_val_batches: 256
+    limit_val_batches: 1.0
     limit_test_batches: 0
-    val_check_interval: 0.25
+    val_check_interval: 1.0
     run_test_after_fit: false
     compute_rfid_after_fit: true
     rfid_split: val
-    rfid_batch_size: 100
-    rfid_num_workers: 8
+    rfid_batch_size: ${oc.env:FFHQ_RFID_BATCH_SIZE,32}
+    rfid_num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}
     rfid_max_samples: 0
     rfid_device: auto
     rfid_feature: 2048
-    learning_rate: 1.0e-4
-    warmup_steps: 500
-    min_lr_ratio: 0.03
+    learning_rate: ${oc.env:FFHQ_STAGE1_ADV_LR,4.0e-5}
+    beta: 0.5
+    beta2: 0.9
+    warmup_steps: ${oc.env:FFHQ_STAGE1_ADV_WARMUP_STEPS,0}
+    min_lr_ratio: 1.0
     gradient_clip_val: 1.0
     log_every_n_steps: 20
 
   data:
-    batch_size: 3
-    num_workers: 4
+    batch_size: ${oc.env:FFHQ_STAGE1_BATCH_SIZE,32}
+    eval_batch_size: ${oc.env:FFHQ_STAGE1_EVAL_BATCH_SIZE,32}
+    num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}
+    pin_memory: true
+    prefetch_factor: 6
     image_size: 256
     train_crop_size: null
     augment: true
 
   model:
+    bottleneck_type: dictionary
+    dropout: 0.0
     num_embeddings: 4096
     embedding_dim: 128
     sparsity_level: 4
@@ -147,39 +167,43 @@ stage1_adv:
     patch_stride: 1
     patch_reconstruction: tile
     data_init_from_first_batch: true
-    recon_mse_weight: 0.25
-    recon_l1_weight: 1.0
-    recon_edge_weight: 0.5
-    perceptual_weight: 0.2
-    perceptual_start_step: 1000
-    perceptual_warmup_steps: 2000
-    adversarial_weight: 0.05
+    recon_mse_weight: 1.0
+    recon_l1_weight: 0.0
+    recon_edge_weight: 0.0
+    perceptual_weight: 1.0
+    perceptual_start_step: 0
+    perceptual_warmup_steps: 0
+    adversarial_weight: 0.75
     adversarial_start_step: 0
     adversarial_warmup_steps: 0
     disc_start_step: 0
-    disc_learning_rate: 5.0e-5
+    disc_learning_rate: null
+    discriminator_beta1: 0.5
+    discriminator_beta2: 0.9
     disc_channels: 64
     disc_num_layers: 3
     disc_norm: group
+    disc_spectral: false
     disc_loss: hinge
     use_adaptive_disc_weight: true
+    disc_factor: 1.0
     compute_fid: true
-    log_images_every_n_steps: 100
-    diag_log_interval: 100
+    log_images_every_n_steps: 250
+    diag_log_interval: 250
     enable_val_latent_visuals: true
     codebook_visual_max_vectors: 4096
 
 stage2:
-  output_dir: outputs/ffhq-full/stage2
-  token_cache_path: outputs/ffhq-full/stage2/token_cache/ffhq__train__img256__cb256_quantile_p99p5.pt
+  output_dir: outputs/ffhq-laser-paper/stage2
+  token_cache_path: outputs/ffhq-laser-paper/stage2/token_cache/ffhq__train__img256__laser_cb256_quantile_p99p5.pt
   ckpt_path: null
 
   token_cache:
     build: true
     force: false
     stage1_checkpoint: null
-    stage1_output_root: outputs/ffhq-full/stage1_adv
-    output: outputs/ffhq-full/stage2/token_cache/ffhq__train__img256__cb256_quantile_p99p5.pt
+    stage1_output_root: outputs/ffhq-laser-paper/stage1_adv
+    output: outputs/ffhq-laser-paper/stage2/token_cache/ffhq__train__img256__laser_cb256_quantile_p99p5.pt
     split: train
     cache_mode: quantized
     coeff_vocab_size: 256
@@ -187,16 +211,16 @@ stage2:
     coeff_quantization: quantile
     coeff_calibration_percentile: 99.5
     coeff_mu: 0.0
-    batch_size: 8
-    num_workers: 4
+    batch_size: ${oc.env:FFHQ_CACHE_BATCH_SIZE,256}
+    num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}
     max_items: 0
     device: auto
 
   data:
     dataset: ffhq
     data_dir: ${oc.env:FFHQ_DIR,${oc.env:DATA_DIR,../data}/ffhq}
-    batch_size: 4
-    num_workers: 4
+    batch_size: ${oc.env:FFHQ_STAGE2_BATCH_SIZE,256}
+    num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}
     image_size: 256
     mean: [0.5, 0.5, 0.5]
     std: [0.5, 0.5, 0.5]
@@ -216,11 +240,11 @@ stage2:
     n_layers: 18
     d_ff: 3072
     dropout: 0.1
-    learning_rate: 2.5e-4
+    learning_rate: ${oc.env:FFHQ_STAGE2_LR,1.0e-3}
     weight_decay: 0.01
-    warmup_steps: 1500
-    max_steps: 300000
-    min_lr_ratio: 0.03
+    warmup_steps: ${oc.env:FFHQ_STAGE2_WARMUP_STEPS,5000}
+    max_steps: ${oc.env:FFHQ_STAGE2_MAX_STEPS,150000}
+    min_lr_ratio: 0.08
     atom_loss_weight: 1.0
     coeff_loss_weight: 1.0
     coeff_depth_weighting: none
@@ -231,19 +255,21 @@ stage2:
     coeff_huber_delta: 0.25
 
   train_ar:
-    batch_size: 4
-    max_epochs: 300
+    batch_size: ${oc.env:FFHQ_STAGE2_BATCH_SIZE,256}
+    max_epochs: ${oc.env:FFHQ_STAGE2_MAX_EPOCHS,800}
     checkpoint_save_top_k: 1
     checkpoint_save_last: true
     checkpoint_keep_recent: 3
-    checkpoint_every_n_epochs: 1
+    checkpoint_every_n_epochs: 5
     accelerator: gpu
     num_nodes: 1
     devices: 1
     strategy: auto
     precision: bf16-mixed
+    deterministic: false
+    accumulate_grad_batches: 1
     gradient_clip_val: 1.0
-    log_every_n_steps: 10
+    log_every_n_steps: 20
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     limit_test_batches: 0
@@ -254,7 +280,7 @@ stage2:
     crop_h_sites: 0
     crop_w_sites: 0
     sample_every_n_steps: 0
-    sample_every_n_epochs: 2
+    sample_every_n_epochs: 20
     sample_num_images: 8
     sample_temperature: 0.7
     sample_top_k: 0
@@ -267,8 +293,8 @@ stage2:
 
   wandb:
     project: laser-ar
-    name: ffhq-full-stage2
-    group: ffhq-full
-    tags: [stage2, ffhq, laser, sparse_spatial_depth, unconditional, full]
+    name: ffhq-laser-paper-stage2
+    group: ffhq-laser-paper
+    tags: [stage2, ffhq, laser, sparse_spatial_depth, unconditional]
     append_timestamp: false
-    save_dir: outputs/ffhq-full/stage2/wandb
+    save_dir: outputs/ffhq-laser-paper/stage2/wandb

@@ -275,6 +275,7 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "discriminator_layers": int(_cfg_get(model_cfg, "discriminator_layers", 3)),
         "learning_rate": _cfg_get(train_cfg, "learning_rate"),
         "beta": _cfg_get(train_cfg, "beta"),
+        "beta2": _cfg_get(train_cfg, "beta2", 0.999),
         "compute_fid": _cfg_get(model_cfg, "compute_fid"),
         "fid_feature": _cfg_get(model_cfg, "fid_feature", 2048),
         "bottleneck_loss_weight": _cfg_get(model_cfg, "bottleneck_loss_weight", 0.5),

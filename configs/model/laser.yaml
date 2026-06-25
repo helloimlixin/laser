@@ -23,14 +23,20 @@ backbone_latent_channels: 128
 decoder_extra_residual_layers: 1
 use_mid_attention: true
 
-# Sparse dictionary bottleneck
+# Bottleneck. `dictionary` is the LASER sparse-code path; `rq` enables the
+# KakaoBrain-style residual quantizer implemented behind the same interface.
 bypass_bottleneck: false
+bottleneck_type: dictionary
 num_embeddings: 512
 embedding_dim: 64
 sparsity_level: 3
 commitment_cost: 0.25
 dict_learning_rate: 1e-4
 data_init_from_first_batch: true
+rq_code_depth: 4
+rq_shared_codebook: true
+rq_decay: 0.99
+rq_restart_unused_codes: true
 
 # Optional hard bound for stage-2 coefficient quantization.
 coef_max: null
