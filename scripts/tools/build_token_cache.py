@@ -33,6 +33,8 @@ IMAGE_TOKEN_CACHE_DATASETS = [
     "stl10",
 ]
 
+MAX_EXACT_QUANTILE_VALUES = 4_000_000
+
 
 def _resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
@@ -85,13 +87,28 @@ def _parse_optional_coeff_max(raw) -> float | None:
     return float(text)
 
 
+def _bounded_quantile_input(values: torch.Tensor, max_values: int = MAX_EXACT_QUANTILE_VALUES) -> torch.Tensor:
+    values = values.reshape(-1)
+    if values.numel() <= int(max_values):
+        return values
+    idx = torch.linspace(
+        0,
+        values.numel() - 1,
+        steps=int(max_values),
+        dtype=torch.long,
+        device=values.device,
+    )
+    return values[idx]
+
+
 def _auto_coeff_absmax(coeffs: torch.Tensor, percentile: float) -> float:
     coeffs = coeffs.detach().reshape(-1).to(torch.float32)
     finite = coeffs[torch.isfinite(coeffs)]
     if finite.numel() <= 0:
         return 1.0
+    finite = _bounded_quantile_input(finite.abs())
     pct = min(max(float(percentile), 0.0), 100.0) / 100.0
-    value = finite.abs().max() if pct >= 1.0 else torch.quantile(finite.abs(), pct)
+    value = finite.max() if pct >= 1.0 else torch.quantile(finite, pct)
     out = float(value.item())
     return out if math.isfinite(out) and out > 0.0 else 1.0
 
@@ -124,6 +141,7 @@ def _adaptive_coeff_bin_values(
     if finite.numel() <= 0:
         return torch.linspace(-coeff_max, coeff_max, steps=coeff_vocab_size, dtype=torch.float32)
     clipped = finite.clamp(-coeff_max, coeff_max)
+    clipped = _bounded_quantile_input(clipped)
     if coeff_vocab_size == 1:
         return clipped.median().reshape(1).cpu()
     qs = torch.linspace(0.0, 1.0, steps=coeff_vocab_size, dtype=torch.float32, device=clipped.device)

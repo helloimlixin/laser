@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import train
 
 
@@ -58,6 +60,14 @@ overrides:
     assert "ar.d_model=256" in cmd
     assert "ar.n_layers=4" in cmd
     assert "train_ar.sample_num_images=2" in cmd
+
+
+def _override_value(cmd, key):
+    prefix = f"{key}="
+    for arg in cmd:
+        if arg.startswith(prefix):
+            return arg.split("=", 1)[1]
+    raise AssertionError(f"missing override {key!r}")
 
 
 def test_stage1_imagenet_class_command_maps_to_nonpatch_d5_ddp():
@@ -142,3 +152,75 @@ def test_stage2_command_uses_train_py_stage2_selector():
     assert "token_cache_path=/tmp/tokens.pt" in cmd
     assert "ar.class_conditional=true" in cmd
     assert "train_ar.devices=2" in cmd
+
+
+def _assert_imagenet_pipeline_uses_rqvae_style_backbone(config_name, *, sparsity_level):
+    config = Path(__file__).resolve().parents[1] / "configs" / config_name
+
+    commands, _, _ = train._pipeline_commands(config)
+    command_by_label = {label: cmd for label, cmd in commands}
+    stage1_cmd = command_by_label["stage 1"]
+    stage1_adv_cmd = command_by_label["stage 1 adversarial"]
+
+    assert _override_value(stage1_cmd, "model.backbone") == "ddpm"
+    assert _override_value(stage1_cmd, "model.num_downsamples") == "5"
+    assert _override_value(stage1_cmd, "model.channel_multipliers") == "[1,1,2,2,4,4]"
+    assert _override_value(stage1_cmd, "model.backbone_latent_channels") == "256"
+    assert _override_value(stage1_cmd, "model.attn_resolutions") == "[8]"
+    assert _override_value(stage1_cmd, "model.decoder_extra_residual_layers") == "0"
+    assert _override_value(stage1_cmd, "model.use_mid_attention") == "true"
+    assert _override_value(stage1_cmd, "model.num_hiddens") == "128"
+    assert _override_value(stage1_cmd, "model.num_residual_blocks") == "2"
+    assert _override_value(stage1_cmd, "model.sparsity_level") == str(sparsity_level)
+    assert _override_value(stage1_cmd, "data.batch_size") == "64"
+    assert _override_value(stage1_cmd, "train.accumulate_grad_batches") == "2"
+    assert _override_value(stage1_cmd, "train.learning_rate") == "4e-05"
+    assert _override_value(stage1_cmd, "train.beta") == "0.5"
+    assert _override_value(stage1_cmd, "train.beta2") == "0.9"
+    assert _override_value(stage1_cmd, "train.warmup_steps") == "5005"
+    assert _override_value(stage1_cmd, "train.min_lr_ratio") == "1.0"
+    assert _override_value(stage1_cmd, "model.dict_learning_rate") == "4e-05"
+    assert _override_value(stage1_cmd, "model.perceptual_weight") == "1.0"
+    assert _override_value(stage1_cmd, "model.perceptual_start_step") == "0"
+    assert _override_value(stage1_cmd, "model.perceptual_warmup_steps") == "0"
+    assert _override_value(stage1_cmd, "model.adversarial_weight") == "0.0"
+    assert _override_value(stage1_adv_cmd, "train.accumulate_grad_batches") == "2"
+    assert _override_value(stage1_adv_cmd, "model.adversarial_weight") == "0.75"
+    assert _override_value(stage1_adv_cmd, "model.disc_learning_rate") == "4e-05"
+    assert _override_value(stage1_adv_cmd, "model.discriminator_beta1") == "0.5"
+    assert _override_value(stage1_adv_cmd, "model.discriminator_beta2") == "0.9"
+    assert "model.backbone=simple" not in stage1_cmd
+    assert "model.backbone=simple" not in stage1_adv_cmd
+
+    checkpoint_shape_keys = (
+        "model.backbone",
+        "model.num_downsamples",
+        "model.channel_multipliers",
+        "model.backbone_latent_channels",
+        "model.attn_resolutions",
+        "model.decoder_extra_residual_layers",
+        "model.use_mid_attention",
+        "model.dropout",
+        "model.num_hiddens",
+        "model.num_residual_blocks",
+        "model.num_residual_hiddens",
+        "model.num_embeddings",
+        "model.embedding_dim",
+        "model.sparsity_level",
+        "model.patch_based",
+        "model.patch_size",
+        "model.patch_stride",
+    )
+    for key in checkpoint_shape_keys:
+        assert _override_value(stage1_adv_cmd, key) == _override_value(stage1_cmd, key)
+
+
+def test_imagenet_pipeline_adv_continuation_keeps_checkpoint_architecture():
+    _assert_imagenet_pipeline_uses_rqvae_style_backbone("imagenet.yaml", sparsity_level=3)
+
+
+def test_imagenet_scratch_pipeline_uses_rqvae_style_backbone():
+    _assert_imagenet_pipeline_uses_rqvae_style_backbone(
+        "imagenet_nonpatch_d5_k4_scratch.yaml",
+        sparsity_level=4,
+    )

@@ -63,8 +63,6 @@ def _compute_generation_fid(
         return {}
 
     dataset = str(_cfg_or_meta(cfg.data, cache_meta, "dataset", "") or "").strip().lower()
-    if dataset not in {"celeba", "celebahq"}:
-        return {}
     data_dir = _cfg_or_meta(cfg.data, cache_meta, "data_dir", None)
     if _is_null_config_value(data_dir):
         return {}
@@ -73,6 +71,14 @@ def _compute_generation_fid(
 
     from src.data.celeba import CelebADataModule
     from src.data.config import DataConfig
+    from src.data.image_folder import ImageFolderDataModule, PAPER_IMAGE_FOLDER_DATASETS
+
+    if dataset in {"celeba", "celebahq"}:
+        dm_cls = CelebADataModule
+    elif dataset in PAPER_IMAGE_FOLDER_DATASETS:
+        dm_cls = ImageFolderDataModule
+    else:
+        return {}
 
     count = min(int(max_items), int(generated.size(0)))
     if count <= 0:
@@ -83,7 +89,7 @@ def _compute_generation_fid(
     mean = _float_tuple(getattr(cfg.data, "mean", None), fallback=cache_meta.get("mean"), channels=3)
     std = _float_tuple(getattr(cfg.data, "std", None), fallback=cache_meta.get("std"), channels=3)
     batch_size = min(max(1, int(count)), max(1, int(getattr(cfg.train_ar, "batch_size", count) or count)))
-    dm = CelebADataModule(
+    dm = dm_cls(
         DataConfig(
             dataset=dataset,
             data_dir=str(data_dir),

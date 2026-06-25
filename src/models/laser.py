@@ -106,6 +106,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             learning_rate,
             beta,
             beta2=0.999,
+            optimizer_beta2=None,
             backbone="ddpm",
             resolution=None,
             num_downsamples=4,
@@ -211,7 +212,9 @@ class LASER(VisualsMixin, pl.LightningModule):
             commitment_cost: Commitment cost for bottleneck
             learning_rate: Learning rate for encoder/decoder
             beta: Adam beta1 parameter
-            beta2: Adam beta2 parameter
+            beta2: Adam beta2 parameter for the main optimizer
+            optimizer_beta2: Optional alias for beta2, used to distinguish the
+                main optimizer beta from discriminator_beta2.
             bottleneck_loss_weight: Weight for encoder-facing bottleneck loss term in total loss
             dictionary_loss_weight: Optional separate weight for dictionary/codebook fitting loss.
                 Defaults to bottleneck_loss_weight to preserve historical objective scaling.
@@ -313,7 +316,12 @@ class LASER(VisualsMixin, pl.LightningModule):
         # Store parameters
         self.learning_rate = learning_rate
         self.beta = float(beta)
+        if optimizer_beta2 is None:
+            optimizer_beta2 = beta2
+        else:
+            beta2 = optimizer_beta2
         self.beta2 = float(beta2)
+        self.optimizer_beta2 = float(optimizer_beta2)
         self.perceptual_weight = perceptual_weight
         self.perceptual_start_step = max(int(perceptual_start_step), 0)
         self.perceptual_warmup_steps = max(int(perceptual_warmup_steps), 0)
@@ -901,9 +909,12 @@ class LASER(VisualsMixin, pl.LightningModule):
         warmup = min(self.warmup_steps, max(0, total_steps - 1))
         step = max(0, int(step))
         if warmup > 0 and step < warmup:
+            ramp = step / float(max(1, warmup))
             if self.min_lr_ratio >= 1.0:
-                return max(0.01, step / float(max(1, warmup)))
-            return max(self.min_lr_ratio, step / float(max(1, warmup)))
+                return max(0.01, ramp)
+            return max(self.min_lr_ratio, ramp)
+        if self.min_lr_ratio >= 1.0:
+            return 1.0
         progress = (step - warmup) / float(max(1, total_steps - warmup))
         progress = min(max(progress, 0.0), 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -1851,10 +1862,17 @@ class LASER(VisualsMixin, pl.LightningModule):
         """Manual-optimization step with one DDP-safe backward for both optimizers."""
         step = int(self._manual_train_step.item())
         opt_ae, opt_disc = self.optimizers()
+        trainer = self._trainer_ref()
+        accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
+        batch_idx_int = int(batch_idx)
+        num_batches = _coerce_positive_finite(getattr(trainer, "num_training_batches", None))
+        is_last_batch = num_batches is not None and batch_idx_int + 1 >= int(num_batches)
+        should_step = ((batch_idx_int + 1) % accum == 0) or is_last_batch
+        if batch_idx_int % accum == 0:
+            opt_ae.zero_grad(set_to_none=True)
+            opt_disc.zero_grad(set_to_none=True)
 
         self._apply_scheduled_lrs(opt_ae, step=step, base_lrs=self._lr_base_lrs)
-        opt_ae.zero_grad(set_to_none=True)
-        opt_disc.zero_grad(set_to_none=True)
 
         self._adv_cache = None
         self._set_discriminator_requires_grad(False)
@@ -1886,28 +1904,28 @@ class LASER(VisualsMixin, pl.LightningModule):
         else:
             weighted_d_loss = self._zero_discriminator_loss_like(loss)
 
-        self.manual_backward(loss + weighted_d_loss)
+        self.manual_backward((loss + weighted_d_loss) / float(accum))
 
-        # Mirror on_before_optimizer_step (skipped in manual mode): project the
-        # dictionary gradient before stepping only the autoencoder optimizer.
-        if not self.bypass_bottleneck:
-            self.bottleneck.project_dictionary_gradient_()
-        self._clip_manual_optimizer(self._raw_optimizer(opt_ae))
-        opt_ae.step()
-        # Mirror the automatic optimizer_step post-update dictionary maintenance.
-        if not self.bypass_bottleneck:
-            self.bottleneck.normalize_dictionary_()
+        if should_step:
+            # Mirror on_before_optimizer_step (skipped in manual mode): project the
+            # dictionary gradient before stepping only the autoencoder optimizer.
+            if not self.bypass_bottleneck:
+                self.bottleneck.project_dictionary_gradient_()
+            self._clip_manual_optimizer(self._raw_optimizer(opt_ae))
+            opt_ae.step()
+            # Mirror the automatic optimizer_step post-update dictionary maintenance.
+            if not self.bypass_bottleneck:
+                self.bottleneck.normalize_dictionary_()
 
-        if disc_should_step:
-            self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
-            opt_disc.step()
-            d_log = dict(on_step=True, on_epoch=False, sync_dist=True, batch_size=int(x.size(0)))
-            self.log('train/disc_loss', weighted_d_loss, prog_bar=True, **d_log)
-            self.log('train/logits_real', self._logits_mean(logits_real), **d_log)
-            self.log('train/logits_fake', self._logits_mean(logits_fake), **d_log)
+            if disc_should_step:
+                self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
+                opt_disc.step()
+                d_log = dict(on_step=True, on_epoch=False, sync_dist=True, batch_size=int(x.size(0)))
+                self.log('train/disc_loss', weighted_d_loss, prog_bar=True, **d_log)
+                self.log('train/logits_real', self._logits_mean(logits_real), **d_log)
+                self.log('train/logits_fake', self._logits_mean(logits_fake), **d_log)
+            self._manual_train_step += 1
         self._adv_cache = None
-
-        self._manual_train_step += 1
 
         if self._should_log_images(batch_idx, prefix='train'):
             self.log_images(
@@ -1984,7 +2002,7 @@ class LASER(VisualsMixin, pl.LightningModule):
 
         optimizer = torch.optim.Adam(
             param_groups,
-            betas=(self.beta, self.beta2),
+            betas=(self.beta, self.optimizer_beta2),
         )
         trainer = self._trainer_ref()
         total_steps, source = self._resolve_lr_total_steps(trainer)

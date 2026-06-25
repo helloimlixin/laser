@@ -322,6 +322,29 @@ def test_dictionary_is_always_in_optimizer_with_optional_lr_override():
     assert dict_group["lr"] == 5e-4
 
 
+def test_laser_optimizer_uses_configured_main_adam_betas():
+    model = _build_model(beta=0.5, optimizer_beta2=0.9)
+
+    optimizer = model.configure_optimizers()
+
+    assert optimizer.param_groups[0]["betas"] == (0.5, 0.9)
+
+
+def test_laser_adversarial_optimizer_uses_configured_discriminator_betas():
+    model = _build_model(
+        adversarial_weight=0.8,
+        disc_start_step=0,
+        discriminator_beta1=0.4,
+        discriminator_beta2=0.8,
+        discriminator_channels=8,
+        discriminator_layers=1,
+    )
+
+    _, disc_optimizer = model.configure_optimizers()
+
+    assert disc_optimizer.param_groups[0]["betas"] == (0.4, 0.8)
+
+
 def test_laser_manual_lr_schedule_applies_first_step_without_scheduler():
     model = _build_model(learning_rate=1e-3, warmup_steps=10, min_lr_ratio=0.01)
     model.__dict__["_trainer"] = type("TrainerStub", (), {"estimated_stepping_batches": 100})()

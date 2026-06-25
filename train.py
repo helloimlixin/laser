@@ -1378,6 +1378,8 @@ def _load_stage_entrypoints():
         print(f"Adversarial Start Recon MSE: {getattr(cfg.model, 'adversarial_start_recon_mse', None)}")
         print(f"Adversarial Quality EMA Decay: {float(getattr(cfg.model, 'adversarial_quality_ema_decay', 0.99))}")
         print(f"Beta: {cfg.train.beta}")
+        print(f"Beta2: {float(getattr(cfg.train, 'beta2', 0.999))}")
+        print(f"Accumulate Grad Batches: {int(getattr(cfg.train, 'accumulate_grad_batches', 1) or 1)}")
         print(f"Max Epochs: {cfg.train.max_epochs}")
         print(f"Max Steps: {getattr(cfg.train, 'max_steps', -1)}")
         print(f"Accelerator: {cfg.train.accelerator}")
@@ -1614,6 +1616,7 @@ def _load_stage_entrypoints():
             precision=cfg.train.precision,
             accumulate_grad_batches=accumulate_grad_batches,
             gradient_clip_val=trainer_gradient_clip_val,
+            accumulate_grad_batches=int(getattr(cfg.train, "accumulate_grad_batches", 1) or 1),
             log_every_n_steps=cfg.train.log_every_n_steps,
             val_check_interval=val_check_interval,
             limit_train_batches=getattr(cfg.train, "limit_train_batches", 1.0),
