@@ -38,7 +38,7 @@ CASES="${CASES:-celebahq,ffhq,imagenet}"
 VARIANTS="${VARIANTS:-d4p2,d3p4,d2p8}"
 
 CELEBAHQ_DIR="${CELEBAHQ_DIR:-/scratch/$USER/Projects/data/celeba_hq}"
-FFHQ_DIR="${FFHQ_DIR:-/cache/home/$USER/datasets/ffhq/images1024x1024_webp}"
+FFHQ_DIR="${FFHQ_DIR:-/scratch/$USER/datasets/ffhq}"
 IMAGENET_DIR="${IMAGENET_DIR:-/scratch/$USER/Projects/data/imagenet}"
 
 # Step-bounded so each chained job can reach adversarial continuation, cache

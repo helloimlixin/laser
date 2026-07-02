@@ -16,7 +16,7 @@ TIME_LIMIT="${TIME_LIMIT:-3-00:00:00}"
 PROJECT="${PROJECT:-laser}"
 RUN_ROOT_BASE="${RUN_ROOT_BASE:-/scratch/$USER/runs/laser_face_short_token_uncond}"
 CELEBAHQ_DIR="${CELEBAHQ_DIR:-/scratch/$USER/Projects/data/celeba_hq}"
-FFHQ_DIR="${FFHQ_DIR:-/cache/home/$USER/datasets/ffhq/images1024x1024_webp}"
+FFHQ_DIR="${FFHQ_DIR:-/scratch/$USER/datasets/ffhq}"
 CASES="${CASES:-celebahq,ffhq}"
 DRY_RUN="${DRY_RUN:-0}"
 

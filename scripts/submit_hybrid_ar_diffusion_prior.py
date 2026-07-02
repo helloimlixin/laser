@@ -23,7 +23,7 @@ DEFAULT_STAGE1_CKPT = Path(
     "laser-train-ffhq-f16-p2s2-k2-a8192-z64-oc32x-cm8-coeffl1w003-s1-3-20260607_010730/"
     "ffhq/stage1/checkpoints/run_20260607_010807/laser/final.ckpt"
 )
-DEFAULT_FFHQ_DIR = Path("/cache/home/xl598/datasets/ffhq/images1024x1024_webp")
+DEFAULT_FFHQ_DIR = Path(f"/scratch/{os.environ.get('USER', 'xl598')}/datasets/ffhq")
 
 
 def q(value: str | Path) -> str:

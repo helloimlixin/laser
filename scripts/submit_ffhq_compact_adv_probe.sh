@@ -9,7 +9,7 @@ USER_NAME="${USER:-xl598}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/scratch/$USER_NAME/submission_snapshots/laser_laser_train_ffhq-dense-nonpatch-k2-z64-a8192-seq512-reconsharp-s1-8-adv3-s2-6_20260608_180810}"
 SOURCE_RUN_ROOT="${SOURCE_RUN_ROOT:-/scratch/$USER_NAME/Projects/laser/runs/vision_lsr_patch_pipeline_ffhq_20260608/laser-train-ffhq-dense-nonpatch-k2-z64-a8192-seq512-reconsharp-s1-8-adv3-s2-6-20260608_180810/ffhq}"
 INIT_CKPT="${INIT_CKPT:-$SOURCE_RUN_ROOT/stage1_adv/checkpoints/run_20260608_222740/laser/final.ckpt}"
-FFHQ_DIR="${FFHQ_DIR:-/cache/home/$USER_NAME/datasets/ffhq/images1024x1024_webp}"
+FFHQ_DIR="${FFHQ_DIR:-/scratch/$USER_NAME/datasets/ffhq}"
 
 PARTITION="${PARTITION:-gpu-redhat}"
 TIME_LIMIT="${TIME_LIMIT:-08:00:00}"

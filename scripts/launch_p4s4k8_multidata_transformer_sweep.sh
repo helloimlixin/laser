@@ -23,7 +23,7 @@ DRY_RUN="${DRY_RUN:-0}"
 CASES="${CASES:-celebahq,ffhq,imagenet,vctk}"
 
 IMAGENET_DIR="${IMAGENET_DIR:-/scratch/$USER/Projects/data/imagenet}"
-FFHQ_DIR="${FFHQ_DIR:-/cache/home/$USER/datasets/ffhq/images1024x1024_webp}"
+FFHQ_DIR="${FFHQ_DIR:-/scratch/$USER/datasets/ffhq}"
 CELEBAHQ_DIR="${CELEBAHQ_DIR:-/scratch/$USER/Projects/data/celeba_hq}"
 VCTK_DIR="${VCTK_DIR:-/scratch/$USER/Projects/data/VCTK-Corpus}"
 
