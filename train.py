@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import shlex
@@ -47,6 +48,8 @@ POST_FIT_RFID_DATASETS = {
     "lsun_cat",
 }
 AUDIO_DATASETS = {"vctk", "maestro"}
+_DISPATCH_STAGE_ENV = "LASER_TRAIN_DISPATCH_STAGE"
+_DISPATCH_ARGV_ENV = "LASER_TRAIN_DISPATCH_ARGV"
 
 
 def _dataset_key(name: object) -> str:
@@ -1719,7 +1722,7 @@ def _load_stage_entrypoints():
     import lightning as pl
     import torch
     import wandb
-    from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint, RichProgressBar
+    from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
     from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.plugins.environments import LightningEnvironment
@@ -2277,6 +2280,17 @@ def _load_stage_entrypoints():
                     every_n_epochs=checkpoint_upload_every_n_epochs,
                 )
             )
+        early_stopping_patience = int(getattr(cfg.train_ar, "early_stopping_patience", 0) or 0)
+        if early_stopping_patience > 0:
+            cbs.append(
+                EarlyStopping(
+                    monitor="val/loss",
+                    mode="min",
+                    patience=early_stopping_patience,
+                    min_delta=float(getattr(cfg.train_ar, "early_stopping_min_delta", 0.0) or 0.0),
+                    verbose=True,
+                )
+            )
         cbs.extend([
             LearningRateMonitor(logging_interval="step"),
             bar,
@@ -2412,6 +2426,8 @@ def _load_stage_entrypoints():
 
 
 def _dispatch_stage(stage: str, stage_argv: list[str]) -> int:
+    os.environ[_DISPATCH_STAGE_ENV] = stage
+    os.environ[_DISPATCH_ARGV_ENV] = json.dumps(stage_argv)
     sys.argv = [sys.argv[0], *stage_argv]
     train_stage1_entry, train_stage2_entry = _load_stage_entrypoints()
     if stage == "1":
@@ -2419,6 +2435,24 @@ def _dispatch_stage(stage: str, stage_argv: list[str]) -> int:
     else:
         train_stage2_entry()
     return 0
+
+
+def _dispatch_from_env(expanded: list[str]) -> tuple[str, list[str]] | None:
+    stage = _stage_token(os.environ.get(_DISPATCH_STAGE_ENV, ""))
+    if not stage:
+        return None
+    if expanded:
+        return stage, expanded
+    raw_argv = os.environ.get(_DISPATCH_ARGV_ENV, "")
+    if not raw_argv:
+        return None
+    try:
+        stage_argv = json.loads(raw_argv)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(stage_argv, list) or not all(isinstance(arg, str) for arg in stage_argv):
+        return None
+    return stage, stage_argv
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2458,6 +2492,9 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch_stage(stage, direct_argv[1:])
 
     stage = _stage_token(expanded[0]) if expanded else None
+    if not stage and (env_dispatch := _dispatch_from_env(expanded)):
+        env_stage, env_argv = env_dispatch
+        return _dispatch_stage(env_stage, env_argv)
     if stage == "pipeline":
         raise SystemExit("Pipeline runs are supported through YAML configs: python train.py --config configs/exp1.yaml")
     if stage and not _looks_like_facade_args(raw_argv[1:]):
