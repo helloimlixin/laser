@@ -86,6 +86,9 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
             ),
             "prior_coeff_vocab_size": int(cfg.coeff_vocab_size or 0),
             "prior_coeff_max": float(cfg.coeff_max),
+            "prior_coeff_head_hidden_mult": float(getattr(cfg, "coeff_head_hidden_mult", 1.0)),
+            "prior_coeff_head_depth": int(getattr(cfg, "coeff_head_depth", 1)),
+            "prior_coeff_head_dropout": float(getattr(cfg, "coeff_head_dropout", 0.0)),
             "prior_real_valued_coeffs": bool(cfg.real_valued_coeffs),
             "prior_gaussian_coeffs": bool(cfg.gaussian_coeffs),
             "prior_autoregressive_coeffs": bool(cfg.autoregressive_coeffs),
@@ -98,6 +101,7 @@ def _prior_checkpoint_hparams(prior: nn.Module) -> dict:
             "prior_text_vocab_size": int(getattr(cfg, "text_vocab_size", 0) or 0),
             "prior_text_max_length": int(getattr(cfg, "text_max_length", 0) or 0),
             "prior_text_pad_id": int(getattr(cfg, "text_pad_id", 0) or 0),
+            "prior_text_conditioning_mode": str(getattr(cfg, "text_conditioning_mode", "additive") or "additive"),
             "prior_text_prefix_length": int(getattr(cfg, "text_prefix_length", 0) or 0),
         }
     if isinstance(prior, GPTPrior) and isinstance(cfg, GPTPriorConfig):
@@ -268,7 +272,11 @@ def build_sparse_prior_from_cache(
     n_layers: int,
     d_ff: int,
     dropout: float,
+    n_depth_layers: Optional[int] = None,
     n_global_spatial_tokens: int = 0,
+    coeff_head_hidden_mult: float = 1.0,
+    coeff_head_depth: int = 1,
+    coeff_head_dropout: float = 0.0,
     autoregressive_coeffs: bool = True,
     class_conditional: bool = False,
     num_classes: int = 0,
@@ -276,6 +284,7 @@ def build_sparse_prior_from_cache(
     text_vocab_size: int = 0,
     text_max_length: int = 0,
     text_pad_id: int = 0,
+    text_conditioning_mode: str = "additive",
     text_prefix_length: int = 16,
 ) -> nn.Module:
     """Build a maintained sparse-token prior from a cached token grid."""
@@ -314,11 +323,18 @@ def build_sparse_prior_from_cache(
                 d_model=int(d_model),
                 n_heads=int(n_heads),
                 n_spatial_layers=int(n_layers),
-                n_depth_layers=max(1, int(n_layers) // 2),
+                n_depth_layers=(
+                    max(1, int(n_layers) // 2)
+                    if n_depth_layers is None
+                    else max(0, int(n_depth_layers))
+                ),
                 n_global_spatial_tokens=int(n_global_spatial_tokens),
                 d_ff=int(d_ff),
                 dropout=float(dropout),
                 coeff_max=coeff_max,
+                coeff_head_hidden_mult=float(coeff_head_hidden_mult),
+                coeff_head_depth=int(coeff_head_depth),
+                coeff_head_dropout=float(coeff_head_dropout),
                 gaussian_coeffs=bool(meta.get("variational_coeffs", False)),
                 coeff_prior_std=float(meta.get("variational_coeff_target_std", 0.25)),
                 coeff_min_std=float(meta.get("variational_coeff_min_std", 0.01)),
@@ -330,6 +346,7 @@ def build_sparse_prior_from_cache(
                 text_vocab_size=int(text_vocab_size),
                 text_max_length=int(text_max_length),
                 text_pad_id=int(text_pad_id),
+                text_conditioning_mode=str(text_conditioning_mode),
                 text_prefix_length=int(text_prefix_length),
             )
         )
@@ -357,11 +374,18 @@ def build_sparse_prior_from_cache(
                 d_model=int(d_model),
                 n_heads=int(n_heads),
                 n_spatial_layers=int(n_layers),
-                n_depth_layers=max(1, int(n_layers) // 2),
+                n_depth_layers=(
+                    max(1, int(n_layers) // 2)
+                    if n_depth_layers is None
+                    else max(0, int(n_depth_layers))
+                ),
                 n_global_spatial_tokens=int(n_global_spatial_tokens),
                 d_ff=int(d_ff),
                 dropout=float(dropout),
                 coeff_max=coeff_max,
+                coeff_head_hidden_mult=float(coeff_head_hidden_mult),
+                coeff_head_depth=int(coeff_head_depth),
+                coeff_head_dropout=float(coeff_head_dropout),
                 autoregressive_coeffs=bool(autoregressive_coeffs),
                 support_order=support_order,
                 class_conditional=bool(class_conditional),
@@ -370,6 +394,7 @@ def build_sparse_prior_from_cache(
                 text_vocab_size=int(text_vocab_size),
                 text_max_length=int(text_max_length),
                 text_pad_id=int(text_pad_id),
+                text_conditioning_mode=str(text_conditioning_mode),
                 text_prefix_length=int(text_prefix_length),
             )
         )
@@ -440,6 +465,10 @@ def build_sparse_prior_from_hparams(
     text_vocab_size = int(hparams.get("prior_text_vocab_size", meta.get("text_vocab_size", 0)) or 0)
     text_max_length = int(hparams.get("prior_text_max_length", meta.get("text_max_length", 0)) or 0)
     text_pad_id = int(hparams.get("prior_text_pad_id", meta.get("text_pad_id", 0)) or 0)
+    text_conditioning_mode = str(
+        hparams.get("prior_text_conditioning_mode", meta.get("text_conditioning_mode", "additive"))
+        or "additive"
+    )
     text_prefix_length = int(hparams.get("prior_text_prefix_length", meta.get("text_prefix_length", 0)) or 0)
     if real_valued_coeffs:
         atom_vocab_size = infer_sparse_atom_vocab_size(cache, atom_vocab_size=atom_vocab_size)
@@ -474,6 +503,9 @@ def build_sparse_prior_from_hparams(
                 d_ff=int(hparams["prior_d_ff"]),
                 dropout=float(hparams["prior_dropout"]),
                 coeff_max=coeff_max,
+                coeff_head_hidden_mult=float(hparams.get("prior_coeff_head_hidden_mult", 1.0)),
+                coeff_head_depth=int(hparams.get("prior_coeff_head_depth", 1)),
+                coeff_head_dropout=float(hparams.get("prior_coeff_head_dropout", 0.0)),
                 gaussian_coeffs=bool(gaussian_coeffs),
                 coeff_prior_std=float(hparams.get("prior_coeff_prior_std", 0.25)),
                 coeff_min_std=float(hparams.get("prior_coeff_min_std", 0.01)),
@@ -485,6 +517,7 @@ def build_sparse_prior_from_hparams(
                 text_vocab_size=text_vocab_size,
                 text_max_length=text_max_length,
                 text_pad_id=text_pad_id,
+                text_conditioning_mode=text_conditioning_mode,
                 text_prefix_length=text_prefix_length,
             )
         )
@@ -521,6 +554,8 @@ class SparseTokenPriorModule(pl.LightningModule):
         prior: nn.Module,
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
+        optimizer_beta1: float = 0.9,
+        optimizer_beta2: float = 0.999,
         warmup_steps: int = 1000,
         min_lr_ratio: float = 0.01,
         atom_loss_weight: float = 1.0,
@@ -533,11 +568,17 @@ class SparseTokenPriorModule(pl.LightningModule):
         sample_coeff_mode: str = "gaussian",
         atom_label_smoothing: float = 0.0,
         atom_coverage_weight: float = 0.0,
+        text_loss_weight: float = 0.0,
+        image_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.prior = prior
         self.learning_rate = float(learning_rate)
         self.weight_decay = float(max(0.0, weight_decay))
+        self.optimizer_beta1 = float(optimizer_beta1)
+        self.optimizer_beta2 = float(optimizer_beta2)
+        if not 0.0 <= self.optimizer_beta1 < 1.0 or not 0.0 <= self.optimizer_beta2 < 1.0:
+            raise ValueError("optimizer betas must be in [0, 1).")
         self.warmup_steps = max(0, int(warmup_steps))
         self.min_lr_ratio = float(max(0.0, min(float(min_lr_ratio), 1.0)))
         self.atom_loss_weight = float(atom_loss_weight)
@@ -548,6 +589,8 @@ class SparseTokenPriorModule(pl.LightningModule):
         # broad atom support instead of collapsing to tens of atoms.
         self.atom_label_smoothing = float(min(max(atom_label_smoothing, 0.0), 1.0))
         self.atom_coverage_weight = float(max(0.0, atom_coverage_weight))
+        self.text_loss_weight = float(max(0.0, text_loss_weight))
+        self.image_loss_weight = float(max(0.0, image_loss_weight))
         self.coeff_loss_weight = float(coeff_loss_weight)
         self.coeff_depth_weighting = str(coeff_depth_weighting).strip().lower()
         self.coeff_focal_gamma = float(max(0.0, coeff_focal_gamma))
@@ -697,13 +740,13 @@ class SparseTokenPriorModule(pl.LightningModule):
         coeff_grid = coeff_flat.view(bsz, int(cfg.H) * int(cfg.W), int(cfg.D))
 
         loss_type = str(self.coeff_loss_type or "mse")
-        forward_out = self.prior(
-            tok_grid,
-            coeff_grid,
-            class_labels=class_labels,
-            text_tokens=text_tokens,
-            text_mask=text_mask,
-        )
+        prior_kwargs = {}
+        if class_labels is not None:
+            prior_kwargs["class_labels"] = class_labels
+        if text_tokens is not None:
+            prior_kwargs["text_tokens"] = text_tokens
+            prior_kwargs["text_mask"] = text_mask
+        forward_out = self.prior(tok_grid, coeff_grid, **prior_kwargs)
         if bool(getattr(self.prior, "gaussian_coeffs", False)):
             atom_logits, coeff_pred, coeff_logvar_pred = forward_out
         else:
@@ -773,7 +816,12 @@ class SparseTokenPriorModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer_cls = torch.optim.AdamW if self.weight_decay > 0 else torch.optim.Adam
-        optimizer = optimizer_cls(self.prior.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        optimizer = optimizer_cls(
+            self.prior.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+            betas=(self.optimizer_beta1, self.optimizer_beta2),
+        )
         trainer = getattr(self, "_trainer", None)
         total_steps = None
         if trainer is not None:
@@ -794,7 +842,9 @@ class SparseTokenPriorModule(pl.LightningModule):
                         and max_epochs_raw > 0
                         and num_batches_raw > 0
                     ):
-                        total_steps = int(max_epochs_raw) * int(num_batches_raw)
+                        accumulate = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
+                        steps_per_epoch = int(math.ceil(num_batches_raw / accumulate))
+                        total_steps = int(max_epochs_raw) * steps_per_epoch
                 except (TypeError, ValueError):
                     total_steps = None
             if total_steps is None:
@@ -838,12 +888,25 @@ class SparseTokenPriorModule(pl.LightningModule):
         cfg = self.prior.cfg
         tok_grid = tok_flat.view(bsz, int(cfg.H) * int(cfg.W), int(cfg.D))
 
-        logits = self.prior(
-            tok_grid,
-            class_labels=class_labels,
-            text_tokens=text_tokens,
-            text_mask=text_mask,
+        want_text_logits = (
+            self.text_loss_weight > 0.0
+            and bool(getattr(self.prior, "text_conditional", False))
+            and str(getattr(self.prior, "text_conditioning_mode", "")).lower() == "rq_prefix"
         )
+        prior_kwargs = {}
+        if class_labels is not None:
+            prior_kwargs["class_labels"] = class_labels
+        if text_tokens is not None:
+            prior_kwargs["text_tokens"] = text_tokens
+            prior_kwargs["text_mask"] = text_mask
+        if want_text_logits:
+            prior_kwargs["return_text_logits"] = True
+        forward_out = self.prior(tok_grid, **prior_kwargs)
+        if want_text_logits:
+            logits, text_logits = forward_out
+        else:
+            logits = forward_out
+            text_logits = None
         per_token_ce = F.cross_entropy(
             logits.reshape(-1, int(cfg.vocab_size)),
             tok_grid.reshape(-1),
@@ -856,6 +919,15 @@ class SparseTokenPriorModule(pl.LightningModule):
             coeff_depth_weighting=self.coeff_depth_weighting,
             coeff_focal_gamma=self.coeff_focal_gamma,
         )
+        image_loss = loss
+        text_ce_loss = None
+        if text_logits is not None and text_tokens is not None and int(text_logits.size(1)) > 0:
+            text_targets = text_tokens[:, 1 : 1 + int(text_logits.size(1))].contiguous()
+            text_ce_loss = F.cross_entropy(
+                text_logits.reshape(-1, int(text_logits.size(-1))),
+                text_targets.reshape(-1),
+            )
+            loss = self.image_loss_weight * image_loss + self.text_loss_weight * text_ce_loss
 
         preds = logits.argmax(dim=-1)
         accuracy = (preds == tok_grid).float().mean()
@@ -875,6 +947,9 @@ class SparseTokenPriorModule(pl.LightningModule):
         log_kwargs = self._step_log_kwargs(prefix, bsz)
         self.log(f"{prefix}/loss", loss, **log_kwargs)
         self.log(f"{prefix}/ce_loss", ce_loss, **log_kwargs)
+        if text_ce_loss is not None:
+            self.log(f"{prefix}/image_loss", image_loss, **log_kwargs)
+            self.log(f"{prefix}/text_ce_loss", text_ce_loss, **log_kwargs)
         self.log(f"{prefix}/accuracy", accuracy, **log_kwargs)
         if atom_accuracy is not None:
             self.log(f"{prefix}/atom_accuracy", atom_accuracy, **log_kwargs)

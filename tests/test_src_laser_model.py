@@ -71,6 +71,15 @@ def test_lpips_range_uses_datamodule_normalization_stats():
     assert torch.allclose(lpips_input, unit * 2.0 - 1.0)
 
 
+def test_lpips_range_does_not_clamp_decoder_overshoot():
+    model = _build_model()
+    normalized = torch.tensor([[[[-1.5, 1.5]], [[-2.0, 2.0]], [[-1.25, 1.25]]]])
+
+    lpips_input = model._image_to_lpips_range(normalized)
+
+    assert torch.equal(lpips_input, normalized)
+
+
 def test_laser_adversarial_training_adds_discriminator_optimizer():
     model = _build_model(
         adversarial_weight=0.05,
@@ -221,9 +230,9 @@ def test_log_images_is_idempotent_per_prefix_and_step(recording_wandb_trainer):
 
     # The same (prefix, step) logs its media exactly once: the repeated "train"
     # call is deduplicated by _claim_media_log, so each grid key appears once.
-    image_keys = [key for payload, _ in calls for key in payload if key.endswith("/images")]
-    assert image_keys.count("train/images") == 1
-    assert image_keys.count("val/images") == 1
+    image_keys = [key for payload, _ in calls for key in payload if key.endswith("/reconstruction_grid")]
+    assert image_keys.count("train/reconstruction_grid") == 1
+    assert image_keys.count("val/reconstruction_grid") == 1
     assert all(payload["trainer/global_step"] == 11 for payload, _ in calls)
 
 

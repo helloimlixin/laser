@@ -284,12 +284,16 @@ def _conditioning_captions(
     prompts: Optional[list[str]] = None,
     *,
     n: int,
+    media_kind: str = "sample",
 ) -> list[str]:
     prompts = list(prompts or [])
     label_list = [] if labels is None else [int(label) for label in labels.detach().cpu().reshape(-1).tolist()]
+    media_kind = str(media_kind or "sample").strip().lower()
+    if media_kind not in {"audio", "image", "sample"}:
+        media_kind = "sample"
     captions: list[str] = []
     for idx in range(max(0, int(n))):
-        parts = [f"generated audio {idx}"]
+        parts = [f"generated {media_kind} {idx}"]
         if idx < len(label_list):
             parts.append(f"conditioned on {_class_label_caption(cache, label_list[idx])}")
         if idx < len(prompts) and str(prompts[idx]).strip():
@@ -421,21 +425,61 @@ def _write_class_label_manifest(path: Path, labels: Optional[torch.Tensor], cach
 def _write_text_prompt_manifest(path: Path, *, stem: str, prompts: list[str]) -> None:
     if not prompts:
         return
-    root = path if path.is_dir() else path.parent
-    root.mkdir(parents=True, exist_ok=True)
-    entries = []
-    for idx, prompt in enumerate(prompts):
-        expected = root / f"{stem}_{idx:02d}.wav"
-        file_name = expected.name if expected.exists() else ""
-        entries.append({"index": int(idx), "file": file_name, "text": str(prompt)})
-    (root / "prompts.txt").write_text("\n".join(str(prompt) for prompt in prompts) + "\n", encoding="utf-8")
-    (root / "sample_texts.tsv").write_text(
+    path = Path(path)
+    if path.is_dir():
+        root = path
+        root.mkdir(parents=True, exist_ok=True)
+        entries = []
+        for idx, prompt in enumerate(prompts):
+            expected = root / f"{stem}_{idx:02d}.wav"
+            file_name = expected.name if expected.exists() else ""
+            entries.append({"index": int(idx), "file": file_name, "text": str(prompt)})
+        txt_path = root / "prompts.txt"
+        tsv_path = root / "sample_texts.tsv"
+        json_path = root / "conditioning.json"
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {
+                "index": int(idx),
+                "file": path.name,
+                "tile_index": int(idx),
+                "text": str(prompt),
+            }
+            for idx, prompt in enumerate(prompts)
+        ]
+        txt_path = path.with_suffix(".prompts.txt")
+        tsv_path = path.with_suffix(".sample_texts.tsv")
+        json_path = path.with_suffix(".conditioning.json")
+    txt_path.write_text("\n".join(str(prompt) for prompt in prompts) + "\n", encoding="utf-8")
+    tsv_path.write_text(
         "index\tfile\ttext\n"
         + "\n".join(f"{entry['index']}\t{entry['file']}\t{entry['text']}" for entry in entries)
         + "\n",
         encoding="utf-8",
     )
-    (root / "conditioning.json").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    json_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+def _compact_prompt_caption(prompts: Optional[list[str]], *, max_items: int = 8, max_chars: int = 240) -> str:
+    if not prompts:
+        return ""
+    compact: list[str] = []
+    seen: set[str] = set()
+    for prompt in prompts:
+        text = " ".join(str(prompt).split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        compact.append(text)
+        if len(compact) >= max_items:
+            break
+    if not compact:
+        return ""
+    joined = "; ".join(compact)
+    if len(joined) > max_chars:
+        joined = joined[: max(0, max_chars - 3)].rstrip() + "..."
+    return joined
 
 
 def _colorize_scalar_maps(
@@ -869,6 +913,9 @@ class Stage2SamplePreviewCallback(pl.Callback):
         if variant_name:
             bits.append(f"variant={variant_name}")
         cap = " ".join(bits)
+        prompt_caption = _compact_prompt_caption(text_prompts)
+        if prompt_caption:
+            cap = f"{cap} prompts: {prompt_caption}"
         log_images = direct.is_file() and direct.suffix.lower() in {".png", ".jpg", ".jpeg"}
         suffix = f"/{variant_name}" if variant_name else ""
         if log_images:
@@ -964,6 +1011,8 @@ class Stage2SamplePreviewCallback(pl.Callback):
                 else:
                     nrow = pick_nrow(int(batch.imgs.size(0)), None)
                     direct = save_grid(batch.imgs, self.out_dir, stem=variant_stem)
+                    if text_prompts:
+                        _write_text_prompt_manifest(direct, stem=variant_stem, prompts=text_prompts)
                     if class_labels is not None:
                         log_direct = _save_labeled_image_grid(
                             batch.imgs,
@@ -1003,6 +1052,7 @@ class Stage2SamplePreviewCallback(pl.Callback):
                         class_labels,
                         text_prompts,
                         n=min(int(batch.imgs.size(0)), self.n),
+                        media_kind="audio" if _is_waveform_samples(batch.imgs) else "image",
                     ),
                     variant_name=variant_name,
                 )
@@ -1041,6 +1091,124 @@ class Stage2SamplePreviewCallback(pl.Callback):
         self._barrier_if_needed(trainer)
         self._last_epoch = epoch
         self._last_step = step
+
+
+class Stage2GenerationFidCallback(pl.Callback):
+    """Compute monitorable generation FID during validation for checkpointing."""
+
+    def __init__(
+        self,
+        *,
+        cfg,
+        cache_pt: str,
+        every_n_epochs: int,
+        n: int,
+        temp: float,
+        top_k: int,
+        ctemp=None,
+        cmode: Optional[str] = None,
+        sample_variants=None,
+        s1_root: str = "outputs",
+        text_prompts: Optional[list[str]] = None,
+        class_labels: Optional[list[int]] = None,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.every_n_epochs = max(1, int(every_n_epochs or 1))
+        self.n = max(1, int(n))
+        self._last_epoch = -1
+        self._saver = Stage2SamplePreviewCallback(
+            cache_pt=cache_pt,
+            out_dir=str(Path(s1_root).expanduser().resolve() / "generation_fid_samples"),
+            n=self.n,
+            temp=temp,
+            top_k=top_k,
+            ctemp=ctemp,
+            cmode=cmode,
+            sample_variants=sample_variants,
+            s1_root=s1_root,
+            use_wandb=False,
+            text_prompts=text_prompts,
+            class_labels=class_labels,
+        )
+
+    def _record_metric(self, trainer: pl.Trainer, mod: pl.LightningModule, payload: dict) -> None:
+        score = payload.get("s2/generation_fid", payload.get("generation/fid"))
+        if score is None:
+            return
+        score_f = float(score)
+        score_t = torch.tensor(score_f, dtype=torch.float32, device=mod.device)
+        for store_name in ("callback_metrics", "logged_metrics"):
+            store = getattr(trainer, store_name, None)
+            if isinstance(store, dict):
+                store["s2/generation_fid"] = score_t
+                store["generation/fid"] = score_t
+        try:
+            mod.log("s2/generation_fid", score_t, logger=True, prog_bar=False, sync_dist=False)
+            mod.log("generation/fid", score_t, logger=True, prog_bar=False, sync_dist=False)
+        except Exception:
+            pass
+        log_wandb_payload(
+            getattr(trainer, "logger", None),
+            payload,
+            step=max(1, int(getattr(trainer, "global_step", 0) or 0)),
+        )
+        print(f"Generation FID for checkpoint monitor: {score_f:.4f}")
+
+    @torch.no_grad()
+    def _compute(self, trainer: pl.Trainer, mod: pl.LightningModule) -> None:
+        dev = mod.device
+        self._saver._ready(dev)
+        shape = _prior_token_shape(mod, self._saver._shape)
+        full_shape = tuple(int(v) for v in self._saver._shape)
+        was_training = bool(mod.training)
+        mod.eval()
+        try:
+            class_labels = self._saver._class_condition(dev, self.n, model=mod)
+            text_tokens, text_mask, _ = self._saver._text_condition(dev, self.n)
+            variant = self._saver.sample_variants[0]
+            batch = _sample_for_preview(
+                mod,
+                self._saver._s1,
+                prior_shape=shape,
+                full_shape=full_shape,
+                n=self.n,
+                temp=float(variant["temp"]),
+                top_k=int(variant["top_k"]),
+                ctemp=variant["ctemp"],
+                cmode=variant["cmode"],
+                class_labels=class_labels,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                dev=dev,
+            )
+        finally:
+            if was_training:
+                mod.train()
+
+        from src.stage2_metrics import build_stage2_metrics_payload
+
+        payload = build_stage2_metrics_payload(
+            batch.imgs.to(dev),
+            cfg=self.cfg,
+            cache=self._saver._cache,
+            max_items=self.n,
+            compute_fid=True,
+            compute_audio=False,
+        )
+        if payload:
+            self._record_metric(trainer, mod, payload)
+
+    def on_validation_end(self, trainer, mod):
+        if bool(getattr(trainer, "sanity_checking", False)):
+            return
+        epoch = int(getattr(trainer, "current_epoch", 0)) + 1
+        if epoch <= 0 or epoch == self._last_epoch or (epoch % self.every_n_epochs) != 0:
+            return
+        if bool(getattr(trainer, "is_global_zero", True)):
+            self._compute(trainer, mod)
+        Stage2SamplePreviewCallback._barrier_if_needed(trainer)
+        self._last_epoch = epoch
 
 @torch.no_grad()
 def save_final_generation_preview(
@@ -1120,6 +1288,8 @@ def save_final_generation_preview(
     else:
         nrow = pick_nrow(int(batch.imgs.size(0)), None)
         direct = save_grid(batch.imgs, saver.out_dir, stem=stem)
+        if normalized_prompts:
+            _write_text_prompt_manifest(Path(direct), stem=stem, prompts=normalized_prompts)
         if labels is not None:
             log_direct = _save_labeled_image_grid(
                 batch.imgs,
@@ -1149,6 +1319,7 @@ def save_final_generation_preview(
             labels,
             normalized_prompts,
             n=min(int(batch.imgs.size(0)), saver.n),
+            media_kind="audio" if _is_waveform_samples(batch.imgs) else "image",
         ),
     )
     if return_batch:

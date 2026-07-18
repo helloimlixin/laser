@@ -204,7 +204,7 @@ class VisualsMixin:
                 except OSError:
                     pass
 
-    def log_images(self, x, recon, prefix='val', max_images=8, audio_meta=None):
+    def log_images(self, x, recon, prefix='val', max_images=8, audio_meta=None, step=None):
         """Log reconstruction images to wandb."""
         # Only log from rank zero in DDP to avoid multi-process logger contention
         if not self._is_log_rank_zero():
@@ -212,9 +212,14 @@ class VisualsMixin:
         logger = getattr(self, "logger", None)
         if logger is None:
             return
-        step = self._wandb_step()
-        if not self._claim_media_log(prefix, step):
+        # Deduplicate against the model/trainer step, not W&B's mutable internal
+        # step. W&B advances its own counter after a media log, while gradient
+        # accumulation can call this method multiple times before the trainer's
+        # optimizer step changes.
+        requested_step = int(self.global_step if step is None else step)
+        if not self._claim_media_log(prefix, requested_step):
             return
+        step = self._wandb_step(requested_step=requested_step)
         
         # Take a small fixed subset to keep W&B logging cheap.
         x = x[:max_images]

@@ -6,6 +6,7 @@ from dataclasses import MISSING, fields, replace
 from typing import Any
 
 from src.data.celeba import CelebADataModule
+from src.data.cc3m import CC3MDataModule
 from src.data.cifar10 import CIFAR10DataModule
 from src.data.coco import COCODataModule
 from src.data.config import DataConfig
@@ -47,6 +48,12 @@ _DATASET_DEFAULTS = {
         "std": (0.5, 0.5, 0.5),
         "image_size": 256,
         "data_dir": "../data/celebahq",
+    },
+    "cc3m": {
+        "mean": (0.5, 0.5, 0.5),
+        "std": (0.5, 0.5, 0.5),
+        "image_size": 256,
+        "data_dir": "../data/cc3m",
     },
     "coco": {
         "mean": (0.5, 0.5, 0.5),
@@ -113,6 +120,7 @@ _DATASET_DEFAULTS = {
 
 _DATAMODULES = {
     "cifar10": CIFAR10DataModule,
+    "cc3m": CC3MDataModule,
     "coco": COCODataModule,
     "imagenette2": Imagenette2DataModule,
     "celeba": CelebADataModule,
@@ -256,6 +264,7 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "recon_l1_weight": float(_cfg_get(model_cfg, "recon_l1_weight", 0.0)),
         "recon_edge_weight": float(_cfg_get(model_cfg, "recon_edge_weight", 0.0)),
         "perceptual_weight": _cfg_get(model_cfg, "perceptual_weight"),
+        "lpips_version": str(_cfg_get(model_cfg, "lpips_version", "0.1")),
         "perceptual_start_step": int(_cfg_get(model_cfg, "perceptual_start_step", 0)),
         "perceptual_warmup_steps": int(_cfg_get(model_cfg, "perceptual_warmup_steps", 0)),
         "adversarial_weight": float(_cfg_get(model_cfg, "adversarial_weight", 0.0)),
@@ -288,6 +297,11 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "patch_reconstruction": _cfg_get(model_cfg, "patch_reconstruction", "tile"),
         "coef_max": _cfg_get(model_cfg, "coef_max", None),
         "data_init_from_first_batch": bool(_cfg_get(model_cfg, "data_init_from_first_batch", False)),
+        "dead_atom_revival": bool(_cfg_get(model_cfg, "dead_atom_revival", False)),
+        "dead_atom_revival_interval": int(_cfg_get(model_cfg, "dead_atom_revival_interval", 500)),
+        "dead_atom_revival_max_fraction": float(_cfg_get(model_cfg, "dead_atom_revival_max_fraction", 0.05)),
+        "dead_atom_revival_noise": float(_cfg_get(model_cfg, "dead_atom_revival_noise", 0.05)),
+        "dead_atom_revival_patience": int(_cfg_get(model_cfg, "dead_atom_revival_patience", 5)),
         "bottleneck_type": str(_cfg_get(model_cfg, "bottleneck_type", "dictionary")),
         "rq_code_depth": int(_cfg_get(model_cfg, "rq_code_depth", 4)),
         "rq_shared_codebook": bool(_cfg_get(model_cfg, "rq_shared_codebook", True)),

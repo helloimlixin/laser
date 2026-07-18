@@ -85,6 +85,9 @@ class SpatialDepthPriorConfig:
     d_ff: int = 1024
     dropout: float = 0.1
     coeff_max: float = 24.0
+    coeff_head_hidden_mult: float = 1.0
+    coeff_head_depth: int = 1
+    coeff_head_dropout: float = 0.0
     gaussian_coeffs: bool = False
     coeff_prior_std: float = 0.25
     coeff_min_std: float = 0.01
@@ -96,6 +99,7 @@ class SpatialDepthPriorConfig:
     text_vocab_size: int = 0
     text_max_length: int = 0
     text_pad_id: int = 0
+    text_conditioning_mode: str = "additive"
     text_prefix_length: int = 16
 
 
@@ -167,8 +171,16 @@ class SpatialDepthPrior(nn.Module):
         self.text_vocab_size = int(getattr(cfg, "text_vocab_size", 0) or 0)
         self.text_max_length = int(getattr(cfg, "text_max_length", 0) or 0)
         self.text_pad_id = int(getattr(cfg, "text_pad_id", 0) or 0)
+        self.text_conditioning_mode = str(
+            getattr(cfg, "text_conditioning_mode", "additive") or "additive"
+        ).strip().lower()
         self.text_prefix_length = int(getattr(cfg, "text_prefix_length", 16) or 0)
         if self.text_conditional:
+            if self.text_conditioning_mode not in {"additive", "rq_prefix"}:
+                raise ValueError(
+                    "text_conditioning_mode must be 'additive' or 'rq_prefix', "
+                    f"got {self.text_conditioning_mode!r}"
+                )
             if self.text_vocab_size <= 2:
                 raise ValueError("text_conditional=True requires text_vocab_size > 2")
             if self.text_max_length <= 0:
@@ -269,6 +281,14 @@ class SpatialDepthPrior(nn.Module):
             if self.text_conditional
             else None
         )
+        self.text_cond_classifier = (
+            nn.Sequential(
+                nn.LayerNorm(cfg.d_model),
+                nn.Linear(cfg.d_model, self.text_vocab_size),
+            )
+            if self.text_conditional and self.text_conditioning_mode == "rq_prefix"
+            else None
+        )
         self.start_emb = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         nn.init.normal_(self.start_emb, std=0.02)
         self.global_spatial_tokens = None
@@ -330,17 +350,9 @@ class SpatialDepthPrior(nn.Module):
         self.token_head = nn.Linear(cfg.d_model, cfg.vocab_size)
         if self.real_valued_coeffs:
             self.atom_coeff_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-            self.coeff_head = nn.Sequential(
-                nn.Linear(cfg.d_model * 2, cfg.d_model),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, 1),
-            )
+            self.coeff_head = self._build_coeff_regressor_head(output_dim=1)
             if self.gaussian_coeffs:
-                self.coeff_logvar_head = nn.Sequential(
-                    nn.Linear(cfg.d_model * 2, cfg.d_model),
-                    nn.GELU(),
-                    nn.Linear(cfg.d_model, 1),
-                )
+                self.coeff_logvar_head = self._build_coeff_regressor_head(output_dim=1)
                 init_target = max(float(cfg.coeff_prior_std) - float(cfg.coeff_min_std), 1e-6)
                 nn.init.zeros_(self.coeff_logvar_head[-1].weight)
                 nn.init.constant_(self.coeff_logvar_head[-1].bias, math.log(math.expm1(init_target)))
@@ -383,6 +395,21 @@ class SpatialDepthPrior(nn.Module):
             torch.tensor(1 if self.autoregressive_coeffs else 0, dtype=torch.int64),
             persistent=True,
         )
+
+    def _build_coeff_regressor_head(self, output_dim: int) -> nn.Sequential:
+        hidden_dim = max(1, int(round(float(self.cfg.d_model) * float(self.cfg.coeff_head_hidden_mult))))
+        hidden_layers = max(1, int(self.cfg.coeff_head_depth))
+        dropout = max(0.0, float(self.cfg.coeff_head_dropout))
+        layers: list[nn.Module] = []
+        in_dim = int(self.cfg.d_model) * 2
+        for _ in range(hidden_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, int(output_dim)))
+        return nn.Sequential(*layers)
 
     def _class_condition(
         self,
@@ -508,6 +535,11 @@ class SpatialDepthPrior(nn.Module):
         positions = torch.arange(max_len, device=device, dtype=torch.long)
         emb = self.text_emb(text_tokens) + self.text_pos_emb(positions).unsqueeze(0)
         emb = emb.to(dtype=dtype)
+        if self.text_conditioning_mode == "rq_prefix":
+            prefix_len = int(self.text_prefix_length) if int(self.text_prefix_length) > 0 else max_len
+            prefix_len = max(1, min(prefix_len, max_len))
+            return None, emb[:, :prefix_len, :].to(dtype=dtype)
+
         weights = text_mask.to(device=device, dtype=dtype).unsqueeze(-1)
         denom = weights.sum(dim=1).clamp_min(1.0)
         pooled = (emb * weights).sum(dim=1) / denom
@@ -655,6 +687,7 @@ class SpatialDepthPrior(nn.Module):
         _sync_optional_module("text_pos_emb", self.text_pos_emb)
         _sync_optional_module("text_norm", self.text_norm)
         _sync_optional_module("text_proj", self.text_proj)
+        _sync_optional_module("text_cond_classifier", self.text_cond_classifier)
         _sync_optional_module("coeff_head", self.coeff_head)
         _sync_optional_module("coeff_token_head", self.coeff_token_head)
         super()._load_from_state_dict(
@@ -720,23 +753,23 @@ class SpatialDepthPrior(nn.Module):
         batch_size: int,
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]],
         text_prefix: Optional[torch.Tensor] = None,
-    ) -> list[Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[list[Optional[Tuple[torch.Tensor, torch.Tensor]]], Optional[torch.Tensor]]:
         prefix = self._conditioning_prefix_tokens(
             batch_size,
             self._activation_dtype(self.start_emb.device),
             text_prefix=text_prefix,
         )
         if prefix is None:
-            return spatial_kv
+            return spatial_kv, None
 
         prefix = prefix.to(device=self.start_emb.device)
-        _, spatial_kv = run_transformer_blocks(
+        prefix_h, spatial_kv = run_transformer_blocks(
             prefix,
             self.spatial_blocks,
-            None,
+            self.spatial_ln,
             kv_cache=spatial_kv,
         )
-        return spatial_kv
+        return spatial_kv, prefix_h[:, -1]
 
     def _prepare_depth_inputs(
         self,
@@ -922,11 +955,66 @@ class SpatialDepthPrior(nn.Module):
         class_labels: Optional[torch.Tensor] = None,
         text_tokens: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_text_logits: bool = False,
+    ):
         tokens, coeffs, act_dtype = self._prepare_depth_inputs(tokens, coeffs)
         B, T, D = tokens.shape
         d_model = self.cfg.d_model
         device = tokens.device
+
+        class_cond = self._class_condition(
+            class_labels,
+            batch_size=B,
+            device=device,
+            dtype=act_dtype,
+        )
+        text_cond, text_prefix = self._text_condition(
+            text_tokens,
+            text_mask,
+            batch_size=B,
+            device=device,
+            dtype=act_dtype,
+        )
+        rq_prefix_mode = (
+            self.text_conditioning_mode == "rq_prefix"
+            and text_prefix is not None
+            and int(text_prefix.size(1)) > 0
+        )
+
+        if rq_prefix_mode:
+            prefix = self._conditioning_prefix_tokens(B, act_dtype, text_prefix=text_prefix)
+            if prefix is None or int(prefix.size(1)) <= 0:
+                raise RuntimeError("rq_prefix text conditioning requires non-empty prefix tokens")
+            pieces = [prefix.to(device=device)]
+            if T > 1:
+                prev_token_emb = self._embed_tokens(tokens[:, :-1])
+                prev_token_emb = self._add_depth_type_embeddings(prev_token_emb)
+                if self.real_valued_coeffs and self.autoregressive_coeffs:
+                    if self.coeff_proj is None:
+                        raise RuntimeError("Missing coeff_proj for autoregressive real-valued coefficient conditioning")
+                    prev_token_emb = prev_token_emb + self.coeff_proj(coeffs[:, :-1].unsqueeze(-1))
+                prev_flat = prev_token_emb.reshape(B, T - 1, D * d_model)
+                prev_spatial = self.spatial_fuse(prev_flat)
+                prev_spatial = prev_spatial + self._spatial_pos(T - 1, device, dtype=act_dtype).unsqueeze(0)
+                if class_cond is not None:
+                    prev_spatial = prev_spatial + class_cond.unsqueeze(1)
+                pieces.append(prev_spatial)
+            body_in = torch.cat(pieces, dim=1)
+            body_h, _ = run_transformer_blocks(
+                body_in,
+                self.spatial_blocks,
+                self.spatial_ln,
+            )
+            prefix_len = int(prefix.size(1))
+            spatial_h = body_h[:, prefix_len - 1 : prefix_len - 1 + T]
+            text_logits = None
+            if return_text_logits and self.text_cond_classifier is not None:
+                text_len = int(text_prefix.size(1))
+                global_len = int(self.n_global_spatial_tokens)
+                if text_len > 1:
+                    text_h = body_h[:, global_len : global_len + text_len - 1]
+                    text_logits = self.text_cond_classifier(text_h)
+            return (spatial_h, text_logits) if return_text_logits else spatial_h
 
         spatial_in = torch.zeros(B, T, d_model, device=device, dtype=act_dtype)
         spatial_in[:, 0] = self.start_emb.squeeze(1)
@@ -941,21 +1029,8 @@ class SpatialDepthPrior(nn.Module):
             spatial_in[:, 1:] = self.spatial_fuse(prev_flat)
 
         spatial_in = spatial_in + self._spatial_pos(T, device, dtype=act_dtype).unsqueeze(0)
-        class_cond = self._class_condition(
-            class_labels,
-            batch_size=B,
-            device=device,
-            dtype=act_dtype,
-        )
         if class_cond is not None:
             spatial_in = spatial_in + class_cond.unsqueeze(1)
-        text_cond, text_prefix = self._text_condition(
-            text_tokens,
-            text_mask,
-            batch_size=B,
-            device=device,
-            dtype=act_dtype,
-        )
         if text_cond is not None:
             spatial_in = spatial_in + text_cond.unsqueeze(1)
         prefix_len = int(self.n_global_spatial_tokens)
@@ -969,7 +1044,7 @@ class SpatialDepthPrior(nn.Module):
         )
         if prefix_len > 0:
             spatial_h = spatial_h[:, prefix_len:]
-        return spatial_h
+        return (spatial_h, None) if return_text_logits else spatial_h
 
     def _forward_depth_hidden_from_spatial(
         self,
@@ -1026,15 +1101,25 @@ class SpatialDepthPrior(nn.Module):
         class_labels: Optional[torch.Tensor] = None,
         text_tokens: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        spatial_h = self._forward_spatial_hidden(
+        return_text_logits: bool = False,
+    ):
+        spatial_out = self._forward_spatial_hidden(
             tokens,
             coeffs,
             class_labels=class_labels,
             text_tokens=text_tokens,
             text_mask=text_mask,
+            return_text_logits=return_text_logits,
         )
-        return self._forward_depth_hidden_from_spatial(spatial_h, tokens, coeffs)
+        text_logits = None
+        if return_text_logits:
+            spatial_h, text_logits = spatial_out
+        else:
+            spatial_h = spatial_out
+        depth_h = self._forward_depth_hidden_from_spatial(spatial_h, tokens, coeffs)
+        if return_text_logits:
+            return depth_h, text_logits
+        return depth_h
 
     def _predict_coeff_distribution_from_concat(
         self,
@@ -1122,18 +1207,27 @@ class SpatialDepthPrior(nn.Module):
         text_tokens: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         mask_tokens: Optional[torch.Tensor] = None,
+        return_text_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if mask_tokens is None:
             mask_tokens = tokens
-        depth_h = self._forward_depth_hidden(
+        depth_out = self._forward_depth_hidden(
             tokens,
             coeffs,
             class_labels=class_labels,
             text_tokens=text_tokens,
             text_mask=text_mask,
+            return_text_logits=return_text_logits,
         )
+        text_logits = None
+        if return_text_logits:
+            depth_h, text_logits = depth_out
+        else:
+            depth_h = depth_out
         token_logits = self.token_head(depth_h)
         token_logits = self._masked_training_logits(token_logits, tokens=mask_tokens)
+        if return_text_logits:
+            return token_logits, depth_h, text_logits
         return token_logits, depth_h
 
     def _mask_generation_logits(
@@ -1180,6 +1274,7 @@ class SpatialDepthPrior(nn.Module):
         text_tokens: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         return_features: bool = False,
+        return_text_logits: bool = False,
         mask_tokens: Optional[torch.Tensor] = None,
     ):
         """Training forward with teacher forcing.
@@ -1197,20 +1292,38 @@ class SpatialDepthPrior(nn.Module):
             real-valued mode: (atom_logits [B, H*W, D, vocab], coeff_mean [B, H*W, D], coeff_logvar [B, H*W, D] or None)
             quantized mode:   token_logits [B, H*W, D, vocab]
         """
-        token_logits, depth_h = self.forward_features(
+        feature_out = self.forward_features(
             tokens,
             coeffs,
             class_labels=class_labels,
             text_tokens=text_tokens,
             text_mask=text_mask,
             mask_tokens=mask_tokens,
+            return_text_logits=return_text_logits,
         )
+        text_logits = None
+        if return_text_logits:
+            token_logits, depth_h, text_logits = feature_out
+        else:
+            token_logits, depth_h = feature_out
         if not self.real_valued_coeffs:
+            if return_text_logits:
+                if return_features:
+                    return token_logits, text_logits, depth_h
+                return token_logits, text_logits
             if return_features:
                 return token_logits, depth_h
             return token_logits
 
         coeff_pred, coeff_logvar = self.predict_coeff_distribution_for_atoms(depth_h, tokens)
+        if return_text_logits:
+            if return_features:
+                if coeff_logvar is None:
+                    return token_logits, coeff_pred, text_logits, depth_h
+                return token_logits, coeff_pred, coeff_logvar, text_logits, depth_h
+            if coeff_logvar is None:
+                return token_logits, coeff_pred, text_logits
+            return token_logits, coeff_pred, coeff_logvar, text_logits
         if return_features:
             if coeff_logvar is None:
                 return token_logits, coeff_pred, depth_h
@@ -1349,10 +1462,16 @@ class SpatialDepthPrior(nn.Module):
         spatial_kv: list[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [
             None
         ] * len(self.spatial_blocks)
-        spatial_kv = self._prime_spatial_kv_with_global_tokens(
+        spatial_kv, first_prefix_h = self._prime_spatial_kv_with_global_tokens(
             batch_size,
             spatial_kv,
             text_prefix=text_prefix,
+        )
+        rq_prefix_mode = (
+            self.text_conditioning_mode == "rq_prefix"
+            and text_prefix is not None
+            and int(text_prefix.size(1)) > 0
+            and first_prefix_h is not None
         )
 
         steps = tqdm(
@@ -1364,7 +1483,9 @@ class SpatialDepthPrior(nn.Module):
         )
         for t in steps:
             # -- spatial input for position t --
-            if t == 0:
+            if t == 0 and rq_prefix_mode:
+                h_t = first_prefix_h.to(device=device, dtype=act_dtype)
+            elif t == 0:
                 x_new = self.start_emb.expand(batch_size, -1, -1).to(dtype=act_dtype)
             else:
                 prev_emb = self._embed_tokens(tokens[:, t - 1])    # [B, D, d]
@@ -1377,22 +1498,24 @@ class SpatialDepthPrior(nn.Module):
                     prev_emb.reshape(batch_size, -1),
                 ).unsqueeze(1)                                   # [B, 1, d]
 
-            x_new = x_new + (
-                self.row_emb(self._rows[t]) + self.col_emb(self._cols[t])
-            ).to(dtype=x_new.dtype)
-            if class_cond is not None:
-                x_new = x_new + class_cond.unsqueeze(1).to(dtype=x_new.dtype)
-            if text_cond is not None:
-                x_new = x_new + text_cond.unsqueeze(1).to(dtype=x_new.dtype)
+            if not (t == 0 and rq_prefix_mode):
+                pos_idx = t if t == 0 else t - 1 if rq_prefix_mode else t
+                x_new = x_new + (
+                    self.row_emb(self._rows[pos_idx]) + self.col_emb(self._cols[pos_idx])
+                ).to(dtype=x_new.dtype)
+                if class_cond is not None:
+                    x_new = x_new + class_cond.unsqueeze(1).to(dtype=x_new.dtype)
+                if text_cond is not None:
+                    x_new = x_new + text_cond.unsqueeze(1).to(dtype=x_new.dtype)
 
-            spatial_h = x_new
-            spatial_h, spatial_kv = run_transformer_blocks(
-                spatial_h,
-                self.spatial_blocks,
-                self.spatial_ln,
-                kv_cache=spatial_kv,
-            )
-            h_t = spatial_h.squeeze(1)                           # [B, d]
+                spatial_h = x_new
+                spatial_h, spatial_kv = run_transformer_blocks(
+                    spatial_h,
+                    self.spatial_blocks,
+                    self.spatial_ln,
+                    kv_cache=spatial_kv,
+                )
+                h_t = spatial_h.squeeze(1)                       # [B, d]
 
             # -- depth stage: autoregressive, no KV cache (D is small) --
             depth_seq: list[torch.Tensor] = []

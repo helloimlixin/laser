@@ -219,6 +219,49 @@ def test_text_conditioning_prefix_preserves_prompt_order():
     assert not torch.allclose(prefix_a, prefix_b)
 
 
+def test_rq_prefix_text_conditioning_uses_text_as_first_context_not_start_token():
+    cfg = SpatialDepthPriorConfig(
+        vocab_size=5,
+        atom_vocab_size=3,
+        coeff_vocab_size=2,
+        H=1,
+        W=2,
+        D=4,
+        real_valued_coeffs=False,
+        d_model=8,
+        n_heads=2,
+        n_spatial_layers=0,
+        n_depth_layers=0,
+        d_ff=16,
+        dropout=0.0,
+        text_conditional=True,
+        text_vocab_size=32,
+        text_max_length=4,
+        text_pad_id=0,
+        text_conditioning_mode="rq_prefix",
+        text_prefix_length=4,
+    )
+    model = SpatialDepthPrior(cfg).eval()
+    tokens = torch.tensor([[[0, 3, 1, 4], [1, 3, 2, 4]]], dtype=torch.long)
+    text = torch.tensor([[2, 3, 4, 0]], dtype=torch.long)
+    mask = text.ne(0)
+
+    with torch.no_grad():
+        model.start_emb.fill_(100.0)
+        spatial_a, text_logits = model._forward_spatial_hidden(
+            tokens,
+            text_tokens=text,
+            text_mask=mask,
+            return_text_logits=True,
+        )
+        model.start_emb.fill_(-100.0)
+        spatial_b = model._forward_spatial_hidden(tokens, text_tokens=text, text_mask=mask)
+
+    assert spatial_a.shape == (1, 2, cfg.d_model)
+    assert text_logits.shape == (1, 3, cfg.text_vocab_size)
+    assert torch.allclose(spatial_a, spatial_b)
+
+
 def test_spatial_depth_prior_quantized_rejects_too_few_atoms_for_unique_support():
     try:
         SpatialDepthPrior(

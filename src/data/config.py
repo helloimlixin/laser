@@ -39,6 +39,7 @@ class DataConfig:
     audio_max_duration_seconds: float = 0.0
     audio_require_text: bool = False
     stl10_include_unlabeled: bool = True
+    max_items: int = 0
     
     @classmethod
     def from_dict(cls, config_dict):

@@ -21,12 +21,14 @@ import os
 import subprocess
 import shlex
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 
 IMAGE_DATASETS = {
+    "cc3m",
     "celeba",
     "celebahq",
     "cifar10",
@@ -184,6 +186,24 @@ def _positive_int(raw: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
     return value
+
+
+def _configure_training_tempdir(output_dir: object) -> Path:
+    """Keep Lightning/fsspec atomic checkpoint temp files off small system /tmp."""
+    configured_tmp = str(os.environ.get("TMPDIR") or "").strip()
+    if configured_tmp:
+        tmpdir = Path(configured_tmp).expanduser().resolve()
+    elif Path("/workspace").is_dir():
+        digest = hashlib.sha1(str(Path(str(output_dir)).expanduser().resolve()).encode("utf-8")).hexdigest()[:12]
+        tmpdir = Path("/workspace/tmp/laser") / digest
+    else:
+        tmpdir = Path(str(output_dir)).expanduser().resolve() / ".tmp"
+    os.environ["TMPDIR"] = str(tmpdir)
+    os.environ["TEMP"] = str(tmpdir)
+    os.environ["TMP"] = str(tmpdir)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = str(tmpdir)
+    return tmpdir
 
 
 def _stage(raw: str) -> str:
@@ -854,6 +874,122 @@ def _make_selected_checkpoint_artifact_callback(callback_base):
     return SelectedCheckpointArtifactCallback
 
 
+def _make_selected_checkpoint_file_callback(callback_base):
+    class SelectedCheckpointFileCallback(callback_base):
+        """Upload top-k checkpoints and last.ckpt to fixed W&B run-file slots.
+
+        W&B artifacts are immutable, so uploading the selected set as an artifact
+        after every validation creates an ever-growing version history. Run files
+        can be replaced in place. The local slots are hard links, which also keeps
+        the selected upload view from duplicating checkpoint bytes on disk.
+        """
+
+        def __init__(
+            self,
+            checkpoint_callback,
+            *,
+            upload_dir: str | os.PathLike[str],
+            every_n_epochs: int = 1,
+        ):
+            super().__init__()
+            self.checkpoint_callback = checkpoint_callback
+            self.upload_dir = Path(upload_dir).expanduser().resolve()
+            self.every_n_epochs = max(1, int(every_n_epochs or 1))
+            self._last_signature = None
+
+        @staticmethod
+        def _source_signature(path: Path) -> tuple[str, int, int]:
+            stat = path.stat()
+            return path.name, int(stat.st_size), int(stat.st_mtime_ns)
+
+        @staticmethod
+        def _replace_hard_link(source: Path, destination: Path) -> None:
+            temporary = destination.with_name(
+                f".{destination.name}.{os.getpid()}.tmp"
+            )
+            temporary.unlink(missing_ok=True)
+            try:
+                os.link(source, temporary)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        def _slot_sources(self) -> list[tuple[str, Path]]:
+            selected = _selected_checkpoint_paths(self.checkpoint_callback)
+            last_raw = str(
+                getattr(self.checkpoint_callback, "last_model_path", "") or ""
+            ).strip()
+            last_path = Path(last_raw).resolve() if last_raw else None
+
+            best_paths = [
+                path
+                for path in selected
+                if last_path is None or path.resolve() != last_path
+            ]
+            save_top_k = max(
+                0, int(getattr(self.checkpoint_callback, "save_top_k", 0) or 0)
+            )
+            slots = [
+                (f"best-{rank:02d}.ckpt", path)
+                for rank, path in enumerate(best_paths[:save_top_k], start=1)
+            ]
+            if last_path is not None and last_path.is_file():
+                slots.append(("last.ckpt", last_path))
+            return slots
+
+        def _upload(self, trainer) -> None:
+            if not bool(getattr(trainer, "is_global_zero", True)):
+                return
+            logger = getattr(trainer, "logger", None)
+            experiment = getattr(logger, "experiment", None)
+            save = getattr(experiment, "save", None)
+            if not callable(save):
+                return
+
+            slots = self._slot_sources()
+            if not slots:
+                return
+            signature = tuple(
+                (slot_name, *self._source_signature(source))
+                for slot_name, source in slots
+            )
+            if signature == self._last_signature:
+                return
+
+            self.upload_dir.mkdir(parents=True, exist_ok=True)
+            active_names = {slot_name for slot_name, _ in slots}
+            for stale in self.upload_dir.glob("best-*.ckpt"):
+                if stale.name not in active_names:
+                    stale.unlink(missing_ok=True)
+            if "last.ckpt" not in active_names:
+                (self.upload_dir / "last.ckpt").unlink(missing_ok=True)
+
+            for slot_name, source in slots:
+                destination = self.upload_dir / slot_name
+                self._replace_hard_link(source, destination)
+                save(
+                    str(destination),
+                    base_path=str(self.upload_dir),
+                    policy="now",
+                )
+            self._last_signature = signature
+
+        def on_validation_end(self, trainer, pl_module) -> None:
+            del pl_module
+            if bool(getattr(trainer, "sanity_checking", False)):
+                return
+            epoch = int(getattr(trainer, "current_epoch", 0))
+            if (epoch + 1) % self.every_n_epochs != 0:
+                return
+            self._upload(trainer)
+
+        def on_train_end(self, trainer, pl_module) -> None:
+            del pl_module
+            self._upload(trainer)
+
+    return SelectedCheckpointFileCallback
+
+
 def _stage1_wandb_tags(cfg) -> list[str]:
     model_cfg = cfg.model
     backbone = str(getattr(model_cfg, "backbone", "") or "unknown").strip().lower()
@@ -885,8 +1021,8 @@ def _validate(args: argparse.Namespace) -> None:
     dataset = args.dataset.strip().lower()
     if args.conditioning == "class" and args.modality != "image":
         raise SystemExit("--conditioning class is only valid with --modality image.")
-    if args.conditioning == "text" and args.modality != "audio":
-        raise SystemExit("--conditioning text is only valid with --modality audio.")
+    if args.conditioning == "text" and args.modality != "audio" and dataset not in {"cc3m"}:
+        raise SystemExit("--conditioning text is only valid with audio datasets or CC3M image runs.")
     if args.conditioning == "class" and dataset not in {"imagenet", "imagenette2", "stl10", "cifar10"}:
         raise SystemExit(f"--conditioning class is not configured for dataset {dataset!r}.")
     if args.stage == "2" and not args.token_cache_path:
@@ -1046,6 +1182,7 @@ def _stage2_command(args: argparse.Namespace, resources: ResourcePlan, extra: li
             ]
         )
     elif args.conditioning == "text":
+        dataset_name = args.dataset.strip().lower()
         overrides.extend(
             [
                 "ar.text_conditional=true",
@@ -1053,6 +1190,16 @@ def _stage2_command(args: argparse.Namespace, resources: ResourcePlan, extra: li
                 "train_ar.sample_text_prompts=[\"The quick brown fox jumps over the lazy dog.\",\"A calm voice reads this sentence clearly.\"]",
             ]
         )
+        if dataset_name == "cc3m":
+            overrides.extend(
+                [
+                    "ar.text_conditioning_mode=rq_prefix",
+                    "ar.text_prefix_length=32",
+                    "ar.text_loss_weight=0.1",
+                    "ar.image_loss_weight=0.9",
+                    "ar.n_global_spatial_tokens=0",
+                ]
+            )
     overrides.extend(extra)
     return [sys.executable, str(script), "stage2", *overrides]
 
@@ -1410,6 +1557,7 @@ def _load_stage_entrypoints():
         base_ckpt_dir = getattr(cfg.checkpoint, "dirpath", os.path.join(cfg.output_dir, "checkpoints"))
         run_ckpt_dir = os.path.join(base_ckpt_dir, f'run_{timestamp}', cfg.model.type)
         os.makedirs(run_ckpt_dir, exist_ok=True)
+        temp_dir = _configure_training_tempdir(cfg.output_dir)
 
         # Determine monitor key and mode (configurable, with safe defaults per model)
         configured_monitor = getattr(cfg.checkpoint, "monitor", None)
@@ -1419,6 +1567,12 @@ def _load_stage_entrypoints():
             monitor_key = "val/loss"
         monitor_mode = getattr(cfg.checkpoint, "mode", "min")
         filename_template = getattr(cfg.checkpoint, "filename", f"{cfg.model.type}-{{epoch:03d}}")
+        checkpoint_save_top_k = int(getattr(cfg.checkpoint, "save_top_k", CHECKPOINT_SAVE_TOP_K))
+        checkpoint_save_last = bool(getattr(cfg.checkpoint, "save_last", CHECKPOINT_SAVE_LAST))
+        checkpoint_every_n_epochs = max(
+            1,
+            int(getattr(cfg.checkpoint, "every_n_epochs", CHECKPOINT_EVERY_N_EPOCHS) or 1),
+        )
         checkpoint_upload_to_wandb = bool(
             getattr(cfg.checkpoint, "upload_to_wandb", CHECKPOINT_UPLOAD_TO_WANDB)
         )
@@ -1426,21 +1580,33 @@ def _load_stage_entrypoints():
             1,
             int(getattr(cfg.checkpoint, "upload_every_n_epochs", CHECKPOINT_UPLOAD_EVERY_N_EPOCHS) or 1),
         )
+        checkpoint_upload_mode = str(
+            getattr(cfg.checkpoint, "upload_mode", "artifact") or "artifact"
+        ).strip().lower()
+        if checkpoint_upload_mode not in {"artifact", "files"}:
+            raise ValueError(
+                "checkpoint.upload_mode must be 'artifact' or 'files', "
+                f"got {checkpoint_upload_mode!r}"
+            )
         with open_dict(cfg):
-            cfg.checkpoint.save_top_k = CHECKPOINT_SAVE_TOP_K
-            cfg.checkpoint.save_last = CHECKPOINT_SAVE_LAST
+            cfg.checkpoint.save_top_k = checkpoint_save_top_k
+            cfg.checkpoint.save_last = checkpoint_save_last
+            cfg.checkpoint.every_n_epochs = checkpoint_every_n_epochs
             cfg.checkpoint.upload_to_wandb = checkpoint_upload_to_wandb
             cfg.checkpoint.upload_every_n_epochs = checkpoint_upload_every_n_epochs
+            cfg.checkpoint.upload_mode = checkpoint_upload_mode
 
         print("\nCheckpoint Configuration:")
         print(f"Base Save Directory: {base_ckpt_dir}")
         print(f"Run Save Directory:  {run_ckpt_dir}")
+        print(f"Temp Directory:      {temp_dir}")
         print(f"Filename Template:   {filename_template}")
         print(f"Monitor:             {monitor_key} (mode={monitor_mode})")
         print(f"Save Top K:          {cfg.checkpoint.save_top_k}")
         print(f"Save Last:           {cfg.checkpoint.save_last}")
-        print(f"Every N Epochs:      {CHECKPOINT_EVERY_N_EPOCHS}")
+        print(f"Every N Epochs:      {checkpoint_every_n_epochs}")
         print(f"W&B Selected Checkpoint Upload: {checkpoint_upload_to_wandb}")
+        print(f"W&B Checkpoint Upload Mode:     {checkpoint_upload_mode}")
         print(f"W&B Upload Every N Epochs:      {checkpoint_upload_every_n_epochs}")
         print("=" * 60 + "\n")
 
@@ -1503,12 +1669,16 @@ def _load_stage_entrypoints():
             )
         trainer_gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 0.0) or 0.0)
         uses_manual_opt = not bool(getattr(model, "automatic_optimization", True))
+        trainer_accumulate_grad_batches = accumulate_grad_batches
         if uses_manual_opt:
             model.manual_gradient_clip_val = trainer_gradient_clip_val
+            model.manual_accumulate_grad_batches = accumulate_grad_batches
             trainer_gradient_clip_val = 0.0
+            trainer_accumulate_grad_batches = 1
             print(
                 "Manual optimization active (adversarial); applying gradient clipping "
-                f"inside the model with value {model.manual_gradient_clip_val}."
+                f"inside the model with value {model.manual_gradient_clip_val} and "
+                f"accumulating {model.manual_accumulate_grad_batches} batch(es) per optimizer step."
             )
 
         if ckpt_path:
@@ -1525,6 +1695,11 @@ def _load_stage_entrypoints():
             run_name = base_run_name
         run_group = str(getattr(cfg.wandb, "group", "") or "").strip() or None
         run_tags = _dedupe_tags([*(getattr(cfg.wandb, "tags", []) or []), *_stage1_wandb_tags(cfg)])
+        wandb_id = str(getattr(cfg.wandb, "id", "") or "").strip() or None
+        wandb_resume = str(getattr(cfg.wandb, "resume", "") or "").strip() or None
+        wandb_kwargs = {}
+        if wandb_resume:
+            wandb_kwargs["resume"] = wandb_resume
         devices_cfg = cfg.train.devices
         try:
             num_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) else len(devices_cfg)
@@ -1538,7 +1713,9 @@ def _load_stage_entrypoints():
             save_dir=cfg.wandb.save_dir,
             group=run_group,
             tags=run_tags if run_tags else None,
+            id=wandb_id,
             log_model=False,
+            **wandb_kwargs,
         )
         wandb_logger.log_hyperparams(
             {
@@ -1555,22 +1732,32 @@ def _load_stage_entrypoints():
         checkpoint_callback = ModelCheckpoint(
             dirpath=run_ckpt_dir,
             filename=filename_template,
-            save_top_k=CHECKPOINT_SAVE_TOP_K,
+            save_top_k=checkpoint_save_top_k,
             monitor=monitor_key,
             mode=monitor_mode,
-            save_last=CHECKPOINT_SAVE_LAST,
-            every_n_epochs=CHECKPOINT_EVERY_N_EPOCHS,
+            save_last=checkpoint_save_last,
+            every_n_epochs=checkpoint_every_n_epochs,
         )
         callbacks = [checkpoint_callback]
         if checkpoint_upload_to_wandb:
-            SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
-            callbacks.append(
-                SelectedCheckpointArtifactCallback(
-                    checkpoint_callback,
-                    artifact_prefix="model",
-                    every_n_epochs=checkpoint_upload_every_n_epochs,
+            if checkpoint_upload_mode == "files":
+                SelectedCheckpointFileCallback = _make_selected_checkpoint_file_callback(Callback)
+                callbacks.append(
+                    SelectedCheckpointFileCallback(
+                        checkpoint_callback,
+                        upload_dir=Path(cfg.output_dir) / "wandb_checkpoints",
+                        every_n_epochs=checkpoint_upload_every_n_epochs,
+                    )
                 )
-            )
+            else:
+                SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
+                callbacks.append(
+                    SelectedCheckpointArtifactCallback(
+                        checkpoint_callback,
+                        artifact_prefix="model",
+                        every_n_epochs=checkpoint_upload_every_n_epochs,
+                    )
+                )
         callbacks.extend([
             LearningRateMonitor(logging_interval='step'),
             progress_bar,
@@ -1617,7 +1804,7 @@ def _load_stage_entrypoints():
             logger=wandb_logger,
             callbacks=callbacks,
             precision=cfg.train.precision,
-            accumulate_grad_batches=accumulate_grad_batches,
+            accumulate_grad_batches=trainer_accumulate_grad_batches,
             gradient_clip_val=trainer_gradient_clip_val,
             log_every_n_steps=cfg.train.log_every_n_steps,
             val_check_interval=val_check_interval,
@@ -1743,6 +1930,7 @@ def _load_stage_entrypoints():
         infer_latest_token_cache as pick_cache,
     )
     from src.stage2_preview import (
+        Stage2GenerationFidCallback,
         Stage2SamplePreviewCallback,
         save_final_generation_preview,
     )
@@ -1903,6 +2091,10 @@ def _load_stage_entrypoints():
             str(_cfg_value(cache_cfg, "coeff_quantization", "uniform")),
             "--coeff_mu",
             str(float(_cfg_value(cache_cfg, "coeff_mu", 0.0))),
+            "--text_max_length",
+            str(int(_cfg_value(cache_cfg, "text_max_length", 160))),
+            "--text_tokenizer",
+            str(_cfg_value(cache_cfg, "text_tokenizer", "char")),
             "--coeff_calibration_percentile",
             str(float(_cfg_value(cache_cfg, "coeff_calibration_percentile", 99.5))),
             "--output",
@@ -2023,9 +2215,13 @@ def _load_stage_entrypoints():
             d_model=cfg.ar.d_model,
             n_heads=cfg.ar.n_heads,
             n_layers=cfg.ar.n_layers,
+            n_depth_layers=getattr(cfg.ar, "n_depth_layers", None),
             d_ff=cfg.ar.d_ff,
             dropout=cfg.ar.dropout,
             n_global_spatial_tokens=cfg.ar.n_global_spatial_tokens,
+            coeff_head_hidden_mult=getattr(cfg.ar, "coeff_head_hidden_mult", 1.0),
+            coeff_head_depth=getattr(cfg.ar, "coeff_head_depth", 1),
+            coeff_head_dropout=getattr(cfg.ar, "coeff_head_dropout", 0.0),
             autoregressive_coeffs=cfg.ar.autoregressive_coeffs,
             class_conditional=class_conditional,
             num_classes=resolved_num_classes,
@@ -2033,6 +2229,7 @@ def _load_stage_entrypoints():
             text_vocab_size=resolved_text_vocab_size,
             text_max_length=resolved_text_max_length,
             text_pad_id=resolved_text_pad_id,
+            text_conditioning_mode=str(getattr(cfg.ar, "text_conditioning_mode", "additive") or "additive"),
             text_prefix_length=cfg.ar.text_prefix_length,
         )
         if real:
@@ -2061,6 +2258,8 @@ def _load_stage_entrypoints():
             prior=prior,
             learning_rate=cfg.ar.learning_rate,
             weight_decay=cfg.ar.weight_decay,
+            optimizer_beta1=float(getattr(cfg.ar, "optimizer_beta1", 0.9)),
+            optimizer_beta2=float(getattr(cfg.ar, "optimizer_beta2", 0.999)),
             warmup_steps=cfg.ar.warmup_steps,
             min_lr_ratio=cfg.ar.min_lr_ratio,
             atom_loss_weight=cfg.ar.atom_loss_weight,
@@ -2071,6 +2270,8 @@ def _load_stage_entrypoints():
             coeff_huber_delta=cfg.ar.coeff_huber_delta,
             sample_coeff_temperature=cfg.ar.sample_coeff_temperature,
             sample_coeff_mode=cfg.ar.sample_coeff_mode,
+            text_loss_weight=float(getattr(cfg.ar, "text_loss_weight", 0.0) or 0.0),
+            image_loss_weight=float(getattr(cfg.ar, "image_loss_weight", 1.0) or 1.0),
         )
         model.save_hyperparameters(
             {
@@ -2119,6 +2320,29 @@ def _load_stage_entrypoints():
                 or 1
             ),
         )
+        checkpoint_monitor = str(getattr(cfg.train_ar, "checkpoint_monitor", "val/loss") or "val/loss")
+        checkpoint_mode = str(getattr(cfg.train_ar, "checkpoint_mode", "min") or "min").lower()
+        if checkpoint_mode not in {"min", "max"}:
+            raise ValueError(f"train_ar.checkpoint_mode must be 'min' or 'max', got {checkpoint_mode!r}")
+        checkpoint_filename = str(getattr(cfg.train_ar, "checkpoint_filename", "") or "")
+        if not checkpoint_filename:
+            checkpoint_filename = f"s2-{{epoch:03d}}-{{{checkpoint_monitor}:.4f}}"
+        generation_fid_every_n_epochs = int(getattr(cfg.train_ar, "generation_fid_every_n_epochs", 0) or 0)
+        if checkpoint_monitor in {"s2/generation_fid", "generation/fid"} and generation_fid_every_n_epochs <= 0:
+            generation_fid_every_n_epochs = checkpoint_every_n_epochs
+        generation_fid_num_samples = int(
+            getattr(
+                cfg.train_ar,
+                "generation_fid_num_samples",
+                getattr(cfg.train_ar, "generation_metric_num_samples", 0),
+            )
+            or 0
+        )
+        if generation_fid_every_n_epochs > 0:
+            generation_fid_num_samples = max(
+                generation_fid_num_samples,
+                int(getattr(cfg.train_ar, "sample_num_images", 4) or 4),
+            )
         torch.use_deterministic_algorithms(deterministic, warn_only=True)
         if torch.cuda.is_available():
             torch.backends.cudnn.deterministic = deterministic
@@ -2135,7 +2359,8 @@ def _load_stage_entrypoints():
         print(f"  Vocab Size: {cfg.ar.vocab_size}")
         print(f"  Model Dim: {cfg.ar.d_model}")
         print(f"  Heads: {cfg.ar.n_heads}")
-        print(f"  Layers: {cfg.ar.n_layers}")
+        print(f"  Spatial Layers: {cfg.ar.n_layers}")
+        print(f"  Depth Layers: {getattr(cfg.ar, 'n_depth_layers', None)}")
         print(f"  FF Dim: {cfg.ar.d_ff}")
         print(f"  Dropout: {cfg.ar.dropout}")
         print(f"  Atom Vocab Size: {cfg.ar.atom_vocab_size}")
@@ -2190,14 +2415,20 @@ def _load_stage_entrypoints():
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         ckpt_dir = os.path.join(cfg.output_dir, "checkpoints", f"s2_{stamp}")
         os.makedirs(ckpt_dir, exist_ok=True)
+        temp_dir = _configure_training_tempdir(cfg.output_dir)
         print(f"\nCheckpoint dir: {ckpt_dir}")
+        print(f"Temp dir: {temp_dir}")
         print(
             "Checkpoint policy: "
             f"save_top_k={checkpoint_save_top_k}, "
             f"save_last={checkpoint_save_last}, "
             f"every_n_epochs={checkpoint_every_n_epochs}, "
+            f"monitor={checkpoint_monitor}, "
+            f"mode={checkpoint_mode}, "
             f"wandb_selected_checkpoint_upload={checkpoint_upload_to_wandb}, "
-            f"wandb_upload_every_n_epochs={checkpoint_upload_every_n_epochs}"
+            f"wandb_upload_every_n_epochs={checkpoint_upload_every_n_epochs}, "
+            f"generation_fid_every_n_epochs={generation_fid_every_n_epochs}, "
+            f"generation_fid_num_samples={generation_fid_num_samples}"
         )
 
         base_run = str(getattr(cfg.wandb, "name", "") or "").strip() or _default_stage2_run_name()
@@ -2258,19 +2489,42 @@ def _load_stage_entrypoints():
                 "sample_top_k": int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
                 "sample_class_labels": sample_class_labels,
                 "sample_text_prompts": sample_text_prompts,
+                "text_conditioning_mode": str(getattr(cfg.ar, "text_conditioning_mode", "additive") or "additive"),
+                "text_prefix_length": int(getattr(cfg.ar, "text_prefix_length", 0) or 0),
+                "text_loss_weight": float(getattr(cfg.ar, "text_loss_weight", 0.0) or 0.0),
+                "image_loss_weight": float(getattr(cfg.ar, "image_loss_weight", 1.0) or 1.0),
             }
         )
 
+        cbs = []
+        if generation_fid_every_n_epochs > 0:
+            cbs.append(
+                Stage2GenerationFidCallback(
+                    cfg=cfg,
+                    cache_pt=str(cfg.token_cache_path),
+                    every_n_epochs=generation_fid_every_n_epochs,
+                    n=generation_fid_num_samples,
+                    temp=float(getattr(cfg.train_ar, "sample_temperature", 1.0) or 1.0),
+                    top_k=int(getattr(cfg.train_ar, "sample_top_k", 0) or 0),
+                    ctemp=getattr(cfg.train_ar, "sample_coeff_temperature", cfg.ar.sample_coeff_temperature),
+                    cmode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
+                    sample_variants=sample_variants,
+                    s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
+                    text_prompts=sample_text_prompts,
+                    class_labels=sample_class_labels,
+                )
+            )
         checkpoint_callback = ModelCheckpoint(
             dirpath=ckpt_dir,
-            filename="s2-{epoch:03d}-{val/loss:.4f}",
+            filename=checkpoint_filename,
             save_top_k=checkpoint_save_top_k,
-            monitor="val/loss",
-            mode="min",
+            monitor=checkpoint_monitor,
+            mode=checkpoint_mode,
             save_last=checkpoint_save_last,
             every_n_epochs=checkpoint_every_n_epochs,
+            auto_insert_metric_name=False,
         )
-        cbs = [checkpoint_callback]
+        cbs.append(checkpoint_callback)
         if checkpoint_upload_to_wandb:
             SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
             cbs.append(
@@ -2415,8 +2669,9 @@ def _load_stage_entrypoints():
             Stage2SamplePreviewCallback._barrier_if_needed(trainer)
 
         print("\nTransformer training complete.")
-        print(f"Best checkpoint: {cbs[0].best_model_path}")
-        return cbs[0].best_model_path
+        best_model_path = str(getattr(checkpoint_callback, "best_model_path", "") or "")
+        print(f"Best checkpoint: {best_model_path}")
+        return best_model_path
 
 
     train_ar = train_stage2
@@ -2510,7 +2765,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Launching:", shlex.join(cmd), flush=True)
     if args.dry_run:
         return 0
-    os.environ.setdefault("LASER_DISABLE_WANDB_MEDIA", "1")
+    os.environ.setdefault("LASER_DISABLE_WANDB_MEDIA", "0")
     os.execv(cmd[0], cmd)
     return 0
 

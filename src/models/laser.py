@@ -74,6 +74,19 @@ def _canonical_attn_resolutions(values) -> Tuple[int, ...]:
     return tuple(sorted({int(v) for v in values}))
 
 
+
+
+def _coerce_positive_finite(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        fvalue = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fvalue) or fvalue <= 0:
+        return None
+    return max(1, int(fvalue))
+
 def _canonical_channel_multipliers(values) -> Optional[Tuple[int, ...]]:
     if values is None:
         return None
@@ -122,6 +135,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             recon_l1_weight=0.0,
             recon_edge_weight=0.0,
             perceptual_weight=1.0,
+            lpips_version="0.1",
             perceptual_start_step=0,
             perceptual_warmup_steps=0,
             adversarial_weight=0.0,
@@ -156,6 +170,11 @@ class LASER(VisualsMixin, pl.LightningModule):
             patch_reconstruction="tile",
             coef_max=None,
             data_init_from_first_batch=False,
+            dead_atom_revival=False,
+            dead_atom_revival_interval=500,
+            dead_atom_revival_max_fraction=0.05,
+            dead_atom_revival_noise=0.05,
+            dead_atom_revival_patience=5,
             bottleneck_type="dictionary",
             rq_code_depth=4,
             rq_shared_codebook=True,
@@ -255,6 +274,12 @@ class LASER(VisualsMixin, pl.LightningModule):
             coef_max: optional coefficient bound retained for token quantization metadata
             data_init_from_first_batch: initialize dictionary atoms from first-batch
                 encoder latents before the first OMP solve.
+            dead_atom_revival: periodically replace dictionary atoms that have not
+                appeared in OMP supports for several usage windows.
+            dead_atom_revival_interval: optimizer-step interval for dead-atom checks.
+            dead_atom_revival_max_fraction: maximum dictionary fraction replaced per check.
+            dead_atom_revival_noise: normalized noise scale added to sampled replacement atoms.
+            dead_atom_revival_patience: number of empty usage windows before an atom is revived.
             sparsity_reg_weight: L1 regularization weight for active sparse coefficient magnitude
             audio_energy_loss_weight: weight for audio magnitude-energy matching
             audio_multires_loss_weight: weight for audio multi-resolution spectrogram matching
@@ -287,6 +312,9 @@ class LASER(VisualsMixin, pl.LightningModule):
         """
         super(LASER, self).__init__()
 
+        # Older DDPM-decoder checkpoints saved this constructor option, but the
+        # maintained decoder no longer exposes a switch for it.
+        kwargs.pop("decoder_upsample_mode", None)
         if kwargs:
             unknown = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported LASER arguments: {unknown}")
@@ -323,6 +351,11 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.beta2 = float(beta2)
         self.optimizer_beta2 = float(optimizer_beta2)
         self.perceptual_weight = perceptual_weight
+        self.lpips_version = str(lpips_version).strip().lower().removeprefix("v")
+        if self.lpips_version not in {"0.0", "0.1"}:
+            raise ValueError(
+                f"lpips_version must be '0.0' or '0.1', got {lpips_version!r}"
+            )
         self.perceptual_start_step = max(int(perceptual_start_step), 0)
         self.perceptual_warmup_steps = max(int(perceptual_warmup_steps), 0)
         self.adversarial_weight = float(adversarial_weight)
@@ -361,6 +394,10 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.discriminator_layers = int(discriminator_layers)
         self.automatic_optimization = True
         self.manual_gradient_clip_val = None
+        # Lightning forbids Trainer-level gradient accumulation when a module
+        # uses manual optimization. train.py transfers the requested value here
+        # for the adversarial path, whose training step performs accumulation.
+        self.manual_accumulate_grad_batches = 1
         self.log_images_every_n_steps = max(int(log_images_every_n_steps), 0)
         self.compute_fid = compute_fid
         self.fid_feature = int(fid_feature)
@@ -617,6 +654,11 @@ class LASER(VisualsMixin, pl.LightningModule):
                 patch_stride=patch_stride,
                 patch_reconstruction=patch_reconstruction,
                 data_init_from_first_batch=data_init_from_first_batch,
+                dead_atom_revival=dead_atom_revival,
+                dead_atom_revival_interval=dead_atom_revival_interval,
+                dead_atom_revival_max_fraction=dead_atom_revival_max_fraction,
+                dead_atom_revival_noise=dead_atom_revival_noise,
+                dead_atom_revival_patience=dead_atom_revival_patience,
             )
         elif bottleneck_type == "rq":
             from .rq_bottleneck import RQBottleneck
@@ -638,7 +680,9 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.bottleneck.requires_grad_(False)
 
         # Initialize LPIPS for perceptual loss only if used
-        self.lpips = LPIPS() if self.perceptual_weight > 0 else None
+        self.lpips = (
+            LPIPS(version=self.lpips_version) if self.perceptual_weight > 0 else None
+        )
         if self.lpips is not None:
             self.lpips.eval()
             for p in self.lpips.parameters():
@@ -742,11 +786,16 @@ class LASER(VisualsMixin, pl.LightningModule):
         use_mid_attention = self.use_mid_attention
         self.save_hyperparameters()
 
+    def _train_image_log_step(self) -> int:
+        if self._adversarial_enabled and hasattr(self, "_manual_train_step"):
+            return int(self._manual_train_step.item())
+        return int(getattr(self, "global_step", 0))
+
     def _should_log_images(self, batch_idx, prefix='train'):
         if self.log_images_every_n_steps <= 0:
             return False
         if prefix == 'train':
-            step = int(getattr(self, "global_step", 0))
+            step = self._train_image_log_step()
             return step > 0 and step % self.log_images_every_n_steps == 0
         return int(batch_idx) == 0
 
@@ -858,17 +907,6 @@ class LASER(VisualsMixin, pl.LightningModule):
         """
         if trainer is None:
             return 1, "fallback"
-
-        def _coerce_positive_finite(value) -> Optional[int]:
-            if value is None:
-                return None
-            try:
-                fvalue = float(value)
-            except (TypeError, ValueError):
-                return None
-            if not math.isfinite(fvalue) or fvalue <= 0:
-                return None
-            return max(1, int(fvalue))
 
         candidates = [("max_steps", getattr(trainer, "max_steps", None))]
         max_epochs = getattr(trainer, "max_epochs", None)
@@ -990,6 +1028,9 @@ class LASER(VisualsMixin, pl.LightningModule):
         optimizer.step(closure=optimizer_closure)
         if not self.bypass_bottleneck:
             self.bottleneck.normalize_dictionary_()
+            revive = getattr(self.bottleneck, "revive_dead_atoms_after_step_", None)
+            if callable(revive):
+                revive(optimizer=self._raw_optimizer(optimizer))
 
     def _empty_sparse_codes_like(self, z_e: torch.Tensor) -> SparseCodes:
         batch_size, _, height, width = z_e.shape
@@ -1068,7 +1109,10 @@ class LASER(VisualsMixin, pl.LightningModule):
         return x
 
     def _image_to_lpips_range(self, x: torch.Tensor) -> torch.Tensor:
-        return self._image_to_unit_range(x, clamp=True).mul(2.0).sub(1.0)
+        # LPIPS in RQ-VAE consumes the raw reconstruction range.  Clamping here
+        # hides decoder overshoot from the perceptual objective and, more
+        # importantly, gives those saturated pixels zero gradient.
+        return self._image_to_unit_range(x, clamp=False).mul(2.0).sub(1.0)
 
     def _effective_perceptual_weight(self, prefix: str) -> float:
         if prefix != "train" or self.perceptual_weight <= 0:
@@ -1754,6 +1798,13 @@ class LASER(VisualsMixin, pl.LightningModule):
         # Compute sparsity
         sparsity = self._support_fraction(sparse_codes)
         effective_sparsity = self._effective_coeff_nonzero_fraction(sparse_codes)
+        if sparse_codes.support.numel() > 0 and sparse_codes.num_embeddings > 0:
+            batch_atom_usage_fraction = recon_raw.new_tensor(
+                float(sparse_codes.support.detach().unique().numel())
+                / float(sparse_codes.num_embeddings)
+            )
+        else:
+            batch_atom_usage_fraction = recon_raw.new_zeros(())
 
         self.log(f'{prefix}/loss', total_loss, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/recon_loss', recon_loss, **log_kwargs)
@@ -1771,6 +1822,28 @@ class LASER(VisualsMixin, pl.LightningModule):
         )
         self.log(f'{prefix}/perceptual_loss', perceptual_loss, **log_kwargs)
         self.log(f'{prefix}/weighted_perceptual_loss', perceptual_weight * perceptual_loss, **log_kwargs)
+        if self.lpips is not None:
+            self.log(
+                f'{prefix}/lpips_eval_mode',
+                recon_raw.new_tensor(float(not self.lpips.training)),
+                **log_kwargs,
+            )
+            self.log(
+                f'{prefix}/lpips_v01_scaling',
+                recon_raw.new_tensor(float(self.lpips.version == "0.1")),
+                **log_kwargs,
+            )
+        if not is_audio:
+            self.log(
+                f'{prefix}/recon_out_of_range_fraction',
+                ((recon_raw < -1.0) | (recon_raw > 1.0)).float().mean(),
+                **log_kwargs,
+            )
+            self.log(
+                f'{prefix}/recon_max_abs',
+                recon_raw.detach().abs().amax(),
+                **log_kwargs,
+            )
         self.log(
             f'{prefix}/perceptual_weight_effective',
             recon_raw.new_tensor(float(perceptual_weight)),
@@ -1828,6 +1901,32 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.log(f'{prefix}/ssim', ssim, prog_bar=True, **log_kwargs)
         self.log(f'{prefix}/sparsity', sparsity, **log_kwargs)
         self.log(f'{prefix}/effective_sparsity', effective_sparsity, **log_kwargs)
+        self.log(f'{prefix}/batch_atom_usage_fraction', batch_atom_usage_fraction, **log_kwargs)
+        if not self.bypass_bottleneck:
+            usage_window = getattr(self.bottleneck, "_atom_usage_window", None)
+            num_atoms = max(int(getattr(self.bottleneck, "num_embeddings", 0) or 0), 1)
+            if torch.is_tensor(usage_window) and usage_window.numel() > 0:
+                atom_window_active_fraction = (
+                    (usage_window.detach() > 0).float().sum() / float(num_atoms)
+                ).to(device=recon_raw.device)
+                self.log(
+                    f'{prefix}/atom_window_active_fraction',
+                    atom_window_active_fraction,
+                    **log_kwargs,
+                )
+            for attr, metric_name in (
+                ("_last_active_atom_count", "last_active_atom_count"),
+                ("_last_dead_atom_count", "dead_atom_count"),
+                ("_last_revived_atom_count", "revived_atom_count"),
+                ("_last_revival_check_step", "last_revival_check_step"),
+            ):
+                value = getattr(self.bottleneck, attr, None)
+                if torch.is_tensor(value):
+                    self.log(
+                        f'{prefix}/{metric_name}',
+                        value.detach().to(device=recon_raw.device, dtype=torch.float32),
+                        **log_kwargs,
+                    )
         
         if return_raw:
             return total_loss, recon_vis, x_vis, recon_raw, x
@@ -1863,7 +1962,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         step = int(self._manual_train_step.item())
         opt_ae, opt_disc = self.optimizers()
         trainer = self._trainer_ref()
-        accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
+        accum = max(1, int(getattr(self, "manual_accumulate_grad_batches", 1) or 1))
         batch_idx_int = int(batch_idx)
         num_batches = _coerce_positive_finite(getattr(trainer, "num_training_batches", None))
         is_last_batch = num_batches is not None and batch_idx_int + 1 >= int(num_batches)
@@ -1877,7 +1976,11 @@ class LASER(VisualsMixin, pl.LightningModule):
         self._adv_cache = None
         self._set_discriminator_requires_grad(False)
         try:
-            loss, recon, x = self.compute_metrics(batch, prefix='train')
+            loss, recon, x, recon_raw, x_raw = self.compute_metrics(
+                batch,
+                prefix='train',
+                return_raw=True,
+            )
         finally:
             self._set_discriminator_requires_grad(True)
         if not torch.isfinite(loss):
@@ -1897,10 +2000,18 @@ class LASER(VisualsMixin, pl.LightningModule):
         if disc_should_step:
             self._apply_scheduled_lrs(opt_disc, step=step, base_lrs=self._disc_lr_base_lrs)
             d_loss, logits_real, logits_fake = self._discriminator_loss(
-                x.detach(),
-                recon.detach(),
+                x_raw.detach(),
+                recon_raw.detach(),
             )
-            weighted_d_loss = float(disc_factor) * disc_schedule_factor * d_loss
+            # RQ-VAE applies disc_weight to the discriminator update as well as
+            # the generator adversarial term.  Keep the same schedule on both
+            # sides of the game.
+            weighted_d_loss = (
+                float(disc_factor)
+                * disc_schedule_factor
+                * float(self.adversarial_weight)
+                * d_loss
+            )
         else:
             weighted_d_loss = self._zero_discriminator_loss_like(loss)
 
@@ -1916,6 +2027,9 @@ class LASER(VisualsMixin, pl.LightningModule):
             # Mirror the automatic optimizer_step post-update dictionary maintenance.
             if not self.bypass_bottleneck:
                 self.bottleneck.normalize_dictionary_()
+                revive = getattr(self.bottleneck, "revive_dead_atoms_after_step_", None)
+                if callable(revive):
+                    revive(optimizer=self._raw_optimizer(opt_ae))
 
             if disc_should_step:
                 self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
@@ -1929,7 +2043,11 @@ class LASER(VisualsMixin, pl.LightningModule):
 
         if self._should_log_images(batch_idx, prefix='train'):
             self.log_images(
-                x, recon, prefix='train', audio_meta=extract_audio_metadata_from_batch(batch)
+                x,
+                recon,
+                prefix='train',
+                audio_meta=extract_audio_metadata_from_batch(batch),
+                step=self._train_image_log_step(),
             )
             self._ddp_barrier_if_needed()
         return loss

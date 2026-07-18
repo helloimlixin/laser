@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 import torch
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,10 +21,21 @@ from src.models.laser import LASER
 from src.sparse_token_codec import build_coeff_bin_values
 from src.stage1_setup import build_stage1_datamodule, data_config_from_overrides
 from src.stage2_paths import default_token_cache_path
+from src.text_conditioning import (
+    CHAR_TOKENIZER,
+    DEFAULT_TEXT_VOCAB_CHARS,
+    RQ_BPE16K_PAD_ID,
+    RQ_BPE16K_TOKENIZER,
+    RQ_BPE16K_VOCAB_SIZE,
+    TEXT_PAD_ID,
+    encode_texts,
+    text_vocab_size,
+)
 
 
 IMAGE_TOKEN_CACHE_DATASETS = [
     "cifar10",
+    "cc3m",
     "celeba",
     "celebahq",
     "coco",
@@ -52,6 +64,7 @@ def _build_datamodule(args):
         mean=tuple(float(x) for x in args.mean),
         std=tuple(float(x) for x in args.std),
         augment=False,
+        max_items=int(args.max_items),
     )
     return build_stage1_datamodule(data_cfg)
 
@@ -66,6 +79,84 @@ def _resolve_loader(datamodule, split: str):
     if split == "test":
         return datamodule.test_dataloader()
     raise ValueError(f"Unsupported split: {split!r}")
+
+
+def _dataset_source_paths(dataset) -> list[str] | None:
+    paths = getattr(dataset, "image_paths", None)
+    if paths is None:
+        paths = getattr(dataset, "paths", None)
+    if paths is None:
+        samples = getattr(dataset, "samples", None)
+        if samples is not None:
+            try:
+                paths = [sample[0] for sample in samples]
+            except Exception:
+                paths = None
+    if paths is None:
+        return None
+    try:
+        paths = [str(Path(path).expanduser().resolve()) for path in paths]
+    except Exception:
+        return None
+    try:
+        if len(paths) != len(dataset):
+            return None
+    except Exception:
+        return None
+    return paths
+
+
+class _SourcePathDataset(Dataset):
+    def __init__(self, dataset, source_paths: list[str]):
+        self.dataset = dataset
+        self.source_paths = list(source_paths)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        path = self.source_paths[int(idx)]
+        if isinstance(item, tuple):
+            return (*item, path)
+        if isinstance(item, list):
+            return (*item, path)
+        return item, path
+
+
+def _loader_with_source_paths(loader):
+    source_paths = _dataset_source_paths(getattr(loader, "dataset", None))
+    if source_paths is None:
+        return loader, False
+
+    kwargs = {
+        "dataset": _SourcePathDataset(loader.dataset, source_paths),
+        "num_workers": int(getattr(loader, "num_workers", 0) or 0),
+        "collate_fn": getattr(loader, "collate_fn", None),
+        "pin_memory": bool(getattr(loader, "pin_memory", False)),
+        "drop_last": False,
+        "timeout": getattr(loader, "timeout", 0),
+        "worker_init_fn": getattr(loader, "worker_init_fn", None),
+        "persistent_workers": bool(getattr(loader, "persistent_workers", False)),
+    }
+    if kwargs["num_workers"] > 0:
+        prefetch_factor = getattr(loader, "prefetch_factor", None)
+        if prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
+
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    if batch_sampler is not None:
+        kwargs["batch_sampler"] = batch_sampler
+        kwargs.pop("drop_last", None)
+    else:
+        kwargs["batch_size"] = int(getattr(loader, "batch_size", 1) or 1)
+        sampler = getattr(loader, "sampler", None)
+        if sampler is not None:
+            kwargs["sampler"] = sampler
+        else:
+            kwargs["shuffle"] = False
+
+    return DataLoader(**kwargs), True
 
 
 def _progress_total(loader, max_items: int) -> int | None:
@@ -199,6 +290,43 @@ def _batch_class_labels(batch, keep: int) -> torch.Tensor | None:
     return labels[:keep].cpu().contiguous()
 
 
+def _batch_source_paths(batch, keep: int) -> list[str] | None:
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        return None
+    paths = batch[-1]
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    if not isinstance(paths, (tuple, list)):
+        return None
+    paths = [str(path) for path in paths[:keep]]
+    if len(paths) != int(keep):
+        return None
+    return paths
+
+
+def _batch_texts(batch, keep: int) -> list[str] | None:
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        return None
+    raw = batch[1]
+    if isinstance(raw, (str, bytes)):
+        values = [raw]
+    else:
+        try:
+            values = list(raw)[:keep]
+        except TypeError:
+            return None
+    if len(values) != int(keep):
+        return None
+    texts: list[str] = []
+    for value in values:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if not isinstance(value, str):
+            return None
+        texts.append(value)
+    return texts
+
+
 def _finalize_class_labels(chunks: list[torch.Tensor], total_items: int) -> torch.Tensor | None:
     if not chunks:
         return None
@@ -237,6 +365,53 @@ def _attach_class_label_metadata(payload: dict, class_labels: torch.Tensor, *, d
     synsets = imagenet_synsets_from_names(dataset_name, raw_names)
     if synsets:
         payload["meta"]["class_synsets"] = synsets
+
+
+def _attach_text_metadata(payload: dict, captions: list[str], *, max_length: int, tokenizer: str = CHAR_TOKENIZER) -> None:
+    total_items = int(payload["tokens_flat"].size(0))
+    if len(captions) < total_items:
+        return
+    selected = list(captions[:total_items])
+    max_length = max(1, int(max_length))
+    tokenizer = str(tokenizer or CHAR_TOKENIZER).strip().lower()
+    if tokenizer in {"bpe16k", "bpe16k_huggingface", "rqvae_bpe16k"}:
+        tokenizer = RQ_BPE16K_TOKENIZER
+    tokens, mask, normalized = encode_texts(
+        selected,
+        max_length=max_length,
+        vocab_chars=DEFAULT_TEXT_VOCAB_CHARS,
+        tokenizer=tokenizer,
+    )
+    if tokenizer == RQ_BPE16K_TOKENIZER:
+        vocab_size = RQ_BPE16K_VOCAB_SIZE
+        pad_id = RQ_BPE16K_PAD_ID
+        extra_meta = {
+            "text_tokenizer": RQ_BPE16K_TOKENIZER,
+            "text_vocab_name": "bpe16k_huggingface",
+        }
+    else:
+        vocab_size = text_vocab_size(DEFAULT_TEXT_VOCAB_CHARS)
+        pad_id = TEXT_PAD_ID
+        extra_meta = {
+            "text_tokenizer": CHAR_TOKENIZER,
+            "text_vocab_chars": DEFAULT_TEXT_VOCAB_CHARS,
+        }
+    payload["text_tokens"] = tokens.contiguous()
+    payload["text_mask"] = mask.contiguous()
+    preview_count = min(len(normalized), 1024)
+    payload["text"] = normalized[:preview_count]
+    payload["meta"].update(
+        {
+            "has_text_conditioning": True,
+            "text_conditioning": "caption",
+            "text_vocab_size": int(vocab_size),
+            "text_max_length": int(max_length),
+            "text_pad_id": int(pad_id),
+            "text_num_captions": int(total_items),
+            "text_preview_count": int(preview_count),
+            **extra_meta,
+        }
+    )
 
 
 def _default_output_path(args):
@@ -299,6 +474,14 @@ def main():
         help="Absolute coefficient percentile used when coeff_max is auto/omitted.",
     )
     parser.add_argument("--coeff_mu", type=float, default=0.0, help="Mu parameter when coeff_quantization=mu_law.")
+    parser.add_argument("--text_max_length", type=int, default=160, help="Maximum caption length for text-conditioned caches.")
+    parser.add_argument(
+        "--text_tokenizer",
+        type=str,
+        default=CHAR_TOKENIZER,
+        choices=[CHAR_TOKENIZER, RQ_BPE16K_TOKENIZER, "bpe16k", "bpe16k_huggingface", "rqvae_bpe16k"],
+        help="Caption tokenizer for text-conditioned caches.",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Output token cache path.")
     parser.add_argument("--ar_output_dir", type=Path, default=Path("outputs/ar"), help="Default root for token caches.")
     parser.add_argument("--max_items", type=int, default=0, help="Optional cap on number of encoded items.")
@@ -322,6 +505,7 @@ def main():
     ).eval().to(device)
     datamodule = _build_datamodule(args)
     loader = _resolve_loader(datamodule, args.split)
+    loader, records_source_paths = _loader_with_source_paths(loader)
     cache_mode = str(args.cache_mode).strip().lower()
     quantized_cache = cache_mode == "quantized"
     coeff_quantization = str(args.coeff_quantization).strip().lower()
@@ -349,6 +533,8 @@ def main():
     all_tokens = []
     all_coeffs = []
     all_class_labels = []
+    all_texts = []
+    all_source_paths = []
     seen = 0
     token_shape = None
     observed_coeff_abs_max = 0.0
@@ -376,6 +562,12 @@ def main():
             class_labels = _batch_class_labels(batch, int(x.size(0)))
             if class_labels is not None:
                 all_class_labels.append(class_labels)
+            texts = _batch_texts(batch, int(x.size(0)))
+            if texts is not None:
+                all_texts.extend(texts)
+            source_paths = _batch_source_paths(batch, int(x.size(0))) if records_source_paths else None
+            if source_paths is not None:
+                all_source_paths.extend(source_paths)
             x = x.to(device, non_blocking=True)
             if quantized_cache and not adaptive_quantized_cache:
                 tokens, current_latent_hw = model.encode_to_tokens(
@@ -477,6 +669,9 @@ def main():
         "variational_coeff_min_std": float(getattr(model.hparams, "variational_coeff_min_std", 0.01)),
         "support_order": "atom_id",
     }
+    if records_source_paths:
+        meta["source_paths_key"] = "source_paths"
+        meta["source_paths_order"] = "token_rows"
     if quantized_cache:
         meta.update(
             {
@@ -497,6 +692,17 @@ def main():
     }
     if coeffs_flat is not None:
         cache["coeffs_flat"] = coeffs_flat
+    if all_source_paths:
+        source_paths = all_source_paths[: int(tokens_flat.size(0))]
+        if len(source_paths) == int(tokens_flat.size(0)):
+            cache["source_paths"] = source_paths
+    if all_texts:
+        _attach_text_metadata(
+            cache,
+            all_texts,
+            max_length=int(args.text_max_length),
+            tokenizer=str(args.text_tokenizer),
+        )
     if class_labels is not None:
         _attach_class_label_metadata(
             cache,

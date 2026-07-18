@@ -255,6 +255,31 @@ def test_sparse_token_prior_lr_schedule_does_not_force_lightning_step_estimate_p
     assert optimizer.param_groups[0]["lr"] == 1e-5
 
 
+def test_sparse_token_prior_lr_schedule_accounts_for_gradient_accumulation():
+    mod = SparseTokenPriorModule(
+        prior=_FakeQuantPrior(),
+        learning_rate=1e-3,
+        optimizer_beta1=0.9,
+        optimizer_beta2=0.95,
+    )
+    trainer = type(
+        "TrainerStub",
+        (),
+        {
+            "max_steps": -1,
+            "max_epochs": 2,
+            "num_training_batches": 100,
+            "accumulate_grad_batches": 4,
+        },
+    )()
+    mod.__dict__["_trainer"] = trainer
+
+    optimizer = mod.configure_optimizers()
+
+    assert mod._lr_total_steps == 50
+    assert optimizer.param_groups[0]["betas"] == (0.9, 0.95)
+
+
 def test_src_spatial_depth_prior_quantized_generation_preserves_unique_atoms():
     torch.manual_seed(0)
 
@@ -321,6 +346,34 @@ def test_build_sparse_prior_from_cache_uses_cache_shape_and_vocab_split():
     assert model.coeff_vocab_size == 2
     assert model.cfg.coeff_max == 7.5
     assert torch.equal(model.cfg.coeff_bin_values, torch.tensor([-1.0, 0.0]))
+
+
+def test_build_sparse_prior_from_cache_accepts_explicit_depth_layers():
+    cache = {
+        "tokens_flat": torch.zeros(4, 8, dtype=torch.int32),
+        "shape": (1, 2, 4),
+        "meta": {
+            "num_atoms": 3,
+            "coeff_bin_values": torch.tensor([-1.0, 0.0], dtype=torch.float32),
+        },
+    }
+
+    model = build_sparse_prior_from_cache(
+        cache,
+        architecture="spatial_depth",
+        total_vocab_size=5,
+        atom_vocab_size=3,
+        coeff_vocab_size=2,
+        d_model=8,
+        n_heads=2,
+        n_layers=6,
+        n_depth_layers=2,
+        d_ff=16,
+        dropout=0.0,
+    )
+
+    assert model.cfg.n_spatial_layers == 6
+    assert model.cfg.n_depth_layers == 2
 
 
 def test_infer_sparse_vocab_sizes_uses_coeff_bin_values_length_when_count_is_missing():

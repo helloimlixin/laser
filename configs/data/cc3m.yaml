@@ -1,0 +1,14 @@
+dataset: cc3m
+data_dir: ${oc.env:CC3M_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/cc3m}
+batch_size: ${oc.env:CC3M_BATCH_SIZE,32}
+eval_batch_size: ${oc.env:CC3M_EVAL_BATCH_SIZE,32}
+num_workers: ${oc.env:CC3M_NUM_WORKERS,4}
+pin_memory: true
+prefetch_factor: 4
+image_size: 256
+train_crop_size: null
+seed: ${seed}
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
+augment: true
+max_items: ${oc.env:CC3M_MAX_ITEMS,0}

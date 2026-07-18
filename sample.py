@@ -14,6 +14,7 @@ if sys.version_info < (3, 10):
 import torch
 
 from src.s2 import load_run, pick_nrow, sample, sample_dir, sample_slide, save_dump, save_grid
+from src.text_conditioning import encode_prompts_from_cache
 
 
 def main():
@@ -35,6 +36,8 @@ def main():
     p.add_argument("--dump", "--save-payload", dest="save_payload", action="store_true", help="Also save the generated token payload as samples.pt.")
     p.add_argument("--latent-h", dest="latent_h", type=int, default=0, help="Optional target latent height for sliding-window high-resolution sampling.")
     p.add_argument("--latent-w", dest="latent_w", type=int, default=0, help="Optional target latent width for sliding-window high-resolution sampling.")
+    p.add_argument("--prompt", action="append", default=[], help="Text prompt for text-conditioned priors. Repeat for multiple prompts.")
+    p.add_argument("--prompts-file", type=Path, default=None, help="Optional newline-delimited text prompts.")
     args = p.parse_args()
 
     run = load_run(
@@ -54,6 +57,26 @@ def main():
         if int(args.latent_h) <= 0 or int(args.latent_w) <= 0:
             raise ValueError("--latent-h and --latent-w must both be > 0 when either is set.")
         target_hw = (int(args.latent_h), int(args.latent_w))
+
+    prompts = list(args.prompt or [])
+    if args.prompts_file is not None:
+        prompts.extend(
+            line.strip()
+            for line in args.prompts_file.expanduser().read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    text_tokens = None
+    text_mask = None
+    normalized_prompts = []
+    if prompts:
+        if target_hw is not None and target_hw != run.shape[:2]:
+            raise ValueError("Text-conditioned prompts are not supported with sliding-window sampling.")
+        text_tokens, text_mask, normalized_prompts = encode_prompts_from_cache(
+            prompts,
+            cache=run.cache,
+            n=int(args.num_samples),
+            device=run.dev,
+        )
 
     if target_hw is not None and target_hw != run.shape[:2]:
         out = sample_slide(
@@ -79,6 +102,8 @@ def main():
             top_k=int(args.top_k),
             ctemp=args.coeff_temperature,
             cmode=args.coeff_sample_mode,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
             dev=run.dev,
         )
 
@@ -91,6 +116,10 @@ def main():
     print(f"Checkpoint: {run.ckpt}")
     print(f"Token cache: {run.cache_pt}")
     print(f"Stage-1 checkpoint: {run.s1.checkpoint_path}")
+    if normalized_prompts:
+        prompt_path = out_dir / "prompts.txt"
+        prompt_path.write_text("\n".join(normalized_prompts) + "\n", encoding="utf-8")
+        print(f"Prompts: {prompt_path}")
     if target_hw is not None:
         print(f"Latent shape: {target_hw}")
     print(f"Saved generation grid: {direct}")

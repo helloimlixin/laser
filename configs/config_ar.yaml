@@ -25,6 +25,8 @@ token_cache:
   coeff_quantization: quantile
   coeff_calibration_percentile: 99.5
   coeff_mu: 0.0
+  text_max_length: 160
+  text_tokenizer: char
   batch_size: 64
   num_workers: 4
   max_items: 0
@@ -66,12 +68,17 @@ ar:
   text_vocab_size: 0
   text_max_length: 0
   text_pad_id: 0
+  text_conditioning_mode: additive
   text_prefix_length: 16
+  text_loss_weight: 0.0
+  image_loss_weight: 1.0
 
   # Model architecture
   d_model: 512
   n_heads: 8
   n_layers: 6
+  # null preserves the legacy spatial_layers // 2 behavior.
+  n_depth_layers: null
   d_ff: 2048
   dropout: 0.1
 
@@ -82,6 +89,8 @@ ar:
   # Training
   learning_rate: 3e-4
   weight_decay: 0.01
+  optimizer_beta1: 0.9
+  optimizer_beta2: 0.999
   warmup_steps: 1000
   max_steps: 50000
   min_lr_ratio: 0.01
@@ -98,6 +107,9 @@ ar:
   # broad atom support instead of collapsing onto tens of atoms.
   atom_label_smoothing: 0.0
   atom_coverage_weight: 0.0
+  coeff_head_hidden_mult: 1.0
+  coeff_head_depth: 1
+  coeff_head_dropout: 0.0
   # Keep the maintained stage-2 path token-prediction focused by default.
   coeff_loss_type: auto
   coeff_huber_delta: 0.5
@@ -119,6 +131,11 @@ train_ar:
   checkpoint_save_last: true
   checkpoint_keep_recent: 3
   checkpoint_every_n_epochs: 1
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+  checkpoint_filename: ""
+  generation_fid_every_n_epochs: 0
+  generation_fid_num_samples: 0
   accelerator: gpu
   num_nodes: 1
   devices: 1

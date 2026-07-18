@@ -129,6 +129,46 @@ def test_dictionary_learning_data_initializes_from_first_batch():
     )
 
 
+def test_dictionary_learning_revives_dead_atoms_after_optimizer_step():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=8,
+        embedding_dim=4,
+        sparsity_level=1,
+        dead_atom_revival=True,
+        dead_atom_revival_interval=1,
+        dead_atom_revival_max_fraction=0.5,
+        dead_atom_revival_noise=0.0,
+        dead_atom_revival_patience=1,
+    )
+    dl.train()
+    with torch.no_grad():
+        dictionary = torch.zeros_like(dl.dictionary)
+        dictionary[:, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        for col in range(1, dl.num_embeddings):
+            dictionary[(col - 1) % 3 + 1, col] = 1.0
+        dl.dictionary.copy_(dictionary)
+        before = dl.dictionary.detach().clone()
+
+    z = torch.zeros(2, 4, 2, 2)
+    z[:, 0] = 1.0
+    _z_out, _loss, codes = dl(z)
+
+    assert set(codes.support.reshape(-1).tolist()) == {0}
+    revived = dl.revive_dead_atoms_after_step_()
+
+    assert revived == 4
+    assert int(dl._last_dead_atom_count.item()) == 7
+    assert int(dl._last_revived_atom_count.item()) == 4
+    assert torch.allclose(
+        dl.dictionary.detach().norm(dim=0),
+        torch.ones(dl.num_embeddings),
+        atol=1e-5,
+    )
+    changed = (dl.dictionary.detach() - before).abs().sum(dim=0) > 1e-6
+    assert int(changed.sum().item()) >= revived
+
+
 def test_ste_keeps_encoder_grad_and_loss_trains_dictionary():
     torch.manual_seed(0)
     dl = DictionaryLearning(

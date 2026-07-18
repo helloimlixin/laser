@@ -24,6 +24,11 @@ class DictionaryLearning(nn.Module):
         patch_stride=None,
         patch_reconstruction="tile",
         data_init_from_first_batch=False,
+        dead_atom_revival=False,
+        dead_atom_revival_interval=500,
+        dead_atom_revival_max_fraction=0.05,
+        dead_atom_revival_noise=0.05,
+        dead_atom_revival_patience=5,
         epsilon=1e-10,
     ):
         super().__init__()
@@ -35,6 +40,11 @@ class DictionaryLearning(nn.Module):
         self.epsilon = float(epsilon)
         self.dict_learning_rate = dict_learning_rate
         self.data_init_from_first_batch = bool(data_init_from_first_batch)
+        self.dead_atom_revival = bool(dead_atom_revival)
+        self.dead_atom_revival_interval = max(1, int(dead_atom_revival_interval))
+        self.dead_atom_revival_max_fraction = float(dead_atom_revival_max_fraction)
+        self.dead_atom_revival_noise = max(0.0, float(dead_atom_revival_noise))
+        self.dead_atom_revival_patience = max(1, int(dead_atom_revival_patience))
 
         if self.num_embeddings <= 0:
             raise ValueError(f"num_embeddings must be positive, got {self.num_embeddings}")
@@ -49,6 +59,11 @@ class DictionaryLearning(nn.Module):
             )
         if self.commitment_cost < 0.0:
             raise ValueError(f"commitment_cost must be >= 0, got {self.commitment_cost}")
+        if self.dead_atom_revival_max_fraction < 0.0:
+            raise ValueError(
+                "dead_atom_revival_max_fraction must be >= 0, got "
+                f"{self.dead_atom_revival_max_fraction}"
+            )
         self.patch_based = bool(patch_based)
         self.patch_size = int(patch_size) if self.patch_based else 1
         if self.patch_size <= 0:
@@ -77,6 +92,17 @@ class DictionaryLearning(nn.Module):
         self.dictionary = nn.Parameter(torch.randn(self.patch_dim, self.num_embeddings) * 0.02)
 
         self.register_buffer("_data_initialized", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("_atom_usage_window", torch.zeros(self.num_embeddings))
+        self.register_buffer(
+            "_atom_unused_intervals",
+            torch.zeros(self.num_embeddings, dtype=torch.long),
+        )
+        self.register_buffer("_revival_step", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_last_dead_atom_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_last_revived_atom_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_last_active_atom_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_last_revival_check_step", torch.zeros((), dtype=torch.long))
+        self._revival_candidate_atoms = None
 
         self.normalize_dictionary_()
         self._last_dl_latent_loss = None
@@ -216,6 +242,11 @@ class DictionaryLearning(nn.Module):
     def _distributed_is_initialized(self):
         return torch.distributed.is_available() and torch.distributed.is_initialized()
 
+    def _distributed_rank(self):
+        if not self._distributed_is_initialized():
+            return 0
+        return int(torch.distributed.get_rank())
+
     @torch.no_grad()
     def _broadcast_dictionary_(self):
         if self._distributed_is_initialized():
@@ -302,8 +333,148 @@ class DictionaryLearning(nn.Module):
                 0,
                 device=self.dictionary.device,
                 dtype=self.dictionary.dtype,
-            )
+        )
         return atoms
+
+    def _max_revival_count(self) -> int:
+        if not self.dead_atom_revival:
+            return 0
+        if self.dead_atom_revival_max_fraction <= 0.0:
+            return 0
+        max_fraction = min(float(self.dead_atom_revival_max_fraction), 1.0)
+        return max(1, int(math.ceil(float(self.num_embeddings) * max_fraction)))
+
+    @torch.no_grad()
+    def _with_revival_noise(self, atoms: torch.Tensor) -> torch.Tensor:
+        if atoms.numel() == 0 or self.dead_atom_revival_noise <= 0.0:
+            return atoms
+        noise = F.normalize(
+            torch.randn_like(atoms.float()),
+            p=2,
+            dim=0,
+            eps=max(float(self.epsilon), 1e-8),
+        ).to(dtype=atoms.dtype)
+        return _normalize_dictionary(
+            atoms + float(self.dead_atom_revival_noise) * noise,
+            eps=self.epsilon,
+        )
+
+    @torch.no_grad()
+    def _record_atom_usage_(self, support: torch.Tensor, signals: torch.Tensor) -> None:
+        if not self.training or not self.dead_atom_revival:
+            return
+        if support.numel() == 0:
+            return
+
+        support_flat = support.detach().reshape(-1).to(torch.long)
+        counts = torch.bincount(support_flat, minlength=self.num_embeddings).to(
+            device=self._atom_usage_window.device,
+            dtype=self._atom_usage_window.dtype,
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        self._atom_usage_window.add_(counts)
+
+        next_step = int(self._revival_step.item()) + 1
+        should_prepare_candidates = (
+            self.dead_atom_revival_max_fraction > 0.0
+            and next_step % int(self.dead_atom_revival_interval) == 0
+        )
+        if not should_prepare_candidates:
+            return
+
+        max_count = self._max_revival_count()
+        if max_count <= 0:
+            self._revival_candidate_atoms = None
+            return
+        max_columns = max(2048, max_count * 16)
+        candidate_signals = self._all_gather_signal_columns(
+            signals,
+            max_local_columns=max_columns,
+        )
+        atoms = self._signal_atoms(candidate_signals, max_count)
+        if atoms is None:
+            self._revival_candidate_atoms = None
+            return
+        self._revival_candidate_atoms = self._with_revival_noise(atoms.detach())
+
+    @torch.no_grad()
+    def _fallback_revival_atoms(self, count: int) -> torch.Tensor:
+        atoms = torch.randn(
+            self.patch_dim,
+            int(count),
+            device=self.dictionary.device,
+            dtype=self.dictionary.dtype,
+        )
+        return _normalize_dictionary(atoms, eps=self.epsilon)
+
+    @torch.no_grad()
+    def _reset_optimizer_state_for_atoms_(self, optimizer, atom_ids: torch.Tensor) -> None:
+        if optimizer is None or atom_ids.numel() == 0:
+            return
+        state = getattr(optimizer, "state", {}).get(self.dictionary, None)
+        if not isinstance(state, dict):
+            return
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            value = state.get(name, None)
+            if torch.is_tensor(value) and value.shape == self.dictionary.shape:
+                value.index_fill_(1, atom_ids.to(device=value.device), 0.0)
+
+    @torch.no_grad()
+    def revive_dead_atoms_after_step_(self, optimizer=None) -> int:
+        if not self.training or not self.dead_atom_revival:
+            return 0
+        self._revival_step.add_(1)
+        self._last_revived_atom_count.zero_()
+        if self.dead_atom_revival_max_fraction <= 0.0:
+            return 0
+        if int(self._revival_step.item()) % int(self.dead_atom_revival_interval) != 0:
+            return 0
+
+        used_this_window = self._atom_usage_window > 0
+        self._last_active_atom_count.copy_(used_this_window.sum().to(torch.long))
+        self._atom_unused_intervals[used_this_window] = 0
+        self._atom_unused_intervals[~used_this_window] += 1
+
+        dead_mask = self._atom_unused_intervals >= int(self.dead_atom_revival_patience)
+        dead_ids = torch.nonzero(dead_mask, as_tuple=False).flatten()
+        dead_count = int(dead_ids.numel())
+        self._last_dead_atom_count.fill_(dead_count)
+        self._last_revival_check_step.copy_(self._revival_step)
+        self._atom_usage_window.zero_()
+
+        max_count = self._max_revival_count()
+        if dead_count <= 0 or max_count <= 0:
+            self._revival_candidate_atoms = None
+            return 0
+
+        if dead_count > max_count:
+            idle = self._atom_unused_intervals.index_select(0, dead_ids)
+            order = torch.argsort(idle, descending=True)
+            dead_ids = dead_ids.index_select(0, order[:max_count])
+        revive_count = int(dead_ids.numel())
+        if revive_count <= 0:
+            self._revival_candidate_atoms = None
+            return 0
+
+        atoms = self._revival_candidate_atoms
+        if atoms is None or int(atoms.size(1)) < revive_count:
+            atoms = self._fallback_revival_atoms(revive_count)
+        else:
+            atoms = atoms[:, :revive_count].to(
+                device=self.dictionary.device,
+                dtype=self.dictionary.dtype,
+            )
+
+        if self._distributed_rank() == 0:
+            self.dictionary.data.index_copy_(1, dead_ids.to(self.dictionary.device), atoms)
+        self._reset_optimizer_state_for_atoms_(optimizer, dead_ids)
+        self._broadcast_dictionary_()
+        self.normalize_dictionary_()
+        self._atom_unused_intervals[dead_ids] = 0
+        self._last_revived_atom_count.fill_(revive_count)
+        self._revival_candidate_atoms = None
+        return revive_count
 
     @torch.no_grad()
     def _maybe_data_initialize_dictionary_(self, signals):
@@ -406,6 +577,7 @@ class DictionaryLearning(nn.Module):
             support, values = self.batch_omp_with_support(signals, dictionary)
         support = support.view(batch_size, grid_h, grid_w, self.sparsity_level)
         values = values.view(batch_size, grid_h, grid_w, self.sparsity_level).float()
+        self._record_atom_usage_(support, signals)
 
         z_dl = self._reconstruct_sparse(support, values, latent_h, latent_w).float()
         dl_latent_loss = F.mse_loss(z_dl, z_e_work.detach())

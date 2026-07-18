@@ -5,3 +5,5 @@ group: null
 tags: []
 append_timestamp: false
 save_dir: "${output_dir}/wandb"
+id: null
+resume: null

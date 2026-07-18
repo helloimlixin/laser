@@ -233,10 +233,13 @@ class MinGPTQuantizedPrior(nn.Module):
         self,
         tokens: torch.Tensor,
         coeffs: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
         return_features: bool = False,
         mask_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del coeffs, return_features
+        del coeffs, class_labels, text_tokens, text_mask, return_features
         source_flat = self._flatten_tokens(tokens)
         target_flat = source_flat if mask_tokens is None else self._flatten_tokens(mask_tokens)
         bos = torch.full(
@@ -308,8 +311,11 @@ class MinGPTQuantizedPrior(nn.Module):
         prompt_tokens: Optional[torch.Tensor] = None,
         prompt_coeffs: Optional[torch.Tensor] = None,
         prompt_mask: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del coeff_temperature, coeff_sample_mode, prompt_coeffs
+        del coeff_temperature, coeff_sample_mode, prompt_coeffs, class_labels, text_tokens, text_mask
         device = next(self.parameters()).device
         if prompt_tokens is not None:
             prompt_flat = self._flatten_tokens(prompt_tokens)

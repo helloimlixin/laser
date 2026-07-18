@@ -1,5 +1,6 @@
 """Core stage-2 behavior: cached sparse tokens build, train, and generate."""
 
+import json
 from types import SimpleNamespace
 
 import torch
@@ -9,7 +10,8 @@ from src.models.sparse_token_prior import (
     build_sparse_prior_from_cache,
     infer_sparse_vocab_sizes,
 )
-from src.stage2_preview import _build_sparse_visuals, _sparse_generation_stats
+from src.stage2_preview import _build_sparse_visuals, _sparse_generation_stats, _write_text_prompt_manifest
+from src.stage2_preview import _conditioning_captions
 
 
 def _quantized_cache():
@@ -98,6 +100,43 @@ def test_stage2_preview_writes_quantized_coeff_bin_maps(tmp_path):
     assert all(path.exists() and path.stat().st_size > 0 for path in paths.values())
     assert stats["generation/coeff_bin_min"] == 0.0
     assert stats["generation/coeff_bin_max"] == 7.0
+
+
+def test_stage2_preview_writes_image_prompt_sidecars(tmp_path):
+    grid = tmp_path / "e001_s0000001.png"
+    grid.write_bytes(b"png")
+
+    _write_text_prompt_manifest(grid, stem="e001_s0000001", prompts=["first prompt", "second prompt"])
+
+    assert grid.with_suffix(".prompts.txt").read_text(encoding="utf-8").splitlines() == [
+        "first prompt",
+        "second prompt",
+    ]
+    assert grid.with_suffix(".sample_texts.tsv").read_text(encoding="utf-8").splitlines() == [
+        "index\tfile\ttext",
+        "0\te001_s0000001.png\tfirst prompt",
+        "1\te001_s0000001.png\tsecond prompt",
+    ]
+    entries = json.loads(grid.with_suffix(".conditioning.json").read_text(encoding="utf-8"))
+    assert entries == [
+        {"index": 0, "file": "e001_s0000001.png", "tile_index": 0, "text": "first prompt"},
+        {"index": 1, "file": "e001_s0000001.png", "tile_index": 1, "text": "second prompt"},
+    ]
+
+
+def test_image_conditioning_captions_are_not_labeled_audio():
+    captions = _conditioning_captions(
+        None,
+        None,
+        ["first prompt", "second prompt"],
+        n=2,
+        media_kind="image",
+    )
+
+    assert captions == [
+        "generated image 0 | text=first prompt",
+        "generated image 1 | text=second prompt",
+    ]
 
 
 def test_sparse_prior_builds_trains_and_generates_quantized_tokens():

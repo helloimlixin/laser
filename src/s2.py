@@ -367,6 +367,8 @@ def _make_net(
         prior=prior,
         learning_rate=float(merged.get("learning_rate", 3e-4)),
         weight_decay=float(merged.get("weight_decay", 0.01)),
+        optimizer_beta1=float(merged.get("optimizer_beta1", 0.9)),
+        optimizer_beta2=float(merged.get("optimizer_beta2", 0.999)),
         warmup_steps=int(merged.get("warmup_steps", 1000)),
         min_lr_ratio=float(merged.get("min_lr_ratio", 0.01)),
         atom_loss_weight=float(merged.get("atom_loss_weight", 1.0)),

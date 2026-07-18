@@ -62,6 +62,16 @@ def test_adversarial_enabled_switches_to_manual_optimization():
     assert isinstance(opts, list) and len(opts) == 2
 
 
+def test_adversarial_train_image_cadence_uses_manual_step():
+    model = _tiny_model(adversarial_weight=0.8, log_images_every_n_steps=2)
+
+    model._manual_train_step.fill_(1)
+    assert not model._should_log_images(0, prefix="train")
+
+    model._manual_train_step.fill_(2)
+    assert model._should_log_images(0, prefix="train")
+
+
 def test_adversarial_training_runs_through_warmup_into_active():
     torch.manual_seed(0)
     # disc_start_step=2 so we cross the warmup boundary within a short fit. Use

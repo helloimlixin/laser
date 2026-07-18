@@ -33,6 +33,11 @@ sparsity_level: 3
 commitment_cost: 0.25
 dict_learning_rate: 1e-4
 data_init_from_first_batch: true
+dead_atom_revival: false
+dead_atom_revival_interval: 500
+dead_atom_revival_max_fraction: 0.05
+dead_atom_revival_noise: 0.05
+dead_atom_revival_patience: 5
 rq_code_depth: 4
 rq_shared_codebook: true
 rq_decay: 0.99
@@ -62,6 +67,7 @@ sparsity_reg_weight: 0.002
 
 # Image perceptual loss (LPIPS). Disabled by default.
 perceptual_weight: 0.15
+lpips_version: "0.1"
 perceptual_start_step: 1000
 perceptual_warmup_steps: 3000
 

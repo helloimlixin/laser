@@ -10,7 +10,9 @@ CKPT_MAP = {
     "vgg_lpips": "vgg.pth"
 }
 
-BUNDLED_CKPT_ROOT = Path(__file__).resolve().parents[2] / "vgg_lpips"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RQVAE_CKPT_ROOT = REPO_ROOT / "rqvae" / "losses" / "vqgan" / ".caches"
+BUNDLED_CKPT_ROOT = REPO_ROOT / "vgg_lpips"
 VGG16_CKPT_CANDIDATES = (
     "vgg16_features.pth",
     "vgg16-397923af.pth",
@@ -37,12 +39,14 @@ def _checkpoint_state_dict(path):
 def get_ckpt_path(name):
     if name not in CKPT_MAP:
         raise ValueError(f"Unknown LPIPS checkpoint {name!r}")
-    bundled_path = BUNDLED_CKPT_ROOT / CKPT_MAP[name]
-    if bundled_path.exists():
-        return str(bundled_path)
+    for root in (RQVAE_CKPT_ROOT, BUNDLED_CKPT_ROOT):
+        path = root / CKPT_MAP[name]
+        if path.exists():
+            return str(path)
     raise FileNotFoundError(
-        f"Bundled LPIPS checkpoint not found at {bundled_path}. "
-        "Expected the repo-local vgg_lpips/vgg.pth checkpoint."
+        f"LPIPS checkpoint not found. Expected RQ-VAE-style checkpoint at "
+        f"{RQVAE_CKPT_ROOT / CKPT_MAP[name]} or compatibility fallback at "
+        f"{BUNDLED_CKPT_ROOT / CKPT_MAP[name]}."
     )
 
 
@@ -50,13 +54,13 @@ def _candidate_vgg16_weight_paths():
     explicit = str(os.environ.get("LASER_VGG16_WEIGHTS", "") or "").strip()
     if explicit:
         yield Path(explicit).expanduser()
-    for filename in VGG16_CKPT_CANDIDATES:
-        yield BUNDLED_CKPT_ROOT / filename
     try:
         hub_dir = Path(torch.hub.get_dir()).expanduser() / "checkpoints"
+        yield hub_dir / "vgg16-397923af.pth"
     except Exception:
-        return
-    yield hub_dir / "vgg16-397923af.pth"
+        pass
+    for filename in VGG16_CKPT_CANDIDATES:
+        yield BUNDLED_CKPT_ROOT / filename
 
 
 def get_vgg16_weights_path():
@@ -101,8 +105,11 @@ def _vgg_features_state_dict(checkpoint_path, features: nn.Module):
 
 
 class LPIPS(nn.Module):
-    def __init__(self):
+    def __init__(self, version="0.1"):
         super(LPIPS, self).__init__()
+        self.version = str(version).strip().lower().removeprefix("v")
+        if self.version not in {"0.0", "0.1"}:
+            raise ValueError(f"LPIPS version must be '0.0' or '0.1', got {version!r}")
         self.scaling_layer = ScalingLayer()
         self.channels = [64, 128, 256, 512, 512]
         self.vgg = VGG16()
@@ -121,18 +128,35 @@ class LPIPS(nn.Module):
 
         self.eval()
 
+    def train(self, mode: bool = True):
+        """Keep the frozen perceptual network in inference mode.
+
+        LPIPS contains dropout in its learned linear calibration heads.  Because
+        this module is registered under LASER, ``LASER.train()`` would otherwise
+        recursively re-enable that dropout even though LPIPS is a frozen loss
+        network.  RQ-VAE explicitly keeps its LPIPS instance in eval mode.
+        """
+        return super().train(False)
+
+    def _prepare_input(self, x):
+        # Official LPIPS v0.0 omitted this scaling step; v0.1 added it.  Keep
+        # the learned linear calibration layers in both modes so this switch
+        # changes only the historical normalization behavior.
+        return self.scaling_layer(x) if self.version == "0.1" else x
+
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(name)
         state_dict = _checkpoint_state_dict(ckpt)
         incompatible = self.load_state_dict(state_dict, strict=False)
+        print(f"loaded pretrained LPIPS loss from {ckpt}")
         expected = {f"lin{i}.model.1.weight" for i in range(5)}
         missing = sorted(expected.intersection(incompatible.missing_keys))
         if missing:
             raise RuntimeError(f"LPIPS checkpoint {ckpt} is missing weights: {missing}")
 
     def forward(self, real_x, fake_x):
-        outs_real = self.vgg(self.scaling_layer(real_x))
-        outs_fake = self.vgg(self.scaling_layer(fake_x))
+        outs_real = self.vgg(self._prepare_input(real_x))
+        outs_fake = self.vgg(self._prepare_input(fake_x))
         features_real, features_fake, diffs = {}, {}, {}
 
         for i in range(len(self.channels)):
