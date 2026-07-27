@@ -15,7 +15,7 @@ type: laser
 in_channels: 3
 
 # --- Backbone (attention U-Net, same family as zdmy0xi3) ---
-backbone: ddpm
+backbone: rqvae
 num_hiddens: 192
 num_residual_blocks: 4
 num_residual_hiddens: 96

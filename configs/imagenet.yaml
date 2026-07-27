@@ -63,7 +63,7 @@ stage1:
   model:
     # RQ-VAE-style ImageNet-256 DDPM backbone: 256 -> 8x8 latent sites,
     # following kakaobrain/rq-vae-transformer's in256-rqvae-8x8x4 shape.
-    backbone: ddpm
+    backbone: rqvae
     num_downsamples: 5
     channel_multipliers: [1, 1, 2, 2, 4, 4]
     backbone_latent_channels: 256
@@ -141,7 +141,7 @@ stage1_adv:
 
   model:
     # Keep the adversarial continuation checkpoint-compatible with stage 1.
-    backbone: ddpm
+    backbone: rqvae
     num_downsamples: 5
     channel_multipliers: [1, 1, 2, 2, 4, 4]
     backbone_latent_channels: 256

@@ -9,12 +9,9 @@ num_hiddens: 128
 num_residual_blocks: 2
 num_residual_hiddens: 64
 
-# Image backbone:
-# - `ddpm`: modular ResNet/U-Net style path. Use `attn_resolutions`,
-#   `use_mid_attention`, `channel_multipliers`, and
-#   `decoder_extra_residual_layers` to decide how much machinery to include.
-# - `simple`: lightweight VQ-VAE-style Conv/ResStack encoder-decoder.
-backbone: simple
+# Original KakaoBrain RQ-VAE encoder/decoder. Historical `ddpm` and `simple`
+# values remain accepted as checkpoint/config aliases but resolve to this path.
+backbone: rqvae
 num_downsamples: 5
 attn_resolutions: [16]
 dropout: 0.0
@@ -24,7 +21,7 @@ decoder_extra_residual_layers: 1
 use_mid_attention: true
 
 # Bottleneck. `dictionary` is the LASER sparse-code path; `rq` enables the
-# KakaoBrain-style residual quantizer implemented behind the same interface.
+# original KakaoBrain residual quantizer behind the same Lightning interface.
 bypass_bottleneck: false
 bottleneck_type: dictionary
 num_embeddings: 512

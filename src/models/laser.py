@@ -14,7 +14,6 @@ from typing import Optional, Sequence, Tuple
 from .bottleneck import DictionaryLearning, SparseCodes
 from .discriminator import (
     AudioMultiScalePeriodDiscriminator,
-    NLayerDiscriminator,
     adopt_weight,
     feature_matching_loss,
     multi_hinge_d_loss,
@@ -23,11 +22,12 @@ from .discriminator import (
     multi_lsgan_g_loss,
     multi_vanilla_d_loss,
 )
-from .lpips import LPIPS
+from .rqvae.discriminator import NLayerDiscriminator
+from .rqvae.lpips import LPIPS
 from .audio_codec import AudioDecoder, AudioEncoder, canonical_int_tuple
-from .decoder import Decoder as DDPMDecoder
+from .rqvae.modules import Decoder as DDPMDecoder
 from .decoder import SimpleDecoder
-from .encoder import Encoder as DDPMEncoder
+from .rqvae.modules import Encoder as DDPMEncoder
 from .encoder import SimpleEncoder
 from .utils import fid_has_enough_samples
 from ._laser_visuals import VisualsMixin
@@ -55,12 +55,13 @@ from src.wandb_media import log_wandb_images, log_wandb_payload, log_wandb_video
 
 
 def _canonical_backbone(raw) -> str:
-    value = str(raw or "ddpm").strip().lower()
-    if value in {"simple", "vqvae", "scratch", "scratch_vqvae", "conv"}:
-        return "simple"
-    if value in {"ddpm", "unet", "attention", "attention_unet"}:
-        return "ddpm"
-    raise ValueError(f"Unsupported LASER backbone {raw!r}; expected 'ddpm' or 'simple'")
+    value = str(raw or "rqvae").strip().lower()
+    if value in {
+        "rqvae", "rq-vae", "official", "ddpm", "unet", "attention",
+        "attention_unet", "simple", "vqvae", "scratch", "scratch_vqvae", "conv",
+    }:
+        return "rqvae"
+    raise ValueError(f"Unsupported LASER backbone {raw!r}; expected 'rqvae'")
 
 
 def _canonical_attn_resolutions(values) -> Tuple[int, ...]:
@@ -120,7 +121,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             beta,
             beta2=0.999,
             optimizer_beta2=None,
-            backbone="ddpm",
+            backbone="rqvae",
             resolution=None,
             num_downsamples=4,
             attn_resolutions=(),
@@ -216,7 +217,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             sparsity_level: Number of non-zero coefficients in sparse coding
             num_residual_blocks: Number of residual blocks
             num_residual_hiddens: Number of hidden units in residual blocks
-            backbone: image encoder/decoder family, either 'ddpm' or 'simple'
+            backbone: image encoder/decoder family; ``rqvae`` is canonical
             resolution: input image resolution for the DDPM-style backbone
             num_downsamples: number of spatial downsampling stages for variable-depth backbones
             attn_resolutions: spatial resolutions that should include self-attention blocks
@@ -524,13 +525,13 @@ class LASER(VisualsMixin, pl.LightningModule):
         if self.audio_backbone == "waveform" and int(in_channels) != 1:
             raise ValueError("LASER waveform audio backbone expects in_channels=1")
 
-        if not self.is_waveform_audio and self.backbone == "ddpm":
+        if not self.is_waveform_audio and self.backbone == "rqvae":
             # The attention U-Net backbone needs a positive input resolution and a
             # channel-multiplier schedule (waveform audio uses the 1D AudioEncoder).
             if self.resolution is None or self.resolution <= 0:
-                raise ValueError("resolution must be a positive integer for the U-Net backbone")
+                raise ValueError("resolution must be a positive integer for the RQ-VAE backbone")
             if self.channel_multipliers is None:
-                raise ValueError("channel_multipliers must be set explicitly for backbone='ddpm'")
+                raise ValueError("channel_multipliers must be set explicitly for backbone='rqvae'")
             self.num_downsamples = len(self.channel_multipliers) - 1
             if self.backbone_latent_channels is None:
                 self.backbone_latent_channels = int(embedding_dim)
@@ -572,7 +573,7 @@ class LASER(VisualsMixin, pl.LightningModule):
                 upsample_rates=self.audio_downsample_rates,
                 dilation_cycle=self.audio_dilation_cycle,
             )
-        elif self.backbone == "ddpm":
+        elif self.backbone == "rqvae":
             enc_dec_kwargs = dict(
                 ch=num_hiddens,
                 out_ch=in_channels,
@@ -608,7 +609,7 @@ class LASER(VisualsMixin, pl.LightningModule):
                     stride=1,
                 )
             self.decoder = DDPMDecoder(
-                **dict(enc_dec_kwargs, extra_res_blocks=self.decoder_extra_residual_layers)
+                **enc_dec_kwargs
             )
         else:
             self.encoder = SimpleEncoder(
@@ -670,6 +671,11 @@ class LASER(VisualsMixin, pl.LightningModule):
                 decay=rq_decay,
                 restart_unused_codes=rq_restart_unused_codes,
                 commitment_cost=commitment_cost,
+                latent_shape=(
+                    self.resolution // (2 ** (len(self.channel_multipliers) - 1)),
+                    self.resolution // (2 ** (len(self.channel_multipliers) - 1)),
+                    int(embedding_dim),
+                ),
             )
         else:
             raise ValueError(
@@ -681,7 +687,7 @@ class LASER(VisualsMixin, pl.LightningModule):
 
         # Initialize LPIPS for perceptual loss only if used
         self.lpips = (
-            LPIPS(version=self.lpips_version) if self.perceptual_weight > 0 else None
+            LPIPS() if self.perceptual_weight > 0 else None
         )
         if self.lpips is not None:
             self.lpips.eval()
@@ -716,10 +722,10 @@ class LASER(VisualsMixin, pl.LightningModule):
                 )
             else:
                 self.discriminator = NLayerDiscriminator(
-                    in_channels=in_channels,
-                    num_filters=self.disc_channels,
-                    num_layers=self.disc_num_layers,
-                    norm=self.disc_norm,
+                    input_nc=in_channels,
+                    ndf=self.disc_channels,
+                    n_layers=self.disc_num_layers,
+                    use_actnorm=self.disc_norm == "actnorm",
                     spectral=self.disc_spectral,
                 )
             # Two optimizers -> Lightning manual optimization. The legacy

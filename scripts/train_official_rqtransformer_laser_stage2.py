@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Train upstream KakaoBrain RQ-Transformer on discretized LASER sparse pairs.
+"""Train the vendored KakaoBrain RQ-Transformer on LASER sparse pairs.
 
-The transformer is imported unchanged from ``third_party/rq-vae-transformer``.
+The transformer implementation lives in ``src.models.rqtransformer``.
 Only the stage-1 auxiliary embedding is adapted: OMP atom ids use the learned
 LASER dictionary and real coefficients are uniformly discretized into the same
 16K per-depth vocabulary used by the official shared classifier.
@@ -10,6 +10,9 @@ LASER dictionary and real coefficients are uniformly discretized into the same
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from dataclasses import make_dataclass
+from datetime import timedelta
 import json
 import math
 import os
@@ -27,15 +30,35 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
 
 ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM = ROOT / "third_party" / "rq-vae-transformer"
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(UPSTREAM))
 
-from omegaconf import OmegaConf
-from rqvae.models.rqtransformer.configs import RQTransformerConfig
-from rqvae.models.rqtransformer.transformers import RQTransformer
-from rqvae.models.rqvae.rqvae import RQVAE
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.base import ContainerMetadata, Metadata
+from omegaconf.nodes import AnyNode, BooleanNode, BytesNode, FloatNode, IntegerNode, StringNode
+from src.models.rqtransformer.configs import RQTransformerConfig
+from src.models.rqtransformer.transformers import RQTransformer
+from src.models.rqvae.rqvae import RQVAE
 from src.data.imagenet_labels import class_names_for_dataset
+
+
+def load_stage1_checkpoint(path: Path):
+    """Load trusted tensor/config state without importing the legacy rqvae package."""
+    from typing import Any
+
+    dist_env = make_dataclass(
+        "DistEnv",
+        [
+            ("world_size", int), ("world_rank", int), ("local_rank", int),
+            ("num_gpus", int), ("master", bool), ("device_name", str),
+        ],
+    )
+    dist_env.__module__ = "rqvae.utils.dist"
+    torch.serialization.add_safe_globals([
+        Any, list, dict, tuple, set, int, str, float, bool, bytes, defaultdict,
+        DictConfig, ListConfig, ContainerMetadata, Metadata, AnyNode, BooleanNode,
+        BytesNode, FloatNode, IntegerNode, StringNode, dist_env,
+    ])
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def rank() -> int:
@@ -46,11 +69,30 @@ def unwrap(model):
     return model.module if isinstance(model, DDP) else model
 
 
+class ResumableDistributedSampler(DistributedSampler):
+    """Distributed sampler that starts at a saved per-rank sample cursor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    def set_start_index(self, start_index: int):
+        self.start_index = max(0, int(start_index))
+
+    def __iter__(self):
+        return iter(list(super().__iter__())[self.start_index:])
+
+    def __len__(self):
+        return max(0, super().__len__() - self.start_index)
+
+
 class LaserAux(nn.Module):
     """Frozen stage-1 encoder and sparse dictionary expected by RQTransformer."""
 
     def __init__(self, checkpoint: Path, num_atoms: int, coeff_vocab_size: int,
-                 coeff_max: float, coeff_scale: float = 1.0):
+                 coeff_max: float, coeff_scale: float = 1.0,
+                 attn_resolutions=(8,), coeff_scales=None,
+                 soft_target_physical=False):
         super().__init__()
         stage1 = RQVAE(
             embed_dim=256,
@@ -62,12 +104,12 @@ class LaserAux(nn.Module):
             ddconfig=dict(
                 double_z=False, z_channels=256, resolution=256, in_channels=3,
                 out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4, 4],
-                num_res_blocks=2, attn_resolutions=[8], dropout=0.0,
+                num_res_blocks=2, attn_resolutions=list(attn_resolutions), dropout=0.0,
             ),
             latent_shape=[8, 8, 256], code_shape=[8, 8, 2],
             shared_codebook=True, restart_unused_codes=True,
         )
-        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        payload = load_stage1_checkpoint(checkpoint)
         state = payload["state_dict"]
         filtered = {k: v for k, v in state.items() if not k.startswith("quantizer.")}
         missing, unexpected = stage1.load_state_dict(filtered, strict=False)
@@ -84,8 +126,13 @@ class LaserAux(nn.Module):
         self.coeff_vocab_size = int(coeff_vocab_size)
         self.vocab_size = self.num_atoms + self.coeff_vocab_size
         self.coeff_max = float(coeff_max)
-        self.coeff_scale = float(coeff_scale)
-        if self.coeff_scale <= 0:
+        scales = coeff_scales if coeff_scales is not None else [coeff_scale, coeff_scale]
+        if len(scales) != 2:
+            raise ValueError("LASER k=2 requires exactly two coefficient scales")
+        self.register_buffer("coeff_scales", torch.tensor(scales, dtype=torch.float32))
+        self.coeff_scale = float(coeff_scale)  # Backward-compatible metadata.
+        self.soft_target_physical = bool(soft_target_physical)
+        if (self.coeff_scales <= 0).any():
             raise ValueError("coeff_scale must be positive")
         self.eval().requires_grad_(False)
 
@@ -111,13 +158,20 @@ class LaserAux(nn.Module):
         v2 = (g11 * y2 - g12 * y1) / det
         atoms = torch.stack((first, second), dim=-1).view(b, h, w, 2)
         physical_coeffs = torch.stack((v1, v2), dim=-1).view(b, h, w, 2)
-        coeffs = (physical_coeffs / self.coeff_scale).clamp(-self.coeff_max, self.coeff_max)
+        scales = self.coeff_scales.view(1, 1, 1, 2)
+        coeffs = (physical_coeffs / scales).clamp(-self.coeff_max, self.coeff_max)
         scaled = (coeffs + self.coeff_max) * ((self.coeff_vocab_size - 1) / (2 * self.coeff_max))
         coeff_tokens = scaled.round().long().clamp(0, self.coeff_vocab_size - 1)
         # The official stage-2 recipe trains against stage-1 soft codes.  For
         # LASER, atom support is discrete OMP while the continuous coefficient
         # posterior is discretized into a temperature-controlled 16K density.
-        coeff_logits = -(coeffs[..., None] - self.coeff_bins).square() / max(float(temp), 1e-6)
+        if self.soft_target_physical:
+            target_values = physical_coeffs[..., None]
+            bin_values = self.coeff_bins.view(1, 1, 1, 1, -1) * scales[..., None]
+        else:
+            target_values = coeffs[..., None]
+            bin_values = self.coeff_bins
+        coeff_logits = -(target_values - bin_values).square() / max(float(temp), 1e-6)
         coeff_probs = coeff_logits.softmax(dim=-1)
         if stochastic:
             coeff_tokens = torch.multinomial(
@@ -139,7 +193,7 @@ class LaserAux(nn.Module):
         atom_vectors = self.dictionary.t()[tokens[..., 0::2]]
         out[..., 0::2, :] = atom_vectors
         coeff_ids = (tokens[..., 1::2] - self.num_atoms).clamp(0, self.coeff_vocab_size - 1)
-        coeff = self.coeff_bins[coeff_ids] * self.coeff_scale
+        coeff = self.coeff_bins[coeff_ids] * self.coeff_scales.view(1, 1, 1, 2)
         # Each pair must cumulatively equal c_i * D_i.  RQTransformer cumsums
         # depth embeddings, so emit D_i followed by (c_i - 1) * D_i.
         out[..., 1::2, :] = (coeff[..., None] - 1.0) * atom_vectors
@@ -149,7 +203,7 @@ class LaserAux(nn.Module):
     def decode_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         atoms = tokens[..., 0::2].long()
         coeff_ids = (tokens[..., 1::2].long() - self.num_atoms).clamp(0, self.coeff_vocab_size - 1)
-        coeffs = self.coeff_bins[coeff_ids] * self.coeff_scale
+        coeffs = self.coeff_bins[coeff_ids] * self.coeff_scales.view(1, 1, 1, 2)
         atom_vectors = self.dictionary.t()[atoms]
         z_q = (atom_vectors * coeffs[..., None]).sum(dim=-2)
         z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
@@ -185,7 +239,10 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
     fig.savefig(target, dpi=140)
     if wb is not None:
         import wandb
-        wb.log({"samples/class_conditional_8x8": wandb.Image(str(target))}, step=step)
+        wb.log({
+            "samples/class_conditional_8x8": wandb.Image(str(target)),
+            "train/global_step": step,
+        })
     plt.close(fig)
     if was_training:
         model.train()
@@ -197,21 +254,33 @@ def evaluate_generation_fid(model, aux, val_loader, num_samples: int, batch_size
     from torchmetrics.image.fid import FrechetInceptionDistance
 
     device = next(model.parameters()).device
-    metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    process_rank = dist.get_rank() if dist.is_initialized() else 0
+    local_samples = int(num_samples) // world + (process_rank < int(num_samples) % world)
+    # Every rank accumulates its shard; compute() merges the sufficient
+    # statistics, avoiding a costly image all-gather.
+    metric = FrechetInceptionDistance(
+        feature=2048, normalize=True, sync_on_compute=dist.is_initialized()
+    ).to(device)
     seen = 0
     for images, _ in val_loader:
         images = ((images.to(device, non_blocking=True).float() + 1.0) * 0.5).clamp(0, 1)
-        keep = min(images.size(0), int(num_samples) - seen)
+        keep = min(images.size(0), local_samples - seen)
         metric.update(images[:keep], real=True)
         seen += keep
-        if seen >= int(num_samples):
+        if seen >= local_samples:
             break
     generated = 0
     was_training = model.training
     model.eval()
-    while generated < int(num_samples):
-        current = min(int(batch_size), int(num_samples) - generated)
-        labels = torch.randint(0, 1000, (current,), device=device)
+    while generated < local_samples:
+        current = min(int(batch_size), local_samples - generated)
+        # Use the exact uniform ImageNet class prior. At 50K samples this emits
+        # exactly 50 generations for each of the 1,000 classes.
+        local_indices = torch.arange(
+            generated, generated + current, device=device, dtype=torch.long
+        )
+        labels = (local_indices * world + process_rank).remainder(1000)
         partial = torch.zeros(current, 8, 8, 4, device=device, dtype=torch.long)
         tokens = model.sample(
             partial, model_aux=aux, cond=labels, temperature=1.0,
@@ -312,30 +381,46 @@ def main():
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--wandb-project", default="laser")
     p.add_argument("--wandb-name", default="imagenet-rqtransformer-laser-a16384-k2-stage2")
+    p.add_argument("--wandb-id", default=None)
     p.add_argument("--fid-num-samples", type=int, default=2048)
     p.add_argument("--fid-batch-size", type=int, default=64)
+    p.add_argument("--fid-every", type=int, default=1,
+                   help="Run full FID every N epochs")
+    p.add_argument("--save-ckpt-freq", type=int, default=2,
+                   help="Save the full training checkpoint every N epochs")
+    p.add_argument(
+        "--upload-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload 16+ GB checkpoints as W&B artifacts (disabled by default)",
+    )
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = p.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world > 1:
-        dist.init_process_group("nccl")
+        # Rank 0 periodically writes a ~16 GB recovery checkpoint to network
+        # storage.  Allow that I/O to outlive NCCL's short default watchdog.
+        dist.init_process_group("nccl", timeout=timedelta(minutes=45))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     args.output.mkdir(parents=True, exist_ok=True)
 
     dataset = datasets.ImageFolder(args.data / "train", transform=image_transform())
     class_names = class_names_for_dataset("imagenet", dataset.classes)
-    sampler = DistributedSampler(dataset, shuffle=True) if world > 1 else None
+    sampler = ResumableDistributedSampler(dataset, shuffle=True) if world > 1 else None
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                         shuffle=sampler is None, num_workers=8, pin_memory=True,
                         persistent_workers=True, drop_last=True)
-    val_loader = None
-    if rank() == 0:
-        val_dataset = datasets.ImageFolder(args.data / "val", transform=val_image_transform())
-        val_loader = DataLoader(val_dataset, batch_size=args.fid_batch_size, shuffle=False,
-                                num_workers=8, pin_memory=True, persistent_workers=True)
+    val_dataset = datasets.ImageFolder(args.data / "val", transform=val_image_transform())
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world, rank=rank(), shuffle=False, drop_last=False
+    ) if world > 1 else None
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.fid_batch_size, sampler=val_sampler,
+        shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True,
+    )
     total_vocab_size = args.num_atoms + args.coeff_vocab_size
     aux = LaserAux(args.checkpoint, args.num_atoms, args.coeff_vocab_size,
                    args.coeff_max, args.coeff_scale).to(device)
@@ -352,37 +437,62 @@ def main():
     if use_wandb:
         import wandb
         wb = wandb.init(project=args.wandb_project, name=args.wandb_name,
+                        id=args.wandb_id, resume="allow" if args.wandb_id else None,
                         config={**vars(args), "architecture": "official-rqtransformer-1400M",
                                 "stochastic_codes": True, "temp": 0.5, "top_p": 0.92})
+        wb.define_metric("train/global_step")
+        for metric_name in ("train/loss", "train/lr", "train/epoch", "val/fid"):
+            wb.define_metric(metric_name, step_metric="train/global_step")
         (args.output / "launch_config.json").write_text(json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
-    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
     checkpoint_dir = args.output / "checkpoints"
     last_checkpoint = checkpoint_dir / "last.pt"
     global_step = 0
     start_epoch = 0
+    resume_batch_idx = 0
     best_fid = []
     if args.resume and last_checkpoint.is_file():
         resume_payload = torch.load(last_checkpoint, map_location="cpu", weights_only=False)
         unwrap(model).load_state_dict(resume_payload["state_dict"], strict=True)
         optimizer.load_state_dict(resume_payload["optimizer"])
+        # The optimizer checkpoint contains the old launch LR. Honor an
+        # explicitly scaled LR when resuming with a larger global batch.
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr
         global_step = int(resume_payload.get("global_step", 0))
         start_epoch = int(resume_payload.get("epoch", 0))
+        resume_batch_idx = int(resume_payload.get("batch_idx", 0))
         best_fid = [(float(x[0]), str(x[1])) for x in resume_payload.get("best_fid", [])]
+        saved_config = resume_payload.get("config", {})
+        old_batch_size = int(saved_config.get("batch_size", args.batch_size))
+        if resume_batch_idx and old_batch_size != args.batch_size:
+            resume_batch_idx = (resume_batch_idx * old_batch_size) // args.batch_size
+        if int(saved_config.get("fid_num_samples", -1)) != args.fid_num_samples:
+            # FIDs from different real/fake sample counts are not comparable.
+            best_fid = []
+            if rank() == 0:
+                print("Reset prior best-FID history because the evaluation "
+                      f"protocol changed from {saved_config.get('fid_num_samples')} "
+                      f"to {args.fid_num_samples} samples", flush=True)
         if rank() == 0:
-            print(f"Resumed from {last_checkpoint}: epoch={start_epoch}, step={global_step}", flush=True)
+            print(f"Resumed from {last_checkpoint}: epoch={start_epoch}, "
+                  f"batch={resume_batch_idx}, step={global_step}", flush=True)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, args.epochs):
+        batch_offset = resume_batch_idx if epoch == start_epoch else 0
         if sampler is not None:
             sampler.set_epoch(epoch)
+            sampler.set_start_index(batch_offset * args.batch_size)
         model.train()
         complete_microbatches = (len(loader) // accumulation) * accumulation
         for batch_idx, (images, labels) in enumerate(loader):
+            absolute_batch_idx = batch_idx + batch_offset
             if batch_idx >= complete_microbatches:
                 break
             images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 tokens, soft_targets = aux.encode_sparse(images, temp=0.5, stochastic=True)
-            sync = ((batch_idx + 1) % accumulation == 0)
+            sync = ((absolute_batch_idx + 1) % accumulation == 0)
             ctx = model.no_sync() if isinstance(model, DDP) and not sync else torch.enable_grad()
             with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(tokens, model_aux=aux, cond=labels, amp=False)
@@ -394,7 +504,8 @@ def main():
                 optimizer.step(); optimizer.zero_grad(set_to_none=True); global_step += 1
                 if wb is not None and global_step % 10 == 0:
                     wb.log({"train/loss": float(loss.detach()) * accumulation,
-                            "train/epoch": epoch, "train/lr": optimizer.param_groups[0]["lr"]}, step=global_step)
+                            "train/epoch": epoch, "train/global_step": global_step,
+                            "train/lr": optimizer.param_groups[0]["lr"]})
                 if global_step % 100 == 0:
                     if dist.is_initialized():
                         dist.barrier()
@@ -405,15 +516,25 @@ def main():
                         print(f"Saved class-conditional samples: {target}", flush=True)
                     if dist.is_initialized():
                         dist.barrier()
+        resume_batch_idx = 0
+        if sampler is not None:
+            sampler.set_start_index(0)
         if dist.is_initialized():
             dist.barrier()
-        if rank() == 0:
+        run_fid = (epoch + 1) % args.fid_every == 0
+        save_epoch = (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs
+        fid = None
+        if run_fid:
             fid = evaluate_generation_fid(
                 unwrap(model), aux, val_loader, args.fid_num_samples, args.fid_batch_size
             )
-            if wb is not None:
-                wb.log({"val/fid": fid, "train/epoch": epoch + 1}, step=global_step)
-            qualifies = len(best_fid) < 3 or fid < max(x[0] for x in best_fid)
+        if rank() == 0:
+            if wb is not None and fid is not None:
+                wb.log({"val/fid": fid, "train/epoch": epoch + 1,
+                        "train/global_step": global_step})
+            qualifies = save_epoch and fid is not None and (
+                len(best_fid) < 3 or fid < max(x[0] for x in best_fid)
+            )
             best_path = None
             if qualifies:
                 best_path = checkpoint_dir / f"best_fid_{fid:.4f}_epoch_{epoch + 1:03d}.pt"
@@ -424,24 +545,30 @@ def main():
                     stale_path = Path(stale)
                     if stale_path.is_file():
                         stale_path.unlink()
-            snapshot = {
-                "epoch": epoch + 1, "global_step": global_step, "fid": fid,
-                "state_dict": unwrap(model).state_dict(), "optimizer": optimizer.state_dict(),
-                "config": vars(args), "best_fid": best_fid,
-            }
-            atomic_torch_save(snapshot, last_checkpoint)
-            upload_checkpoint(
-                wb, last_checkpoint, artifact_name=f"{wb.id}-last",
-                aliases=["latest"], metadata={"epoch": epoch + 1, "step": global_step, "fid": fid},
-            )
-            if best_path is not None:
-                shutil.copy2(last_checkpoint, best_path)
-                upload_checkpoint(
-                    wb, best_path, artifact_name=f"{wb.id}-best-fid",
-                    aliases=["best", f"epoch-{epoch + 1}"],
-                    metadata={"epoch": epoch + 1, "step": global_step, "fid": fid},
-                )
-            print(f"Epoch {epoch + 1}: FID={fid:.4f}; saved {last_checkpoint}", flush=True)
+            if save_epoch:
+                snapshot = {
+                    "epoch": epoch + 1, "global_step": global_step, "fid": fid,
+                    "state_dict": unwrap(model).state_dict(), "optimizer": optimizer.state_dict(),
+                    "config": vars(args), "best_fid": best_fid,
+                }
+                atomic_torch_save(snapshot, last_checkpoint)
+                if args.upload_checkpoints:
+                    artifact_aliases = ["latest"]
+                    if best_path is not None:
+                        artifact_aliases.extend(["best", f"epoch-{epoch + 1}"])
+                    upload_checkpoint(
+                        wb, last_checkpoint, artifact_name=f"{wb.id}-checkpoint",
+                        aliases=artifact_aliases,
+                        metadata={"epoch": epoch + 1, "step": global_step, "fid": fid},
+                    )
+                if best_path is not None:
+                    shutil.copy2(last_checkpoint, best_path)
+            if not save_epoch:
+                print(f"Epoch {epoch + 1}: checkpoint skipped", flush=True)
+            elif fid is None:
+                print(f"Epoch {epoch + 1}: FID skipped; saved {last_checkpoint}", flush=True)
+            else:
+                print(f"Epoch {epoch + 1}: FID={fid:.4f}; saved {last_checkpoint}", flush=True)
         if dist.is_initialized():
             dist.barrier()
     if wb is not None:

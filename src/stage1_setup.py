@@ -250,7 +250,7 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "embedding_dim": _cfg_get(model_cfg, "embedding_dim"),
         "num_residual_blocks": _cfg_get(model_cfg, "num_residual_blocks"),
         "num_residual_hiddens": _cfg_get(model_cfg, "num_residual_hiddens"),
-        "backbone": _cfg_get(model_cfg, "backbone", "ddpm"),
+        "backbone": _cfg_get(model_cfg, "backbone", "rqvae"),
         "resolution": _image_resolution(image_size),
         "num_downsamples": int(_cfg_get(model_cfg, "num_downsamples", 2)),
         "attn_resolutions": tuple(_cfg_get(model_cfg, "attn_resolutions", ())),

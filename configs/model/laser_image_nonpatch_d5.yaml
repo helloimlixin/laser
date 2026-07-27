@@ -7,7 +7,7 @@ defaults:
 type: laser
 in_channels: 3
 
-backbone: ddpm
+backbone: rqvae
 num_hiddens: 128
 num_residual_blocks: 3
 num_residual_hiddens: 96

@@ -1,0 +1,75 @@
+# Original KakaoBrain RQ-VAE architecture hosted by the LASER Lightning module.
+type: laser
+in_channels: 3
+backbone: rqvae
+
+# Official 256x256 image backbone (8x8 latent grid).
+num_hiddens: 128
+num_residual_blocks: 2
+num_residual_hiddens: 64  # accepted by the shared Lightning schema
+num_downsamples: 5
+channel_multipliers: [1, 1, 2, 2, 4, 4]
+backbone_latent_channels: 256
+attn_resolutions: [16]
+dropout: 0.0
+use_mid_attention: true
+decoder_extra_residual_layers: 0
+
+# Original residual-quantization bottleneck.
+bottleneck_type: rq
+num_embeddings: 2048
+embedding_dim: 256
+sparsity_level: 4  # shared stage-2 depth/token-count field
+rq_code_depth: 4
+rq_shared_codebook: true
+rq_decay: 0.99
+rq_restart_unused_codes: true
+commitment_cost: 0.25
+bypass_bottleneck: false
+
+# Dictionary-only settings are inert for this model but retained in the common schema.
+dict_learning_rate: null
+patch_based: false
+patch_size: 1
+patch_stride: 1
+patch_reconstruction: tile
+coef_max: null
+data_init_from_first_batch: false
+dead_atom_revival: false
+
+# RQ-VAE reconstruction/perceptual/GAN recipe.
+recon_mse_weight: 1.0
+recon_l1_weight: 0.0
+recon_edge_weight: 0.0
+bottleneck_loss_weight: 1.0
+dictionary_loss_weight: null
+sparsity_reg_weight: 0.0
+perceptual_weight: 1.0
+lpips_version: "0.1"
+perceptual_start_step: 0
+perceptual_warmup_steps: 0
+adversarial_weight: 0.75
+adversarial_start_step: 0
+adversarial_warmup_steps: 0
+disc_start_step: 0
+disc_num_layers: 2
+disc_channels: 64
+disc_norm: batch
+disc_spectral: false
+disc_loss: hinge
+disc_learning_rate: null
+use_adaptive_disc_weight: true
+disc_factor: 1.0
+disc_weight_max: 10000.0
+
+beta: 0.5
+discriminator_beta1: 0.5
+discriminator_beta2: 0.9
+discriminator_channels: 64
+discriminator_layers: 2
+compute_fid: true
+fid_feature: 2048
+log_images_every_n_steps: 500
+diag_log_interval: 0
+enable_val_latent_visuals: true
+codebook_visual_max_vectors: 1024
