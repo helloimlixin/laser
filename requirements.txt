@@ -7,6 +7,7 @@ wandb
 omegaconf
 tqdm
 torchmetrics
+torch-fidelity
 numpy
 matplotlib
 scipy

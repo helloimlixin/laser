@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Distributed full-ImageNet reconstruction FID for an upstream LASER checkpoint."""
+
+from __future__ import annotations
+import argparse, importlib.util, json, logging, os, sys
+from datetime import timedelta
+from pathlib import Path
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+from torchvision import datasets
+from torchmetrics.image.fid import FrechetInceptionDistance
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scripts.train_official_rqtransformer_laser_stage2 import LaserAux, val_image_transform
+
+
+def native_fid_model(device):
+    # Import the repository's FID Inception module directly. Importing the
+    # rqvae.metrics package eagerly loads unrelated CLIP/tokenizer metrics.
+    inception_path = (ROOT / "third_party" / "rq-vae-transformer" /
+                      "rqvae" / "metrics" / "inception.py")
+    spec = importlib.util.spec_from_file_location("laser_native_fid_inception", inception_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class InceptionWrapper(module.InceptionV3):
+        def forward(self, inp):
+            pred = super().forward(inp)[0]
+            if pred.size(2) != 1 or pred.size(3) != 1:
+                pred = torch.nn.functional.adaptive_avg_pool2d(pred, (1, 1))
+            return pred.reshape(pred.shape[0], -1)
+
+    block = module.InceptionV3.BLOCK_INDEX_BY_DIM[2048]
+    return InceptionWrapper([block]).to(device).eval()
+
+
+def native_frechet(real_sum, real_cross, fake_sum, fake_cross, count):
+    import numpy as np
+    from scipy import linalg
+    n = float(count)
+    mu_r = (real_sum / n).cpu().numpy()
+    mu_f = (fake_sum / n).cpu().numpy()
+    cov_r = ((real_cross - torch.outer(real_sum, real_sum) / n) / (n - 1)).cpu().numpy()
+    cov_f = ((fake_cross - torch.outer(fake_sum, fake_sum) / n) / (n - 1)).cpu().numpy()
+    diff = mu_r - mu_f
+    covmean, _ = linalg.sqrtm(cov_r.dot(cov_f), disp=False)
+    if not np.isfinite(covmean).all():
+        logging.warning("FID covariance product is singular; adding 1e-6 to diagonals")
+        offset = np.eye(cov_r.shape[0]) * 1e-6
+        covmean = linalg.sqrtm((cov_r + offset).dot(cov_f + offset))
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            raise ValueError(f"Imaginary component {np.max(np.abs(covmean.imag))}")
+        covmean = covmean.real
+    return float(diff.dot(diff) + np.trace(cov_r) + np.trace(cov_f) - 2 * np.trace(covmean))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--data", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--batch-size", type=int, default=96)
+    p.add_argument("--backend", choices=("torchmetrics", "native"), default="torchmetrics")
+    args = p.parse_args()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    if world > 1:
+        dist.init_process_group("nccl", timeout=timedelta(minutes=45))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dataset = datasets.ImageFolder(args.data / "val", transform=val_image_transform())
+    sampler = DistributedSampler(dataset, shuffle=False, drop_last=False) if world > 1 else None
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
+                        num_workers=8, pin_memory=True, persistent_workers=True)
+    # Native DictionaryLearning.forward() leaves its OMP coefficients
+    # unbounded. Disable the stage-2 tokenization clamp for reconstruction FID.
+    aux = LaserAux(args.checkpoint, 16384, 2048, 20.0, 6.4,
+                   clamp_coeffs=False).to(device).eval()
+    metric = None
+    inception = None
+    if args.backend == "torchmetrics":
+        metric = FrechetInceptionDistance(feature=2048, normalize=True,
+                                          sync_on_compute=world > 1).to(device)
+    else:
+        inception = native_fid_model(device)
+        real_sum = torch.zeros(2048, device=device, dtype=torch.float64)
+        fake_sum = torch.zeros_like(real_sum)
+        real_cross = torch.zeros(2048, 2048, device=device, dtype=torch.float64)
+        fake_cross = torch.zeros_like(real_cross)
+    seen = 0
+    with torch.no_grad():
+        for images, _ in loader:
+            images = images.to(device, non_blocking=True)
+            atoms, coeffs = aux.encode_sparse_components(images)
+            vectors = aux.dictionary.t()[atoms.long()]
+            # encode_sparse_components returns stage-2-normalized coefficients;
+            # restore the physical LASER values for native stage-1 reconstruction.
+            physical_coeffs = coeffs * aux.coeff_scales.view(1, 1, 1, 2)
+            z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
+            z_q = aux.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+            recon = ((aux.decoder(z_q).float() + 1.0) * 0.5).clamp(0, 1)
+            real = ((images.float() + 1.0) * 0.5).clamp(0, 1)
+            if metric is not None:
+                metric.update(real, real=True)
+                metric.update(recon, real=False)
+            else:
+                fr = inception(real).float()
+                ff = inception(recon).float()
+                real_sum += fr.sum(0, dtype=torch.float64)
+                fake_sum += ff.sum(0, dtype=torch.float64)
+                # The repo's native backend passes activations to numpy.cov,
+                # whose accumulation is fp64. Match that numerical behavior.
+                fr64, ff64 = fr.double(), ff.double()
+                real_cross += fr64.t() @ fr64
+                fake_cross += ff64.t() @ ff64
+            seen += images.size(0)
+    if metric is not None:
+        value = float(metric.compute().item())
+    else:
+        count = torch.tensor(float(seen), device=device, dtype=torch.float64)
+        for tensor in (real_sum, fake_sum, real_cross, fake_cross, count):
+            if dist.is_initialized():
+                dist.all_reduce(tensor)
+        value = native_frechet(real_sum, real_cross, fake_sum, fake_cross, int(count.item()))
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        payload = {"checkpoint": str(args.checkpoint), "checkpoint_epoch": 10,
+                   "split": "imagenet_val", "num_images": 50000,
+                   "fid_backend": args.backend, "rfid": value}
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2))
+        os.replace(temporary, args.output)
+        print(f"Full ImageNet validation rFID: {value:.6f}", flush=True)
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()

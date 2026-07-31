@@ -144,6 +144,10 @@ class RQTransformer(Stage2Model):
         xs_emb, _ = model_aux.get_code_emb_with_depth(xs)
         return xs_emb
 
+    def classify_head_outputs(self, head_outputs):
+        """Classify depth outputs; subclasses may return a compact representation."""
+        return self.classifier(head_outputs)
+
     def forward(self, xs, model_aux=None, cond=None, amp=False):
         with torch.amp.autocast("cuda", enabled=amp):
 
@@ -214,7 +218,7 @@ class RQTransformer(Stage2Model):
             head_outputs = self.head_transformer(depth_ctx_full)
             head_outputs = head_outputs.reshape(B, H, W, D, -1)
 
-            seq_logits = self.classifier(head_outputs)
+            seq_logits = self.classify_head_outputs(head_outputs)
 
             if cond_len > 1:
                 return seq_logits, cond_logits  # shape: (B, H, W, D, vocab_size), (B, cond_len-1, vocab_size_cond)

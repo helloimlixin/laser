@@ -6,6 +6,7 @@ OUT="${OUTPUT_DIR:-$ROOT/outputs/imagenet_x3h5cl0h_stage2_a16384_k2_c2048_m20/st
 DATA_ROOT="${IMAGENET_ROOT:-/workspace/Projects/data/imagenet}"
 STAGE1_CHECKPOINT="${STAGE1_CHECKPOINT:-$ROOT/outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-2048}"
 mkdir -p "$OUT"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="8"
@@ -23,7 +24,7 @@ exec torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" \
   --checkpoint "$STAGE1_CHECKPOINT" \
   --data "$DATA_ROOT" \
   --output "$OUT" \
-  --epochs 100 --batch-size 8 --total-batch-size 2048 \
+  --epochs 100 --batch-size 8 --total-batch-size "$TOTAL_BATCH_SIZE" \
   --num-atoms 16384 --coeff-vocab-size 2048 --coeff-max 20 --coeff-scale 6.4 --lr 0.0005 \
   --fid-num-samples 50000 --fid-batch-size 96 --fid-every 5 --save-ckpt-freq 2 \
   --upload-checkpoints \

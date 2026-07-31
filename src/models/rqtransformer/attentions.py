@@ -66,9 +66,27 @@ class MultiSelfAttention(nn.Module):
         x = x.transpose(0, 1).contiguous()  # (B, T, C) -> (T, B, C)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(T, B*self.n_head, C//self.n_head).transpose(0, 1)  # (B*nh, T, hs)
-        q = self.query(x).view(T, B*self.n_head, C//self.n_head).transpose(0, 1)  # (B*nh, T, hs)
-        v = self.value(x).view(T, B*self.n_head, C//self.n_head).transpose(0, 1)  # (B*nh, T, hs)
+        head_dim = C // self.n_head
+        k4 = self.key(x).view(T, B, self.n_head, head_dim).permute(1, 2, 0, 3)
+        q4 = self.query(x).view(T, B, self.n_head, head_dim).permute(1, 2, 0, 3)
+        v4 = self.value(x).view(T, B, self.n_head, head_dim).permute(1, 2, 0, 3)
+
+        # Training uses PyTorch SDPA, which selects H100 FlashAttention kernels.
+        # Keep the established explicit path for autoregressive KV caching.
+        if not caching and past_kv is None:
+            dropout_p = float(self.attn_drop.p) if self.training else 0.0
+            y = F.scaled_dot_product_attention(
+                q4, k4, v4,
+                dropout_p=dropout_p,
+                is_causal=bool(self.mask),
+            )
+            y = y.permute(2, 0, 1, 3).contiguous().view(T, B, C)
+            y = self.resid_drop(self.proj(y))
+            return y.transpose(0, 1).contiguous()
+
+        k = k4.reshape(B * self.n_head, T, head_dim)
+        q = q4.reshape(B * self.n_head, T, head_dim)
+        v = v4.reshape(B * self.n_head, T, head_dim)
 
         if past_kv is not None:
             past_key, past_value = past_kv
