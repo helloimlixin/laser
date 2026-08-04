@@ -8,7 +8,7 @@ fi
 
 CURRENT_PID="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/tmp/laser-swgbasnb-stage2-checkpoints}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/outputs/swgbasnb_cached_duplicate/stage2/checkpoints}"
 CHECKPOINT="$CHECKPOINT_DIR/last.pt"
 STAGE1="${STAGE1_CHECKPOINT:-$ROOT/outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt}"
 DATA="${IMAGENET_ROOT:-/workspace/Projects/data/imagenet}"

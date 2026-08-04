@@ -9,7 +9,7 @@ fi
 CURRENT_PID="$1"
 TARGET_EPOCH="$2"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/tmp/laser-swgbasnb-stage2-checkpoints}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/outputs/swgbasnb_cached_duplicate/stage2/checkpoints}"
 CHECKPOINT="$CHECKPOINT_DIR/last.pt"
 
 while kill -0 "$CURRENT_PID" 2>/dev/null; do

@@ -6,7 +6,7 @@ DATA_ROOT="${IMAGENET_ROOT:-/workspace/Projects/data/imagenet}"
 STAGE1="${STAGE1_CHECKPOINT:-$ROOT/outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt}"
 OUT="${OUTPUT_DIR:-$ROOT/outputs/swgbasnb_compound_pairs_from_scratch}"
 CACHE="${TOKEN_CACHE:-$OUT/token_cache/imagenet_train_compound_pairs.pt}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/tmp/laser-swgbasnb-compound-checkpoints}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUT/stage2/checkpoints}"
 WANDB_ID="${WANDB_ID:-}"
 
 mkdir -p "$OUT/token_cache" "$CHECKPOINT_DIR"

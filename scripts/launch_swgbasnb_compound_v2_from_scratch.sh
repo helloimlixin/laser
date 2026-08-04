@@ -6,7 +6,7 @@ DATA_ROOT="${IMAGENET_ROOT:-/workspace/Projects/data/imagenet}"
 STAGE1="${STAGE1_CHECKPOINT:-$ROOT/outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt}"
 CACHE="${TOKEN_CACHE:-$ROOT/outputs/swgbasnb_compound_pairs_from_scratch/token_cache/imagenet_train_compound_pairs.pt}"
 OUT="${OUTPUT_DIR:-$ROOT/outputs/swgbasnb_compound_v2_from_scratch}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/tmp/laser-swgbasnb-compound-v2-checkpoints}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUT/stage2/checkpoints}"
 
 test -f "$CACHE"
 test -f "${CACHE%.pt}.validation.json"
