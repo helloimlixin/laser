@@ -1,226 +1,249 @@
-# ImageNet RQ-Transformer migration runbook
+# ImageNet compound RQ-Transformer lab migration runbook
 
-Updated: 2026-07-27 UTC
+Updated: 2026-08-04 UTC
 
-## Migration status
+## Current RunPod job
 
-- The four-GPU training run was intentionally stopped on 2026-07-27 UTC.
-- No training or `torchrun` process should be active on the source machine.
-- The latest completed handoff checkpoint is `checkpoints/last.pt` from epoch
-  30, global step 11,513.
-- Latest recorded 50K FID: 29.0004 at epoch 30.
-- The launcher now defaults to eight local GPU processes and native NCCL peer
-  transport. Paths and process count can be overridden through environment
-  variables documented below.
+- W&B run: `helloimlixin-rutgers/laser/c5cos10r`
+- Run name: `imagenet-rqtransformer-laser-compound-v5b-original-cosine-from-epoch10`
+- State when this runbook was updated: running on four H100 80 GB GPUs
+- Launcher: `scripts/launch_compound_v5b_original_cosine_scratch.sh`
+- Trainer: `scripts/train_official_rqtransformer_laser_stage2.py`
+- Output: `outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2`
+- Recovery checkpoint: `outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2/checkpoints/last.pt`
+- Stage-1 checkpoint: `outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt`
+- Token cache: `outputs/swgbasnb_compound_pairs_from_scratch/token_cache/imagenet_train_compound_pairs.pt`
+- ImageNet root: `/workspace/Projects/data/imagenet`
 
-Checkpoint SHA-256 checksums for transfer verification:
+The job resumed at epoch 10/global step 6,250. The migration snapshot uploaded
+while writing this runbook is the completed epoch-18 checkpoint at global step
+11,250. It is approximately 17.4 GB and contains model, optimizer, scheduler,
+epoch/global-step cursor, and best-metric history.
+
+Latest completed evaluation at the time of migration preparation:
 
 ```text
-5186e9498777f9f91069cfbdb0bc8af39d84524877b67b43a9235e5e98aa07fa  outputs/imagenet_x3h5cl0h_stage2_a16384_k2_c2048_m20/stage2/checkpoints/last.pt
-e7644121b6b4644ac9405bae56881fd59d5f8dd32f91473ae965f30b1aac1606  outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt
+epoch 15: FID 31.9039, Inception Score 32.2789 +/- 0.5079
 ```
 
-After copying, verify with `sha256sum` before launching.
-
-## Current run
-
-- W&B project: `laser`
-- W&B run ID: `swgbasnb`
-- W&B run name: `imagenet-official-rqtransformer-laser-a16384-k2-c2048-m20`
-- Output directory: `outputs/imagenet_x3h5cl0h_stage2_a16384_k2_c2048_m20/stage2`
-- Resume checkpoint: `outputs/imagenet_x3h5cl0h_stage2_a16384_k2_c2048_m20/stage2/checkpoints/last.pt`
-- Stage-1 checkpoint: `outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt`
-- ImageNet root: `/workspace/Projects/data/imagenet`
-- Launcher: `scripts/launch_x3h5cl0h_official_stage2.sh`
-- Trainer: `scripts/train_official_rqtransformer_laser_stage2.py`
-- Current checkpoint size: approximately 16.7 GB
-- Resume is enabled by default. The trainer restores the model, AdamW optimizer,
-  epoch, batch cursor, global step, and best-FID history.
-
-## Architecture
+## Active RunPod settings
 
 ```yaml
-dataset:
-  type: imagenet
-  vocab_size: 16384
-  transforms:
-    type: imagenet256x256
+hardware:
+  gpus: 4
+  gpu_type: H100 80 GB
+  distributed_backend: DDP
 
-arch:
-  type: rq-transformer
-  block_size: [8, 8, 4]
-  embed_dim: 1536
-  input_embed_dim: 256
-  shared_tok_emb: true
-  shared_cls_emb: true
-  input_emb_vqvae: true
-  head_emb_vqvae: true
-  cumsum_depth_ctx: true
-  vocab_size_cond: 1000
-  block_size_cond: 1
-  body:
-    n_layer: 42
-    block:
-      n_head: 24
-  head:
-    n_layer: 6
-    block:
-      n_head: 24
-```
+model:
+  architecture: compound-v4-micro2-rqtransformer-1400M
+  parameter_count: 1_451_676_160
+  num_atoms: 16384
+  coeff_vocab_size: 2048
+  coeff_max: 20
+  coeff_scale: 6.4
+  compound_tokens: true
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
 
-LASER adaptation details:
-
-- Dictionary atoms: 16,384
-- Coefficient vocabulary: 2,048
-- Combined classifier vocabulary: 18,432
-- Coefficient maximum: 20
-- Coefficient scale: 6.4
-- Code layout alternates atom and coefficient depths.
-- Stage-1 auxiliary embeddings use the frozen dictionary checkpoint above.
-
-## Active training settings
-
-```yaml
-loss:
-  type: soft_target_cross_entropy
-  stochastic_codes: true
-  temp: 0.5
+objective:
+  atom_loss_weight: 1.5
+  compound_distribution_geometry: true
+  geometry_top_k: 4
+  geometry_loss_weight: 0.05
+  geometry_start_epoch: 2
+  geometry_warmup_epochs: 3
 
 optimizer:
-  type: adamW
-  init_lr: 0.0005
+  type: fused AdamW
+  lr: 0.0005
   weight_decay: 0.0001
   betas: [0.9, 0.95]
-  max_gn: 1.0
-
-experiment:
-  amp: true
-  batch_size_per_gpu: 8
+  lr_schedule: cosine
+  lr_schedule_epochs: 100
+  min_lr: 0
   total_batch_size: 2048
+
+training:
   epochs: 100
-  save_ckpt_freq: 2
-  fid_every: 5
+  batch_size_per_gpu: 64
+  gradient_accumulation: 8
+  precision: bfloat16 autocast with FP32 parameters and optimizer
+  save_ckpt_freq_epochs: 2
+  save_step_freq: 250
+  sample_grid_every_optimizer_steps: 500
+
+evaluation:
+  fid_every_epochs: 5
   fid_num_samples: 50000
-  fid_batch_size: 96
-  sample_grid_every_optimizer_steps: 100
-  sample:
-    top_k: 16384
-    top_p: 0.92
+  fid_batch_size_per_gpu: 96
+  atom_temperature: 0.90
+  atom_top_p: 0.92
+  coeff_temperature: 1.00
+  coeff_top_p: 0.85
 ```
 
-Additional behavior:
-
-- Full local checkpoints are saved atomically every two epochs.
-- W&B checkpoint artifact upload is enabled.
-- One artifact version is uploaded per checkpoint event under
-  `swgbasnb-checkpoint`.
-- Every uploaded version receives `latest`. A qualifying FID checkpoint also
-  receives `best` and `epoch-N` aliases on the same artifact version. Do not
-  restore the old duplicate `last` plus `best` uploads; that exhausted disk quota.
-- 50K FID runs every five epochs.
-- Class-grid previews run every 100 optimizer steps and do not write a full
-  recovery checkpoint.
-
-## Launcher environment
-
-```bash
-cd /workspace/Projects/laser
-bash scripts/launch_x3h5cl0h_official_stage2.sh
-```
-
-The migration-ready launcher accepts:
-
-```bash
-NPROC_PER_NODE=8
-IMAGENET_ROOT=/workspace/Projects/data/imagenet
-STAGE1_CHECKPOINT=/workspace/Projects/laser/outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt
-OUTPUT_DIR=/workspace/Projects/laser/outputs/imagenet_x3h5cl0h_stage2_a16384_k2_c2048_m20/stage2
-```
-
-For a temporary four-GPU launch, set `NPROC_PER_NODE=4`. With four GPUs,
-batch 8 per GPU, and total batch 2048, gradient accumulation is:
+The effective batch is unchanged by accumulation:
 
 ```text
-2048 / (4 * 8) = 64 microbatches per optimizer step
+4 GPUs * 64 samples/GPU * 8 microbatches = 2048 samples/update
 ```
 
-## Switching to eight H100s
+## Required lab configuration: 2 x RTX 4000 Ada (20 GB each)
 
-1. Copy the repository, stage-1 checkpoint, and latest stage-2 checkpoint to the
-   same relative paths on the new machine.
-2. Copy or recreate the ImageNet directory with `train/` and `val/` folders.
-3. Ensure at least 40 GB of free quota beyond existing checkpoints: an atomic
-   local save and W&B artifact staging may each temporarily require about 17 GB.
-4. Authenticate W&B and keep the same run ID, `swgbasnb`.
-5. The launcher now defaults to:
+Do not launch the current DDP trainer unchanged on this machine. The checkpoint
+contains 1.452B FP32 parameters (5.81 GB). Replicated FP32 parameters, gradients,
+and two Adam moments have a theoretical lower bound of about 23.2 GB per GPU
+before activations, CUDA workspaces, DDP buckets, or the frozen stage-1 model.
+Reducing only `--batch-size` therefore cannot fit a 20 GB GPU.
 
-   ```bash
-   torchrun --standalone --nproc_per_node=8
-   ```
+Preserve the architecture, optimizer recipe, global batch, and cosine schedule,
+but use two-way FSDP `FULL_SHARD` for parameters, gradients, and optimizer state.
+Start with this conservative memory profile:
 
-6. Keep `--batch-size 8`, `--total-batch-size 2048`, and `--lr 0.0005` to
-   preserve the current optimization recipe. Accumulation becomes 32:
+```yaml
+hardware:
+  gpus: 2
+  gpu_type: RTX 4000 Ada 20 GB
+  distributed_backend: FSDP FULL_SHARD
 
-   ```text
-   2048 / (8 * 8) = 32 microbatches per optimizer step
-   ```
+training:
+  batch_size_per_gpu: 4
+  total_batch_size: 2048
+  gradient_accumulation: 256
+  precision: bfloat16 autocast
+  sample_grid_every_optimizer_steps: 0
 
-7. Native NCCL P2P/shared-memory transport is enabled by default. Only on a
-   host with broken CUDA peer mappings should these be exported manually:
-
-   ```bash
-   export NCCL_P2P_DISABLE=1
-   export NCCL_SHM_DISABLE=1
-   ```
-
-8. Launch inside a persistent session:
-
-   ```bash
-   tmux new-session -s imagenet_stage2
-   cd /workspace/Projects/laser
-   bash scripts/launch_x3h5cl0h_official_stage2.sh
-   ```
-
-9. Verify all ranks and the resume cursor:
-
-   ```bash
-   nvidia-smi
-   ps -ef | rg 'torchrun|train_official_rqtransformer'
-   ```
-
-   Expected output includes a line similar to:
-
-   ```text
-   Resumed from .../checkpoints/last.pt: epoch=..., batch=..., step=...
-   ```
-
-## No-gradient-accumulation alternative
-
-This is **not** the active configuration. On eight GPUs with batch 8, disabling
-accumulation requires `--total-batch-size 64`. A linear LR scaling from the
-active recipe gives approximately:
+evaluation:
+  fid_batch_size_per_gpu: 4
+  fid_num_samples: 50000
+  fid_every_epochs: 5
+```
 
 ```text
-0.0005 * 64 / 2048 = 0.000015625
+2 GPUs * 4 samples/GPU * 256 microbatches = 2048 samples/update
 ```
 
-That would create roughly 20,000 optimizer updates per ImageNet epoch instead
-of about 625. It materially changes optimization and is not expected to reduce
-the amount of image compute per epoch. Use it only as a deliberate new recipe,
-not as a transparent resume of the current run.
+Keep `--lr 0.0005`, `--lr-schedule cosine`, `--lr-schedule-epochs 100`, and
+`--min-lr 0`. Keeping the same global batch and optimizer-step count preserves
+the intended schedule. Disable the 64-image training preview initially because
+its generation batch is independent of `--batch-size`; re-enable it only after
+adding a configurable, tested preview batch size.
+
+This is the target command shape after FSDP support is implemented and tested:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  scripts/train_official_rqtransformer_laser_stage2.py \
+  --checkpoint outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt \
+  --token-cache outputs/swgbasnb_compound_pairs_from_scratch/token_cache/imagenet_train_compound_pairs.pt \
+  --compound-tokens \
+  --compound-micro-transformer-layers 2 \
+  --compound-depth-specific-coeff-heads \
+  --compound-distribution-geometry \
+  --geometry-top-k 4 \
+  --atom-loss-weight 1.5 \
+  --geometry-loss-weight 0.05 \
+  --geometry-start-epoch 2 \
+  --geometry-warmup-epochs 3 \
+  --data /path/to/imagenet \
+  --output outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2 \
+  --checkpoint-dir outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2/checkpoints \
+  --epochs 100 \
+  --batch-size 4 \
+  --total-batch-size 2048 \
+  --num-atoms 16384 \
+  --coeff-vocab-size 2048 \
+  --coeff-max 20 \
+  --coeff-scale 6.4 \
+  --lr 0.0005 \
+  --lr-schedule cosine \
+  --lr-schedule-epochs 100 \
+  --min-lr 0 \
+  --fid-num-samples 50000 \
+  --fid-batch-size 4 \
+  --fid-every 5 \
+  --save-ckpt-freq 2 \
+  --save-step-freq 250 \
+  --sample-grid-every 0 \
+  --atom-temperature 0.90 \
+  --atom-top-p 0.92 \
+  --coeff-temperature 1.00 \
+  --coeff-top-p 0.85 \
+  --upload-checkpoints \
+  --resume \
+  --resume-checkpoint outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2/checkpoints/last.pt \
+  --wandb-id c5cos10r \
+  --wandb-name imagenet-rqtransformer-laser-compound-v5b-original-cosine-from-epoch10
+```
+
+The command above is documentation, not yet runnable: the trainer currently
+only wraps the model in DDP and has no `--distributed-backend fsdp` option.
+
+## FSDP implementation checklist
+
+- Add FSDP `FULL_SHARD` wrapping at transformer-block granularity. Do not wrap
+  the frozen stage-1 auxiliary model.
+- Update `unwrap()`, gradient-accumulation `no_sync()`, gradient clipping, and
+  rank-zero save paths for FSDP.
+- Load the existing full DDP model and AdamW state into FSDP on resume. Preserve
+  `epoch`, `batch_idx`, `global_step`, scheduler state, and best-metric history.
+- Save a full, CPU-offloaded, rank-zero-compatible checkpoint so future DDP/FSDP
+  launches can read the same format. Avoid materializing it on every rank.
+- Run a two-GPU smoke test with batch 1, then batch 4. Record peak allocated and
+  reserved memory on both GPUs. Fall back to batch 2 and accumulation 512 if
+  either rank approaches 19 GB or FID generation OOMs.
+- Verify the lab host has enough RAM and at least 55 GB of free local disk for
+  one 17.4 GB checkpoint, one atomic-save temporary, and W&B staging.
+- Test native NCCL over PCIe first. Set `NCCL_P2P_DISABLE=1` only if the host's
+  peer mappings or IOMMU configuration cause NCCL failures.
+
+Expect a large throughput reduction: the lab job performs 32 times as many
+training microbatches per optimizer step as the active RunPod job, before the
+additional H100-versus-RTX performance difference.
+
+## W&B migration artifacts
+
+- Existing evaluated checkpoint artifact: `c5cos10r-checkpoint:v0`
+  (`best`, `epoch-15`), containing the epoch-15 recovery/best checkpoints and
+  inherited best checkpoints from the source run.
+- Migration checkpoint artifact: `c5cos10r-checkpoint:v1` (committed, 18.68 GB),
+  containing `stage2/last.pt` from epoch 18/global step 11,250 and
+  `stage1/best_rfid_slot3_model.pt`. It has aliases `migration-epoch-18` and
+  `migration-step-11250`.
+- Token-cache artifact: `c5cos10r-token-cache:v0` (committed, 658.5 MB),
+  containing `imagenet_train_compound_pairs.pt`. It has alias `migration`.
+
+Download the immutable `:v1`/`:v0` versions or their `migration-*` aliases,
+not the moving `latest` checkpoint alias: the active job will move `latest` on
+its next FID upload. W&B validates each downloaded file against its artifact
+manifest. Place the files at the relative paths used in the target command.
+ImageNet itself is not uploaded and must be copied or mounted with standard
+`train/` and `val/` directories.
+
+## Cutover checklist
+
+1. Let the RunPod job finish its current optimizer step and save a fresh
+   recovery checkpoint. Do not copy a `.tmp` file.
+2. Upload the final recovery checkpoint as a new `c5cos10r-checkpoint` artifact
+   version and record its epoch/global step here if it is newer than step 11,250.
+3. Download the migration artifacts and ImageNet onto the lab machine.
+4. Implement and smoke-test the FSDP checklist before terminating RunPod.
+5. Resume with W&B ID `c5cos10r`, confirm the printed epoch/batch/global-step
+   cursor, and compare the first resumed LR with the last W&B LR.
+6. Confirm both GPUs remain below 19 GB during training and FID generation.
+7. Only after the lab resume has completed at least one optimizer step and a
+   recovery save should the RunPod be shut down.
 
 ## Operational cautions
 
-- Never delete `checkpoints/last.pt` unless a replacement has been validated.
-- An interrupted atomic save may leave `checkpoints/last.pt.tmp`; the previous
-  `last.pt` remains valid. Remove only the incomplete `.tmp` after confirming no
-  training process is writing it.
-- Interrupted W&B uploads may leave large files under
-  `/workspace/.local/share/wandb/artifacts/staging`. Confirm the uploader is dead
-  before removing an orphaned staging file.
-- The stage-1 checkpoint contains legacy OmegaConf metadata. The trainer uses a
-  weights-only compatibility loader and does not require the old third-party
-  package on `PYTHONPATH`.
-- The current machine disables NCCL P2P and shared memory because its GPU peer
-  mappings are unavailable. Do not carry those overrides onto a healthy
-  NVLink/NVSwitch machine without testing native NCCL first.
+- Never delete the newest validated `last.pt` until its W&B artifact and lab
+  download have both been verified.
+- The trainer atomically replaces `last.pt`; an interrupted write should leave
+  the previous checkpoint intact and may leave `last.pt.tmp`.
+- W&B checkpoint upload occurs automatically only on FID epochs. Step-frequency
+  recovery saves are local unless explicitly uploaded for migration.
+- The stage-1 checkpoint contains legacy OmegaConf metadata. Use the trainer's
+  compatibility loader rather than importing the old third-party package.
+- Changing the per-GPU batch is resume-compatible. Changing the model
+  architecture, global batch, optimizer-step count, or cosine horizon is not a
+  transparent continuation of `c5cos10r`.
