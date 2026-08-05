@@ -85,7 +85,9 @@ def main():
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--dataset", choices=("imagenet", "ffhq"), default="imagenet")
+    p.add_argument(
+        "--dataset", choices=("imagenet", "celebahq", "ffhq"), default="imagenet"
+    )
     p.add_argument("--num-images", type=int, default=50_000)
     p.add_argument("--num-atoms", type=int, default=16_384)
     p.add_argument("--coeff-vocab-size", type=int, default=2_048)
@@ -100,9 +102,9 @@ def main():
         dist.init_process_group("nccl", timeout=timedelta(minutes=45))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    if args.dataset == "ffhq":
+    if args.dataset in {"celebahq", "ffhq"}:
         full_dataset = FlatImages(args.data, transform=val_image_transform())
-        split_name = f"ffhq_first_{args.num_images}"
+        split_name = f"{args.dataset}_full_{args.num_images}"
     else:
         full_dataset = datasets.ImageFolder(
             args.data / "val", transform=val_image_transform()
@@ -125,7 +127,7 @@ def main():
         args.coeff_vocab_size,
         20.0,
         1.0,
-        attn_resolutions=((16,) if args.dataset == "ffhq" else (8,)),
+        attn_resolutions=((16,) if args.dataset in {"celebahq", "ffhq"} else (8,)),
         clamp_coeffs=False,
     ).to(device).eval()
     metric = None

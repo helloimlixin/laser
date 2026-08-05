@@ -6,8 +6,8 @@ LASER is a two-stage image model:
    dictionary using Orthogonal Matching Pursuit (OMP).
 2. A transformer learns to generate the resulting atom/coefficient events.
 
-The repository also retains a VQ-VAE baseline and generic Hydra entrypoints, but
-the experiment documented below is the current FFHQ-256 RQ-VAE-compatible path.
+The repository also retains a VQ-VAE baseline and generic Hydra entrypoints. The
+experiments documented below use the current 256×256 RQ-VAE-compatible face path.
 
 ## FFHQ-256 Results
 
@@ -37,7 +37,26 @@ rendering cannot change their relative size or vertical alignment.
 Stage-2 run:
 [`ffhq-a2048-k2-compound-v5b-official-rqtransformer-350M`](https://wandb.ai/helloimlixin-rutgers/laser/runs/ffhq-compound-rqt350-a2048k2-20260805)
 
+## CelebA-HQ-256 Results
+
+Stage-1 checkpoint:
+[`celebahq-a2048-k2-rqvae-strict-20260720-145706`](https://wandb.ai/helloimlixin-rutgers/laser/runs/celebahq-a2048-k2-rqvae-strict-20260720-145706)
+
+Full-dataset reconstruction FID: **9.851521** on all 30,000 CelebA-HQ
+images (28,000 training and 2,000 validation images), using the same continuous
+OMP reconstruction and TorchMetrics Inception protocol as FFHQ.
+
+### Stage-1 Reconstruction
+
+The two 8×8 panels were generated from one in-memory batch, with originals on
+the left and their direct continuous-OMP Stage-1 reconstructions in the same
+positions on the right.
+
+![Aligned CelebA-HQ originals on the left and direct Stage-1 reconstructions on the right](docs/assets/celebahq-a2048-k2-stage1-originals-vs-reconstructions-8x8.jpg)
+
 ## Model Design
+
+Both reported checkpoints use the architecture below.
 
 ```text
 image [B, 3, 256, 256]
