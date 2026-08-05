@@ -4,6 +4,7 @@ from omegaconf import OmegaConf
 from src.models.rqtransformer.configs import RQTransformerConfig
 from scripts.train_official_rqtransformer_laser_stage2 import (
     CompoundLaserRQTransformer,
+    build_model,
     compound_objective,
     scheduled_geometry_weight,
 )
@@ -149,3 +150,24 @@ def test_geometry_weight_waits_then_warms_up_to_target():
     assert abs(scheduled_geometry_weight(0.05, 3.5, 2.0, 3.0) - 0.025) < 1e-12
     assert abs(scheduled_geometry_weight(0.05, 5.0, 2.0, 3.0) - 0.05) < 1e-12
     assert abs(scheduled_geometry_weight(0.05, 20.0, 2.0, 3.0) - 0.05) < 1e-12
+
+
+def test_ffhq_compound_preset_preserves_original_350m_geometry():
+    with torch.device("meta"):
+        model = build_model(
+            3072,
+            2048,
+            compound=True,
+            coeff_vocab_size=1024,
+            compound_micro_transformer_layers=2,
+            compound_depth_specific_coeff_heads=True,
+            model_preset="ffhq-350m",
+        )
+
+    assert tuple(model.block_size) == (8, 8, 2)
+    assert model.config.embed_dim == 1024
+    assert model.config.vocab_size_cond == 1
+    assert len(model.body_transformer.blocks) == 24
+    assert len(model.head_transformer.blocks) == 4
+    assert model.body_transformer.blocks[0].attn.n_head == 16
+    assert sum(parameter.numel() for parameter in model.parameters()) == 383_477_760

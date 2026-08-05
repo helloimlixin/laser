@@ -2,11 +2,56 @@
 
 Updated: 2026-08-04 UTC
 
+## Active local pivot: CelebA-HQ compound RQ-Transformer
+
+- W&B run: `helloimlixin-rutgers/laser/celebahq-compound-rqt350-a2048k2-20260804`
+- Run name: `celebahq-a2048-k2-compound-v5b-official-rqtransformer-350M`
+- State: running on 2 x RTX 4000 Ada (20 GB)
+- Launcher: `scripts/launch_celebahq_a2048_k2_compound_official_stage2.sh`
+- Output: `outputs/celebahq-a2048-k2-rqvae-strict-20260720-145706/stage2-compound-v5b-official-rqtransformer-350M`
+- Log: `runs/celebahq_a2048_k2_compound_production.log`
+- Stage-1 source: `helloimlixin-rutgers/laser/celebahq-a2048-k2-rqvae-strict-20260720-145706`
+- Stage-1 checkpoint: best rFID slot 1, epoch 150, rFID 18.4206; downloaded
+  checkpoint MD5 `7b098c140b8b653ca263d9d12f9cbb22` matches W&B.
+- Dataset: `/home/xl598/Projects/data/celeba_hq` (28,000 train, 2,000 val).
+- Token cache: 28,000 rows of 8x8x2 compound components, with per-depth
+  coefficient scales `[45.83333206, 10.94791698]`; validation passed with exact
+  atom agreement and maximum normalized coefficient error 0.00158.
+- Token-cache artifact: `celebahq-compound-rqt350-a2048k2-20260804-token-cache:v0`
+  (`latest`, `training-cache`).
+
+The stage-2 body/head geometry and optimizer settings match KakaoBrain's
+original FFHQ 350M configuration: embedding width 1024, 24 body layers, four
+depth-head layers, 16 attention heads, AdamW at fixed LR 5e-4, weight decay
+1e-4, betas (0.9, 0.95), global batch 128, 200 epochs, and top-k 250 sampling.
+The compound v5b change uses two `(atom, coefficient)` events at every 8x8
+location, a two-layer pair-local micro-transformer, depth-specific coefficient
+heads, atom loss weight 1.5, and distribution-geometry weight 0.05 warmed from
+epochs 2 through 5. The resulting model has 383,477,760 parameters.
+
+Validation on the lab GPUs:
+
+- One production-shaped DDP optimizer step passed at 7.55 GiB allocated and
+  7.61 GiB reserved on both GPUs.
+- Batch-8 compound autoregressive generation and stage-1 decode passed at
+  12.06 GiB allocated and 12.36 GiB reserved on both GPUs.
+- FID follows the original FFHQ protocol: 50,000 generated images against all
+  training images, evaluated every 50 epochs.
+- Preview sampling writes four separate, borderless 8x8 mosaics every 1,000
+  optimizer steps. Each filename and W&B panel identifies exactly one sampling
+  setting; the images themselves contain no title, subtitle, label, margin, or
+  padding. The four settings compare original top-k 250, a colder top-k 250,
+  atom/coefficient nucleus sampling, and a hybrid top-k/top-p setting.
+- Every scheduled full checkpoint upload contains `last.pt`, all retained
+  top-three FID checkpoints, and all retained top-three Inception Score
+  checkpoints. Step-250 atomic recovery saves remain local so artifact upload
+  does not stall training every few minutes.
+
 ## Current RunPod job
 
 - W&B run: `helloimlixin-rutgers/laser/c5cos10r`
 - Run name: `imagenet-rqtransformer-laser-compound-v5b-original-cosine-from-epoch10`
-- State when this runbook was updated: running on four H100 80 GB GPUs
+- State when migration work began: crashed after the four-H100 RunPod job stopped
 - Launcher: `scripts/launch_compound_v5b_original_cosine_scratch.sh`
 - Trainer: `scripts/train_official_rqtransformer_laser_stage2.py`
 - Output: `outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2`
@@ -19,6 +64,12 @@ The job resumed at epoch 10/global step 6,250. The migration snapshot uploaded
 while writing this runbook is the completed epoch-18 checkpoint at global step
 11,250. It is approximately 17.4 GB and contains model, optimizer, scheduler,
 epoch/global-step cursor, and best-metric history.
+
+The final W&B summary reached global step 11,750 with LR
+`0.0004576489747989561`, but no artifact newer than the step-11,250 immutable
+snapshot was committed before the crash. A continuation from `:v1` must replay
+those 500 unartifacted optimizer steps. The checkpointed LR at step 11,250 is
+`0.00046108198137550626` and was reproduced exactly by the lab smoke tests.
 
 Latest completed evaluation at the time of migration preparation:
 
@@ -98,7 +149,8 @@ Reducing only `--batch-size` therefore cannot fit a 20 GB GPU.
 
 Preserve the architecture, optimizer recipe, global batch, and cosine schedule,
 but use two-way FSDP `FULL_SHARD` for parameters, gradients, and optimizer state.
-Start with this conservative memory profile:
+The initial batch-4 profile passed training but FID-style generation reserved
+19.15 GB. Per the fallback rule below, use this validated profile:
 
 ```yaml
 hardware:
@@ -107,20 +159,20 @@ hardware:
   distributed_backend: FSDP FULL_SHARD
 
 training:
-  batch_size_per_gpu: 4
+  batch_size_per_gpu: 2
   total_batch_size: 2048
-  gradient_accumulation: 256
+  gradient_accumulation: 512
   precision: bfloat16 autocast
   sample_grid_every_optimizer_steps: 0
 
 evaluation:
-  fid_batch_size_per_gpu: 4
+  fid_batch_size_per_gpu: 2
   fid_num_samples: 50000
   fid_every_epochs: 5
 ```
 
 ```text
-2 GPUs * 4 samples/GPU * 256 microbatches = 2048 samples/update
+2 GPUs * 2 samples/GPU * 512 microbatches = 2048 samples/update
 ```
 
 Keep `--lr 0.0005`, `--lr-schedule cosine`, `--lr-schedule-epochs 100`, and
@@ -129,11 +181,13 @@ the intended schedule. Disable the 64-image training preview initially because
 its generation batch is independent of `--batch-size`; re-enable it only after
 adding a configurable, tested preview batch size.
 
-This is the target command shape after FSDP support is implemented and tested:
+The production launcher implementing this command is
+`scripts/launch_compound_v5b_lab_fsdp.sh`:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 \
   scripts/train_official_rqtransformer_laser_stage2.py \
+  --distributed-backend fsdp \
   --checkpoint outputs/imagenet_x3h5cl0h_stage2/stage1_checkpoint/best_rfid_slot3_model.pt \
   --token-cache outputs/swgbasnb_compound_pairs_from_scratch/token_cache/imagenet_train_compound_pairs.pt \
   --compound-tokens \
@@ -149,7 +203,7 @@ torchrun --standalone --nproc_per_node=2 \
   --output outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2 \
   --checkpoint-dir outputs/swgbasnb_compound_v5b_original_cosine_from_epoch10/stage2/checkpoints \
   --epochs 100 \
-  --batch-size 4 \
+  --batch-size 2 \
   --total-batch-size 2048 \
   --num-atoms 16384 \
   --coeff-vocab-size 2048 \
@@ -160,7 +214,7 @@ torchrun --standalone --nproc_per_node=2 \
   --lr-schedule-epochs 100 \
   --min-lr 0 \
   --fid-num-samples 50000 \
-  --fid-batch-size 4 \
+  --fid-batch-size 2 \
   --fid-every 5 \
   --save-ckpt-freq 2 \
   --save-step-freq 250 \
@@ -176,25 +230,55 @@ torchrun --standalone --nproc_per_node=2 \
   --wandb-name imagenet-rqtransformer-laser-compound-v5b-original-cosine-from-epoch10
 ```
 
-The command above is documentation, not yet runnable: the trainer currently
-only wraps the model in DDP and has no `--distributed-backend fsdp` option.
+The command is now runnable once ImageNet `val/` is present on the lab host.
 
-## FSDP implementation checklist
+## Lab migration implementation and validation
 
-- Add FSDP `FULL_SHARD` wrapping at transformer-block granularity. Do not wrap
+- Added transformer-block-granularity FSDP `FULL_SHARD`; the frozen stage-1
+  auxiliary model remains unwrapped.
+- Added FSDP-safe clipping, accumulation, cached sampling, rank-zero full
+  checkpoint save, and DDP/FSDP optimizer-state conversion. FSDP deliberately
+  reduce-scatters every microbatch because `no_sync()` retains full gradients.
+- FID sampling temporarily offloads sharded Adam state to 125 GB host RAM while
+  full parameters are summoned, then restores the optimizer state to each GPU.
+- Downloaded and manifest-verified all three immutable migration files, then
+  hard-linked them into the exact paths listed above.
+- Unit tests: `10 passed` for the focused scheduler/checkpoint/objective suite.
+- Two-rank toy test: legacy DDP optimizer load, FSDP update, rank-zero full save,
+  and ordinary AdamW reload all passed.
+- Full 1.452B smoke measurements (allocated/reserved on both ranks):
+  - training batch 1: `11.75/18.38 GiB`
+  - training batch 4: `11.81/18.20 GiB`
+  - training batch 2: `11.77/18.60 GiB`
+  - generation batch 4 before optimizer offload: `18.23/19.15 GiB`
+  - generation batch 2 after optimizer offload: `16.81/17.07 GiB`
+- A full 17.42 GB FSDP recovery save at step 11,251 was loaded successfully by
+  an ordinary unwrapped model and AdamW with all 829 states. The smoke-only
+  checkpoint was deleted after validation; the migration checkpoint is intact.
+- Smoke logs are under `runs/c5cos10r_fsdp_smoke*.log`.
+- Current blocker (2026-08-04): no ImageNet tree exists at
+  `/home/xl598/Projects/data/imagenet` or the usual lab mount locations. The
+  production launcher has not been started because epoch-20 FID cannot run
+  without ImageNet validation images. Standard ImageNet access/copy/mount is
+  required; the token cache means training images are not read during stage 2,
+  but the validation set is still required for the established FID protocol.
+
+## FSDP implementation checklist (completed)
+
+- [x] Add FSDP `FULL_SHARD` wrapping at transformer-block granularity. Do not wrap
   the frozen stage-1 auxiliary model.
-- Update `unwrap()`, gradient-accumulation `no_sync()`, gradient clipping, and
+- [x] Update `unwrap()`, gradient-accumulation `no_sync()`, gradient clipping, and
   rank-zero save paths for FSDP.
-- Load the existing full DDP model and AdamW state into FSDP on resume. Preserve
+- [x] Load the existing full DDP model and AdamW state into FSDP on resume. Preserve
   `epoch`, `batch_idx`, `global_step`, scheduler state, and best-metric history.
-- Save a full, CPU-offloaded, rank-zero-compatible checkpoint so future DDP/FSDP
+- [x] Save a full, CPU-offloaded, rank-zero-compatible checkpoint so future DDP/FSDP
   launches can read the same format. Avoid materializing it on every rank.
-- Run a two-GPU smoke test with batch 1, then batch 4. Record peak allocated and
+- [x] Run a two-GPU smoke test with batch 1, then batch 4. Record peak allocated and
   reserved memory on both GPUs. Fall back to batch 2 and accumulation 512 if
   either rank approaches 19 GB or FID generation OOMs.
-- Verify the lab host has enough RAM and at least 55 GB of free local disk for
+- [x] Verify the lab host has enough RAM and at least 55 GB of free local disk for
   one 17.4 GB checkpoint, one atomic-save temporary, and W&B staging.
-- Test native NCCL over PCIe first. Set `NCCL_P2P_DISABLE=1` only if the host's
+- [x] Test native NCCL over PCIe first. Set `NCCL_P2P_DISABLE=1` only if the host's
   peer mappings or IOMMU configuration cause NCCL failures.
 
 Expect a large throughput reduction: the lab job performs 32 times as many

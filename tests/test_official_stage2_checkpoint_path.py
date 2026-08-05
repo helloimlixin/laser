@@ -6,6 +6,9 @@ import torch
 
 from scripts.train_official_rqtransformer_laser_stage2 import (
     create_cosine_lr_scheduler,
+    optimizer_state_to_ids,
+    optimizer_state_to_names,
+    optimizer_state_uses_names,
     persistent_checkpoint_dir,
 )
 
@@ -64,3 +67,29 @@ def test_cosine_lr_scheduler_round_trips_checkpoint_state():
     assert resumed_optimizer.param_groups[0]["lr"] == pytest.approx(
         optimizer.param_groups[0]["lr"]
     )
+
+
+def test_optimizer_state_rekeys_between_ddp_ids_and_fsdp_names():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(3, 4),
+        torch.nn.GELU(),
+        torch.nn.Linear(4, 2),
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loss = model(torch.ones(2, 3)).square().mean()
+    loss.backward()
+    optimizer.step()
+    id_state = optimizer.state_dict()
+
+    named_state = optimizer_state_to_names(id_state, model)
+    assert optimizer_state_uses_names(named_state)
+    assert set(named_state["state"]) == set(dict(model.named_parameters()))
+
+    parameter_names = [name for name, _ in model.named_parameters()]
+    restored = optimizer_state_to_ids(named_state, parameter_names)
+    assert not optimizer_state_uses_names(restored)
+    assert restored["param_groups"] == id_state["param_groups"]
+    for parameter_id, state in id_state["state"].items():
+        assert restored["state"][parameter_id].keys() == state.keys()
+        for key, value in state.items():
+            assert torch.equal(restored["state"][parameter_id][key], value)

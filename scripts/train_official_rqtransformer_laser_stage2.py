@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import make_dataclass
 from datetime import timedelta
+from functools import partial
 import json
 import math
 import os
@@ -25,10 +27,20 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    FullOptimStateDictConfig,
+    FullStateDictConfig,
+    FullyShardedDataParallel as FSDP,
+    OptimStateKeyType,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
+from torchvision.utils import save_image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -37,7 +49,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from omegaconf.base import ContainerMetadata, Metadata
 from omegaconf.nodes import AnyNode, BooleanNode, BytesNode, FloatNode, IntegerNode, StringNode
 from src.models.rqtransformer.configs import RQTransformerConfig
-from src.models.rqtransformer.attentions import AttentionStack
+from src.models.rqtransformer.attentions import AttentionBlock, AttentionStack
 from src.models.rqtransformer.transformers import RQTransformer, sample_from_logits
 from src.models.rqvae.rqvae import RQVAE
 from src.data.imagenet_labels import class_names_for_dataset
@@ -68,14 +80,192 @@ def rank() -> int:
 
 
 def unwrap(model):
-    return model.module if isinstance(model, DDP) else model
+    return model.module if isinstance(model, (DDP, FSDP)) else model
+
+
+def is_fsdp_model(model) -> bool:
+    return isinstance(model, FSDP)
+
+
+def wrap_distributed_model(model, backend: str, device: torch.device, world_size: int):
+    """Wrap the trainable stage-2 model without touching the frozen stage-1 model."""
+    if world_size <= 1:
+        if backend == "fsdp":
+            raise ValueError("--distributed-backend fsdp requires more than one process")
+        return model
+    if backend == "ddp":
+        return DDP(model, device_ids=[device.index], broadcast_buffers=False)
+    if backend != "fsdp":
+        raise ValueError(f"unsupported distributed backend: {backend}")
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={AttentionBlock},
+    )
+    return FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=device,
+        sync_module_states=True,
+        limit_all_gathers=True,
+    )
+
+
+def optimizer_state_uses_names(optimizer_state) -> bool:
+    state = optimizer_state.get("state", {})
+    if state:
+        return isinstance(next(iter(state)), str)
+    groups = optimizer_state.get("param_groups", [])
+    return bool(groups and groups[0].get("params") and isinstance(groups[0]["params"][0], str))
+
+
+def optimizer_state_to_names(optimizer_state, unwrapped_model):
+    """Convert a legacy DDP optimizer checkpoint to FSDP's full named format."""
+    if optimizer_state_uses_names(optimizer_state):
+        return optimizer_state
+    return FSDP.rekey_optim_state_dict(
+        optimizer_state,
+        OptimStateKeyType.PARAM_NAME,
+        unwrapped_model,
+    )
+
+
+def optimizer_state_to_ids(optimizer_state, parameter_names):
+    """Return the standard ID-keyed optimizer format consumed by non-FSDP AdamW."""
+    if not optimizer_state_uses_names(optimizer_state):
+        return optimizer_state
+    name_to_id = {name: index for index, name in enumerate(parameter_names)}
+    unknown = set(optimizer_state.get("state", {})) - set(name_to_id)
+    for group in optimizer_state.get("param_groups", []):
+        unknown.update(name for name in group.get("params", []) if name not in name_to_id)
+    if unknown:
+        preview = ", ".join(sorted(unknown)[:5])
+        raise KeyError(f"optimizer checkpoint contains unknown parameters: {preview}")
+    converted = dict(optimizer_state)
+    converted["state"] = {
+        name_to_id[name]: value for name, value in optimizer_state.get("state", {}).items()
+    }
+    converted_groups = []
+    for group in optimizer_state.get("param_groups", []):
+        group_names = set(group.get("params", []))
+        ordered_ids = [name_to_id[name] for name in parameter_names if name in group_names]
+        converted_groups.append({**group, "params": ordered_ids})
+    converted["param_groups"] = converted_groups
+    return converted
+
+
+def optimizer_state_for_unwrapped_load(optimizer_state, unwrapped_model):
+    if not optimizer_state_uses_names(optimizer_state):
+        return optimizer_state
+    return FSDP.rekey_optim_state_dict(
+        optimizer_state,
+        OptimStateKeyType.PARAM_ID,
+        unwrapped_model,
+    )
+
+
+def full_checkpoint_states(model, optimizer, parameter_names):
+    """Gather one DDP-compatible full checkpoint on rank zero only."""
+    if not is_fsdp_model(model):
+        if rank() != 0:
+            return None, None
+        return unwrap(model).state_dict(), optimizer.state_dict()
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        model_state = model.state_dict()
+        optimizer_state = FSDP.optim_state_dict(model, optimizer)
+    if rank() == 0:
+        optimizer_state = optimizer_state_to_ids(optimizer_state, parameter_names)
+    return model_state, optimizer_state
+
+
+@contextmanager
+def model_for_custom_methods(model):
+    """Expose sampling methods safely while FSDP parameters are sharded."""
+    if is_fsdp_model(model):
+        with FSDP.summon_full_params(
+            model, recurse=True, writeback=False, rank0_only=False, offload_to_cpu=False
+        ):
+            # Cached autoregressive methods are not routed through FSDP.forward().
+            # Once all parameters are summoned, temporarily expose each wrapped
+            # block's underlying module. Otherwise ordinary calls made by the
+            # coefficient micro-transformer reshard a nested block mid-context.
+            replacements = []
+
+            def expose_unwrapped_children(module):
+                for name, child in list(module.named_children()):
+                    if isinstance(child, FSDP):
+                        replacements.append((module, name, child))
+                        module._modules[name] = unwrap(child)
+                        expose_unwrapped_children(module._modules[name])
+                    else:
+                        expose_unwrapped_children(child)
+
+            exposed_model = unwrap(model)
+            expose_unwrapped_children(exposed_model)
+            try:
+                yield exposed_model
+            finally:
+                for parent, name, wrapper in reversed(replacements):
+                    parent._modules[name] = wrapper
+    else:
+        yield unwrap(model)
+
+
+def cuda_memory_report(device: torch.device, phase: str):
+    """Collect peak CUDA usage from every rank and print it once on rank zero."""
+    torch.cuda.synchronize(device)
+    local = torch.tensor(
+        [torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
+        dtype=torch.float64,
+        device=device,
+    )
+    if dist.is_initialized():
+        gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local)
+    else:
+        gathered = [local]
+    values = [(float(item[0]) / 2**30, float(item[1]) / 2**30) for item in gathered]
+    if rank() == 0:
+        summary = "; ".join(
+            f"rank {index}: allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB"
+            for index, (allocated, reserved) in enumerate(values)
+        )
+        print(f"CUDA memory ({phase}) — {summary}", flush=True)
+    return values
+
+
+def move_optimizer_state(optimizer, device):
+    """Move Adam state tensors without changing parameter or group identity."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+
+
+@contextmanager
+def optimizer_state_offloaded_for_generation(model, optimizer, device):
+    """Free optimizer memory while autoregressive sampling needs a large batch."""
+    move_optimizer_state(optimizer, torch.device("cpu"))
+    torch.cuda.empty_cache()
+    try:
+        yield
+    finally:
+        move_optimizer_state(optimizer, device)
 
 
 def persistent_checkpoint_dir(output: Path, configured: Path | None) -> Path:
     """Resolve checkpoint storage and reject ephemeral/out-of-workspace targets."""
     target = (configured or (output / "checkpoints")).expanduser().resolve()
     workspace = Path("/workspace")
-    if workspace.is_dir() and not target.is_relative_to(workspace.resolve()):
+    resolved_workspace = workspace.resolve()
+    output_uses_workspace = output.expanduser().resolve().is_relative_to(resolved_workspace)
+    if (workspace.is_dir() or output_uses_workspace) and not target.is_relative_to(resolved_workspace):
         raise ValueError(
             f"Checkpoint directory must be under /workspace so it survives restarts; got {target}"
         )
@@ -348,59 +538,108 @@ class SparseTokenCacheDataset(torch.utils.data.Dataset):
 
 @torch.no_grad()
 def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=None,
-                      atom_temperature=1.0, atom_top_p=0.92,
-                      coeff_temperature=1.0, coeff_top_p=0.92):
+                      num_condition_classes=1000,
+                      num_samples=64,
+                      sample_batch_size=8,
+                      setting_name="default",
+                      atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
+                      coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92):
     device = next(model.parameters()).device
-    chosen = torch.randperm(1000, device=device)[:8]
-    labels = chosen.repeat_interleave(8)
+    grid_side = math.isqrt(int(num_samples))
+    if grid_side * grid_side != int(num_samples):
+        raise ValueError("preview sample count must be a perfect square")
+    if num_condition_classes == 1:
+        chosen = torch.zeros(grid_side, device=device, dtype=torch.long)
+    else:
+        chosen = torch.randperm(num_condition_classes, device=device)[:grid_side]
+    labels = chosen.repeat_interleave(grid_side)
     was_training = model.training
     model.eval()
-    if isinstance(model, CompoundLaserRQTransformer):
-        atoms, coeff_ids = model.sample_compound(
-            64, aux, cond=labels,
-            atom_temperature=atom_temperature,
-            atom_top_k=aux.num_atoms, atom_top_p=atom_top_p,
-            coeff_temperature=coeff_temperature, coeff_top_p=coeff_top_p,
-            amp=True,
-        )
-        images = (aux.decode_compound(atoms, coeff_ids).float().cpu() + 1.0) * 0.5
-    else:
-        partial = torch.zeros(64, 8, 8, 4, device=device, dtype=torch.long)
-        tokens = model.sample(
-            partial, model_aux=aux, cond=labels, temperature=1.0,
-            top_k=16384, top_p=0.92, amp=True, cached=True, is_tqdm=False,
-        )
-        images = (aux.decode_tokens(tokens).float().cpu() + 1.0) * 0.5
-    labels_cpu = labels.cpu().tolist()
-    fig, axes = plt.subplots(8, 8, figsize=(20, 22))
-    for index, axis in enumerate(axes.flat):
-        axis.imshow(images[index].permute(1, 2, 0).clamp(0, 1).numpy())
-        class_id = int(labels_cpu[index])
-        label = class_names[class_id] if class_id < len(class_names) else f"class {class_id}"
-        axis.set_title(f"{class_id}: {label}", fontsize=7)
-        axis.axis("off")
-    fig.suptitle(f"Class-conditional samples — optimizer step {step}", fontsize=16)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    image_batches = []
+    for start in range(0, num_samples, sample_batch_size):
+        stop = min(start + sample_batch_size, num_samples)
+        batch_labels = labels[start:stop]
+        current = stop - start
+        if isinstance(model, CompoundLaserRQTransformer):
+            atoms, coeff_ids = model.sample_compound(
+                current, aux, cond=batch_labels,
+                atom_temperature=atom_temperature,
+                atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
+                coeff_temperature=coeff_temperature,
+                coeff_top_k=coeff_top_k or aux.coeff_vocab_size,
+                coeff_top_p=coeff_top_p,
+                amp=True,
+            )
+            batch_images = aux.decode_compound(atoms, coeff_ids)
+        else:
+            partial = torch.zeros(current, 8, 8, 4, device=device, dtype=torch.long)
+            batch_images = aux.decode_tokens(model.sample(
+                partial, model_aux=aux, cond=batch_labels, temperature=1.0,
+                top_k=atom_top_k or aux.num_atoms, top_p=atom_top_p,
+                amp=True, cached=True, is_tqdm=False,
+            ))
+        image_batches.append(((batch_images.float().cpu() + 1.0) * 0.5).clamp(0, 1))
+    images = torch.cat(image_batches)
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
-    target = sample_dir / f"step_{step:07d}.png"
-    fig.savefig(target, dpi=140)
+    target = sample_dir / f"step_{step:07d}_{setting_name}.png"
+    # A raw padding-free mosaic: no figure canvas, margins, labels, or titles.
+    save_image(images, target, nrow=grid_side, padding=0)
     if wb is not None:
         import wandb
         wb.log({
-            "samples/class_conditional_8x8": wandb.Image(str(target)),
+            f"samples/{setting_name}": wandb.Image(str(target)),
             "train/global_step": step,
         })
-    plt.close(fig)
     if was_training:
         model.train()
     return target
 
 
+def preview_sampling_settings(args):
+    original = {
+        "setting_name": "at1_k250_p1__ct1_k250_p1",
+        "atom_temperature": 1.0, "atom_top_k": 250, "atom_top_p": 1.0,
+        "coeff_temperature": 1.0, "coeff_top_k": 250, "coeff_top_p": 1.0,
+    }
+    if not args.sample_grid_sweep:
+        return [{
+            "setting_name": (
+                f"at{args.atom_temperature:g}_k{args.atom_top_k}_p{args.atom_top_p:g}"
+                f"__ct{args.coeff_temperature:g}_k{args.coeff_top_k}_p{args.coeff_top_p:g}"
+            ),
+            "atom_temperature": args.atom_temperature,
+            "atom_top_k": args.atom_top_k,
+            "atom_top_p": args.atom_top_p,
+            "coeff_temperature": args.coeff_temperature,
+            "coeff_top_k": args.coeff_top_k,
+            "coeff_top_p": args.coeff_top_p,
+        }]
+    return [
+        original,
+        {
+            "setting_name": "at0.85_k250_p1__ct0.85_k250_p1",
+            "atom_temperature": 0.85, "atom_top_k": 250, "atom_top_p": 1.0,
+            "coeff_temperature": 0.85, "coeff_top_k": 250, "coeff_top_p": 1.0,
+        },
+        {
+            "setting_name": "at0.9_k0_p0.92__ct1_k0_p0.85",
+            "atom_temperature": 0.9, "atom_top_k": 0, "atom_top_p": 0.92,
+            "coeff_temperature": 1.0, "coeff_top_k": 0, "coeff_top_p": 0.85,
+        },
+        {
+            "setting_name": "at0.95_k250_p0.95__ct0.9_k250_p0.95",
+            "atom_temperature": 0.95, "atom_top_k": 250, "atom_top_p": 0.95,
+            "coeff_temperature": 0.9, "coeff_top_k": 250, "coeff_top_p": 0.95,
+        },
+    ]
+
+
 @torch.no_grad()
 def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_size: int = 64,
-                                atom_temperature=1.0, atom_top_p=0.92,
-                                coeff_temperature=1.0, coeff_top_p=0.92):
+                                num_condition_classes=1000,
+                                atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
+                                coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92):
     from torchmetrics.image.fid import FrechetInceptionDistance
     from torchmetrics.image.inception import InceptionScore
 
@@ -429,18 +668,20 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
     model.eval()
     while generated < local_samples:
         current = min(int(batch_size), local_samples - generated)
-        # Use the exact uniform ImageNet class prior. At 50K samples this emits
-        # exactly 50 generations for each of the 1,000 classes.
+        # ImageNet uses the exact uniform class prior. Face models have a
+        # single unconditional embedding and therefore receive all-zero ids.
         local_indices = torch.arange(
             generated, generated + current, device=device, dtype=torch.long
         )
-        labels = (local_indices * world + process_rank).remainder(1000)
+        labels = (local_indices * world + process_rank).remainder(num_condition_classes)
         if isinstance(model, CompoundLaserRQTransformer):
             atoms, coeff_ids = model.sample_compound(
                 current, aux, cond=labels,
                 atom_temperature=atom_temperature,
-                atom_top_k=aux.num_atoms, atom_top_p=atom_top_p,
-                coeff_temperature=coeff_temperature, coeff_top_p=coeff_top_p,
+                atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
+                coeff_temperature=coeff_temperature,
+                coeff_top_k=coeff_top_k or aux.coeff_vocab_size,
+                coeff_top_p=coeff_top_p,
                 amp=True,
             )
             images = ((aux.decode_compound(atoms, coeff_ids).float() + 1.0) * 0.5).clamp(0, 1)
@@ -473,7 +714,9 @@ def upload_checkpoints(wb, paths: list[Path], *, artifact_name: str, aliases, me
     artifact = wandb.Artifact(artifact_name, type="model", metadata=metadata)
     for path in paths:
         artifact.add_file(str(path), name=path.name)
-    wb.log_artifact(artifact, aliases=list(aliases))
+    logged = wb.log_artifact(artifact, aliases=list(aliases))
+    logged.wait()
+    print(f"Uploaded checkpoint artifact {logged.name}", flush=True)
 
 
 def upload_checkpoint(wb, path: Path, *, artifact_name: str, aliases, metadata):
@@ -481,6 +724,27 @@ def upload_checkpoint(wb, path: Path, *, artifact_name: str, aliases, metadata):
     upload_checkpoints(
         wb, [path], artifact_name=artifact_name, aliases=aliases, metadata=metadata
     )
+
+
+def upload_token_cache_once(wb, token_cache: Path, output_dir: Path):
+    """Upload the immutable cache once, with a persistent local receipt."""
+    import wandb
+
+    receipt = output_dir / "token_cache_artifact.json"
+    if receipt.is_file():
+        return
+    payload = torch.load(token_cache, map_location="cpu", weights_only=True, mmap=True)
+    metadata = dict(payload.get("meta", {}))
+    artifact = wandb.Artifact(f"{wb.id}-token-cache", type="dataset", metadata=metadata)
+    artifact.add_file(str(token_cache), name=token_cache.name)
+    logged = wb.log_artifact(artifact, aliases=["latest", "training-cache"])
+    logged.wait()
+    receipt.write_text(json.dumps({
+        "artifact": f"{wb.id}-token-cache",
+        "version": logged.version,
+        "file": str(token_cache.resolve()),
+    }, indent=2) + "\n")
+    print(f"Uploaded token cache artifact {logged.name}", flush=True)
 
 
 def image_transform():
@@ -740,7 +1004,8 @@ class CompoundLaserRQTransformer(RQTransformer):
     @torch.no_grad()
     def sample_compound(self, batch_size, model_aux, cond=None, temperature=1.0,
                         atom_top_k=16384, atom_top_p=0.92, coeff_top_p=0.92,
-                        atom_temperature=None, coeff_temperature=None, amp=True):
+                        coeff_top_k=0, atom_temperature=None,
+                        coeff_temperature=None, amp=True):
         H, W, D = self.block_size
         device = next(self.parameters()).device
         atoms = torch.zeros(batch_size, H, W, D, device=device, dtype=torch.long)
@@ -764,7 +1029,8 @@ class CompoundLaserRQTransformer(RQTransformer):
                     atom_vec = model_aux.dictionary.t()[atom.long()]
                     coeff_logits = self.coefficient_logits(hidden, atom_vec, depth_index=d)
                     coeff_id = sample_from_logits(coeff_logits, temperature=coeff_temperature,
-                                                  top_k=self.coeff_vocab_size, top_p=coeff_top_p)
+                                                  top_k=coeff_top_k or self.coeff_vocab_size,
+                                                  top_p=coeff_top_p)
                     atoms[:, h, w, d] = atom
                     coeff_ids[:, h, w, d] = coeff_id
                     packed[:, h, w, d] = atom * self.coeff_vocab_size + coeff_id
@@ -775,15 +1041,36 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 coeff_vocab_size=2048, compound_refiner_layers=0,
                 compound_geometry_head=False,
                 compound_micro_transformer_layers=0,
-                compound_depth_specific_coeff_heads=False):
+                compound_depth_specific_coeff_heads=False,
+                model_preset="imagenet-1400m"):
+    presets = {
+        "imagenet-1400m": {
+            "embed_dim": 1536, "vocab_size_cond": 1000,
+            "body_layers": 42, "body_heads": 24,
+            "head_layers": 6, "head_heads": 24,
+        },
+        # Exact body/head geometry from KakaoBrain's
+        # ffhq256-rqtransformer-8x8x4-350M.yaml. Compound mode changes only
+        # the depth axis from four scalar slots to two sparse-pair events.
+        "ffhq-350m": {
+            "embed_dim": 1024, "vocab_size_cond": 1,
+            "body_layers": 24, "body_heads": 16,
+            "head_layers": 4, "head_heads": 16,
+        },
+    }
+    try:
+        preset = presets[model_preset]
+    except KeyError as error:
+        raise ValueError(f"unknown model preset: {model_preset}") from error
     cfg = OmegaConf.create({
-        "type": "rq-transformer", "block_size": [8, 8, 2 if compound else 4], "embed_dim": 1536,
+        "type": "rq-transformer", "block_size": [8, 8, 2 if compound else 4],
+        "embed_dim": preset["embed_dim"],
         "input_embed_dim": 256, "shared_tok_emb": True, "shared_cls_emb": True,
         "input_emb_vqvae": True, "head_emb_vqvae": True, "cumsum_depth_ctx": True,
         "vocab_size": num_atoms if compound else total_vocab_size,
-        "vocab_size_cond": 1000, "block_size_cond": 1,
-        "body": {"n_layer": 42, "block": {"n_head": 24}},
-        "head": {"n_layer": 6, "block": {"n_head": 24}},
+        "vocab_size_cond": preset["vocab_size_cond"], "block_size_cond": 1,
+        "body": {"n_layer": preset["body_layers"], "block": {"n_head": preset["body_heads"]}},
+        "head": {"n_layer": preset["head_layers"], "block": {"n_head": preset["head_heads"]}},
     })
     if compound:
         return CompoundLaserRQTransformer(
@@ -916,13 +1203,27 @@ def main():
     p.add_argument("--resume-checkpoint", type=Path, default=None,
                    help="Explicit source stage-2 checkpoint (allows a new output/run)")
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--dataset", choices=("imagenet", "celebahq"), default="imagenet")
+    p.add_argument(
+        "--model-preset", choices=("imagenet-1400m", "ffhq-350m"),
+        default="imagenet-1400m",
+    )
+    p.add_argument(
+        "--fid-real-split", choices=("train", "val"), default=None,
+        help="Reference split; defaults to val for ImageNet and train for CelebA-HQ/FFHQ",
+    )
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--total-batch-size", type=int, default=2048)
+    p.add_argument(
+        "--distributed-backend", choices=("ddp", "fsdp"), default="ddp",
+        help="Multi-GPU wrapper; FSDP uses transformer-block FULL_SHARD",
+    )
     p.add_argument("--num-atoms", type=int, default=16384)
     p.add_argument("--coeff-vocab-size", type=int, default=2048)
     p.add_argument("--coeff-max", type=float, default=20.0)
     p.add_argument("--coeff-scale", type=float, default=6.4)
+    p.add_argument("--coeff-scales", type=float, nargs=2)
     p.add_argument(
         "--compound-tokens", action=argparse.BooleanOptionalAction, default=False,
         help="Use 128 compound (atom, coefficient) AR events instead of 256 scalar events",
@@ -945,8 +1246,12 @@ def main():
     p.add_argument("--geometry-start-epoch", type=float, default=0.0)
     p.add_argument("--geometry-warmup-epochs", type=float, default=0.0)
     p.add_argument("--atom-temperature", type=float, default=1.0)
+    p.add_argument("--atom-top-k", type=int, default=0,
+                   help="0 keeps all atom logits")
     p.add_argument("--atom-top-p", type=float, default=0.92)
     p.add_argument("--coeff-temperature", type=float, default=1.0)
+    p.add_argument("--coeff-top-k", type=int, default=0,
+                   help="0 keeps all coefficient logits")
     p.add_argument("--coeff-top-p", type=float, default=0.92)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument(
@@ -959,12 +1264,17 @@ def main():
     )
     p.add_argument("--min-lr", type=float, default=0.0)
     p.add_argument("--wandb-project", default="laser")
+    p.add_argument("--wandb-entity", default="helloimlixin-rutgers")
     p.add_argument("--wandb-name", default="imagenet-rqtransformer-laser-a16384-k2-stage2")
     p.add_argument("--wandb-id", default=None)
+    p.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"), default="online",
+        help="Disable W&B for local memory smoke tests with --wandb-mode disabled",
+    )
     p.add_argument("--fid-num-samples", type=int, default=2048)
     p.add_argument("--fid-batch-size", type=int, default=64)
     p.add_argument("--fid-every", type=int, default=1,
-                   help="Run full FID every N epochs")
+                   help="Run full FID every N epochs; 0 disables evaluation")
     p.add_argument("--save-ckpt-freq", type=int, default=2,
                    help="Save the full training checkpoint every N epochs")
     p.add_argument("--save-step-freq", type=int, default=0,
@@ -973,13 +1283,43 @@ def main():
                    help="Persistent checkpoint directory under /workspace")
     p.add_argument("--sample-grid-every", type=int, default=100,
                    help="Generate the expensive 64-image class grid every N optimizer steps; 0 disables it")
+    p.add_argument("--sample-grid-size", type=int, default=64,
+                   help="Perfect-square preview batch size")
+    p.add_argument("--sample-grid-batch-size", type=int, default=8,
+                   help="Memory-safe generation minibatch used to assemble a preview grid")
+    p.add_argument(
+        "--sample-grid-sweep", action=argparse.BooleanOptionalAction, default=False,
+        help="Write one grid for each built-in atom/coefficient sampling preset",
+    )
+    p.add_argument(
+        "--sample-grid-on-start", action=argparse.BooleanOptionalAction, default=False,
+        help="Generate one preview after initialization/resume, before training",
+    )
     p.add_argument(
         "--upload-checkpoints",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Upload 16+ GB checkpoints as W&B artifacts (disabled by default)",
     )
+    p.add_argument(
+        "--upload-token-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload the immutable token cache once as a W&B dataset artifact",
+    )
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--max-optimizer-steps", type=int, default=0,
+        help="Stop after this many optimizer steps in this launch; 0 runs all epochs",
+    )
+    p.add_argument(
+        "--smoke-test", action="store_true",
+        help="Synchronize/step after one microbatch while preserving the configured global schedule",
+    )
+    p.add_argument(
+        "--generation-smoke-test", action="store_true",
+        help="Generate and decode one FID-sized batch, report peak memory, and exit",
+    )
     args = p.parse_args()
     if args.compound_refiner_layers < 0:
         raise ValueError("--compound-refiner-layers cannot be negative")
@@ -999,6 +1339,19 @@ def main():
         raise ValueError("--geometry-warmup-epochs cannot be negative")
     if args.save_step_freq < 0:
         raise ValueError("--save-step-freq cannot be negative")
+    if (args.sample_grid_size <= 0 or
+            math.isqrt(args.sample_grid_size) ** 2 != args.sample_grid_size):
+        raise ValueError("--sample-grid-size must be a positive perfect square")
+    if not 0 < args.sample_grid_batch_size <= args.sample_grid_size:
+        raise ValueError("--sample-grid-batch-size must be in [1, --sample-grid-size]")
+    if args.fid_every < 0:
+        raise ValueError("--fid-every cannot be negative")
+    if args.max_optimizer_steps < 0:
+        raise ValueError("--max-optimizer-steps cannot be negative")
+    if args.smoke_test and args.max_optimizer_steps <= 0:
+        raise ValueError("--smoke-test requires --max-optimizer-steps")
+    if args.smoke_test and args.generation_smoke_test:
+        raise ValueError("training and generation smoke modes are mutually exclusive")
     if args.lr <= 0:
         raise ValueError("--lr must be positive")
     if args.lr_schedule_epochs <= 0:
@@ -1007,6 +1360,10 @@ def main():
         raise ValueError("--min-lr must be between zero and --lr")
     if args.lr_schedule == "cosine" and args.epochs > args.lr_schedule_epochs:
         raise ValueError("--epochs cannot exceed the global cosine schedule horizon")
+    if args.dataset == "celebahq" and args.model_preset != "ffhq-350m":
+        raise ValueError("CelebA-HQ requires --model-preset ffhq-350m")
+    if args.model_preset == "ffhq-350m" and args.dataset != "celebahq":
+        raise ValueError("--model-preset ffhq-350m is currently defined for CelebA-HQ")
     if args.geometry_loss_weight > 0 and not args.compound_tokens:
         raise ValueError("geometry contribution loss requires --compound-tokens")
     if args.compound_distribution_geometry and args.geometry_loss_weight <= 0:
@@ -1015,6 +1372,8 @@ def main():
         raise ValueError("depth-specific coefficient heads require --compound-tokens")
     if args.atom_temperature <= 0 or args.coeff_temperature <= 0:
         raise ValueError("sampling temperatures must be positive")
+    if args.atom_top_k < 0 or args.coeff_top_k < 0:
+        raise ValueError("sampling top-k values cannot be negative")
     if not 0 < args.atom_top_p <= 1 or not 0 < args.coeff_top_p <= 1:
         raise ValueError("sampling top-p values must be in (0, 1]")
 
@@ -1033,26 +1392,87 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     args.output.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = persistent_checkpoint_dir(args.output, args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_checkpoint = checkpoint_dir / "last.pt"
+    resume_checkpoint = args.resume_checkpoint or last_checkpoint
 
-    image_dataset = datasets.ImageFolder(args.data / "train", transform=image_transform())
-    class_names = class_names_for_dataset("imagenet", image_dataset.classes)
-    dataset = SparseTokenCacheDataset(args.token_cache) if args.token_cache else image_dataset
+    if args.token_cache:
+        dataset = SparseTokenCacheDataset(args.token_cache)
+        cache_meta = dataset.meta
+        expected_cache = {
+            "dataset": args.dataset,
+            "num_atoms": args.num_atoms,
+            "coeff_vocab_size": args.coeff_vocab_size,
+        }
+        for key, expected in expected_cache.items():
+            actual = cache_meta.get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"token cache {key} mismatch: cache={actual!r}, launch={expected!r}"
+                )
+        cached_coeff_max = float(cache_meta.get("coeff_max", args.coeff_max))
+        if not math.isclose(cached_coeff_max, args.coeff_max, rel_tol=0.0, abs_tol=1e-8):
+            raise ValueError(
+                "token cache coeff_max mismatch: "
+                f"cache={cached_coeff_max}, launch={args.coeff_max}"
+            )
+        cached_scales = cache_meta.get("coeff_scales")
+        if cached_scales is not None:
+            cached_scales = [float(value) for value in cached_scales]
+            if args.coeff_scales is None:
+                args.coeff_scales = cached_scales
+            elif any(
+                not math.isclose(float(given), cached, rel_tol=1e-6, abs_tol=1e-8)
+                for given, cached in zip(args.coeff_scales, cached_scales)
+            ):
+                raise ValueError(
+                    "token cache coeff_scales mismatch: "
+                    f"cache={cached_scales}, launch={args.coeff_scales}"
+                )
+        elif not math.isclose(
+            float(cache_meta.get("coeff_scale", args.coeff_scale)),
+            args.coeff_scale, rel_tol=1e-6, abs_tol=1e-8,
+        ):
+            raise ValueError("token cache coeff_scale does not match the launch")
+        class_names = (
+            ["unconditional"] if args.dataset == "celebahq"
+            else class_names_for_dataset("imagenet")
+        )
+    else:
+        image_dataset = datasets.ImageFolder(args.data / "train", transform=image_transform())
+        class_names = (
+            ["unconditional"] if args.dataset == "celebahq"
+            else class_names_for_dataset("imagenet", image_dataset.classes)
+        )
+        dataset = image_dataset
     sampler = ResumableDistributedSampler(dataset, shuffle=True) if world > 1 else None
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                         shuffle=sampler is None, num_workers=8, pin_memory=True,
                         persistent_workers=True, drop_last=True)
-    val_dataset = datasets.ImageFolder(args.data / "val", transform=val_image_transform())
-    val_sampler = DistributedSampler(
-        val_dataset, num_replicas=world, rank=rank(), shuffle=False, drop_last=False
-    ) if world > 1 else None
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.fid_batch_size, sampler=val_sampler,
-        shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True,
-    )
+    val_loader = None
+    if args.fid_every > 0:
+        fid_real_split = args.fid_real_split or (
+            "train" if args.dataset == "celebahq" else "val"
+        )
+        val_dataset = datasets.ImageFolder(
+            args.data / fid_real_split, transform=val_image_transform()
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world, rank=rank(), shuffle=False, drop_last=False
+        ) if world > 1 else None
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.fid_batch_size, sampler=val_sampler,
+            shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True,
+        )
     total_vocab_size = args.num_atoms + args.coeff_vocab_size
+    num_condition_classes = 1 if args.model_preset == "ffhq-350m" else 1000
     aux = LaserAux(args.checkpoint, args.num_atoms, args.coeff_vocab_size,
-                   args.coeff_max, args.coeff_scale).to(device)
-    model = build_model(
+                   args.coeff_max, args.coeff_scale,
+                   attn_resolutions=((16,) if args.dataset == "celebahq" else (8,)),
+                   coeff_scales=args.coeff_scales,
+                   soft_target_physical=args.coeff_scales is not None).to(device)
+    unwrapped_model = build_model(
         total_vocab_size, args.num_atoms, compound=args.compound_tokens,
         coeff_vocab_size=args.coeff_vocab_size,
         compound_refiner_layers=args.compound_refiner_layers,
@@ -1061,13 +1481,55 @@ def main():
         ),
         compound_micro_transformer_layers=args.compound_micro_transformer_layers,
         compound_depth_specific_coeff_heads=args.compound_depth_specific_coeff_heads,
-    ).to(device)
-    if world > 1:
-        model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
+        model_preset=args.model_preset,
+    )
+    parameter_names = [name for name, _ in unwrapped_model.named_parameters()]
+
+    resume_payload = None
+    resume_optimizer_state = None
+    checkpoint_exists = args.resume and resume_checkpoint.is_file()
+    if checkpoint_exists:
+        should_load = args.distributed_backend != "fsdp" or rank() == 0
+        if should_load:
+            raw_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+            unwrapped_model.load_state_dict(raw_payload["state_dict"], strict=True)
+            resume_optimizer_state = raw_payload["optimizer"]
+            resume_payload = {
+                key: value for key, value in raw_payload.items()
+                if key not in ("state_dict", "optimizer")
+            }
+            del raw_payload
+            if args.distributed_backend == "fsdp":
+                resume_optimizer_state = optimizer_state_to_names(
+                    resume_optimizer_state, unwrapped_model
+                )
+        if args.distributed_backend == "fsdp":
+            metadata = [resume_payload]
+            dist.broadcast_object_list(metadata, src=0)
+            resume_payload = metadata[0]
+
+    unwrapped_model = unwrapped_model.to(device)
+    model = wrap_distributed_model(
+        unwrapped_model, args.distributed_backend, device, world
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=1e-4,
         betas=(0.9, 0.95), fused=True,
     )
+    if checkpoint_exists:
+        if is_fsdp_model(model):
+            sharded_optimizer_state = FSDP.scatter_full_optim_state_dict(
+                resume_optimizer_state if rank() == 0 else None,
+                model,
+                optim=optimizer,
+            )
+            optimizer.load_state_dict(sharded_optimizer_state)
+            del sharded_optimizer_state
+        else:
+            optimizer.load_state_dict(
+                optimizer_state_for_unwrapped_load(resume_optimizer_state, unwrap(model))
+            )
+        del resume_optimizer_state
     accumulation = args.total_batch_size // (args.batch_size * world)
     if accumulation * args.batch_size * world != args.total_batch_size:
         raise ValueError("total batch size must be divisible by per-step global batch size")
@@ -1075,21 +1537,24 @@ def main():
     optimizer_steps_per_epoch = complete_microbatches // accumulation
     if optimizer_steps_per_epoch <= 0:
         raise ValueError("training loader does not contain a complete optimizer step")
-    use_wandb = rank() == 0
+    use_wandb = rank() == 0 and args.wandb_mode != "disabled"
     wb = None
     if use_wandb:
         import wandb
-        wb = wandb.init(project=args.wandb_project, name=args.wandb_name,
+        wb = wandb.init(entity=args.wandb_entity, project=args.wandb_project,
+                        name=args.wandb_name,
                         id=args.wandb_id, resume="allow" if args.wandb_id else None,
+                        mode=args.wandb_mode,
                         config={**vars(args), "architecture": (
-                            f"compound-v4-micro{args.compound_micro_transformer_layers}-rqtransformer-1400M"
+                            f"compound-v4-micro{args.compound_micro_transformer_layers}-rqtransformer-{args.model_preset}"
                             if args.compound_tokens and args.compound_micro_transformer_layers > 0
-                            else f"compound-v3-refiner{args.compound_refiner_layers}-rqtransformer-1400M"
+                            else f"compound-v3-refiner{args.compound_refiner_layers}-rqtransformer-{args.model_preset}"
                             if args.compound_tokens and args.compound_refiner_layers > 0
-                            else "compound-rqtransformer-1400M" if args.compound_tokens
-                            else "official-rqtransformer-1400M"
+                            else f"compound-rqtransformer-{args.model_preset}" if args.compound_tokens
+                            else f"official-rqtransformer-{args.model_preset}"
                         ),
-                                "stochastic_codes": True, "temp": 0.5, "top_p": 0.92})
+                                "stochastic_codes": True, "temp": 0.5, "top_p": 0.92,
+                                "preview_sampling_settings": preview_sampling_settings(args)})
         wb.define_metric("train/global_step")
         for metric_name in (
             "train/loss", "train/atom_nll", "train/coeff_cross_entropy",
@@ -1107,21 +1572,17 @@ def main():
         ):
             wb.define_metric(metric_name, step_metric="train/global_step")
         (args.output / "launch_config.json").write_text(json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
+        if args.upload_token_cache:
+            if args.token_cache is None:
+                raise ValueError("--upload-token-cache requires --token-cache")
+            upload_token_cache_once(wb, args.token_cache, args.output)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
-    checkpoint_dir = persistent_checkpoint_dir(args.output, args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    last_checkpoint = checkpoint_dir / "last.pt"
-    resume_checkpoint = args.resume_checkpoint or last_checkpoint
     global_step = 0
     start_epoch = 0
     resume_batch_idx = 0
     best_fid = []
     best_inception = []
-    resume_payload = None
-    if args.resume and resume_checkpoint.is_file():
-        resume_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
-        unwrap(model).load_state_dict(resume_payload["state_dict"], strict=True)
-        optimizer.load_state_dict(resume_payload["optimizer"])
+    if resume_payload is not None:
         global_step = int(resume_payload.get("global_step", 0))
         start_epoch = int(resume_payload.get("epoch", 0))
         resume_batch_idx = int(resume_payload.get("batch_idx", 0))
@@ -1176,8 +1637,79 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = args.lr
     optimizer.zero_grad(set_to_none=True)
+    if args.sample_grid_on_start:
+        if dist.is_initialized():
+            dist.barrier()
+        with optimizer_state_offloaded_for_generation(model, optimizer, device):
+            with model_for_custom_methods(model) as sampling_model:
+                if rank() == 0:
+                    for setting in preview_sampling_settings(args):
+                        target = sample_class_grid(
+                            sampling_model, aux, class_names, args.output,
+                            global_step, wb=wb,
+                            num_condition_classes=num_condition_classes,
+                            num_samples=args.sample_grid_size,
+                            sample_batch_size=args.sample_grid_batch_size,
+                            **setting,
+                        )
+                        print(f"Saved startup samples: {target}", flush=True)
+                if is_fsdp_model(model):
+                    dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
+    if args.generation_smoke_test:
+        with optimizer_state_offloaded_for_generation(model, optimizer, device):
+            torch.cuda.reset_peak_memory_stats(device)
+            with model_for_custom_methods(model) as generation_model:
+                generation_model.eval()
+                labels = torch.arange(args.fid_batch_size, device=device).remainder(
+                    num_condition_classes
+                )
+                if isinstance(generation_model, CompoundLaserRQTransformer):
+                    atoms, coeff_ids = generation_model.sample_compound(
+                        args.fid_batch_size,
+                        aux,
+                        cond=labels,
+                        atom_temperature=args.atom_temperature,
+                        atom_top_k=args.atom_top_k or aux.num_atoms,
+                        atom_top_p=args.atom_top_p,
+                        coeff_temperature=args.coeff_temperature,
+                        coeff_top_k=args.coeff_top_k or aux.coeff_vocab_size,
+                        coeff_top_p=args.coeff_top_p,
+                        amp=True,
+                    )
+                    images = aux.decode_compound(atoms, coeff_ids)
+                else:
+                    partial = torch.zeros(
+                        args.fid_batch_size, 8, 8, 4, device=device, dtype=torch.long
+                    )
+                    tokens = generation_model.sample(
+                        partial,
+                        model_aux=aux,
+                        cond=labels,
+                        temperature=1.0,
+                        top_k=aux.num_atoms,
+                        top_p=args.atom_top_p,
+                        amp=True,
+                        cached=True,
+                        is_tqdm=False,
+                    )
+                    images = aux.decode_tokens(tokens)
+                if not torch.isfinite(images).all():
+                    raise RuntimeError("generation smoke test produced non-finite pixels")
+                del images
+            cuda_memory_report(device, f"generation smoke batch {args.fid_batch_size}")
+        if rank() == 0:
+            print("Generation smoke test passed", flush=True)
+        if wb is not None:
+            wb.finish()
+        return
     last_perf_step = global_step
     last_perf_time = time.monotonic()
+    launch_start_step = global_step
+    memory_reported = False
+    stop_training = False
+    torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(start_epoch, args.epochs):
         batch_offset = resume_batch_idx if epoch == start_epoch else 0
         if sampler is not None:
@@ -1193,6 +1725,8 @@ def main():
                 atoms = atoms.to(device, non_blocking=True)
                 coeffs = coeffs.to(device, non_blocking=True)
                 labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
+                if num_condition_classes == 1:
+                    labels.zero_()
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     if args.compound_tokens:
                         coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
@@ -1208,6 +1742,8 @@ def main():
             else:
                 images, labels = batch
                 images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+                if num_condition_classes == 1:
+                    labels.zero_()
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     if args.compound_tokens:
                         atoms, coeffs = aux.encode_sparse_components(images)
@@ -1219,7 +1755,10 @@ def main():
                         compact_targets = (atoms.long(), target_coeff_probs, target_physical)
                     else:
                         tokens, soft_targets = aux.encode_sparse(images, temp=0.5, stochastic=True)
-            sync = ((absolute_batch_idx + 1) % accumulation == 0)
+            sync = args.smoke_test or ((absolute_batch_idx + 1) % accumulation == 0)
+            # FSDP deliberately reduce-scatters every microbatch. Its no_sync()
+            # retains full, unsharded gradients and is too memory-hungry for a
+            # 1.45B-parameter model on these 20 GB cards.
             ctx = model.no_sync() if isinstance(model, DDP) and not sync else torch.enable_grad()
             with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(tokens, model_aux=aux, cond=labels, amp=False)
@@ -1323,12 +1862,29 @@ def main():
                     loss = -(soft_targets * log_probs).sum(dim=-1).mean() / accumulation
             loss.backward()
             if sync:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = (
+                    model.clip_grad_norm_(1.0)
+                    if is_fsdp_model(model)
+                    else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                )
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                if not memory_reported:
+                    memory_values = cuda_memory_report(
+                        device, f"first optimizer step {global_step}"
+                    )
+                    if wb is not None:
+                        memory_payload = {"train/global_step": global_step}
+                        for memory_rank, (allocated, reserved) in enumerate(memory_values):
+                            memory_payload.update({
+                                f"system/rank{memory_rank}_peak_allocated_gib": allocated,
+                                f"system/rank{memory_rank}_peak_reserved_gib": reserved,
+                            })
+                        wb.log(memory_payload)
+                    memory_reported = True
                 if wb is not None and global_step % 10 == 0:
                     now = time.monotonic()
                     elapsed = max(now - last_perf_time, 1e-6)
@@ -1347,6 +1903,9 @@ def main():
                 if args.save_step_freq > 0 and global_step % args.save_step_freq == 0:
                     if dist.is_initialized():
                         dist.barrier()
+                    model_state, optimizer_state = full_checkpoint_states(
+                        model, optimizer, parameter_names
+                    )
                     if rank() == 0:
                         recovery_snapshot = {
                             "epoch": epoch,
@@ -1355,8 +1914,8 @@ def main():
                             "fid": None,
                             "inception_score": None,
                             "inception_score_std": None,
-                            "state_dict": unwrap(model).state_dict(),
-                            "optimizer": optimizer.state_dict(),
+                            "state_dict": model_state,
+                            "optimizer": optimizer_state,
                             "scheduler": None if scheduler is None else scheduler.state_dict(),
                             "config": vars(args),
                             "best_fid": best_fid,
@@ -1367,28 +1926,50 @@ def main():
                             f"Step {global_step}: saved recovery checkpoint {last_checkpoint}",
                             flush=True,
                         )
+                        del recovery_snapshot
+                    del model_state, optimizer_state
                     if dist.is_initialized():
                         dist.barrier()
                 if args.sample_grid_every > 0 and global_step % args.sample_grid_every == 0:
                     if dist.is_initialized():
                         dist.barrier()
-                    if rank() == 0:
-                        target = sample_class_grid(
-                            unwrap(model), aux, class_names, args.output, global_step, wb=wb,
-                            atom_temperature=args.atom_temperature,
-                            atom_top_p=args.atom_top_p,
-                            coeff_temperature=args.coeff_temperature,
-                            coeff_top_p=args.coeff_top_p,
-                        )
-                        print(f"Saved class-conditional samples: {target}", flush=True)
+                    with optimizer_state_offloaded_for_generation(model, optimizer, device):
+                        with model_for_custom_methods(model) as sampling_model:
+                            if rank() == 0:
+                                for setting in preview_sampling_settings(args):
+                                    target = sample_class_grid(
+                                        sampling_model, aux, class_names, args.output,
+                                        global_step, wb=wb,
+                                        num_condition_classes=num_condition_classes,
+                                        num_samples=args.sample_grid_size,
+                                        sample_batch_size=args.sample_grid_batch_size,
+                                        **setting,
+                                    )
+                                    print(f"Saved preview samples: {target}", flush=True)
+                            if is_fsdp_model(model):
+                                dist.barrier()
                     if dist.is_initialized():
                         dist.barrier()
+                if (
+                    args.max_optimizer_steps > 0
+                    and global_step - launch_start_step >= args.max_optimizer_steps
+                ):
+                    stop_training = True
+                    break
+        if stop_training:
+            if rank() == 0:
+                print(
+                    f"Stopped after {global_step - launch_start_step} optimizer step(s) "
+                    "as requested; skipped epoch evaluation and checkpointing",
+                    flush=True,
+                )
+            break
         resume_batch_idx = 0
         if sampler is not None:
             sampler.set_start_index(0)
         if dist.is_initialized():
             dist.barrier()
-        run_fid = (epoch + 1) % args.fid_every == 0
+        run_fid = args.fid_every > 0 and (epoch + 1) % args.fid_every == 0
         # Every evaluated model must be recoverable, even when the FID cadence
         # does not coincide with the periodic recovery-checkpoint cadence.
         save_epoch = (
@@ -1400,13 +1981,23 @@ def main():
         inception_score = None
         inception_score_std = None
         if run_fid:
-            fid, inception_score, inception_score_std = evaluate_generation_metrics(
-                unwrap(model), aux, val_loader, args.fid_num_samples, args.fid_batch_size,
-                atom_temperature=args.atom_temperature,
-                atom_top_p=args.atom_top_p,
-                coeff_temperature=args.coeff_temperature,
-                coeff_top_p=args.coeff_top_p,
-            )
+            with optimizer_state_offloaded_for_generation(model, optimizer, device):
+                torch.cuda.reset_peak_memory_stats(device)
+                with model_for_custom_methods(model) as generation_model:
+                    fid, inception_score, inception_score_std = evaluate_generation_metrics(
+                        generation_model, aux, val_loader, args.fid_num_samples,
+                        args.fid_batch_size,
+                        num_condition_classes=num_condition_classes,
+                        atom_temperature=args.atom_temperature,
+                        atom_top_k=args.atom_top_k,
+                        atom_top_p=args.atom_top_p,
+                        coeff_temperature=args.coeff_temperature,
+                        coeff_top_k=args.coeff_top_k,
+                        coeff_top_p=args.coeff_top_p,
+                    )
+                cuda_memory_report(device, f"epoch {epoch + 1} FID generation")
+        best_path = None
+        best_inception_path = None
         if rank() == 0:
             if wb is not None and fid is not None:
                 wb.log({
@@ -1419,7 +2010,6 @@ def main():
             qualifies = fid is not None and (
                 len(best_fid) < 3 or fid < max(x[0] for x in best_fid)
             )
-            best_path = None
             if qualifies:
                 best_path = checkpoint_dir / f"best_fid_{fid:.4f}_epoch_{epoch + 1:03d}.pt"
                 best_fid.append((fid, str(best_path)))
@@ -1433,7 +2023,6 @@ def main():
                 len(best_inception) < 3
                 or inception_score > min(x[0] for x in best_inception)
             )
-            best_inception_path = None
             if qualifies_inception:
                 best_inception_path = checkpoint_dir / (
                     f"best_is_{inception_score:.4f}_epoch_{epoch + 1:03d}.pt"
@@ -1445,12 +2034,16 @@ def main():
                     stale_path = Path(stale)
                     if stale_path.is_file():
                         stale_path.unlink()
-            if save_epoch:
+        if save_epoch:
+            model_state, optimizer_state = full_checkpoint_states(
+                model, optimizer, parameter_names
+            )
+            if rank() == 0:
                 snapshot = {
                     "epoch": epoch + 1, "global_step": global_step, "fid": fid,
                     "inception_score": inception_score,
                     "inception_score_std": inception_score_std,
-                    "state_dict": unwrap(model).state_dict(), "optimizer": optimizer.state_dict(),
+                    "state_dict": model_state, "optimizer": optimizer_state,
                     "scheduler": None if scheduler is None else scheduler.state_dict(),
                     "config": vars(args), "best_fid": best_fid,
                     "best_inception": best_inception,
@@ -1460,13 +2053,14 @@ def main():
                     shutil.copy2(last_checkpoint, best_path)
                 if best_inception_path is not None:
                     shutil.copy2(last_checkpoint, best_inception_path)
-                # Artifact cadence follows full FID evaluation cadence. Each
-                # version contains the recoverable last checkpoint and every
-                # locally available member of the top-three FID set.
-                if args.upload_checkpoints and run_fid:
+                # Every scheduled full save uploads a recoverable `last` plus
+                # every locally retained top-three FID and Inception member.
+                if args.upload_checkpoints:
                     artifact_aliases = ["latest"]
                     if best_path is not None:
-                        artifact_aliases.extend(["best", f"epoch-{epoch + 1}"])
+                        artifact_aliases.extend(["best-fid", f"fid-epoch-{epoch + 1}"])
+                    if best_inception_path is not None:
+                        artifact_aliases.extend(["best-is", f"is-epoch-{epoch + 1}"])
                     selected_paths = [last_checkpoint]
                     selected_paths.extend(
                         path for _, saved_path in best_fid
@@ -1489,6 +2083,9 @@ def main():
                             "selected_checkpoints": [path.name for path in selected_paths],
                         },
                     )
+                del snapshot
+            del model_state, optimizer_state
+        if rank() == 0:
             if not save_epoch:
                 print(f"Epoch {epoch + 1}: checkpoint skipped", flush=True)
             elif fid is None:
