@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Distributed full-ImageNet reconstruction FID for an upstream LASER checkpoint."""
+"""Distributed reconstruction FID for an upstream LASER checkpoint."""
 
 from __future__ import annotations
 import argparse, importlib.util, json, logging, os, sys
@@ -7,13 +7,35 @@ from datetime import timedelta
 from pathlib import Path
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 from torchvision import datasets
 from torchmetrics.image.fid import FrechetInceptionDistance
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.train_official_rqtransformer_laser_stage2 import LaserAux, val_image_transform
+
+
+class FlatImages(Dataset):
+    """Recursively load an image directory without requiring class folders."""
+
+    def __init__(self, root: Path, transform):
+        self.files = sorted(
+            path
+            for path in root.rglob("*")
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        if not self.files:
+            raise ValueError(f"no images found below {root}")
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        with Image.open(self.files[index]) as image:
+            return self.transform(image.convert("RGB")), 0
 
 
 def native_fid_model(device):
@@ -63,23 +85,49 @@ def main():
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--dataset", choices=("imagenet", "ffhq"), default="imagenet")
+    p.add_argument("--num-images", type=int, default=50_000)
+    p.add_argument("--num-atoms", type=int, default=16_384)
+    p.add_argument("--coeff-vocab-size", type=int, default=2_048)
     p.add_argument("--batch-size", type=int, default=96)
     p.add_argument("--backend", choices=("torchmetrics", "native"), default="torchmetrics")
     args = p.parse_args()
+    if args.num_images <= 0:
+        p.error("--num-images must be positive")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
     if world > 1:
         dist.init_process_group("nccl", timeout=timedelta(minutes=45))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dataset = datasets.ImageFolder(args.data / "val", transform=val_image_transform())
+    if args.dataset == "ffhq":
+        full_dataset = FlatImages(args.data, transform=val_image_transform())
+        split_name = f"ffhq_first_{args.num_images}"
+    else:
+        full_dataset = datasets.ImageFolder(
+            args.data / "val", transform=val_image_transform()
+        )
+        split_name = "imagenet_val"
+    if len(full_dataset) < args.num_images:
+        raise ValueError(
+            f"{args.dataset} has {len(full_dataset):,} images, fewer than requested "
+            f"{args.num_images:,}"
+        )
+    dataset = Subset(full_dataset, range(args.num_images))
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=False) if world > 1 else None
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
                         num_workers=8, pin_memory=True, persistent_workers=True)
     # Native DictionaryLearning.forward() leaves its OMP coefficients
     # unbounded. Disable the stage-2 tokenization clamp for reconstruction FID.
-    aux = LaserAux(args.checkpoint, 16384, 2048, 20.0, 6.4,
-                   clamp_coeffs=False).to(device).eval()
+    aux = LaserAux(
+        args.checkpoint,
+        args.num_atoms,
+        args.coeff_vocab_size,
+        20.0,
+        1.0,
+        attn_resolutions=((16,) if args.dataset == "ffhq" else (8,)),
+        clamp_coeffs=False,
+    ).to(device).eval()
     metric = None
     inception = None
     if args.backend == "torchmetrics":
@@ -93,7 +141,7 @@ def main():
         fake_cross = torch.zeros_like(real_cross)
     seen = 0
     with torch.no_grad():
-        for images, _ in loader:
+        for batch_idx, (images, _) in enumerate(loader):
             images = images.to(device, non_blocking=True)
             atoms, coeffs = aux.encode_sparse_components(images)
             vectors = aux.dictionary.t()[atoms.long()]
@@ -118,6 +166,12 @@ def main():
                 real_cross += fr64.t() @ fr64
                 fake_cross += ff64.t() @ ff64
             seen += images.size(0)
+            if (not dist.is_initialized() or dist.get_rank() == 0) and batch_idx % 100 == 0:
+                global_seen = min(args.num_images, seen * world)
+                print(
+                    f"rFID encoded {global_seen:,}/{args.num_images:,} images",
+                    flush=True,
+                )
     if metric is not None:
         value = float(metric.compute().item())
     else:
@@ -127,14 +181,18 @@ def main():
                 dist.all_reduce(tensor)
         value = native_frechet(real_sum, real_cross, fake_sum, fake_cross, int(count.item()))
     if not dist.is_initialized() or dist.get_rank() == 0:
-        payload = {"checkpoint": str(args.checkpoint), "checkpoint_epoch": 10,
-                   "split": "imagenet_val", "num_images": 50000,
+        payload = {"checkpoint": str(args.checkpoint),
+                   "split": split_name, "dataset": args.dataset,
+                   "num_images": args.num_images,
                    "fid_backend": args.backend, "rfid": value}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.output.with_suffix(args.output.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, indent=2))
         os.replace(temporary, args.output)
-        print(f"Full ImageNet validation rFID: {value:.6f}", flush=True)
+        print(
+            f"Full {args.dataset.upper()} {args.num_images:,}-image rFID: {value:.6f}",
+            flush=True,
+        )
     if dist.is_initialized():
         dist.destroy_process_group()
 

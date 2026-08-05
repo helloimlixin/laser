@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
     BackwardPrefetch,
@@ -38,7 +39,7 @@ from torch.distributed.fsdp import (
     StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
@@ -535,6 +536,27 @@ class SparseTokenCacheDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         return self.atoms[index], self.coeffs[index], self.labels[index]
+
+
+class FlatImages(Dataset):
+    """Recursively load an unconditional image dataset from flat files."""
+
+    def __init__(self, root: Path, transform):
+        self.files = sorted(
+            path
+            for path in root.rglob("*")
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        if not self.files:
+            raise ValueError(f"no images found below {root}")
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        with Image.open(self.files[index]) as image:
+            return self.transform(image.convert("RGB")), 0
 
 @torch.no_grad()
 def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=None,
@@ -1203,7 +1225,7 @@ def main():
     p.add_argument("--resume-checkpoint", type=Path, default=None,
                    help="Explicit source stage-2 checkpoint (allows a new output/run)")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--dataset", choices=("imagenet", "celebahq"), default="imagenet")
+    p.add_argument("--dataset", choices=("imagenet", "celebahq", "ffhq"), default="imagenet")
     p.add_argument(
         "--model-preset", choices=("imagenet-1400m", "ffhq-350m"),
         default="imagenet-1400m",
@@ -1360,10 +1382,11 @@ def main():
         raise ValueError("--min-lr must be between zero and --lr")
     if args.lr_schedule == "cosine" and args.epochs > args.lr_schedule_epochs:
         raise ValueError("--epochs cannot exceed the global cosine schedule horizon")
-    if args.dataset == "celebahq" and args.model_preset != "ffhq-350m":
-        raise ValueError("CelebA-HQ requires --model-preset ffhq-350m")
-    if args.model_preset == "ffhq-350m" and args.dataset != "celebahq":
-        raise ValueError("--model-preset ffhq-350m is currently defined for CelebA-HQ")
+    face_datasets = {"celebahq", "ffhq"}
+    if args.dataset in face_datasets and args.model_preset != "ffhq-350m":
+        raise ValueError("CelebA-HQ and FFHQ require --model-preset ffhq-350m")
+    if args.model_preset == "ffhq-350m" and args.dataset not in face_datasets:
+        raise ValueError("--model-preset ffhq-350m is defined for CelebA-HQ and FFHQ")
     if args.geometry_loss_weight > 0 and not args.compound_tokens:
         raise ValueError("geometry contribution loss requires --compound-tokens")
     if args.compound_distribution_geometry and args.geometry_loss_weight <= 0:
@@ -1436,13 +1459,17 @@ def main():
         ):
             raise ValueError("token cache coeff_scale does not match the launch")
         class_names = (
-            ["unconditional"] if args.dataset == "celebahq"
+            ["unconditional"] if args.dataset in face_datasets
             else class_names_for_dataset("imagenet")
         )
     else:
-        image_dataset = datasets.ImageFolder(args.data / "train", transform=image_transform())
+        image_dataset = (
+            FlatImages(args.data, transform=image_transform())
+            if args.dataset == "ffhq"
+            else datasets.ImageFolder(args.data / "train", transform=image_transform())
+        )
         class_names = (
-            ["unconditional"] if args.dataset == "celebahq"
+            ["unconditional"] if args.dataset in face_datasets
             else class_names_for_dataset("imagenet", image_dataset.classes)
         )
         dataset = image_dataset
@@ -1452,12 +1479,23 @@ def main():
                         persistent_workers=True, drop_last=True)
     val_loader = None
     if args.fid_every > 0:
-        fid_real_split = args.fid_real_split or (
-            "train" if args.dataset == "celebahq" else "val"
-        )
-        val_dataset = datasets.ImageFolder(
-            args.data / fid_real_split, transform=val_image_transform()
-        )
+        if args.dataset == "ffhq":
+            val_dataset = FlatImages(args.data, transform=val_image_transform())
+            # A full-dataset cache defines the matching real-reference corpus.
+            if args.token_cache is not None:
+                if len(val_dataset) < len(dataset):
+                    raise ValueError(
+                        f"FFHQ image corpus ({len(val_dataset):,}) is smaller than "
+                        f"the token cache ({len(dataset):,})"
+                    )
+                val_dataset = Subset(val_dataset, range(len(dataset)))
+        else:
+            fid_real_split = args.fid_real_split or (
+                "train" if args.dataset == "celebahq" else "val"
+            )
+            val_dataset = datasets.ImageFolder(
+                args.data / fid_real_split, transform=val_image_transform()
+            )
         val_sampler = DistributedSampler(
             val_dataset, num_replicas=world, rank=rank(), shuffle=False, drop_last=False
         ) if world > 1 else None
@@ -1469,7 +1507,7 @@ def main():
     num_condition_classes = 1 if args.model_preset == "ffhq-350m" else 1000
     aux = LaserAux(args.checkpoint, args.num_atoms, args.coeff_vocab_size,
                    args.coeff_max, args.coeff_scale,
-                   attn_resolutions=((16,) if args.dataset == "celebahq" else (8,)),
+                   attn_resolutions=((16,) if args.dataset in face_datasets else (8,)),
                    coeff_scales=args.coeff_scales,
                    soft_target_physical=args.coeff_scales is not None).to(device)
     unwrapped_model = build_model(
