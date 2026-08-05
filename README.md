@@ -14,30 +14,25 @@ the experiment documented below is the current FFHQ-256 RQ-VAE-compatible path.
 Stage-1 checkpoint:
 [`ffhq-a2048-k2-rqvae-strict-20260720-145706`](https://wandb.ai/helloimlixin-rutgers/laser/runs/ffhq-a2048-k2-rqvae-strict-20260720-145706)
 
-| Evaluation set | Images | rFID |
-| --- | ---: | ---: |
-| Deterministic FFHQ subset | 50,000 | **3.516491** |
-| Complete FFHQ dataset | 70,000 | **3.371500** |
+Full-dataset reconstruction FID: **3.371500** on all 70,000 FFHQ images.
 
 rFID uses TorchMetrics' 2,048-dimensional Inception features and compares real
 images with reconstructions from the frozen encoder, continuous OMP coefficients,
 dictionary, and decoder. Images are converted to RGB, resized and center-cropped
 to 256×256, then mapped to `[0, 1]` for the metric.
 
-### Token-cache Reconstruction
+### Stage-1 Reconstruction
 
-These panels contain cache rows 0–63 in identical row-major order. The right panel
-uses the nearest of 1,024 coefficient bins before decoding.
+Both panels were produced from the same in-memory batch of the first 64 sorted
+FFHQ images, so every cell has the same row and column in both grids. The right
+panel is the direct Stage-1 reconstruction using continuous OMP coefficients; it
+does not read from the token cache or quantize coefficients.
 
-| Original FFHQ inputs | Quantized cache reconstructions |
-| :---: | :---: |
-| ![First 64 original FFHQ inputs in an 8 by 8 grid](docs/assets/ffhq-a2048-k2-token-cache-originals-8x8.jpg) | ![Matched compound-token cache reconstructions in an 8 by 8 grid](docs/assets/ffhq-a2048-k2-token-cache-reconstructions-8x8.jpg) |
+![Aligned FFHQ originals on the left and direct Stage-1 reconstructions on the right](docs/assets/ffhq-a2048-k2-stage1-originals-vs-reconstructions-8x8.jpg)
 
-Cache validation on 64 freshly encoded images recovered every atom ID, measured
-coefficient MAE `1.97e-4` after float16 storage, and found no duplicate atom
-inside a two-atom support. Quantized reconstruction MSE is `0.025393` in
-`[-1, 1]`. The recorded unit-peak PSNR is `15.9529 dB`; using the full
-peak-to-peak range of 2 gives `21.9735 dB`.
+Originals are on the left; their direct Stage-1 reconstructions are in the same
+positions on the right. The two 8×8 panels are stored in one image so README
+rendering cannot change their relative size or vertical alignment.
 
 Stage-2 run:
 [`ffhq-a2048-k2-compound-v5b-official-rqtransformer-350M`](https://wandb.ai/helloimlixin-rutgers/laser/runs/ffhq-compound-rqt350-a2048k2-20260805)
@@ -183,12 +178,9 @@ FFHQ_ROOT=/path/to/ffhq \
   bash scripts/run_ffhq_a2048_k2_compound_official_pipeline.sh
 ```
 
-The launcher validates the 50,000-image rFID result and full 70,000-image cache
-before resuming the official-settings Stage-2 run. The full 70,000-image rFID
-pass uses
-[`evaluate_upstream_laser_rfid.py`](scripts/evaluate_upstream_laser_rfid.py),
-and matched cache grids use
-[`log_compound_cache_reconstruction.py`](scripts/log_compound_cache_reconstruction.py).
+The launcher validates its Stage-1 reconstruction gate and the full 70,000-image
+cache before resuming the official-settings Stage-2 run. Full-dataset rFID uses
+[`evaluate_upstream_laser_rfid.py`](scripts/evaluate_upstream_laser_rfid.py).
 
 ## Code Map
 
