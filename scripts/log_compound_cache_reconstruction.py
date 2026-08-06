@@ -82,6 +82,7 @@ def main() -> None:
         float(meta.get("coeff_scale", 1.0)),
         attn_resolutions=((16,) if meta.get("dataset") in {"ffhq", "celebahq"} else (8,)),
         coeff_scales=coeff_scales,
+        coeff_bin_centers=meta.get("coeff_bin_centers"),
     ).to("cuda:0").eval()
 
     reconstruction_batches = []
@@ -165,6 +166,7 @@ def main() -> None:
         "num_images": args.num_images,
         "grid": [args.nrow, args.nrow],
         "coeff_scales": coeff_scales,
+        "coeff_quantization": meta.get("coeff_quantization", "uniform"),
         "output": str(args.output.resolve()),
         "original_output": (
             str(args.original_output.resolve()) if args.original_output is not None else None

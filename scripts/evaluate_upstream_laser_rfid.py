@@ -38,6 +38,21 @@ class FlatImages(Dataset):
             return self.transform(image.convert("RGB")), 0
 
 
+class IndexedSubset(Dataset):
+    """Return source images together with their row-aligned cache index."""
+
+    def __init__(self, dataset: Dataset, count: int):
+        self.dataset = dataset
+        self.count = int(count)
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        image, _ = self.dataset[index]
+        return image, index
+
+
 def native_fid_model(device):
     # Import the repository's FID Inception module directly. Importing the
     # rqvae.metrics package eagerly loads unrelated CLIP/tokenizer metrics.
@@ -86,6 +101,10 @@ def main():
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument(
+        "--token-cache", type=Path, default=None,
+        help="Decode row-aligned quantized cache entries instead of continuous coefficients",
+    )
+    p.add_argument(
         "--dataset", choices=("imagenet", "celebahq", "ffhq"), default="imagenet"
     )
     p.add_argument("--num-images", type=int, default=50_000)
@@ -93,9 +112,18 @@ def main():
     p.add_argument("--coeff-vocab-size", type=int, default=2_048)
     p.add_argument("--batch-size", type=int, default=96)
     p.add_argument("--backend", choices=("torchmetrics", "native"), default="torchmetrics")
+    p.add_argument("--wandb-entity", default="helloimlixin-rutgers")
+    p.add_argument("--wandb-project", default="laser")
+    p.add_argument("--wandb-id", default=None)
+    p.add_argument("--wandb-name", default=None)
+    p.add_argument(
+        "--wandb-mode", choices=("online", "disabled"), default="disabled"
+    )
     args = p.parse_args()
     if args.num_images <= 0:
         p.error("--num-images must be positive")
+    if args.wandb_mode == "online" and (not args.wandb_id or not args.wandb_name):
+        p.error("--wandb-id and --wandb-name are required in online mode")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
     if world > 1:
@@ -115,7 +143,25 @@ def main():
             f"{args.dataset} has {len(full_dataset):,} images, fewer than requested "
             f"{args.num_images:,}"
         )
-    dataset = Subset(full_dataset, range(args.num_images))
+    cache_payload = None
+    cache_meta = None
+    if args.token_cache is not None:
+        cache_payload = torch.load(
+            args.token_cache, map_location="cpu", weights_only=True, mmap=True
+        )
+        cache_meta = dict(cache_payload["meta"])
+        if cache_meta.get("dataset") != args.dataset:
+            raise ValueError(
+                f"token cache dataset mismatch: {cache_meta.get('dataset')!r} != {args.dataset!r}"
+            )
+        if len(cache_payload["atoms"]) < args.num_images:
+            raise ValueError(
+                f"token cache has {len(cache_payload['atoms']):,} rows, fewer than "
+                f"the requested {args.num_images:,}"
+            )
+        dataset = IndexedSubset(full_dataset, args.num_images)
+    else:
+        dataset = Subset(full_dataset, range(args.num_images))
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=False) if world > 1 else None
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
                         num_workers=8, pin_memory=True, persistent_workers=True)
@@ -123,12 +169,16 @@ def main():
     # unbounded. Disable the stage-2 tokenization clamp for reconstruction FID.
     aux = LaserAux(
         args.checkpoint,
-        args.num_atoms,
-        args.coeff_vocab_size,
-        20.0,
-        1.0,
+        int(cache_meta["num_atoms"]) if cache_meta is not None else args.num_atoms,
+        int(cache_meta["coeff_vocab_size"]) if cache_meta is not None else args.coeff_vocab_size,
+        float(cache_meta["coeff_max"]) if cache_meta is not None else 20.0,
+        float(cache_meta.get("coeff_scale", 1.0)) if cache_meta is not None else 1.0,
         attn_resolutions=((16,) if args.dataset in {"celebahq", "ffhq"} else (8,)),
-        clamp_coeffs=False,
+        coeff_scales=(cache_meta.get("coeff_scales") if cache_meta is not None else None),
+        clamp_coeffs=cache_meta is not None,
+        coeff_bin_centers=(
+            cache_meta.get("coeff_bin_centers") if cache_meta is not None else None
+        ),
     ).to(device).eval()
     metric = None
     inception = None
@@ -143,16 +193,25 @@ def main():
         fake_cross = torch.zeros_like(real_cross)
     seen = 0
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(loader):
+        for batch_idx, (images, row_indices) in enumerate(loader):
             images = images.to(device, non_blocking=True)
-            atoms, coeffs = aux.encode_sparse_components(images)
-            vectors = aux.dictionary.t()[atoms.long()]
-            # encode_sparse_components returns stage-2-normalized coefficients;
-            # restore the physical LASER values for native stage-1 reconstruction.
-            physical_coeffs = coeffs * aux.coeff_scales.view(1, 1, 1, 2)
-            z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
-            z_q = aux.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
-            recon = ((aux.decoder(z_q).float() + 1.0) * 0.5).clamp(0, 1)
+            if cache_payload is None:
+                atoms, coeffs = aux.encode_sparse_components(images)
+                vectors = aux.dictionary.t()[atoms.long()]
+                # encode_sparse_components returns stage-2-normalized coefficients;
+                # restore the physical LASER values for native stage-1 reconstruction.
+                physical_coeffs = coeffs * aux.coeff_scales.view(1, 1, 1, 2)
+                z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
+                z_q = aux.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+                recon = ((aux.decoder(z_q).float() + 1.0) * 0.5).clamp(0, 1)
+            else:
+                indices = row_indices.long()
+                atoms = cache_payload["atoms"][indices].to(device, dtype=torch.long)
+                coeffs = cache_payload["coeffs"][indices].to(device, dtype=torch.float32)
+                coeff_ids, _ = aux.compound_coeff_ids(
+                    coeffs, stochastic=False, hard=True
+                )
+                recon = ((aux.decode_compound(atoms, coeff_ids).float() + 1.0) * 0.5).clamp(0, 1)
             real = ((images.float() + 1.0) * 0.5).clamp(0, 1)
             if metric is not None:
                 metric.update(real, real=True)
@@ -186,11 +245,40 @@ def main():
         payload = {"checkpoint": str(args.checkpoint),
                    "split": split_name, "dataset": args.dataset,
                    "num_images": args.num_images,
-                   "fid_backend": args.backend, "rfid": value}
+                   "fid_backend": args.backend, "rfid": value,
+                   "token_cache": str(args.token_cache) if args.token_cache is not None else None,
+                   "coeff_quantization": (
+                       cache_meta.get("coeff_quantization", "uniform")
+                       if cache_meta is not None else "continuous"
+                   )}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.output.with_suffix(args.output.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, indent=2))
         os.replace(temporary, args.output)
+        if args.wandb_mode == "online":
+            import wandb
+
+            run = wandb.init(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                id=args.wandb_id,
+                name=args.wandb_name,
+                resume="allow",
+            )
+            metric_name = (
+                "diagnostics/quantized_reconstruction_rfid"
+                if cache_meta is not None
+                else "diagnostics/continuous_reconstruction_rfid"
+            )
+            run.config.update(
+                {"diagnostic_coefficient_quantizer": payload["coeff_quantization"]},
+                allow_val_change=True,
+            )
+            run.log({
+                metric_name: value,
+                "diagnostics/reconstruction_rfid_num_images": args.num_images,
+            })
+            run.finish()
         print(
             f"Full {args.dataset.upper()} {args.num_images:,}-image rFID: {value:.6f}",
             flush=True,

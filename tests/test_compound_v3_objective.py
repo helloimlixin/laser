@@ -4,10 +4,29 @@ from omegaconf import OmegaConf
 from src.models.rqtransformer.configs import RQTransformerConfig
 from scripts.train_official_rqtransformer_laser_stage2 import (
     CompoundLaserRQTransformer,
+    LaserAux,
     build_model,
     compound_objective,
     scheduled_geometry_weight,
 )
+
+
+def test_hard_compound_targets_use_nearest_custom_coefficient_center():
+    aux = LaserAux.__new__(LaserAux)
+    torch.nn.Module.__init__(aux)
+    aux.coeff_vocab_size = 4
+    aux.register_buffer("coeff_bins", torch.tensor([-3.0, -0.25, 0.5, 3.0]))
+    coefficients = torch.tensor([[[[-0.2, 2.8]]]])
+
+    ids, probabilities = aux.compound_coeff_ids(
+        coefficients, stochastic=False, hard=True
+    )
+
+    assert torch.equal(ids, torch.tensor([[[[1, 3]]]]))
+    assert torch.equal(
+        probabilities,
+        torch.tensor([[[[[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]]]),
+    )
 
 
 def test_compound_objective_weights_atoms_and_zeroes_exact_geometry():

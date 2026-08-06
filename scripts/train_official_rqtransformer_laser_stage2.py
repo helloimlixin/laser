@@ -3,8 +3,8 @@
 
 The transformer implementation lives in ``src.models.rqtransformer``.
 Only the stage-1 auxiliary embedding is adapted: OMP atom ids use the learned
-LASER dictionary and real coefficients are uniformly discretized into the same
-16K per-depth vocabulary used by the official shared classifier.
+LASER dictionary supports remain discrete while real coefficients are mapped
+through either a uniform grid or cache-provided nonuniform scalar centers.
 """
 
 from __future__ import annotations
@@ -348,7 +348,8 @@ class LaserAux(nn.Module):
     def __init__(self, checkpoint: Path, num_atoms: int, coeff_vocab_size: int,
                  coeff_max: float, coeff_scale: float = 1.0,
                  attn_resolutions=(8,), coeff_scales=None,
-                 soft_target_physical=False, clamp_coeffs=True):
+                 soft_target_physical=False, clamp_coeffs=True,
+                 coeff_bin_centers=None):
         super().__init__()
         stage1 = RQVAE(
             embed_dim=256,
@@ -377,7 +378,20 @@ class LaserAux(nn.Module):
         self.post_quant_conv = stage1.post_quant_conv
         self.decoder = stage1.decoder
         self.register_buffer("dictionary", F.normalize(state["quantizer.dictionary"].float(), dim=0))
-        self.register_buffer("coeff_bins", torch.linspace(-coeff_max, coeff_max, coeff_vocab_size))
+        if coeff_bin_centers is None:
+            coefficient_bins = torch.linspace(-coeff_max, coeff_max, coeff_vocab_size)
+        else:
+            coefficient_bins = torch.as_tensor(coeff_bin_centers, dtype=torch.float32)
+            if coefficient_bins.ndim != 1 or coefficient_bins.numel() != coeff_vocab_size:
+                raise ValueError(
+                    "custom coefficient-bin centers must be a one-dimensional "
+                    f"sequence of length {coeff_vocab_size}"
+                )
+            if not torch.isfinite(coefficient_bins).all():
+                raise ValueError("custom coefficient-bin centers must be finite")
+            if not torch.all(coefficient_bins[1:] > coefficient_bins[:-1]):
+                raise ValueError("custom coefficient-bin centers must be strictly increasing")
+        self.register_buffer("coeff_bins", coefficient_bins)
         self.num_atoms = int(num_atoms)
         self.coeff_vocab_size = int(coeff_vocab_size)
         self.vocab_size = self.num_atoms + self.coeff_vocab_size
@@ -423,11 +437,11 @@ class LaserAux(nn.Module):
 
     @torch.no_grad()
     def sparse_targets(self, atoms: torch.Tensor, coeffs: torch.Tensor, *, temp: float = 0.5,
-                       stochastic: bool = True, compact: bool = False):
+                       stochastic: bool = True, compact: bool = False,
+                       hard: bool = False):
         atoms = atoms.long()
         coeffs = coeffs.float()
-        scaled = (coeffs + self.coeff_max) * ((self.coeff_vocab_size - 1) / (2 * self.coeff_max))
-        coeff_tokens = scaled.round().long().clamp(0, self.coeff_vocab_size - 1)
+        coeff_tokens = (coeffs[..., None] - self.coeff_bins).abs().argmin(dim=-1)
         # The official stage-2 recipe trains against stage-1 soft codes.  For
         # LASER, atom support is discrete OMP while the continuous coefficient
         # posterior is discretized into a temperature-controlled 16K density.
@@ -438,8 +452,13 @@ class LaserAux(nn.Module):
             target_values = coeffs[..., None]
             bin_values = self.coeff_bins
         coeff_logits = -(target_values - bin_values).square() / max(float(temp), 1e-6)
-        coeff_probs = coeff_logits.softmax(dim=-1)
-        if stochastic:
+        if hard:
+            coeff_probs = F.one_hot(
+                coeff_tokens, num_classes=self.coeff_vocab_size
+            ).to(coeff_logits.dtype)
+        else:
+            coeff_probs = coeff_logits.softmax(dim=-1)
+        if stochastic and not hard:
             coeff_tokens = torch.multinomial(
                 coeff_probs.reshape(-1, self.coeff_vocab_size), 1
             ).reshape_as(coeff_tokens)
@@ -457,9 +476,12 @@ class LaserAux(nn.Module):
         return tokens, soft_targets
 
     @torch.no_grad()
-    def encode_sparse(self, images: torch.Tensor, *, temp: float = 0.5, stochastic: bool = True):
+    def encode_sparse(self, images: torch.Tensor, *, temp: float = 0.5,
+                      stochastic: bool = True, hard: bool = False):
         atoms, coeffs = self.encode_sparse_components(images)
-        return self.sparse_targets(atoms, coeffs, temp=temp, stochastic=stochastic)
+        return self.sparse_targets(
+            atoms, coeffs, temp=temp, stochastic=stochastic, hard=hard
+        )
 
     @torch.no_grad()
     def get_code_emb_with_depth(self, tokens: torch.Tensor):
@@ -483,16 +505,20 @@ class LaserAux(nn.Module):
 
     @torch.no_grad()
     def compound_coeff_ids(self, coeffs: torch.Tensor, *, stochastic: bool = True,
-                           temp: float = 0.5):
+                           temp: float = 0.5, hard: bool = False):
         """Quantize real coefficients for compound (atom, coefficient) events."""
         target_values = coeffs.float()[..., None]
         logits = -(target_values - self.coeff_bins).square() / max(float(temp), 1e-6)
-        probs = logits.softmax(dim=-1)
-        if stochastic:
+        nearest = logits.argmax(dim=-1)
+        if hard:
+            probs = F.one_hot(nearest, num_classes=self.coeff_vocab_size).to(logits.dtype)
+        else:
+            probs = logits.softmax(dim=-1)
+        if stochastic and not hard:
             ids = torch.multinomial(probs.reshape(-1, self.coeff_vocab_size), 1)
             ids = ids.reshape(coeffs.shape)
         else:
-            ids = probs.argmax(dim=-1)
+            ids = nearest
         return ids.long(), probs
 
     @torch.no_grad()
@@ -1247,6 +1273,14 @@ def main():
     p.add_argument("--coeff-scale", type=float, default=6.4)
     p.add_argument("--coeff-scales", type=float, nargs=2)
     p.add_argument(
+        "--coeff-target-mode", choices=("soft", "hard"), default="soft",
+        help="Use stochastic soft coefficient targets or deterministic nearest-bin targets",
+    )
+    p.add_argument(
+        "--coeff-target-temperature", type=float, default=0.5,
+        help="Squared-distance soft-target temperature; ignored in hard mode",
+    )
+    p.add_argument(
         "--compound-tokens", action=argparse.BooleanOptionalAction, default=False,
         help="Use 128 compound (atom, coefficient) AR events instead of 256 scalar events",
     )
@@ -1395,6 +1429,8 @@ def main():
         raise ValueError("depth-specific coefficient heads require --compound-tokens")
     if args.atom_temperature <= 0 or args.coeff_temperature <= 0:
         raise ValueError("sampling temperatures must be positive")
+    if args.coeff_target_temperature <= 0:
+        raise ValueError("coefficient target temperature must be positive")
     if args.atom_top_k < 0 or args.coeff_top_k < 0:
         raise ValueError("sampling top-k values cannot be negative")
     if not 0 < args.atom_top_p <= 1 or not 0 < args.coeff_top_p <= 1:
@@ -1420,6 +1456,8 @@ def main():
     last_checkpoint = checkpoint_dir / "last.pt"
     resume_checkpoint = args.resume_checkpoint or last_checkpoint
 
+    cache_meta = None
+    cached_bin_centers = None
     if args.token_cache:
         dataset = SparseTokenCacheDataset(args.token_cache)
         cache_meta = dataset.meta
@@ -1458,6 +1496,14 @@ def main():
             args.coeff_scale, rel_tol=1e-6, abs_tol=1e-8,
         ):
             raise ValueError("token cache coeff_scale does not match the launch")
+        cached_bin_centers = cache_meta.get("coeff_bin_centers")
+        if cached_bin_centers is not None:
+            if len(cached_bin_centers) != args.coeff_vocab_size:
+                raise ValueError(
+                    "token cache coefficient-bin count mismatch: "
+                    f"cache={len(cached_bin_centers)}, launch={args.coeff_vocab_size}"
+                )
+            cached_bin_centers = [float(value) for value in cached_bin_centers]
         class_names = (
             ["unconditional"] if args.dataset in face_datasets
             else class_names_for_dataset("imagenet")
@@ -1509,7 +1555,8 @@ def main():
                    args.coeff_max, args.coeff_scale,
                    attn_resolutions=((16,) if args.dataset in face_datasets else (8,)),
                    coeff_scales=args.coeff_scales,
-                   soft_target_physical=args.coeff_scales is not None).to(device)
+                   soft_target_physical=args.coeff_scales is not None,
+                   coeff_bin_centers=cached_bin_centers).to(device)
     unwrapped_model = build_model(
         total_vocab_size, args.num_atoms, compound=args.compound_tokens,
         coeff_vocab_size=args.coeff_vocab_size,
@@ -1591,7 +1638,12 @@ def main():
                             else f"compound-rqtransformer-{args.model_preset}" if args.compound_tokens
                             else f"official-rqtransformer-{args.model_preset}"
                         ),
-                                "stochastic_codes": True, "temp": 0.5, "top_p": 0.92,
+                                "stochastic_codes": args.coeff_target_mode == "soft",
+                                "temp": args.coeff_target_temperature, "top_p": 0.92,
+                                "coefficient_quantizer": (
+                                    None if cache_meta is None
+                                    else cache_meta.get("coeff_quantization", "uniform")
+                                ),
                                 "preview_sampling_settings": preview_sampling_settings(args)})
         wb.define_metric("train/global_step")
         for metric_name in (
@@ -1768,14 +1820,22 @@ def main():
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     if args.compound_tokens:
                         coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
-                            coeffs, temp=0.5, stochastic=True
+                            coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            hard=args.coeff_target_mode == "hard",
                         )
                         tokens = atoms.long() * args.coeff_vocab_size + coeff_ids
                         target_physical = aux.physical_contributions(atoms, coeffs)
                         compact_targets = (atoms.long(), target_coeff_probs, target_physical)
                     else:
                         tokens, compact_targets = aux.sparse_targets(
-                            atoms, coeffs, temp=0.5, stochastic=True, compact=True
+                            atoms,
+                            coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            compact=True,
+                            hard=args.coeff_target_mode == "hard",
                         )
             else:
                 images, labels = batch
@@ -1786,13 +1846,21 @@ def main():
                     if args.compound_tokens:
                         atoms, coeffs = aux.encode_sparse_components(images)
                         coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
-                            coeffs, temp=0.5, stochastic=True
+                            coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            hard=args.coeff_target_mode == "hard",
                         )
                         tokens = atoms.long() * args.coeff_vocab_size + coeff_ids
                         target_physical = aux.physical_contributions(atoms, coeffs)
                         compact_targets = (atoms.long(), target_coeff_probs, target_physical)
                     else:
-                        tokens, soft_targets = aux.encode_sparse(images, temp=0.5, stochastic=True)
+                        tokens, soft_targets = aux.encode_sparse(
+                            images,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            hard=args.coeff_target_mode == "hard",
+                        )
             sync = args.smoke_test or ((absolute_batch_idx + 1) % accumulation == 0)
             # FSDP deliberately reduce-scatters every microbatch. Its no_sync()
             # retains full, unsharded gradients and is too memory-hungry for a
