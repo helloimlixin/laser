@@ -61,10 +61,11 @@ def main():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--num-atoms", type=int, default=16384)
+    p.add_argument("--sparsity-level", type=int, default=2)
     p.add_argument("--coeff-vocab-size", type=int, default=2048)
     p.add_argument("--coeff-max", type=float, default=20.0)
     p.add_argument("--coeff-scale", type=float, default=6.4)
-    p.add_argument("--coeff-scales", type=float, nargs=2)
+    p.add_argument("--coeff-scales", type=float, nargs="+")
     p.add_argument(
         "--auto-coeff-scales-percentile", type=float, default=None,
         help=(
@@ -76,6 +77,13 @@ def main():
     p.add_argument("--compound", action="store_true",
                    help="Label cache as paired (atom, coefficient) events and validate pair decoding")
     args = p.parse_args()
+    if args.sparsity_level <= 0:
+        p.error("--sparsity-level must be positive")
+    if args.coeff_scales is not None and len(args.coeff_scales) != args.sparsity_level:
+        p.error(
+            f"--coeff-scales requires {args.sparsity_level} values for "
+            f"k={args.sparsity_level}"
+        )
     if args.coeff_scales is not None and args.auto_coeff_scales_percentile is not None:
         p.error("--coeff-scales and --auto-coeff-scales-percentile are mutually exclusive")
     if (args.auto_coeff_scales_percentile is not None and
@@ -112,6 +120,7 @@ def main():
         attn_resolutions=((16,) if args.dataset in {"celebahq", "ffhq"} else (8,)),
         coeff_scales=args.coeff_scales,
         clamp_coeffs=not calibrating,
+        sparsity_level=args.sparsity_level,
     ).to(device)
     shard = args.output.with_suffix(f".rank{rank:02d}.pt")
     if shard.is_file():
@@ -141,13 +150,13 @@ def main():
         order = torch.cat([x["indices"] for x in parts]).argsort()
         merged_coeffs = torch.cat([x["coeffs"] for x in parts])[order].float()
         if calibrating:
-            absolute = merged_coeffs.abs().reshape(-1, 2)
+            absolute = merged_coeffs.abs().reshape(-1, args.sparsity_level)
             quantile = float(args.auto_coeff_scales_percentile) / 100.0
             coeff_scales = torch.quantile(absolute, quantile, dim=0) / args.coeff_max
             if not torch.isfinite(coeff_scales).all() or (coeff_scales <= 0).any():
                 raise RuntimeError(f"invalid calibrated coefficient scales: {coeff_scales}")
             merged_coeffs = (
-                merged_coeffs / coeff_scales.view(1, 1, 1, 2)
+                merged_coeffs / coeff_scales.view(1, 1, 1, args.sparsity_level)
             ).clamp(-args.coeff_max, args.coeff_max)
             aux.coeff_scales.copy_(coeff_scales.to(device))
             aux.coeff_max = float(args.coeff_max)
@@ -166,7 +175,7 @@ def main():
             "labels": torch.cat([x["labels"] for x in parts])[order].contiguous(),
             "meta": {"format": ("laser_compound_pairs_v1" if args.compound else "laser_sparse_components_v1"), "dataset": args.dataset,
                      "transform": "resize256_center_crop256", "items": len(base),
-                     "shape": [8, 8, 2], "num_atoms": args.num_atoms,
+                     "shape": [8, 8, args.sparsity_level], "num_atoms": args.num_atoms,
                      "coeff_vocab_size": args.coeff_vocab_size, "coeff_max": args.coeff_max,
                      "coeff_scale": args.coeff_scale,
                      "coeff_scales": [float(x) for x in coeff_scales],
@@ -198,8 +207,9 @@ def main():
         if args.compound:
             with torch.inference_mode():
                 coeff_ids, _ = aux.compound_coeff_ids(cached_c.to(device), stochastic=False)
-                quantized = aux.coeff_bins[coeff_ids] * aux.coeff_scales.view(1, 1, 1, 2)
-                physical = cached_c.to(device) * aux.coeff_scales.view(1, 1, 1, 2)
+                scale_view = aux.coeff_scales.view(1, 1, 1, args.sparsity_level)
+                quantized = aux.coeff_bins[coeff_ids] * scale_view
+                physical = cached_c.to(device) * scale_view
                 squared_error = 0.0
                 pixel_count = 0
                 source = torch.cat(verify_images)
@@ -216,15 +226,27 @@ def main():
                     )
                     pixel_count += target.numel()
             mse = squared_error / pixel_count
+            duplicate_indices = torch.triu_indices(
+                args.sparsity_level, args.sparsity_level, offset=1
+            )
+            pairwise_duplicate = (
+                cached_a[..., :, None] == cached_a[..., None, :]
+            )[..., duplicate_indices[0], duplicate_indices[1]]
+            duplicate_fraction = (
+                float(pairwise_duplicate.float().mean())
+                if pairwise_duplicate.numel() > 0 else 0.0
+            )
             report.update({
-                "compound_sequence_length": 128,
-                "scalar_sequence_length_baseline": 256,
+                "compound_sequence_length": 8 * 8 * args.sparsity_level,
+                "scalar_sequence_length_baseline": 2 * 8 * 8 * args.sparsity_level,
                 "physical_coeff_quantization_mae": float((quantized - physical).abs().mean()),
                 "coeff_bound_fraction": float((cached_c.abs() >= args.coeff_max).float().mean()),
                 "quantized_reconstruction_mse": mse,
                 "quantized_reconstruction_psnr": float(-10.0 * torch.log10(torch.tensor(max(mse, 1e-12)))),
-                "duplicate_atom_within_pair_fraction": float((cached_a[..., 0] == cached_a[..., 1]).float().mean()),
+                "duplicate_atom_within_support_fraction": duplicate_fraction,
             })
+            if args.sparsity_level == 2:
+                report["duplicate_atom_within_pair_fraction"] = duplicate_fraction
         max_label = 0 if args.dataset in {"celebahq", "ffhq"} else 999
         report["passed"] = report["atom_exact_fraction"] == 1.0 and report["coeff_max_error"] < 0.02 and report["coeff_finite"] and report["atom_min"] >= 0 and report["atom_max"] < args.num_atoms and report["label_min"] >= 0 and report["label_max"] <= max_label
         args.output.with_suffix(".validation.json").write_text(json.dumps(report, indent=2) + "\n")

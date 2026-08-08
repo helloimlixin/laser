@@ -45,6 +45,7 @@ from torchvision.utils import save_image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "third_party" / "rq-vae-transformer"))
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from omegaconf.base import ContainerMetadata, Metadata
@@ -52,7 +53,7 @@ from omegaconf.nodes import AnyNode, BooleanNode, BytesNode, FloatNode, IntegerN
 from src.models.rqtransformer.configs import RQTransformerConfig
 from src.models.rqtransformer.attentions import AttentionBlock, AttentionStack
 from src.models.rqtransformer.transformers import RQTransformer, sample_from_logits
-from src.models.rqvae.rqvae import RQVAE
+from rqvae.models.rqvae.rqvae import RQVAE
 from src.data.imagenet_labels import class_names_for_dataset
 
 
@@ -354,8 +355,11 @@ class LaserAux(nn.Module):
                  coeff_max: float, coeff_scale: float = 1.0,
                  attn_resolutions=(8,), coeff_scales=None,
                  soft_target_physical=False, clamp_coeffs=True,
-                 coeff_bin_centers=None):
+                 coeff_bin_centers=None, sparsity_level: int = 2):
         super().__init__()
+        self.sparsity_level = int(sparsity_level)
+        if self.sparsity_level <= 0:
+            raise ValueError("sparsity_level must be positive")
         stage1 = RQVAE(
             embed_dim=256,
             n_embed=num_atoms,
@@ -368,12 +372,21 @@ class LaserAux(nn.Module):
                 out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4, 4],
                 num_res_blocks=2, attn_resolutions=list(attn_resolutions), dropout=0.0,
             ),
-            latent_shape=[8, 8, 256], code_shape=[8, 8, 2],
+            latent_shape=[8, 8, 256], code_shape=[8, 8, self.sparsity_level],
             shared_codebook=True, restart_unused_codes=True,
         )
         payload = load_stage1_checkpoint(checkpoint)
         state = payload["state_dict"]
-        filtered = {k: v for k, v in state.items() if not k.startswith("quantizer.")}
+        # Accept both native RQ-VAE checkpoints and maintained LASER Lightning
+        # checkpoints.  The latter uses descriptive projection/bottleneck names.
+        filtered = {}
+        for key, value in state.items():
+            if key.startswith(("encoder.", "decoder.", "quant_conv.", "post_quant_conv.")):
+                filtered[key] = value
+            elif key.startswith("pre_bottleneck."):
+                filtered["quant_conv." + key.removeprefix("pre_bottleneck.")] = value
+            elif key.startswith("post_bottleneck."):
+                filtered["post_quant_conv." + key.removeprefix("post_bottleneck.")] = value
         missing, unexpected = stage1.load_state_dict(filtered, strict=False)
         bad_missing = [k for k in missing if not k.startswith("quantizer.")]
         if bad_missing or unexpected:
@@ -382,7 +395,14 @@ class LaserAux(nn.Module):
         self.quant_conv = stage1.quant_conv
         self.post_quant_conv = stage1.post_quant_conv
         self.decoder = stage1.decoder
-        self.register_buffer("dictionary", F.normalize(state["quantizer.dictionary"].float(), dim=0))
+        dictionary_key = (
+            "quantizer.dictionary"
+            if "quantizer.dictionary" in state
+            else "bottleneck.dictionary"
+        )
+        if dictionary_key not in state:
+            raise RuntimeError("stage-1 checkpoint has no sparse dictionary")
+        self.register_buffer("dictionary", F.normalize(state[dictionary_key].float(), dim=0))
         if coeff_bin_centers is None:
             coefficient_bins = torch.linspace(-coeff_max, coeff_max, coeff_vocab_size)
         else:
@@ -401,9 +421,16 @@ class LaserAux(nn.Module):
         self.coeff_vocab_size = int(coeff_vocab_size)
         self.vocab_size = self.num_atoms + self.coeff_vocab_size
         self.coeff_max = float(coeff_max)
-        scales = coeff_scales if coeff_scales is not None else [coeff_scale, coeff_scale]
-        if len(scales) != 2:
-            raise ValueError("LASER k=2 requires exactly two coefficient scales")
+        scales = (
+            coeff_scales
+            if coeff_scales is not None
+            else [coeff_scale] * self.sparsity_level
+        )
+        if len(scales) != self.sparsity_level:
+            raise ValueError(
+                f"LASER k={self.sparsity_level} requires exactly "
+                f"{self.sparsity_level} coefficient scales"
+            )
         self.register_buffer("coeff_scales", torch.tensor(scales, dtype=torch.float32))
         self.coeff_scale = float(coeff_scale)  # Backward-compatible metadata.
         self.soft_target_physical = bool(soft_target_physical)
@@ -417,24 +444,55 @@ class LaserAux(nn.Module):
         z = self.quant_conv(self.encoder(images)).permute(0, 2, 3, 1).float()
         b, h, w, c = z.shape
         signals = z.reshape(-1, c)
-        dictionary = self.dictionary
-        gram = dictionary.t() @ dictionary
-        corr0 = signals @ dictionary
-        first = corr0.abs().argmax(dim=1)
-        a = gram[first, first].clamp_min(1e-6)
-        c1 = corr0.gather(1, first[:, None]).squeeze(1) / a
-        residual_corr = corr0 - c1[:, None] * gram[first]
-        residual_corr.scatter_(1, first[:, None], 0.0)
-        second = residual_corr.abs().argmax(dim=1)
-        g11, g22, g12 = gram[first, first], gram[second, second], gram[first, second]
-        y1 = corr0.gather(1, first[:, None]).squeeze(1)
-        y2 = corr0.gather(1, second[:, None]).squeeze(1)
-        det = (g11 * g22 - g12.square()).clamp_min(1e-6)
-        v1 = (g22 * y1 - g12 * y2) / det
-        v2 = (g11 * y2 - g12 * y1) / det
-        atoms = torch.stack((first, second), dim=-1).view(b, h, w, 2)
-        physical_coeffs = torch.stack((v1, v2), dim=-1).view(b, h, w, 2)
-        scales = self.coeff_scales.view(1, 1, 1, 2)
+        # Cache extraction runs the encoder under BF16 autocast, but OMP's
+        # Cholesky solve must remain FP32 for dtype consistency and stability.
+        with torch.autocast(device_type=signals.device.type, enabled=False):
+            signals = signals.float()
+            dictionary = self.dictionary.float()
+            gram = dictionary.t() @ dictionary
+            corr_init = signals @ dictionary
+            corr = corr_init
+            num_signals = signals.shape[0]
+            signal_idx = torch.arange(num_signals, device=signals.device)
+            available = torch.ones_like(corr_init, dtype=torch.bool)
+            support = torch.empty(num_signals, 0, dtype=torch.long, device=signals.device)
+            chol = torch.ones(num_signals, 1, 1, device=signals.device, dtype=signals.dtype)
+            active_coeffs = None
+            for depth in range(1, self.sparsity_level + 1):
+                scores = corr.abs().masked_fill(~available, -1.0)
+                next_atoms = scores.argmax(dim=1)
+                available[signal_idx, next_atoms] = False
+                expanded_idx = signal_idx[:, None].expand(num_signals, depth)
+                if depth > 1:
+                    previous = support
+                    repeated_new = next_atoms[:, None].expand(num_signals, depth - 1)
+                    gram_cross = gram[previous, repeated_new].unsqueeze(-1)
+                    solved = torch.linalg.solve_triangular(
+                        chol, gram_cross, upper=False
+                    ).transpose(1, 2)
+                    bottom_right = (
+                        1.0 - solved.square().sum(dim=2, keepdim=True)
+                    ).clamp_min(1e-10).sqrt()
+                    zeros = torch.zeros(
+                        num_signals, depth - 1, 1,
+                        device=signals.device, dtype=signals.dtype,
+                    )
+                    chol = torch.cat(
+                        (
+                            torch.cat((chol, zeros), dim=2),
+                            torch.cat((solved, bottom_right), dim=2),
+                        ),
+                        dim=1,
+                    )
+                support = torch.cat((support, next_atoms[:, None]), dim=1)
+                active_corr = corr_init[expanded_idx, support]
+                active_coeffs = torch.cholesky_solve(
+                    active_corr.unsqueeze(-1), chol
+                ).squeeze(-1)
+                corr = corr_init - active_coeffs.unsqueeze(1).bmm(gram[support]).squeeze(1)
+        atoms = support.view(b, h, w, self.sparsity_level)
+        physical_coeffs = active_coeffs.view(b, h, w, self.sparsity_level)
+        scales = self.coeff_scales.view(1, 1, 1, self.sparsity_level)
         coeffs = physical_coeffs / scales
         if self.clamp_coeffs:
             coeffs = coeffs.clamp(-self.coeff_max, self.coeff_max)
@@ -451,8 +509,13 @@ class LaserAux(nn.Module):
         # LASER, atom support is discrete OMP while the continuous coefficient
         # posterior is discretized into a temperature-controlled 16K density.
         if self.soft_target_physical:
-            target_values = (coeffs * self.coeff_scales.view(1, 1, 1, 2))[..., None]
-            bin_values = self.coeff_bins.view(1, 1, 1, 1, -1) * self.coeff_scales.view(1, 1, 1, 2, 1)
+            target_values = (
+                coeffs * self.coeff_scales.view(1, 1, 1, self.sparsity_level)
+            )[..., None]
+            bin_values = (
+                self.coeff_bins.view(1, 1, 1, 1, -1)
+                * self.coeff_scales.view(1, 1, 1, self.sparsity_level, 1)
+            )
         else:
             target_values = coeffs[..., None]
             bin_values = self.coeff_bins
@@ -468,15 +531,15 @@ class LaserAux(nn.Module):
                 coeff_probs.reshape(-1, self.coeff_vocab_size), 1
             ).reshape_as(coeff_tokens)
         b, h, w, _ = atoms.shape
-        tokens = torch.empty(b, h, w, 4, device=atoms.device, dtype=torch.long)
+        scalar_depth = 2 * self.sparsity_level
+        tokens = torch.empty(b, h, w, scalar_depth, device=atoms.device, dtype=torch.long)
         tokens[..., 0::2] = atoms
         tokens[..., 1::2] = coeff_tokens + self.num_atoms
         if compact:
             return tokens, (atoms, coeff_probs)
-        soft_targets = torch.zeros(b, h, w, 4, self.vocab_size,
+        soft_targets = torch.zeros(b, h, w, scalar_depth, self.vocab_size,
                                    device=atoms.device, dtype=coeff_probs.dtype)
-        soft_targets[..., 0, :].scatter_(-1, atoms[..., 0, None], 1.0)
-        soft_targets[..., 2, :].scatter_(-1, atoms[..., 1, None], 1.0)
+        soft_targets[..., 0::2, :self.num_atoms].scatter_(-1, atoms[..., None], 1.0)
         soft_targets[..., 1::2, self.num_atoms:] = coeff_probs
         return tokens, soft_targets
 
@@ -494,7 +557,9 @@ class LaserAux(nn.Module):
         atom_vectors = self.dictionary.t()[tokens[..., 0::2]]
         out[..., 0::2, :] = atom_vectors
         coeff_ids = (tokens[..., 1::2] - self.num_atoms).clamp(0, self.coeff_vocab_size - 1)
-        coeff = self.coeff_bins[coeff_ids] * self.coeff_scales.view(1, 1, 1, 2)
+        coeff = self.coeff_bins[coeff_ids] * self.coeff_scales.view(
+            1, 1, 1, self.sparsity_level
+        )
         out[..., 1::2, :] = (coeff[..., None] - 1.0) * atom_vectors
         return out, None
 
@@ -502,7 +567,9 @@ class LaserAux(nn.Module):
     def decode_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         atoms = tokens[..., 0::2].long()
         coeff_ids = (tokens[..., 1::2].long() - self.num_atoms).clamp(0, self.coeff_vocab_size - 1)
-        coeffs = self.coeff_bins[coeff_ids] * self.coeff_scales.view(1, 1, 1, 2)
+        coeffs = self.coeff_bins[coeff_ids] * self.coeff_scales.view(
+            1, 1, 1, self.sparsity_level
+        )
         atom_vectors = self.dictionary.t()[atoms]
         z_q = (atom_vectors * coeffs[..., None]).sum(dim=-2)
         z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
@@ -531,7 +598,7 @@ class LaserAux(nn.Module):
         """Physical latent contribution of every compound sparse event."""
         atom_vectors = self.dictionary.t()[atoms.long()]
         coeffs = self.coeff_bins[coeff_ids.long().clamp(0, self.coeff_vocab_size - 1)]
-        scale_shape = [1] * (coeffs.ndim - 1) + [2]
+        scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level]
         coeffs = coeffs * self.coeff_scales.view(*scale_shape)
         return atom_vectors * coeffs[..., None]
 
@@ -539,7 +606,7 @@ class LaserAux(nn.Module):
     def physical_contributions(self, atoms: torch.Tensor, coeffs: torch.Tensor):
         """Continuous physical LASER contribution c_i d_{a_i} for each pair."""
         atom_vectors = self.dictionary.t()[atoms.long()]
-        scale_shape = [1] * (coeffs.ndim - 1) + [2]
+        scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level]
         physical_coeffs = coeffs.float() * self.coeff_scales.view(*scale_shape)
         return atom_vectors * physical_coeffs[..., None]
 
@@ -1117,6 +1184,7 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 compound_geometry_head=False,
                 compound_micro_transformer_layers=0,
                 compound_depth_specific_coeff_heads=False,
+                sparsity_level=2,
                 model_preset="imagenet-1400m"):
     presets = {
         "imagenet-1400m": {
@@ -1126,7 +1194,7 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
         },
         # Exact body/head geometry from KakaoBrain's
         # ffhq256-rqtransformer-8x8x4-350M.yaml. Compound mode changes only
-        # the depth axis from four scalar slots to two sparse-pair events.
+        # the depth axis from scalar slots to sparse compound events.
         "ffhq-350m": {
             "embed_dim": 1024, "vocab_size_cond": 1,
             "body_layers": 24, "body_heads": 16,
@@ -1138,7 +1206,8 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
     except KeyError as error:
         raise ValueError(f"unknown model preset: {model_preset}") from error
     cfg = OmegaConf.create({
-        "type": "rq-transformer", "block_size": [8, 8, 2 if compound else 4],
+        "type": "rq-transformer",
+        "block_size": [8, 8, sparsity_level if compound else 2 * sparsity_level],
         "embed_dim": preset["embed_dim"],
         "input_embed_dim": 256, "shared_tok_emb": True, "shared_cls_emb": True,
         "input_emb_vqvae": True, "head_emb_vqvae": True, "cumsum_depth_ctx": True,
@@ -1295,10 +1364,11 @@ def main():
         help="Multi-GPU wrapper; FSDP uses transformer-block FULL_SHARD",
     )
     p.add_argument("--num-atoms", type=int, default=16384)
+    p.add_argument("--sparsity-level", type=int, default=2)
     p.add_argument("--coeff-vocab-size", type=int, default=2048)
     p.add_argument("--coeff-max", type=float, default=20.0)
     p.add_argument("--coeff-scale", type=float, default=6.4)
-    p.add_argument("--coeff-scales", type=float, nargs=2)
+    p.add_argument("--coeff-scales", type=float, nargs="+")
     p.add_argument(
         "--coeff-target-mode", choices=("soft", "hard"), default="soft",
         help="Use stochastic soft coefficient targets or deterministic nearest-bin targets",
@@ -1309,7 +1379,7 @@ def main():
     )
     p.add_argument(
         "--compound-tokens", action=argparse.BooleanOptionalAction, default=False,
-        help="Use 128 compound (atom, coefficient) AR events instead of 256 scalar events",
+        help="Use one compound (atom, coefficient) AR event per sparse component",
     )
     p.add_argument("--compound-refiner-layers", type=int, default=0)
     p.add_argument("--compound-micro-transformer-layers", type=int, default=0)
@@ -1404,6 +1474,13 @@ def main():
         help="Generate and decode one FID-sized batch, report peak memory, and exit",
     )
     args = p.parse_args()
+    if args.sparsity_level <= 0:
+        raise ValueError("--sparsity-level must be positive")
+    if args.coeff_scales is not None and len(args.coeff_scales) != args.sparsity_level:
+        raise ValueError(
+            f"--coeff-scales requires {args.sparsity_level} values for "
+            f"k={args.sparsity_level}"
+        )
     if args.compound_refiner_layers < 0:
         raise ValueError("--compound-refiner-layers cannot be negative")
     if args.compound_micro_transformer_layers < 0:
@@ -1492,6 +1569,7 @@ def main():
             "dataset": args.dataset,
             "num_atoms": args.num_atoms,
             "coeff_vocab_size": args.coeff_vocab_size,
+            "shape": [8, 8, args.sparsity_level],
         }
         for key, expected in expected_cache.items():
             actual = cache_meta.get(key)
@@ -1508,6 +1586,11 @@ def main():
         cached_scales = cache_meta.get("coeff_scales")
         if cached_scales is not None:
             cached_scales = [float(value) for value in cached_scales]
+            if len(cached_scales) != args.sparsity_level:
+                raise ValueError(
+                    "token cache coefficient scale count mismatch: "
+                    f"cache={len(cached_scales)}, k={args.sparsity_level}"
+                )
             if args.coeff_scales is None:
                 args.coeff_scales = cached_scales
             elif any(
@@ -1583,7 +1666,8 @@ def main():
                    attn_resolutions=((16,) if args.dataset in face_datasets else (8,)),
                    coeff_scales=args.coeff_scales,
                    soft_target_physical=args.coeff_scales is not None,
-                   coeff_bin_centers=cached_bin_centers).to(device)
+                   coeff_bin_centers=cached_bin_centers,
+                   sparsity_level=args.sparsity_level).to(device)
     unwrapped_model = build_model(
         total_vocab_size, args.num_atoms, compound=args.compound_tokens,
         coeff_vocab_size=args.coeff_vocab_size,
@@ -1593,6 +1677,7 @@ def main():
         ),
         compound_micro_transformer_layers=args.compound_micro_transformer_layers,
         compound_depth_specific_coeff_heads=args.compound_depth_specific_coeff_heads,
+        sparsity_level=args.sparsity_level,
         model_preset=args.model_preset,
     )
     parameter_names = [name for name, _ in unwrapped_model.named_parameters()]
@@ -1680,12 +1765,15 @@ def main():
             "train/geometry_weight",
             "train/geometry_pair_mse", "train/geometry_spatial_mse",
             "train/atom_top1", "train/coeff_bin_mae", "train/grad_norm",
-            "train/atom_nll_depth0", "train/atom_nll_depth1",
-            "train/atom_top1_depth0", "train/atom_top1_depth1",
-            "train/coeff_cross_entropy_depth0", "train/coeff_cross_entropy_depth1",
-            "train/coeff_bin_mae_depth0", "train/coeff_bin_mae_depth1",
             "train/images_per_second", "train/lr", "train/epoch", "val/fid",
         )
+        for depth_index in range(args.sparsity_level):
+            metric_names += (
+                f"train/atom_nll_depth{depth_index}",
+                f"train/atom_top1_depth{depth_index}",
+                f"train/coeff_cross_entropy_depth{depth_index}",
+                f"train/coeff_bin_mae_depth{depth_index}",
+            )
         if uses_inception_score(args.dataset):
             metric_names += ("val/inception_score", "val/inception_score_std")
         for metric_name in metric_names:
@@ -1943,7 +2031,9 @@ def main():
                             ).sum(dim=-1)
                             pred_coeff_ids = coeff_logits.argmax(dim=-1)
                             target_coeff_ids = target_coeff_probs.argmax(dim=-1)
-                            pair_scales = aux.coeff_scales.view(1, 1, 1, 2)
+                            pair_scales = aux.coeff_scales.view(
+                                1, 1, 1, args.sparsity_level
+                            )
                             pred_values = aux.coeff_bins[pred_coeff_ids] * pair_scales
                             target_values = aux.coeff_bins[target_coeff_ids] * pair_scales
                             diagnostic_metrics = {

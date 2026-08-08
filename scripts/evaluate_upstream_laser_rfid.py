@@ -109,6 +109,7 @@ def main():
     )
     p.add_argument("--num-images", type=int, default=50_000)
     p.add_argument("--num-atoms", type=int, default=16_384)
+    p.add_argument("--sparsity-level", type=int, default=2)
     p.add_argument("--coeff-vocab-size", type=int, default=2_048)
     p.add_argument("--batch-size", type=int, default=96)
     p.add_argument("--backend", choices=("torchmetrics", "native"), default="torchmetrics")
@@ -122,6 +123,8 @@ def main():
     args = p.parse_args()
     if args.num_images <= 0:
         p.error("--num-images must be positive")
+    if args.sparsity_level <= 0:
+        p.error("--sparsity-level must be positive")
     if args.wandb_mode == "online" and (not args.wandb_id or not args.wandb_name):
         p.error("--wandb-id and --wandb-name are required in online mode")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -167,6 +170,9 @@ def main():
                         num_workers=8, pin_memory=True, persistent_workers=True)
     # Native DictionaryLearning.forward() leaves its OMP coefficients
     # unbounded. Disable the stage-2 tokenization clamp for reconstruction FID.
+    sparsity_level = (
+        int(cache_meta["shape"][-1]) if cache_meta is not None else args.sparsity_level
+    )
     aux = LaserAux(
         args.checkpoint,
         int(cache_meta["num_atoms"]) if cache_meta is not None else args.num_atoms,
@@ -179,6 +185,7 @@ def main():
         coeff_bin_centers=(
             cache_meta.get("coeff_bin_centers") if cache_meta is not None else None
         ),
+        sparsity_level=sparsity_level,
     ).to(device).eval()
     metric = None
     inception = None
@@ -200,7 +207,9 @@ def main():
                 vectors = aux.dictionary.t()[atoms.long()]
                 # encode_sparse_components returns stage-2-normalized coefficients;
                 # restore the physical LASER values for native stage-1 reconstruction.
-                physical_coeffs = coeffs * aux.coeff_scales.view(1, 1, 1, 2)
+                physical_coeffs = coeffs * aux.coeff_scales.view(
+                    1, 1, 1, sparsity_level
+                )
                 z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
                 z_q = aux.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
                 recon = ((aux.decoder(z_q).float() + 1.0) * 0.5).clamp(0, 1)

@@ -13,6 +13,9 @@ class DataConfig:
     prefetch_factor: Optional[int] = 2
     image_size: Union[int, Tuple[int, int]] = 32
     train_crop_size: Optional[Union[int, Tuple[int, int]]] = None
+    train_random_resized_crop_scale: Optional[Tuple[float, float]] = None
+    train_list_file: Optional[str] = None
+    val_list_file: Optional[str] = None
     seed: int = 42
     mean: Tuple[float, ...] = (0.4914, 0.4822, 0.4465)  # CIFAR10 default
     std: Tuple[float, ...] = (0.2470, 0.2435, 0.2616)   # CIFAR10 default

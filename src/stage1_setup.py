@@ -257,6 +257,7 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "dropout": float(_cfg_get(model_cfg, "dropout", 0.0)),
         "channel_multipliers": _cfg_get(model_cfg, "channel_multipliers", None),
         "backbone_latent_channels": _cfg_get(model_cfg, "backbone_latent_channels", None),
+        "force_quant_conv": bool(_cfg_get(model_cfg, "force_quant_conv", False)),
         "decoder_extra_residual_layers": int(_cfg_get(model_cfg, "decoder_extra_residual_layers", 1)),
         "use_mid_attention": bool(_cfg_get(model_cfg, "use_mid_attention", True)),
         "commitment_cost": _cfg_get(model_cfg, "commitment_cost"),

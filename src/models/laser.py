@@ -128,6 +128,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             dropout=0.0,
             channel_multipliers=None,
             backbone_latent_channels=None,
+            force_quant_conv=False,
             decoder_extra_residual_layers=1,
             use_mid_attention=True,
             bottleneck_loss_weight=0.5,
@@ -227,6 +228,8 @@ class LASER(VisualsMixin, pl.LightningModule):
                 len(channel_multipliers) - 1
             backbone_latent_channels: width of the continuous DDPM latent
                 before projecting into the sparse bottleneck embedding_dim
+            force_quant_conv: retain learned 1x1 RQ-VAE quant/post-quant
+                projections even when their input and output widths match
             decoder_extra_residual_layers: extra decoder residual blocks per level for the DDPM-style backbone
             use_mid_attention: whether to keep the bottleneck self-attention block enabled
             commitment_cost: Commitment cost for bottleneck
@@ -505,6 +508,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         self.backbone_latent_channels = (
             None if backbone_latent_channels is None else int(backbone_latent_channels)
         )
+        self.force_quant_conv = bool(force_quant_conv)
         self.decoder_extra_residual_layers = int(decoder_extra_residual_layers)
         self.use_mid_attention = bool(use_mid_attention)
         if dict_learning_rate is not None and float(dict_learning_rate) <= 0.0:
@@ -589,7 +593,10 @@ class LASER(VisualsMixin, pl.LightningModule):
                 use_mid_attention=self.use_mid_attention,
             )
             self.encoder = DDPMEncoder(**enc_dec_kwargs)
-            if self.backbone_latent_channels == int(embedding_dim):
+            if (
+                self.backbone_latent_channels == int(embedding_dim)
+                and not self.force_quant_conv
+            ):
                 self.pre_bottleneck = nn.Identity()
                 self.post_bottleneck = nn.Identity()
             else:
@@ -1836,7 +1843,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             )
             self.log(
                 f'{prefix}/lpips_v01_scaling',
-                recon_raw.new_tensor(float(self.lpips.version == "0.1")),
+                recon_raw.new_tensor(float(self.lpips_version == "0.1")),
                 **log_kwargs,
             )
         if not is_audio:

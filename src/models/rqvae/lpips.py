@@ -4,12 +4,9 @@ import torch
 import torch.nn as nn
 from torchvision import models
 from collections import namedtuple
-from pathlib import Path
 
 from .lpips_utils import get_ckpt_path
-
-
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from ..lpips import get_vgg16_weights_path
 
 
 class LPIPS(nn.Module):
@@ -93,11 +90,7 @@ class vgg16(torch.nn.Module):
         super(vgg16, self).__init__()
         backbone = models.vgg16(weights=None)
         if pretrained:
-            weights_path = _PROJECT_ROOT / "vgg_lpips" / "vgg16-397923af.pth"
-            if not weights_path.is_file():
-                raise FileNotFoundError(
-                    f"Missing VGG16 weights at {weights_path}; run the project weight setup first"
-                )
+            weights_path = get_vgg16_weights_path()
             state = torch.load(weights_path, map_location="cpu", weights_only=True)
             backbone.load_state_dict(state)
         vgg_pretrained_features = backbone.features

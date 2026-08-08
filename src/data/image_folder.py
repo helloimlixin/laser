@@ -95,10 +95,25 @@ class ImageFolderDataModule(pl.LightningDataModule):
         return int(raw)
 
     def _train_transform(self):
-        ops = [transforms.Resize(self._resize_to())]
-        train_crop = self._train_crop_to()
-        if train_crop is not None and train_crop != self._resize_to():
-            ops.append(transforms.RandomCrop(train_crop))
+        random_resized_scale = getattr(
+            self.config, "train_random_resized_crop_scale", None
+        )
+        if random_resized_scale is not None:
+            scale = tuple(float(value) for value in random_resized_scale)
+            if len(scale) != 2 or not 0 < scale[0] <= scale[1] <= 1:
+                raise ValueError(
+                    "train_random_resized_crop_scale must be two ordered values in (0, 1]"
+                )
+            ops = [
+                transforms.RandomResizedCrop(
+                    self._resize_to(), scale=scale, ratio=(1.0, 1.0)
+                )
+            ]
+        else:
+            ops = [transforms.Resize(self._resize_to())]
+            train_crop = self._train_crop_to()
+            if train_crop is not None and train_crop != self._resize_to():
+                ops.append(transforms.RandomCrop(train_crop))
         if bool(self.config.augment):
             ops.append(transforms.RandomHorizontalFlip())
         ops.extend([transforms.ToTensor(), transforms.Normalize(self.config.mean, self.config.std)])
@@ -136,6 +151,59 @@ class ImageFolderDataModule(pl.LightningDataModule):
             return
 
         root = self._resolve_data_dir()
+        train_list_file = getattr(self.config, "train_list_file", None)
+        val_list_file = getattr(self.config, "val_list_file", None)
+        if train_list_file or val_list_file:
+            if not train_list_file or not val_list_file:
+                raise ValueError("train_list_file and val_list_file must be configured together")
+
+            path_by_stem = None
+
+            def listed_paths(raw_list_file: str) -> list[Path]:
+                nonlocal path_by_stem
+                list_path = Path(str(raw_list_file)).expanduser()
+                if not list_path.is_file():
+                    raise FileNotFoundError(f"dataset split list not found: {list_path}")
+                names = [line.strip() for line in list_path.read_text().splitlines() if line.strip()]
+                paths = [root / name for name in names]
+                if any(not path.is_file() for path in paths):
+                    # Some complete FFHQ mirrors store recovered images in a
+                    # nested directory and/or lossless WebP while retaining the
+                    # canonical five-digit stem used by the official split.
+                    if path_by_stem is None:
+                        all_paths = FlatImageDataset._list_image_paths(root)
+                        path_by_stem = {path.stem: path for path in all_paths}
+                        if len(path_by_stem) != len(all_paths):
+                            raise ValueError(
+                                f"image root {root} contains duplicate filename stems"
+                            )
+                    paths = [path if path.is_file() else path_by_stem.get(path.stem) for path in paths]
+                    missing_names = [name for name, path in zip(names, paths) if path is None]
+                    if missing_names:
+                        raise FileNotFoundError(
+                            f"dataset split list {list_path} references "
+                            f"{len(missing_names)} missing images; first missing: {missing_names[0]}"
+                        )
+                return paths
+
+            train_paths = listed_paths(str(train_list_file))
+            val_paths = listed_paths(str(val_list_file))
+            overlap = set(train_paths).intersection(val_paths)
+            if overlap:
+                raise ValueError(
+                    f"configured train/val split lists overlap on {len(overlap)} files"
+                )
+            self.train_dataset = FlatImageDataset(
+                root, transform=self._train_transform(), paths=train_paths
+            )
+            self.val_dataset = FlatImageDataset(
+                root, transform=self._eval_transform(), paths=val_paths
+            )
+            self.test_dataset = FlatImageDataset(
+                root, transform=self._eval_transform(), paths=val_paths
+            )
+            return
+
         train_dir = self._first_existing_dir(root, ("train", "training", "train256", "images_train"))
         val_dir = self._first_existing_dir(root, ("val", "valid", "validation", "test", "images_val"))
         test_dir = self._first_existing_dir(root, ("test", "testing"))
