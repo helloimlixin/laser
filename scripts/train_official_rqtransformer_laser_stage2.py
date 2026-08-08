@@ -80,6 +80,11 @@ def rank() -> int:
     return dist.get_rank() if dist.is_initialized() else 0
 
 
+def uses_inception_score(dataset: str) -> bool:
+    """Inception Score is only part of the ImageNet generation protocol."""
+    return dataset == "imagenet"
+
+
 def unwrap(model):
     return model.module if isinstance(model, (DDP, FSDP)) else model
 
@@ -687,9 +692,9 @@ def preview_sampling_settings(args):
 def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_size: int = 64,
                                 num_condition_classes=1000,
                                 atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
-                                coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92):
+                                coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92,
+                                compute_inception_score=True):
     from torchmetrics.image.fid import FrechetInceptionDistance
-    from torchmetrics.image.inception import InceptionScore
 
     device = next(model.parameters()).device
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -700,9 +705,12 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
     fid_metric = FrechetInceptionDistance(
         feature=2048, normalize=True, sync_on_compute=dist.is_initialized()
     ).to(device)
-    inception_metric = InceptionScore(
-        normalize=True, splits=10, sync_on_compute=dist.is_initialized()
-    ).to(device)
+    inception_metric = None
+    if compute_inception_score:
+        from torchmetrics.image.inception import InceptionScore
+        inception_metric = InceptionScore(
+            normalize=True, splits=10, sync_on_compute=dist.is_initialized()
+        ).to(device)
     seen = 0
     for images, _ in val_loader:
         images = ((images.to(device, non_blocking=True).float() + 1.0) * 0.5).clamp(0, 1)
@@ -741,19 +749,38 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
             )
             images = ((aux.decode_tokens(tokens).float() + 1.0) * 0.5).clamp(0, 1)
         fid_metric.update(images, real=False)
-        inception_metric.update(images)
+        if inception_metric is not None:
+            inception_metric.update(images)
         generated += current
     fid = float(fid_metric.compute().item())
-    inception_mean, inception_std = inception_metric.compute()
+    if inception_metric is None:
+        inception_mean = inception_std = None
+    else:
+        inception_mean, inception_std = (
+            float(value.item()) for value in inception_metric.compute()
+        )
     if was_training:
         model.train()
-    return fid, float(inception_mean.item()), float(inception_std.item())
+    return fid, inception_mean, inception_std
 
 
 def atomic_torch_save(payload, target: Path):
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     torch.save(payload, temporary)
+    os.replace(temporary, target)
+
+
+def snapshot_checkpoint(source: Path, target: Path):
+    """Create an atomic, space-efficient snapshot of an immutable checkpoint."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".snapshot.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        # Hard links can fail when a custom checkpoint directory crosses filesystems.
+        shutil.copy2(source, temporary)
     os.replace(temporary, target)
 
 
@@ -1646,7 +1673,7 @@ def main():
                                 ),
                                 "preview_sampling_settings": preview_sampling_settings(args)})
         wb.define_metric("train/global_step")
-        for metric_name in (
+        metric_names = (
             "train/loss", "train/atom_nll", "train/coeff_cross_entropy",
             "train/coeff_target_entropy", "train/coeff_kl",
             "train/classification_loss", "train/geometry_loss",
@@ -1658,8 +1685,10 @@ def main():
             "train/coeff_cross_entropy_depth0", "train/coeff_cross_entropy_depth1",
             "train/coeff_bin_mae_depth0", "train/coeff_bin_mae_depth1",
             "train/images_per_second", "train/lr", "train/epoch", "val/fid",
-            "val/inception_score", "val/inception_score_std",
-        ):
+        )
+        if uses_inception_score(args.dataset):
+            metric_names += ("val/inception_score", "val/inception_score_std")
+        for metric_name in metric_names:
             wb.define_metric(metric_name, step_metric="train/global_step")
         (args.output / "launch_config.json").write_text(json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
         if args.upload_token_cache:
@@ -1680,6 +1709,8 @@ def main():
         best_inception = [
             (float(x[0]), str(x[1])) for x in resume_payload.get("best_inception", [])
         ]
+        if not uses_inception_score(args.dataset):
+            best_inception = []
         saved_config = resume_payload.get("config", {})
         old_batch_size = int(saved_config.get("batch_size", args.batch_size))
         if resume_batch_idx and old_batch_size != args.batch_size:
@@ -2100,19 +2131,24 @@ def main():
                         coeff_temperature=args.coeff_temperature,
                         coeff_top_k=args.coeff_top_k,
                         coeff_top_p=args.coeff_top_p,
+                        compute_inception_score=uses_inception_score(args.dataset),
                     )
                 cuda_memory_report(device, f"epoch {epoch + 1} FID generation")
         best_path = None
         best_inception_path = None
         if rank() == 0:
             if wb is not None and fid is not None:
-                wb.log({
+                evaluation_payload = {
                     "val/fid": fid,
-                    "val/inception_score": inception_score,
-                    "val/inception_score_std": inception_score_std,
                     "train/epoch": epoch + 1,
                     "train/global_step": global_step,
-                })
+                }
+                if inception_score is not None:
+                    evaluation_payload.update({
+                        "val/inception_score": inception_score,
+                        "val/inception_score_std": inception_score_std,
+                    })
+                wb.log(evaluation_payload)
             qualifies = fid is not None and (
                 len(best_fid) < 3 or fid < max(x[0] for x in best_fid)
             )
@@ -2156,9 +2192,9 @@ def main():
                 }
                 atomic_torch_save(snapshot, last_checkpoint)
                 if best_path is not None:
-                    shutil.copy2(last_checkpoint, best_path)
+                    snapshot_checkpoint(last_checkpoint, best_path)
                 if best_inception_path is not None:
-                    shutil.copy2(last_checkpoint, best_inception_path)
+                    snapshot_checkpoint(last_checkpoint, best_inception_path)
                 # Every scheduled full save uploads a recoverable `last` plus
                 # every locally retained top-three FID and Inception member.
                 if args.upload_checkpoints:
@@ -2197,12 +2233,10 @@ def main():
             elif fid is None:
                 print(f"Epoch {epoch + 1}: FID skipped; saved {last_checkpoint}", flush=True)
             else:
-                print(
-                    f"Epoch {epoch + 1}: FID={fid:.4f}; "
-                    f"IS={inception_score:.4f}+/-{inception_score_std:.4f}; "
-                    f"saved {last_checkpoint}",
-                    flush=True,
-                )
+                metrics = f"FID={fid:.4f}"
+                if inception_score is not None:
+                    metrics += f"; IS={inception_score:.4f}+/-{inception_score_std:.4f}"
+                print(f"Epoch {epoch + 1}: {metrics}; saved {last_checkpoint}", flush=True)
         if dist.is_initialized():
             dist.barrier()
     if wb is not None:

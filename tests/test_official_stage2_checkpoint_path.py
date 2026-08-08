@@ -10,6 +10,8 @@ from scripts.train_official_rqtransformer_laser_stage2 import (
     optimizer_state_to_names,
     optimizer_state_uses_names,
     persistent_checkpoint_dir,
+    snapshot_checkpoint,
+    uses_inception_score,
 )
 
 
@@ -22,6 +24,23 @@ def test_checkpoint_dir_defaults_below_output():
 def test_checkpoint_dir_rejects_ephemeral_tmp():
     with pytest.raises(ValueError, match="must be under /workspace"):
         persistent_checkpoint_dir(Path("/workspace/outputs/example"), Path("/tmp/checkpoints"))
+
+
+def test_checkpoint_snapshot_reuses_storage(tmp_path):
+    source = tmp_path / "last.pt"
+    target = tmp_path / "best.pt"
+    source.write_bytes(b"checkpoint payload")
+
+    snapshot_checkpoint(source, target)
+
+    assert target.read_bytes() == source.read_bytes()
+    assert target.stat().st_ino == source.stat().st_ino
+
+
+def test_inception_score_is_only_used_for_imagenet():
+    assert uses_inception_score("imagenet")
+    assert not uses_inception_score("ffhq")
+    assert not uses_inception_score("celebahq")
 
 
 def make_optimizer(lr=5e-4):

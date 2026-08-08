@@ -190,3 +190,4 @@ Data/
 
 # Local experiment artifacts (run outputs, checkpoints, logs) — never tracked
 runs/
+notebooks/work_dirs/

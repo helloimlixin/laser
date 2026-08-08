@@ -145,7 +145,7 @@ exec torchrun --standalone --nproc_per_node=2 \
   --sample-grid-batch-size 8 \
   --sample-grid-sweep \
   --sample-grid-on-start \
-  --upload-checkpoints \
+  --no-upload-checkpoints \
   --upload-token-cache \
   --resume \
   --wandb-entity helloimlixin-rutgers \
