@@ -312,6 +312,16 @@ def create_cosine_lr_scheduler(
             eta_min=float(min_lr),
             last_epoch=int(completed_steps) - 1,
         )
+        # PyTorch releases differ on whether the constructor immediately
+        # writes the closed-form LR for a nonzero last_epoch. Make the resumed
+        # legacy-checkpoint position explicit and version-independent.
+        progress = float(completed_steps) / float(total_steps)
+        resumed_lr = float(min_lr) + 0.5 * (float(initial_lr) - float(min_lr)) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = resumed_lr
+        scheduler._last_lr = [resumed_lr for _ in optimizer.param_groups]
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=int(total_steps), eta_min=float(min_lr)
@@ -866,6 +876,66 @@ def upload_checkpoint(wb, path: Path, *, artifact_name: str, aliases, metadata):
     upload_checkpoints(
         wb, [path], artifact_name=artifact_name, aliases=aliases, metadata=metadata
     )
+
+
+def _replace_hard_link(source: Path, destination: Path):
+    """Atomically point a fixed upload slot at an immutable checkpoint inode."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        shutil.copy2(source, temporary)
+    try:
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def upload_selected_checkpoint_files(
+    wb,
+    *,
+    last_checkpoint: Path,
+    best_fid,
+    upload_dir: Path,
+):
+    """Replace fixed W&B run-file slots with last plus the best three FIDs.
+
+    Artifact versions are immutable and therefore accumulate indefinitely.
+    Run files keep stable online names, matching the Stage-1 retention policy,
+    while the local hard links avoid another multi-gigabyte checkpoint copy.
+    """
+    sources = [("last.pt", last_checkpoint)]
+    sources.extend(
+        (f"best-fid-{rank_index:02d}.pt", Path(saved_path))
+        for rank_index, (_, saved_path) in enumerate(
+            sorted(best_fid, key=lambda item: float(item[0]))[:3], start=1
+        )
+    )
+    sources = [(slot, source.resolve()) for slot, source in sources if source.is_file()]
+    if not sources:
+        return []
+
+    upload_dir = upload_dir.expanduser().resolve()
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    active_names = {slot for slot, _ in sources}
+    for stale in upload_dir.glob("best-fid-*.pt"):
+        if stale.name not in active_names:
+            stale.unlink(missing_ok=True)
+
+    uploaded = []
+    for slot, source in sources:
+        destination = upload_dir / slot
+        _replace_hard_link(source, destination)
+        wb.save(str(destination), base_path=str(upload_dir), policy="now")
+        uploaded.append(destination)
+    print(
+        "Queued fixed W&B checkpoint files: "
+        + ", ".join(path.name for path in uploaded),
+        flush=True,
+    )
+    return uploaded
 
 
 def upload_token_cache_once(wb, token_cache: Path, output_dir: Path):
@@ -1453,6 +1523,15 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Upload 16+ GB checkpoints as W&B artifacts (disabled by default)",
+    )
+    p.add_argument(
+        "--checkpoint-upload-mode",
+        choices=("artifact", "files"),
+        default="artifact",
+        help=(
+            "artifact creates immutable versions; files replaces fixed last and "
+            "best-FID slots on the W&B run"
+        ),
     )
     p.add_argument(
         "--upload-token-cache",
@@ -2153,6 +2232,16 @@ def main():
                             f"Step {global_step}: saved recovery checkpoint {last_checkpoint}",
                             flush=True,
                         )
+                        if (
+                            args.upload_checkpoints
+                            and args.checkpoint_upload_mode == "files"
+                        ):
+                            upload_selected_checkpoint_files(
+                                wb,
+                                last_checkpoint=last_checkpoint,
+                                best_fid=best_fid,
+                                upload_dir=args.output / "wandb_checkpoints",
+                            )
                         del recovery_snapshot
                     del model_state, optimizer_state
                     if dist.is_initialized():
@@ -2287,7 +2376,7 @@ def main():
                     snapshot_checkpoint(last_checkpoint, best_inception_path)
                 # Every scheduled full save uploads a recoverable `last` plus
                 # every locally retained top-three FID and Inception member.
-                if args.upload_checkpoints:
+                if args.upload_checkpoints and args.checkpoint_upload_mode == "artifact":
                     artifact_aliases = ["latest"]
                     if best_path is not None:
                         artifact_aliases.extend(["best-fid", f"fid-epoch-{epoch + 1}"])
@@ -2314,6 +2403,13 @@ def main():
                             "inception_score_std": inception_score_std,
                             "selected_checkpoints": [path.name for path in selected_paths],
                         },
+                    )
+                elif args.upload_checkpoints:
+                    upload_selected_checkpoint_files(
+                        wb,
+                        last_checkpoint=last_checkpoint,
+                        best_fid=best_fid,
+                        upload_dir=args.output / "wandb_checkpoints",
                     )
                 del snapshot
             del model_state, optimizer_state
