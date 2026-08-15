@@ -83,7 +83,14 @@ def native_frechet(real_sum, real_cross, fake_sum, fake_cross, count):
     cov_r = ((real_cross - torch.outer(real_sum, real_sum) / n) / (n - 1)).cpu().numpy()
     cov_f = ((fake_cross - torch.outer(fake_sum, fake_sum) / n) / (n - 1)).cpu().numpy()
     diff = mu_r - mu_f
-    covmean, _ = linalg.sqrtm(cov_r.dot(cov_f), disp=False)
+    covariance_product = cov_r.dot(cov_f)
+    # scipy<1.18 returned ``(sqrt, error_estimate)`` when ``disp=False``;
+    # scipy>=1.18 removed ``disp`` and returns the square root directly.
+    try:
+        sqrtm_result = linalg.sqrtm(covariance_product, disp=False)
+    except TypeError:
+        sqrtm_result = linalg.sqrtm(covariance_product)
+    covmean = sqrtm_result[0] if isinstance(sqrtm_result, tuple) else sqrtm_result
     if not np.isfinite(covmean).all():
         logging.warning("FID covariance product is singular; adding 1e-6 to diagonals")
         offset = np.eye(cov_r.shape[0]) * 1e-6
@@ -102,7 +109,14 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument(
         "--token-cache", type=Path, default=None,
-        help="Decode row-aligned quantized cache entries instead of continuous coefficients",
+        help="Decode row-aligned cache entries instead of re-encoding source images",
+    )
+    p.add_argument(
+        "--cache-coeff-mode", choices=("continuous", "quantized"), default="quantized",
+        help=(
+            "For --token-cache, decode cached coefficients directly or through "
+            "the Stage-2 nearest-bin tokenizer"
+        ),
     )
     p.add_argument(
         "--dataset", choices=("imagenet", "celebahq", "ffhq"), default="imagenet"
@@ -217,10 +231,22 @@ def main():
                 indices = row_indices.long()
                 atoms = cache_payload["atoms"][indices].to(device, dtype=torch.long)
                 coeffs = cache_payload["coeffs"][indices].to(device, dtype=torch.float32)
-                coeff_ids, _ = aux.compound_coeff_ids(
-                    coeffs, stochastic=False, hard=True
-                )
-                recon = ((aux.decode_compound(atoms, coeff_ids).float() + 1.0) * 0.5).clamp(0, 1)
+                if args.cache_coeff_mode == "quantized":
+                    coeff_ids, _ = aux.compound_coeff_ids(
+                        coeffs, stochastic=False, hard=True
+                    )
+                    decoded = aux.decode_compound(atoms, coeff_ids)
+                else:
+                    vectors = aux.dictionary.t()[atoms]
+                    physical_coeffs = coeffs * aux.coeff_scales.view(
+                        1, 1, 1, sparsity_level
+                    )
+                    z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
+                    z_q = aux.post_quant_conv(
+                        z_q.permute(0, 3, 1, 2).contiguous()
+                    )
+                    decoded = aux.decoder(z_q).clamp(-1.0, 1.0)
+                recon = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
             real = ((images.float() + 1.0) * 0.5).clamp(0, 1)
             if metric is not None:
                 metric.update(real, real=True)
@@ -251,13 +277,22 @@ def main():
                 dist.all_reduce(tensor)
         value = native_frechet(real_sum, real_cross, fake_sum, fake_cross, int(count.item()))
     if not dist.is_initialized() or dist.get_rank() == 0:
-        payload = {"checkpoint": str(args.checkpoint),
+        payload = {"checkpoint": str(args.checkpoint.resolve()),
                    "split": split_name, "dataset": args.dataset,
                    "num_images": args.num_images,
                    "fid_backend": args.backend, "rfid": value,
-                   "token_cache": str(args.token_cache) if args.token_cache is not None else None,
+                   "token_cache": (
+                       str(args.token_cache.resolve())
+                       if args.token_cache is not None else None
+                   ),
+                   "cache_coeff_mode": (
+                       args.cache_coeff_mode if cache_meta is not None else None
+                   ),
                    "coeff_quantization": (
-                       cache_meta.get("coeff_quantization", "uniform")
+                       (
+                           cache_meta.get("coeff_quantization", "uniform")
+                           if args.cache_coeff_mode == "quantized" else "continuous-cache"
+                       )
                        if cache_meta is not None else "continuous"
                    )}
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +310,7 @@ def main():
                 resume="allow",
             )
             metric_name = (
-                "diagnostics/quantized_reconstruction_rfid"
+                f"diagnostics/{args.cache_coeff_mode}_cache_reconstruction_rfid"
                 if cache_meta is not None
                 else "diagnostics/continuous_reconstruction_rfid"
             )

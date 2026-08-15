@@ -16,6 +16,19 @@ Stage-1 checkpoint:
 
 Full-dataset reconstruction FID: **3.371500** on all 70,000 FFHQ images.
 
+The levelwise-VAR cache preflight reconstructs the same 70,000 images before
+Stage 2 starts. Cached continuous coefficients give **3.403012 rFID** and the
+actual nearest-bin 1,024-way coefficient tokens give **3.403619 rFID**, a
+tokenization delta of only **+0.000607**. These gates are part of
+[`run_ffhq_a2048_k2_levelwise_var_pipeline.sh`](scripts/run_ffhq_a2048_k2_levelwise_var_pipeline.sh).
+
+The revised reference-matched coefficient tokenizer uses 2,048 bins and fits
+the per-depth scales at the 99.5th percentile (`[36.041668, 8.53125]`), closely
+matching the successful compound Stage-2 run. Its full-cache continuous and
+quantized rFIDs are **3.413573** and **3.412992**, respectively. The pipeline
+also logs aligned source, continuous-cache, and quantized-cache 8×8 grids to
+W&B before training so cache artifacts cannot be confused with prior samples.
+
 rFID uses TorchMetrics' 2,048-dimensional Inception features and compares real
 images with reconstructions from the frozen encoder, continuous OMP coefficients,
 dictionary, and decoder. Images are converted to RGB, resized and center-cropped

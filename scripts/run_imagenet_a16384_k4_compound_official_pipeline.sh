@@ -21,25 +21,43 @@ STAGE2_WANDB_ID="${STAGE2_WANDB_ID:-imga16384k4cmp-${STAMP//-/}}"
 NPROC="${NPROC:-4}"
 STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-32}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-32}"
+STAGE2_DISTRIBUTED_BACKEND="${STAGE2_DISTRIBUTED_BACKEND:-ddp}"
+STAGE2_WANDB_MODE="${STAGE2_WANDB_MODE:-online}"
 CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-64}"
 FID_BATCH_SIZE="${FID_BATCH_SIZE:-16}"
+FID_REFERENCE_STATS="${FID_REFERENCE_STATS:-$THIRD_PARTY/assets/fid_stats/imagenet_256_train.npz}"
+FID_REFERENCE_SHA256="${FID_REFERENCE_SHA256:-3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
 TASK_TMPDIR="${TASK_TMPDIR:-/tmp/laser_imagenet_a16384k4_$STAMP}"
 
 for required in "$PYTHON_BIN" "$DATA_ROOT/train" "$DATA_ROOT/val" \
   "$THIRD_PARTY/main_stage1.py" "$STAGE1_CONFIG" \
+  "$FID_REFERENCE_STATS" \
   "$ROOT/vgg_lpips/vgg.pth" "$ROOT/vgg_lpips/vgg16-397923af.pth"; do
   if [[ ! -e "$required" ]]; then
     echo "Missing required input: $required" >&2
     exit 1
   fi
 done
+actual_fid_reference_sha256="$(sha256sum "$FID_REFERENCE_STATS" | cut -d' ' -f1)"
+if [[ "$actual_fid_reference_sha256" != "$FID_REFERENCE_SHA256" ]]; then
+  echo "Unexpected FID reference checksum: $actual_fid_reference_sha256" >&2
+  exit 1
+fi
 if (( STAGE1_BATCH_SIZE * NPROC != 128 )); then
   echo "Stage-1 batch * world size must equal the reference total batch 128" >&2
   exit 1
 fi
 if (( 2048 % (STAGE2_BATCH_SIZE * NPROC) != 0 )); then
   echo "Stage-2 batch * world size must divide the reference total batch 2048" >&2
+  exit 1
+fi
+if [[ "$STAGE2_DISTRIBUTED_BACKEND" != ddp && "$STAGE2_DISTRIBUTED_BACKEND" != fsdp ]]; then
+  echo "Stage-2 distributed backend must be ddp or fsdp" >&2
+  exit 1
+fi
+if [[ "$STAGE2_WANDB_MODE" != online && "$STAGE2_WANDB_MODE" != offline && "$STAGE2_WANDB_MODE" != disabled ]]; then
+  echo "Stage-2 W&B mode must be online, offline, or disabled" >&2
   exit 1
 fi
 
@@ -107,10 +125,16 @@ stage1_microbatch=$STAGE1_BATCH_SIZE
 stage1_effective_batch=128
 stage2_microbatch=$STAGE2_BATCH_SIZE
 stage2_effective_batch=2048
+stage2_distributed_backend=$STAGE2_DISTRIBUTED_BACKEND
+stage2_wandb_mode=$STAGE2_WANDB_MODE
+nccl_p2p_disable=${NCCL_P2P_DISABLE:-0}
 checkpoint_policy=fixed W&B run files: last plus metric-best three
+metric_backend=original RQ-VAE TensorFlow-FID Inception + ImageNet train stats + SciPy FID + 10-split IS
+fid_reference_stats=$FID_REFERENCE_STATS
+fid_reference_sha256=$actual_fid_reference_sha256
 stage1_entrypoint=$THIRD_PARTY/main_stage1.py
 stage1_encoder_decoder=$THIRD_PARTY/rqvae/models/rqvae/modules.py
-restart=RUN_ROOT=$RUN_ROOT STAMP=$STAMP STAGE1_WANDB_ID=$STAGE1_WANDB_ID STAGE2_WANDB_ID=$STAGE2_WANDB_ID $0
+restart=RUN_ROOT=$RUN_ROOT STAMP=$STAMP STAGE1_WANDB_ID=$STAGE1_WANDB_ID STAGE2_WANDB_ID=$STAGE2_WANDB_ID NPROC=$NPROC STAGE1_BATCH_SIZE=$STAGE1_BATCH_SIZE STAGE2_BATCH_SIZE=$STAGE2_BATCH_SIZE STAGE2_DISTRIBUTED_BACKEND=$STAGE2_DISTRIBUTED_BACKEND STAGE2_WANDB_MODE=$STAGE2_WANDB_MODE FID_BATCH_SIZE=$FID_BATCH_SIZE NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0} $0
 EOF
 
 active_phase=stage1
@@ -146,13 +170,13 @@ if [[ ! -f "$STAGE1_OUT/.phase_complete" ]]; then
   if [[ -f "$stage1_last" ]]; then
     stage1_resume=(--load-path "$stage1_last" --resume)
   fi
-  status "$active_phase" starting "third-party RQ-VAE encoder/decoder; a16384 k4; f32; effective batch 128; rFID top 3"
+  status "$active_phase" starting "third-party RQ-VAE encoder/decoder; a16384 k4; f32; effective batch 128; original RQ-VAE rFID top 3"
   export WANDB_ENTITY="helloimlixin-rutgers"
   export WANDB_PROJECT="laser"
   export WANDB_RUN_ID="$STAGE1_WANDB_ID"
   export WANDB_NAME="imagenet-a16384-k4-third-party-rqvae-stage1-$STAMP"
   export WANDB_RUN_GROUP="imagenet-a16384-k4-compound-$STAMP"
-  export WANDB_TAGS="stage1,imagenet,laser,rqvae,third_party_encoder_decoder,a16384,k4,8x8x4,f32,effective-batch128,rfid-top3,wandb-files-overwrite"
+  export WANDB_TAGS="stage1,imagenet,laser,rqvae,third_party_encoder_decoder,a16384,k4,8x8x4,f32,effective-batch128,original-rqvae-rfid,rfid-top3,wandb-files-overwrite"
   export WANDB_CHECKPOINT_UPLOAD=1
   (
     cd "$THIRD_PARTY"
@@ -163,7 +187,8 @@ if [[ ! -f "$STAGE1_OUT/.phase_complete" ]]; then
       "${stage1_resume[@]}" \
       "dataset.root=$DATA_ROOT" \
       "experiment.batch_size=$STAGE1_BATCH_SIZE" \
-      experiment.total_batch_size=128
+      experiment.total_batch_size=128 \
+      experiment.rfid_backend=original-rqvae
   ) 2>&1 | tee -a "$RUN_ROOT/logs/stage1.log"
   STAGE1_BEST="$(select_stage1_best)"
   if [[ ! -f "$STAGE1_BEST" ]]; then
@@ -200,13 +225,13 @@ fi
 status "$active_phase" complete "cache=$TOKEN_CACHE"
 
 active_phase=stage2
-status "$active_phase" starting "ImageNet 1.4B compound RQ-Transformer; best 3 by FID"
+status "$active_phase" starting "ImageNet 1.4B compound RQ-Transformer; RQ-VAE ImageNet-train FID/IS; best 3 by FID"
 torchrun --standalone --nproc_per_node="$NPROC" \
   "$ROOT/scripts/train_official_rqtransformer_laser_stage2.py" \
   --checkpoint "$STAGE1_BEST" --data "$DATA_ROOT" --dataset imagenet \
   --model-preset imagenet-1400m --token-cache "$TOKEN_CACHE" \
   --output "$STAGE2_OUT" --checkpoint-dir "$STAGE2_OUT/checkpoints" \
-  --distributed-backend ddp --epochs 100 --batch-size "$STAGE2_BATCH_SIZE" \
+  --distributed-backend "$STAGE2_DISTRIBUTED_BACKEND" --epochs 100 --batch-size "$STAGE2_BATCH_SIZE" \
   --total-batch-size 2048 --num-atoms 16384 --sparsity-level 4 \
   --coeff-vocab-size 2048 --coeff-max 20 --coeff-scale 6.4 \
   --compound-tokens --compound-micro-transformer-layers 2 \
@@ -217,11 +242,13 @@ torchrun --standalone --nproc_per_node="$NPROC" \
   --atom-temperature 1.0 --atom-top-p 0.92 \
   --coeff-temperature 1.0 --coeff-top-p 0.92 \
   --fid-num-samples 50000 --fid-batch-size "$FID_BATCH_SIZE" --fid-every 5 \
+  --metric-backend original-rqvae --fid-reference-stats "$FID_REFERENCE_STATS" \
   --save-ckpt-freq 5 --save-step-freq 500 \
   --sample-grid-every 500 --sample-grid-size 64 \
-  --sample-grid-batch-size "$FID_BATCH_SIZE" \
+  --sample-grid-samples-per-class 8 \
+  --sample-grid-batch-size "$FID_BATCH_SIZE" --sample-grid-on-start \
   --upload-checkpoints --checkpoint-upload-mode files --resume \
-  --wandb-mode online --wandb-entity helloimlixin-rutgers --wandb-project laser \
+  --wandb-mode "$STAGE2_WANDB_MODE" --wandb-entity helloimlixin-rutgers --wandb-project laser \
   --wandb-id "$STAGE2_WANDB_ID" \
   --wandb-name "imagenet-a16384-k4-compound-official-rqtransformer-1400M-$STAMP" \
   2>&1 | tee -a "$RUN_ROOT/logs/stage2.log"

@@ -3,6 +3,7 @@ torchvision
 lightning
 rich>=10.2.2
 hydra-core
+huggingface_hub
 wandb
 omegaconf
 tqdm

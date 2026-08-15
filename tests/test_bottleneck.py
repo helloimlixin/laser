@@ -236,6 +236,34 @@ def test_batch_omp_uses_unclipped_least_squares_coefficients():
     assert torch.allclose(values, torch.tensor([[3.0, -2.0]]), atol=1e-4)
 
 
+def test_progressive_dictionary_loss_matches_rqvae_depth_average():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=2,
+        commitment_cost=1.0,
+        progressive_loss=True,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(torch.eye(2))
+
+    # OMP reconstructs [2, 1] as [2, 0] at depth one and exactly at depth two.
+    # The per-element MSEs are therefore 0.5 and 0.0, matching RQ-VAE's mean
+    # over cumulative reconstruction depths: (0.5 + 0.0) / 2 = 0.25.
+    z = torch.tensor([[[[2.0]], [[1.0]]]], requires_grad=True)
+    _, commitment_loss, _ = dl(z)
+
+    assert dl._last_dictionary_loss.item() == pytest.approx(0.25)
+    assert dl._last_commitment_loss.item() == pytest.approx(0.25)
+    assert dl._last_final_dictionary_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert commitment_loss.item() == pytest.approx(0.25)
+    assert dl._last_bottleneck_objective.item() == pytest.approx(0.5)
+
+    dl._last_bottleneck_objective_for_backward.backward()
+    assert z.grad is not None
+    assert dl.dictionary.grad is not None
+
+
 def test_batch_omp_fixed_sparsity_does_not_reselect_atoms_on_zero_ties():
     dl = DictionaryLearning(
         num_embeddings=3,

@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import make_dataclass
 from datetime import timedelta
 from functools import partial
+import hashlib
 import json
 import math
 import os
@@ -27,7 +28,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
     BackwardPrefetch,
@@ -41,7 +42,6 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 from torchvision import datasets, transforms
-from torchvision.utils import save_image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -106,7 +106,7 @@ def wrap_distributed_model(model, backend: str, device: torch.device, world_size
         raise ValueError(f"unsupported distributed backend: {backend}")
     auto_wrap_policy = partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={AttentionBlock},
+        transformer_layer_cls={AttentionBlock, LevelwiseVARBlock},
     )
     return FSDP(
         model,
@@ -339,6 +339,155 @@ def create_cosine_lr_scheduler(
                 f"launch T_max={total_steps}, eta_min={min_lr}"
             )
     return scheduler
+
+
+def create_warmup_linear_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    initial_lr: float,
+    min_lr: float,
+    total_steps: int,
+    warmup_steps: int,
+    warmup_start_ratio: float = 0.005,
+    completed_steps: int = 0,
+    state_dict=None,
+):
+    """FoundationVision VAR-style warmup followed by linear LR decay."""
+    if total_steps <= 0:
+        raise ValueError("warmup-linear schedule requires a positive step count")
+    if not 0 <= warmup_steps < total_steps:
+        raise ValueError("warmup steps must be in [0, total_steps)")
+    if not 0 < warmup_start_ratio <= 1:
+        raise ValueError("warmup start ratio must be in (0, 1]")
+    if not 0 <= min_lr <= initial_lr:
+        raise ValueError("minimum LR must be between zero and the initial LR")
+    if not 0 <= completed_steps <= total_steps:
+        raise ValueError(
+            f"completed optimizer steps ({completed_steps}) must be in [0, {total_steps}]"
+        )
+
+    min_ratio = float(min_lr) / float(initial_lr)
+
+    def lr_multiplier(step: int) -> float:
+        step = min(max(int(step), 0), int(total_steps))
+        if warmup_steps > 0 and step < warmup_steps:
+            progress = float(step) / float(warmup_steps)
+            return warmup_start_ratio + (1.0 - warmup_start_ratio) * progress
+        decay_steps = max(int(total_steps) - int(warmup_steps), 1)
+        progress = float(step - warmup_steps) / float(decay_steps)
+        return 1.0 - (1.0 - min_ratio) * min(max(progress, 0.0), 1.0)
+
+    schedule_config = {
+        "initial_lr": float(initial_lr),
+        "min_lr": float(min_lr),
+        "total_steps": int(total_steps),
+        "warmup_steps": int(warmup_steps),
+        "warmup_start_ratio": float(warmup_start_ratio),
+    }
+    for param_group in optimizer.param_groups:
+        param_group["initial_lr"] = float(initial_lr)
+
+    if state_dict is None:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lr_multiplier,
+            last_epoch=int(completed_steps) - 1,
+        )
+        scheduler._laser_schedule_config = schedule_config
+        current_lr = float(initial_lr) * lr_multiplier(completed_steps)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+        scheduler.last_epoch = int(completed_steps)
+        scheduler._last_lr = [current_lr for _ in optimizer.param_groups]
+    else:
+        saved_config = state_dict.get("_laser_schedule_config")
+        if saved_config is not None and saved_config != schedule_config:
+            raise ValueError(
+                "resumed warmup-linear settings differ from this launch: "
+                f"checkpoint={saved_config}, launch={schedule_config}"
+            )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lr_multiplier
+        )
+        scheduler._laser_schedule_config = schedule_config
+        scheduler.load_state_dict(state_dict)
+        if scheduler.last_epoch != completed_steps:
+            raise ValueError(
+                "scheduler/checkpoint step mismatch: "
+                f"scheduler={scheduler.last_epoch}, checkpoint={completed_steps}"
+            )
+        current_lr = float(initial_lr) * lr_multiplier(completed_steps)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+        scheduler._last_lr = [current_lr for _ in optimizer.param_groups]
+    return scheduler
+
+
+def remap_resume_batch_index(
+    batch_index: int,
+    *,
+    saved_config,
+    batch_size: int,
+    world_size: int,
+    total_batch_size: int,
+    global_step: int,
+    start_epoch: int,
+    optimizer_steps_per_epoch: int,
+):
+    """Map a saved per-rank cursor onto the current physical batch layout.
+
+    Recovery checkpoints store a per-rank dataloader batch index.  Preserving
+    only that integer replays or skips data when either the microbatch or world
+    size changes.  Convert through the global number of samples already seen
+    in the epoch instead.  Older checkpoints did not record their world size,
+    so infer it from their synchronized accumulation boundary.
+    """
+    batch_index = int(batch_index)
+    if batch_index <= 0:
+        return 0, int(saved_config.get("world_size", world_size))
+
+    old_batch_size = int(saved_config.get("batch_size", batch_size))
+    old_total_batch_size = int(
+        saved_config.get("total_batch_size", total_batch_size)
+    )
+    old_world_size = saved_config.get("world_size")
+    if old_world_size is None:
+        completed_steps_in_epoch = int(global_step) - (
+            int(start_epoch) * int(optimizer_steps_per_epoch)
+        )
+        if completed_steps_in_epoch <= 0 or batch_index % completed_steps_in_epoch:
+            raise ValueError(
+                "cannot infer the world size of this legacy mid-epoch checkpoint"
+            )
+        old_accumulation = batch_index // completed_steps_in_epoch
+        old_global_microbatch = old_batch_size * old_accumulation
+        if (
+            old_global_microbatch <= 0
+            or old_total_batch_size % old_global_microbatch
+        ):
+            raise ValueError(
+                "legacy checkpoint cursor is inconsistent with its total batch size"
+            )
+        old_world_size = old_total_batch_size // old_global_microbatch
+    old_world_size = int(old_world_size)
+    if old_world_size <= 0:
+        raise ValueError("checkpoint world size must be positive")
+
+    completed_samples = batch_index * old_batch_size * old_world_size
+    current_global_microbatch = int(batch_size) * int(world_size)
+    if current_global_microbatch <= 0 or completed_samples % current_global_microbatch:
+        raise ValueError(
+            "checkpoint data cursor cannot be represented by the current physical batch"
+        )
+    remapped = completed_samples // current_global_microbatch
+    if total_batch_size % current_global_microbatch:
+        raise ValueError("total batch size must divide the current physical batch")
+    current_accumulation = total_batch_size // current_global_microbatch
+    if remapped % current_accumulation:
+        raise ValueError(
+            "remapped checkpoint cursor is not on an optimizer-step boundary"
+        )
+    return remapped, old_world_size
 
 
 class ResumableDistributedSampler(DistributedSampler):
@@ -666,23 +815,135 @@ class FlatImages(Dataset):
         with Image.open(self.files[index]) as image:
             return self.transform(image.convert("RGB")), 0
 
+def _preview_font(size: int):
+    """Load a stable readable font while retaining a Pillow-only fallback."""
+    candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=int(size))
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_class_name(draw, class_name: str, font, max_width: int):
+    """Wrap a class name to the label column using measured pixel widths."""
+    words = str(class_name).replace("_", " ").split()
+    if not words:
+        return ["unknown"]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _class_name_layout(draw, class_name: str, max_width: int, max_height: int):
+    """Choose the largest font whose wrapped class name fits one image row."""
+    for size in range(30, 13, -1):
+        font = _preview_font(size)
+        lines = _wrap_class_name(draw, class_name, font, max_width)
+        text = "\n".join(lines)
+        bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=4)
+        if bbox[2] - bbox[0] <= max_width and bbox[3] - bbox[1] <= max_height:
+            return text, font, bbox
+    font = _preview_font(13)
+    text = "\n".join(_wrap_class_name(draw, class_name, font, max_width))
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=3)
+    return text, font, bbox
+
+
+def save_class_labeled_grid(images: torch.Tensor, chosen_classes: torch.Tensor,
+                            class_names, target: Path, *, samples_per_class: int = 8,
+                            label_width: int = 256):
+    """Save paper-style class rows with an adjacent left-hand label column.
+
+    Image tiles are pasted edge-to-edge: there is no padding between columns,
+    no padding between rows, and no margin around the image mosaic.
+    """
+    images = images.detach().cpu().to(torch.float32).clamp(0, 1)
+    samples_per_class = int(samples_per_class)
+    chosen = [int(value) for value in chosen_classes.detach().cpu().tolist()]
+    expected = len(chosen) * samples_per_class
+    if images.ndim != 4 or images.shape[0] != expected:
+        raise ValueError(
+            f"expected {expected} BCHW preview images for {len(chosen)} class rows, "
+            f"got {tuple(images.shape)}"
+        )
+    if images.shape[1] not in (1, 3):
+        raise ValueError(f"preview images need 1 or 3 channels, got {images.shape[1]}")
+    tile_height, tile_width = int(images.shape[2]), int(images.shape[3])
+    label_width = max(1, int(label_width))
+    canvas = Image.new(
+        "RGB",
+        (label_width + samples_per_class * tile_width, len(chosen) * tile_height),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    for row, class_index in enumerate(chosen):
+        row_y = row * tile_height
+        class_name = (
+            str(class_names[class_index])
+            if class_names is not None and 0 <= class_index < len(class_names)
+            else f"class {class_index}"
+        )
+        text, font, bbox = _class_name_layout(
+            draw, class_name, max_width=label_width - 24, max_height=tile_height - 24
+        )
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        text_x = max(12, (label_width - text_width) // 2)
+        text_y = row_y + max(12, (tile_height - text_height) // 2 - bbox[1])
+        draw.multiline_text(
+            (text_x, text_y), text, font=font, fill="black", spacing=4, align="center"
+        )
+        for column in range(samples_per_class):
+            index = row * samples_per_class + column
+            array = images[index].mul(255).round().to(torch.uint8)
+            array = array.permute(1, 2, 0).contiguous().numpy()
+            if array.shape[-1] == 1:
+                tile = Image.fromarray(array[..., 0], mode="L").convert("RGB")
+            else:
+                tile = Image.fromarray(array, mode="RGB")
+            canvas.paste(
+                tile,
+                (label_width + column * tile_width, row_y),
+            )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(target)
+    return target
+
+
 @torch.no_grad()
 def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=None,
                       num_condition_classes=1000,
                       num_samples=64,
                       sample_batch_size=8,
+                      samples_per_class=8,
                       setting_name="default",
                       atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
                       coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92):
     device = next(model.parameters()).device
-    grid_side = math.isqrt(int(num_samples))
-    if grid_side * grid_side != int(num_samples):
-        raise ValueError("preview sample count must be a perfect square")
+    num_samples = int(num_samples)
+    samples_per_class = int(samples_per_class)
+    if samples_per_class <= 0 or num_samples <= 0 or num_samples % samples_per_class:
+        raise ValueError("preview sample count must be divisible by samples per class")
+    num_class_rows = num_samples // samples_per_class
     if num_condition_classes == 1:
-        chosen = torch.zeros(grid_side, device=device, dtype=torch.long)
+        chosen = torch.zeros(num_class_rows, device=device, dtype=torch.long)
     else:
-        chosen = torch.randperm(num_condition_classes, device=device)[:grid_side]
-    labels = chosen.repeat_interleave(grid_side)
+        chosen = torch.randperm(num_condition_classes, device=device)[:num_class_rows]
+    labels = chosen.repeat_interleave(samples_per_class)
     was_training = model.training
     model.eval()
     image_batches = []
@@ -690,7 +951,7 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
         stop = min(start + sample_batch_size, num_samples)
         batch_labels = labels[start:stop]
         current = stop - start
-        if isinstance(model, CompoundLaserRQTransformer):
+        if isinstance(model, (CompoundLaserRQTransformer, LevelwiseLaserVAR)):
             atoms, coeff_ids = model.sample_compound(
                 current, aux, cond=batch_labels,
                 atom_temperature=atom_temperature,
@@ -713,8 +974,13 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     target = sample_dir / f"step_{step:07d}_{setting_name}.png"
-    # A raw padding-free mosaic: no figure canvas, margins, labels, or titles.
-    save_image(images, target, nrow=grid_side, padding=0)
+    save_class_labeled_grid(
+        images,
+        chosen,
+        class_names,
+        target,
+        samples_per_class=samples_per_class,
+    )
     if wb is not None:
         import wandb
         wb.log({
@@ -770,32 +1036,52 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
                                 num_condition_classes=1000,
                                 atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
                                 coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92,
-                                compute_inception_score=True):
-    from torchmetrics.image.fid import FrechetInceptionDistance
+                                compute_inception_score=True,
+                                metric_backend="original-rqvae",
+                                fid_reference_stats=None):
 
     device = next(model.parameters()).device
     world = dist.get_world_size() if dist.is_initialized() else 1
     process_rank = dist.get_rank() if dist.is_initialized() else 0
     local_samples = int(num_samples) // world + (process_rank < int(num_samples) % world)
-    # Every rank accumulates its shard; compute() merges the sufficient
-    # statistics, avoiding a costly image all-gather.
-    fid_metric = FrechetInceptionDistance(
-        feature=2048, normalize=True, sync_on_compute=dist.is_initialized()
-    ).to(device)
+    metric_backend = str(metric_backend).lower()
+    original_metrics = metric_backend == "original-rqvae"
+    if original_metrics:
+        from src.rqvae_metrics import DistributedOriginalRQVAEMetrics
+        fid_metric = DistributedOriginalRQVAEMetrics(
+            device,
+            compute_inception_score=compute_inception_score,
+            reference_stats_path=fid_reference_stats,
+        )
+    elif metric_backend == "torchmetrics":
+        if fid_reference_stats is not None:
+            raise ValueError(
+                "precomputed RQ-VAE reference statistics require "
+                "--metric-backend original-rqvae"
+            )
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        fid_metric = FrechetInceptionDistance(
+            feature=2048, normalize=True, sync_on_compute=dist.is_initialized()
+        ).to(device)
+    else:
+        raise ValueError(f"unsupported metric backend: {metric_backend}")
     inception_metric = None
-    if compute_inception_score:
+    if compute_inception_score and not original_metrics:
         from torchmetrics.image.inception import InceptionScore
         inception_metric = InceptionScore(
             normalize=True, splits=10, sync_on_compute=dist.is_initialized()
         ).to(device)
-    seen = 0
-    for images, _ in val_loader:
-        images = ((images.to(device, non_blocking=True).float() + 1.0) * 0.5).clamp(0, 1)
-        keep = min(images.size(0), local_samples - seen)
-        fid_metric.update(images[:keep], real=True)
-        seen += keep
-        if seen >= local_samples:
-            break
+    if fid_reference_stats is None:
+        if val_loader is None:
+            raise ValueError("FID needs either a real-image loader or reference statistics")
+        seen = 0
+        for images, _ in val_loader:
+            images = ((images.to(device, non_blocking=True).float() + 1.0) * 0.5).clamp(0, 1)
+            keep = min(images.size(0), local_samples - seen)
+            fid_metric.update(images[:keep], real=True)
+            seen += keep
+            if seen >= local_samples:
+                break
     generated = 0
     was_training = model.training
     model.eval()
@@ -807,7 +1093,7 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
             generated, generated + current, device=device, dtype=torch.long
         )
         labels = (local_indices * world + process_rank).remainder(num_condition_classes)
-        if isinstance(model, CompoundLaserRQTransformer):
+        if isinstance(model, (CompoundLaserRQTransformer, LevelwiseLaserVAR)):
             atoms, coeff_ids = model.sample_compound(
                 current, aux, cond=labels,
                 atom_temperature=atom_temperature,
@@ -829,13 +1115,18 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
         if inception_metric is not None:
             inception_metric.update(images)
         generated += current
-    fid = float(fid_metric.compute().item())
-    if inception_metric is None:
-        inception_mean = inception_std = None
-    else:
-        inception_mean, inception_std = (
-            float(value.item()) for value in inception_metric.compute()
+    if original_metrics:
+        fid, inception_mean, inception_std = fid_metric.compute(
+            shuffle_for_inception=True
         )
+    else:
+        fid = float(fid_metric.compute().item())
+        if inception_metric is None:
+            inception_mean = inception_std = None
+        else:
+            inception_mean, inception_std = (
+                float(value.item()) for value in inception_metric.compute()
+            )
     if was_training:
         model.train()
     return fid, inception_mean, inception_std
@@ -1038,6 +1329,328 @@ class AtomConditionedRefinerBlock(nn.Module):
     def forward(self, hidden, atom_context):
         fused = torch.cat((hidden, atom_context, hidden * atom_context), dim=-1)
         return hidden + self.net(fused)
+
+
+class LevelwiseVARSelfAttention(nn.Module):
+    """Self-attention with an explicit VAR-style block-causal level mask."""
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        if embed_dim % num_heads:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.dropout = float(dropout)
+        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim)
+        self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_drop = nn.Dropout(self.dropout)
+
+    def forward(self, inputs: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+        batch, length, channels = inputs.shape
+        qkv = self.qkv(inputs).reshape(
+            batch, length, 3, self.num_heads, self.head_dim
+        ).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv.unbind(dim=0)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=allowed[:length, :length].view(1, 1, length, length),
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch, length, channels)
+        return self.proj_drop(self.proj(attended))
+
+
+class LevelwiseVARBlock(nn.Module):
+    """Pre-normalized transformer block used by the next-level prior."""
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn_norm = nn.LayerNorm(embed_dim)
+        self.attn = LevelwiseVARSelfAttention(embed_dim, num_heads, dropout)
+        self.mlp_norm = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, inputs: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+        inputs = inputs + self.attn(self.attn_norm(inputs), allowed)
+        return inputs + self.mlp(self.mlp_norm(inputs))
+
+
+class LevelwiseLaserVAR(nn.Module):
+    """VAR-style next-sparsity-level prior over LASER coefficient maps.
+
+    One autoregressive stage is one complete ``H x W`` OMP-depth map. All
+    spatial pairs in a stage are predicted in parallel, and stage ``d`` is
+    conditioned only on the accumulated physical reconstruction from stages
+    ``< d``. During teacher forcing, the block-causal mask allows all positions
+    in the same stage to attend to one another without exposing its targets.
+    """
+
+    def __init__(
+        self,
+        *,
+        height: int,
+        width: int,
+        sparsity_level: int,
+        input_dim: int,
+        embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        num_atoms: int,
+        coeff_vocab_size: int,
+        num_condition_classes: int,
+        dropout: float = 0.0,
+        refiner_layers: int = 0,
+        micro_transformer_layers: int = 0,
+        depth_specific_coeff_heads: bool = False,
+        geometry_head: bool = False,
+        micro_transformer_config=None,
+    ):
+        super().__init__()
+        if min(height, width, sparsity_level, input_dim, embed_dim, num_layers, num_heads) <= 0:
+            raise ValueError("levelwise VAR dimensions must be positive")
+        if refiner_layers > 0 and micro_transformer_layers > 0:
+            raise ValueError("MLP refiner and micro-transformer are mutually exclusive")
+        self.block_size = torch.Size((height, width, sparsity_level))
+        self.num_atoms = int(num_atoms)
+        self.coeff_vocab_size = int(coeff_vocab_size)
+        self.embed_dim = int(embed_dim)
+        self.input_dim = int(input_dim)
+        self.num_condition_classes = int(num_condition_classes)
+        self.refiner_layers = int(refiner_layers)
+        self.micro_transformer_layers = int(micro_transformer_layers)
+        self.depth_specific_coeff_heads = bool(depth_specific_coeff_heads)
+
+        spatial_tokens = int(height) * int(width)
+        level_ids = torch.arange(sparsity_level).repeat_interleave(spatial_tokens)
+        # Rows are queries and columns are keys. A level can see all positions
+        # from its own level and all earlier levels, exactly as in VAR.
+        self.register_buffer(
+            "level_attention_allowed",
+            level_ids[:, None] >= level_ids[None, :],
+            persistent=False,
+        )
+        self.input_projection = nn.Linear(input_dim, embed_dim)
+        self.condition_embedding = nn.Embedding(num_condition_classes, embed_dim)
+        self.start_position = nn.Parameter(torch.empty(1, spatial_tokens, embed_dim))
+        self.spatial_position = nn.Parameter(torch.empty(1, 1, spatial_tokens, embed_dim))
+        self.level_embedding = nn.Embedding(sparsity_level, embed_dim)
+        self.input_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([
+            LevelwiseVARBlock(embed_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        self.output_norm = nn.LayerNorm(embed_dim)
+        self.atom_classifier = nn.Linear(embed_dim, num_atoms)
+        self.coeff_atom_proj = nn.Linear(input_dim, embed_dim, bias=False)
+
+        if self.micro_transformer_layers > 0:
+            if micro_transformer_config is None:
+                raise ValueError("micro-transformer configuration is required")
+            config = micro_transformer_config.copy()
+            config.n_layer = self.micro_transformer_layers
+            self.coeff_micro_transformer = AttentionStack(config)
+            self.coeff_micro_pos = nn.Parameter(torch.empty(1, 2, embed_dim))
+            nn.init.normal_(self.coeff_micro_pos, mean=0.0, std=0.02)
+        elif self.refiner_layers > 0:
+            self.coeff_refiner = nn.ModuleList([
+                AtomConditionedRefinerBlock(embed_dim)
+                for _ in range(self.refiner_layers)
+            ])
+        else:
+            self.coeff_fusion = nn.Sequential(
+                nn.LayerNorm(3 * embed_dim),
+                nn.Linear(3 * embed_dim, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+
+        def make_coeff_classifier():
+            return nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, coeff_vocab_size),
+            )
+
+        if self.depth_specific_coeff_heads:
+            self.coeff_classifier = nn.ModuleList([
+                make_coeff_classifier() for _ in range(sparsity_level)
+            ])
+        else:
+            self.coeff_classifier = make_coeff_classifier()
+        self.contribution_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, input_dim),
+        ) if geometry_head else None
+
+        nn.init.normal_(self.start_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.spatial_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.level_embedding.weight, mean=0.0, std=0.02)
+
+    def unpack(self, packed: torch.Tensor):
+        atoms = packed.div(self.coeff_vocab_size, rounding_mode="floor")
+        return atoms, packed.remainder(self.coeff_vocab_size)
+
+    def refine_coefficient_hidden(self, hidden, atom_vectors):
+        atom_context = self.coeff_atom_proj(atom_vectors)
+        if self.micro_transformer_layers > 0:
+            pair = torch.stack((hidden, atom_context), dim=-2)
+            pair = pair + self.coeff_micro_pos
+            refined = self.coeff_micro_transformer(
+                pair.reshape(-1, 2, pair.shape[-1])
+            ).reshape_as(pair)
+            return hidden + refined[..., -1, :]
+        if self.refiner_layers > 0:
+            for block in self.coeff_refiner:
+                hidden = block(hidden, atom_context)
+            return hidden
+        fused = torch.cat((hidden, atom_context, hidden * atom_context), dim=-1)
+        return hidden + self.coeff_fusion(fused)
+
+    def classify_coefficients(self, refined, depth_index=None):
+        if not self.depth_specific_coeff_heads:
+            return self.coeff_classifier(refined)
+        if depth_index is not None:
+            return self.coeff_classifier[int(depth_index)](refined)
+        if refined.shape[-2] != len(self.coeff_classifier):
+            raise ValueError("depth-specific coefficient heads require an explicit depth axis")
+        return torch.stack([
+            head(refined[..., depth, :])
+            for depth, head in enumerate(self.coeff_classifier)
+        ], dim=-2)
+
+    def coefficient_logits(self, hidden, atom_vectors, depth_index=None):
+        refined = self.refine_coefficient_hidden(hidden, atom_vectors)
+        return self.classify_coefficients(refined, depth_index=depth_index)
+
+    def single_level_contributions(self, model_aux, atoms, coeff_ids, level: int):
+        """Decode one sampled level without broadcasting every depth scale."""
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        coefficients = model_aux.coeff_bins[coeff_ids.long()]
+        physical_coefficients = coefficients * model_aux.coeff_scales[int(level)]
+        return atom_vectors * physical_coefficients.unsqueeze(-1)
+
+    def _level_inputs(self, contributions: torch.Tensor) -> torch.Tensor:
+        cumulative = contributions.cumsum(dim=-2)
+        previous = torch.cat(
+            (torch.zeros_like(contributions[..., :1, :]), cumulative[..., :-1, :]),
+            dim=-2,
+        )
+        return previous.permute(0, 3, 1, 2, 4).contiguous()
+
+    def level_hidden(self, level_inputs: torch.Tensor, cond=None) -> torch.Tensor:
+        batch, levels, height, width, channels = level_inputs.shape
+        if (height, width) != tuple(self.block_size[:2]) or channels != self.input_dim:
+            raise ValueError(
+                "levelwise input shape mismatch: "
+                f"got {(height, width, channels)}, expected "
+                f"{(*self.block_size[:2], self.input_dim)}"
+            )
+        if not 0 < levels <= self.block_size[-1]:
+            raise ValueError("invalid number of sparsity levels")
+        if cond is None:
+            cond = torch.zeros(batch, device=level_inputs.device, dtype=torch.long)
+        cond = cond.reshape(batch)
+        spatial_tokens = height * width
+        inputs = level_inputs.reshape(batch, levels, spatial_tokens, channels)
+        hidden = self.input_projection(inputs.float())
+        hidden = hidden + self.condition_embedding(cond)[:, None, None, :]
+        hidden = hidden + self.spatial_position[:, :, :spatial_tokens]
+        level_ids = torch.arange(levels, device=hidden.device)
+        hidden = hidden + self.level_embedding(level_ids)[None, :, None, :]
+        hidden[:, 0] = hidden[:, 0] + self.start_position[:, :spatial_tokens]
+        hidden = self.input_dropout(hidden.reshape(batch, levels * spatial_tokens, -1))
+        allowed = self.level_attention_allowed[:hidden.shape[1], :hidden.shape[1]]
+        for block in self.blocks:
+            hidden = block(hidden, allowed)
+        hidden = self.output_norm(hidden)
+        return hidden.reshape(batch, levels, height, width, -1)
+
+    def forward(self, packed, model_aux=None, cond=None, amp=False):
+        if model_aux is None:
+            raise ValueError("levelwise VAR requires the frozen LASER auxiliary model")
+        atoms, coeff_ids = self.unpack(packed)
+        contributions = model_aux.compound_embeddings(atoms, coeff_ids)
+        hidden = self.level_hidden(self._level_inputs(contributions), cond=cond)
+        hidden = hidden.permute(0, 2, 3, 1, 4).contiguous()
+        atom_logits = self.atom_classifier(hidden)
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        refined = self.refine_coefficient_hidden(hidden, atom_vectors)
+        outputs = {
+            "atom_logits": atom_logits,
+            "coeff_logits": self.classify_coefficients(refined),
+        }
+        if self.contribution_head is not None:
+            outputs["physical_contribution"] = self.contribution_head(refined)
+        return outputs
+
+    @torch.no_grad()
+    def sample_compound(
+        self,
+        batch_size,
+        model_aux,
+        cond=None,
+        temperature=1.0,
+        atom_top_k=16384,
+        atom_top_p=0.92,
+        coeff_top_p=0.92,
+        coeff_top_k=0,
+        atom_temperature=None,
+        coeff_temperature=None,
+        amp=True,
+    ):
+        height, width, depth = self.block_size
+        device = next(self.parameters()).device
+        atoms = torch.zeros(batch_size, height, width, depth, device=device, dtype=torch.long)
+        coeff_ids = torch.full_like(atoms, self.coeff_vocab_size // 2)
+        accumulated = model_aux.dictionary.new_zeros(
+            batch_size, height, width, self.input_dim
+        )
+        prior_level_inputs = []
+        atom_temperature = float(temperature if atom_temperature is None else atom_temperature)
+        coeff_temperature = float(temperature if coeff_temperature is None else coeff_temperature)
+        for level in range(depth):
+            prior_level_inputs.append(accumulated.clone())
+            level_inputs = torch.stack(prior_level_inputs, dim=1)
+            with torch.amp.autocast("cuda", enabled=amp):
+                hidden = self.level_hidden(level_inputs, cond=cond)[:, level]
+                atom_logits = self.atom_classifier(hidden).reshape(-1, self.num_atoms)
+                if level > 0:
+                    previous_atoms = atoms[..., :level].reshape(-1, level)
+                    atom_logits = atom_logits.clone()
+                    atom_logits.scatter_(1, previous_atoms, -float("inf"))
+                sampled_atoms = sample_from_logits(
+                    atom_logits,
+                    temperature=atom_temperature,
+                    top_k=min(atom_top_k, self.num_atoms),
+                    top_p=atom_top_p,
+                ).reshape(batch_size, height, width)
+                atom_vectors = model_aux.dictionary.t()[sampled_atoms]
+                coeff_logits = self.coefficient_logits(
+                    hidden, atom_vectors, depth_index=level
+                ).reshape(-1, self.coeff_vocab_size)
+                sampled_coeffs = sample_from_logits(
+                    coeff_logits,
+                    temperature=coeff_temperature,
+                    top_k=min(coeff_top_k or self.coeff_vocab_size, self.coeff_vocab_size),
+                    top_p=coeff_top_p,
+                ).reshape(batch_size, height, width)
+            atoms[..., level] = sampled_atoms
+            coeff_ids[..., level] = sampled_coeffs
+            accumulated.add_(
+                self.single_level_contributions(
+                    model_aux, sampled_atoms, sampled_coeffs, level
+                )
+            )
+        return atoms, coeff_ids
 
 
 class CompoundLaserRQTransformer(RQTransformer):
@@ -1250,6 +1863,7 @@ class CompoundLaserRQTransformer(RQTransformer):
         return atoms, coeff_ids
 
 def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
+                levelwise_var=False,
                 coeff_vocab_size=2048, compound_refiner_layers=0,
                 compound_geometry_head=False,
                 compound_micro_transformer_layers=0,
@@ -1287,6 +1901,30 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
         "head": {"n_layer": preset["head_layers"], "block": {"n_head": preset["head_heads"]}},
     })
     if compound:
+        if levelwise_var:
+            if model_preset != "ffhq-350m":
+                raise ValueError("levelwise VAR is currently defined for ffhq-350m")
+            rq_config = RQTransformerConfig.create(cfg)
+            return LevelwiseLaserVAR(
+                height=8,
+                width=8,
+                sparsity_level=sparsity_level,
+                input_dim=256,
+                embed_dim=preset["embed_dim"],
+                # The official FFHQ RQ-Transformer has 24 spatial plus four
+                # depth blocks. With no separate depth decoder, all 28 blocks
+                # become the approximately 350M next-level VAR backbone.
+                num_layers=preset["body_layers"] + preset["head_layers"],
+                num_heads=preset["body_heads"],
+                num_atoms=num_atoms,
+                coeff_vocab_size=coeff_vocab_size,
+                num_condition_classes=preset["vocab_size_cond"],
+                refiner_layers=compound_refiner_layers,
+                geometry_head=compound_geometry_head,
+                micro_transformer_layers=compound_micro_transformer_layers,
+                depth_specific_coeff_heads=compound_depth_specific_coeff_heads,
+                micro_transformer_config=rq_config.head,
+            )
         return CompoundLaserRQTransformer(
             RQTransformerConfig.create(cfg), num_atoms=num_atoms,
             coeff_vocab_size=coeff_vocab_size,
@@ -1307,8 +1945,11 @@ def compound_objective(
     target_physical,
     *,
     atom_weight: float,
+    coeff_regression_weight: float = 0.0,
+    coeff_crps_weight: float = 0.0,
     geometry_weight: float,
     accumulation: int,
+    coefficient_bins=None,
     distribution_geometry: bool = False,
     geometry_dictionary=None,
     geometry_coeff_bins=None,
@@ -1332,6 +1973,36 @@ def compound_objective(
     classification = (
         atom_weight * atom_nll.sum(dim=-1) + coeff_cross_entropy.sum(dim=-1)
     ).mean() / ((atom_weight + 1.0) * depth)
+
+    coefficient_regression = atom_logits.new_zeros((), dtype=torch.float32)
+    coefficient_crps = atom_logits.new_zeros((), dtype=torch.float32)
+    predicted_coefficients = target_coefficients = None
+    if coeff_regression_weight > 0 or coeff_crps_weight > 0:
+        if coefficient_bins is None:
+            raise ValueError(
+                "coefficient regression/CRPS requires coefficient bin centers"
+            )
+        bins = coefficient_bins.float()
+    if coeff_regression_weight > 0:
+        predicted_coefficients = (coeff_log_probs.exp() * bins).sum(dim=-1)
+        target_coefficients = (target_coeff_probs.float() * bins).sum(dim=-1)
+        coefficient_regression = F.smooth_l1_loss(
+            predicted_coefficients, target_coefficients
+        )
+    if coeff_crps_weight > 0:
+        if bins.ndim != 1 or bins.numel() < 2:
+            raise ValueError("coefficient CRPS requires at least two ordered bins")
+        bin_widths = bins[1:] - bins[:-1]
+        if (bin_widths <= 0).any():
+            raise ValueError("coefficient CRPS bins must be strictly increasing")
+        # Discrete approximation to integral (F_pred(x) - F_target(x))^2 dx.
+        # Unlike expected-value regression, CRPS is a proper scoring rule for
+        # the complete ordered coefficient distribution.
+        predicted_cdf = coeff_log_probs.exp().cumsum(dim=-1)[..., :-1]
+        target_cdf = target_coeff_probs.float().cumsum(dim=-1)[..., :-1]
+        coefficient_crps = (
+            (predicted_cdf - target_cdf).square() * bin_widths
+        ).sum(dim=-1).mean()
 
     geometry = atom_logits.new_zeros((), dtype=torch.float32)
     pair_mse = atom_logits.new_zeros((), dtype=torch.float32)
@@ -1382,11 +2053,20 @@ def compound_objective(
         spatial_energy = target_spatial.square().mean().detach().clamp_min(1e-6)
         geometry = 0.5 * (pair_mse / pair_energy + spatial_mse / spatial_energy)
 
-    total = (classification + geometry_weight * geometry) / accumulation
+    total = (
+        classification
+        + coeff_regression_weight * coefficient_regression
+        + coeff_crps_weight * coefficient_crps
+        + geometry_weight * geometry
+    ) / accumulation
     return total, {
         "atom_nll": atom_nll,
         "coeff_cross_entropy": coeff_cross_entropy,
         "classification": classification,
+        "coefficient_regression": coefficient_regression,
+        "coefficient_crps": coefficient_crps,
+        "predicted_coefficients": predicted_coefficients,
+        "target_coefficients": target_coefficients,
         "geometry": geometry,
         "geometry_pair_mse": pair_mse,
         "geometry_spatial_mse": spatial_mse,
@@ -1414,6 +2094,11 @@ def main():
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--token-cache", type=Path, default=None,
                    help="Precomputed atoms/coefficients/labels; disables image loading and encoding")
+    p.add_argument(
+        "--cache-rfid-preflight", type=Path, nargs=2, default=None,
+        metavar=("CONTINUOUS_JSON", "QUANTIZED_JSON"),
+        help="Validated full-cache reconstruction-rFID results to record on W&B",
+    )
     p.add_argument("--resume-checkpoint", type=Path, default=None,
                    help="Explicit source stage-2 checkpoint (allows a new output/run)")
     p.add_argument("--output", type=Path, required=True)
@@ -1425,6 +2110,13 @@ def main():
     p.add_argument(
         "--fid-real-split", choices=("train", "val"), default=None,
         help="Reference split; defaults to val for ImageNet and train for CelebA-HQ/FFHQ",
+    )
+    p.add_argument(
+        "--fid-reference-stats", type=Path, default=None,
+        help=(
+            "Precomputed original RQ-VAE mu/sigma NPZ. For paper-comparable "
+            "ImageNet FID use assets/fid_stats/imagenet_256_train.npz"
+        ),
     )
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=8)
@@ -1451,6 +2143,13 @@ def main():
         "--compound-tokens", action=argparse.BooleanOptionalAction, default=False,
         help="Use one compound (atom, coefficient) AR event per sparse component",
     )
+    p.add_argument(
+        "--levelwise-var", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "Predict one complete spatial sparse-coefficient level at a time "
+            "with FoundationVision VAR-style block-causal next-level training"
+        ),
+    )
     p.add_argument("--compound-refiner-layers", type=int, default=0)
     p.add_argument("--compound-micro-transformer-layers", type=int, default=0)
     p.add_argument(
@@ -1465,6 +2164,17 @@ def main():
     )
     p.add_argument("--geometry-top-k", type=int, default=4)
     p.add_argument("--atom-loss-weight", type=float, default=1.0)
+    p.add_argument(
+        "--coeff-regression-weight", type=float, default=0.0,
+        help="Smooth-L1 weight on the expected normalized coefficient value",
+    )
+    p.add_argument(
+        "--coeff-crps-weight", type=float, default=0.0,
+        help=(
+            "Weight for coefficient-bin CRPS, an ordinal proper scoring rule "
+            "over the full predicted coefficient distribution"
+        ),
+    )
     p.add_argument("--geometry-loss-weight", type=float, default=0.0)
     p.add_argument("--geometry-start-epoch", type=float, default=0.0)
     p.add_argument("--geometry-warmup-epochs", type=float, default=0.0)
@@ -1478,14 +2188,24 @@ def main():
     p.add_argument("--coeff-top-p", type=float, default=0.92)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument(
-        "--lr-schedule", choices=("cosine", "constant"), default="cosine",
-        help="Optimizer-step LR schedule; cosine matches the original RQ-Transformer recipe",
+        "--lr-schedule", choices=("cosine", "warmup-linear", "constant"), default="cosine",
+        help=(
+            "Optimizer-step LR schedule; warmup-linear matches FoundationVision VAR"
+        ),
     )
     p.add_argument(
         "--lr-schedule-epochs", type=int, default=100,
         help="Global cosine horizon; independent of the target epoch for this relaunch",
     )
     p.add_argument("--min-lr", type=float, default=0.0)
+    p.add_argument(
+        "--warmup-epochs", type=float, default=0.0,
+        help="Warmup duration for --lr-schedule warmup-linear",
+    )
+    p.add_argument(
+        "--warmup-start-ratio", type=float, default=0.005,
+        help="Initial/peak LR ratio for --lr-schedule warmup-linear",
+    )
     p.add_argument("--wandb-project", default="laser")
     p.add_argument("--wandb-entity", default="helloimlixin-rutgers")
     p.add_argument("--wandb-name", default="imagenet-rqtransformer-laser-a16384-k2-stage2")
@@ -1496,6 +2216,15 @@ def main():
     )
     p.add_argument("--fid-num-samples", type=int, default=2048)
     p.add_argument("--fid-batch-size", type=int, default=64)
+    p.add_argument(
+        "--metric-backend",
+        choices=("original-rqvae", "torchmetrics"),
+        default="original-rqvae",
+        help=(
+            "original-rqvae uses the vendored TensorFlow-FID Inception weights, "
+            "SciPy Frechet equation, and upstream ten-split Inception Score"
+        ),
+    )
     p.add_argument("--fid-every", type=int, default=1,
                    help="Run full FID every N epochs; 0 disables evaluation")
     p.add_argument("--save-ckpt-freq", type=int, default=2,
@@ -1507,7 +2236,9 @@ def main():
     p.add_argument("--sample-grid-every", type=int, default=100,
                    help="Generate the expensive 64-image class grid every N optimizer steps; 0 disables it")
     p.add_argument("--sample-grid-size", type=int, default=64,
-                   help="Perfect-square preview batch size")
+                   help="Total preview images; must divide into complete class rows")
+    p.add_argument("--sample-grid-samples-per-class", type=int, default=8,
+                   help="Number of adjacent samples in each labeled class row")
     p.add_argument("--sample-grid-batch-size", type=int, default=8,
                    help="Memory-safe generation minibatch used to assemble a preview grid")
     p.add_argument(
@@ -1553,6 +2284,22 @@ def main():
         help="Generate and decode one FID-sized batch, report peak memory, and exit",
     )
     args = p.parse_args()
+    cache_rfid_preflight = None
+    if args.cache_rfid_preflight is not None:
+        cache_rfid_preflight = {}
+        for expected_mode, result_path in zip(
+            ("continuous", "quantized"), args.cache_rfid_preflight
+        ):
+            result = json.loads(result_path.read_text())
+            value = float(result.get("rfid", float("nan")))
+            if (
+                result.get("cache_coeff_mode") != expected_mode
+                or not math.isfinite(value)
+            ):
+                raise ValueError(
+                    f"invalid {expected_mode} cache-rFID preflight: {result_path}"
+                )
+            cache_rfid_preflight[expected_mode] = value
     if args.sparsity_level <= 0:
         raise ValueError("--sparsity-level must be positive")
     if args.coeff_scales is not None and len(args.coeff_scales) != args.sparsity_level:
@@ -1566,10 +2313,16 @@ def main():
         raise ValueError("--compound-micro-transformer-layers cannot be negative")
     if args.compound_refiner_layers > 0 and args.compound_micro_transformer_layers > 0:
         raise ValueError("compound MLP refiner and micro-transformer are mutually exclusive")
+    if args.levelwise_var and not args.compound_tokens:
+        raise ValueError("--levelwise-var requires --compound-tokens")
     if args.geometry_top_k <= 0:
         raise ValueError("--geometry-top-k must be positive")
     if args.atom_loss_weight <= 0:
         raise ValueError("--atom-loss-weight must be positive")
+    if args.coeff_regression_weight < 0:
+        raise ValueError("--coeff-regression-weight cannot be negative")
+    if args.coeff_crps_weight < 0:
+        raise ValueError("--coeff-crps-weight cannot be negative")
     if args.geometry_loss_weight < 0:
         raise ValueError("--geometry-loss-weight cannot be negative")
     if args.geometry_start_epoch < 0:
@@ -1578,13 +2331,23 @@ def main():
         raise ValueError("--geometry-warmup-epochs cannot be negative")
     if args.save_step_freq < 0:
         raise ValueError("--save-step-freq cannot be negative")
-    if (args.sample_grid_size <= 0 or
-            math.isqrt(args.sample_grid_size) ** 2 != args.sample_grid_size):
-        raise ValueError("--sample-grid-size must be a positive perfect square")
+    if (args.sample_grid_size <= 0 or args.sample_grid_samples_per_class <= 0 or
+            args.sample_grid_size % args.sample_grid_samples_per_class != 0):
+        raise ValueError(
+            "--sample-grid-size must be positive and divisible by "
+            "--sample-grid-samples-per-class"
+        )
     if not 0 < args.sample_grid_batch_size <= args.sample_grid_size:
         raise ValueError("--sample-grid-batch-size must be in [1, --sample-grid-size]")
     if args.fid_every < 0:
         raise ValueError("--fid-every cannot be negative")
+    if args.fid_reference_stats is not None:
+        from src.rqvae_metrics import load_reference_statistics
+        load_reference_statistics(args.fid_reference_stats)
+        if args.metric_backend != "original-rqvae":
+            raise ValueError(
+                "--fid-reference-stats requires --metric-backend original-rqvae"
+            )
     if args.max_optimizer_steps < 0:
         raise ValueError("--max-optimizer-steps cannot be negative")
     if args.smoke_test and args.max_optimizer_steps <= 0:
@@ -1597,7 +2360,13 @@ def main():
         raise ValueError("--lr-schedule-epochs must be positive")
     if not 0 <= args.min_lr <= args.lr:
         raise ValueError("--min-lr must be between zero and --lr")
-    if args.lr_schedule == "cosine" and args.epochs > args.lr_schedule_epochs:
+    if args.warmup_epochs < 0:
+        raise ValueError("--warmup-epochs cannot be negative")
+    if not 0 < args.warmup_start_ratio <= 1:
+        raise ValueError("--warmup-start-ratio must be in (0, 1]")
+    if args.lr_schedule == "warmup-linear" and args.warmup_epochs >= args.lr_schedule_epochs:
+        raise ValueError("--warmup-epochs must be shorter than the LR schedule")
+    if args.lr_schedule in {"cosine", "warmup-linear"} and args.epochs > args.lr_schedule_epochs:
         raise ValueError("--epochs cannot exceed the global cosine schedule horizon")
     face_datasets = {"celebahq", "ffhq"}
     if args.dataset in face_datasets and args.model_preset != "ffhq-350m":
@@ -1713,7 +2482,7 @@ def main():
                         shuffle=sampler is None, num_workers=8, pin_memory=True,
                         persistent_workers=True, drop_last=True)
     val_loader = None
-    if args.fid_every > 0:
+    if args.fid_every > 0 and args.fid_reference_stats is None:
         if args.dataset == "ffhq":
             val_dataset = FlatImages(args.data, transform=val_image_transform())
             # A full-dataset cache defines the matching real-reference corpus.
@@ -1749,6 +2518,7 @@ def main():
                    sparsity_level=args.sparsity_level).to(device)
     unwrapped_model = build_model(
         total_vocab_size, args.num_atoms, compound=args.compound_tokens,
+        levelwise_var=args.levelwise_var,
         coeff_vocab_size=args.coeff_vocab_size,
         compound_refiner_layers=args.compound_refiner_layers,
         compound_geometry_head=(
@@ -1813,6 +2583,11 @@ def main():
     optimizer_steps_per_epoch = complete_microbatches // accumulation
     if optimizer_steps_per_epoch <= 0:
         raise ValueError("training loader does not contain a complete optimizer step")
+    runtime_config = {
+        **vars(args),
+        "world_size": world,
+        "accumulation_steps": accumulation,
+    }
     use_wandb = rank() == 0 and args.wandb_mode != "disabled"
     wb = None
     if use_wandb:
@@ -1821,7 +2596,10 @@ def main():
                         name=args.wandb_name,
                         id=args.wandb_id, resume="allow" if args.wandb_id else None,
                         mode=args.wandb_mode,
-                        config={**vars(args), "architecture": (
+                        config={**runtime_config, "architecture": (
+                            f"levelwise-var-micro{args.compound_micro_transformer_layers}-{args.model_preset}"
+                            if args.levelwise_var
+                            else
                             f"compound-v4-micro{args.compound_micro_transformer_layers}-rqtransformer-{args.model_preset}"
                             if args.compound_tokens and args.compound_micro_transformer_layers > 0
                             else f"compound-v3-refiner{args.compound_refiner_layers}-rqtransformer-{args.model_preset}"
@@ -1837,9 +2615,20 @@ def main():
                                 ),
                                 "preview_sampling_settings": preview_sampling_settings(args)})
         wb.define_metric("train/global_step")
+        if cache_rfid_preflight is not None:
+            continuous_rfid = cache_rfid_preflight["continuous"]
+            quantized_rfid = cache_rfid_preflight["quantized"]
+            wb.summary["diagnostics/continuous_cache_reconstruction_rfid"] = continuous_rfid
+            wb.summary["diagnostics/quantized_cache_reconstruction_rfid"] = quantized_rfid
+            wb.summary["diagnostics/cache_quantization_rfid_delta"] = (
+                quantized_rfid - continuous_rfid
+            )
         metric_names = (
             "train/loss", "train/atom_nll", "train/coeff_cross_entropy",
             "train/coeff_target_entropy", "train/coeff_kl",
+            "train/coeff_regression_loss", "train/coeff_expected_mae",
+            "train/coeff_expected_physical_mae",
+            "train/coeff_crps",
             "train/classification_loss", "train/geometry_loss",
             "train/geometry_weight",
             "train/geometry_pair_mse", "train/geometry_spatial_mse",
@@ -1852,12 +2641,40 @@ def main():
                 f"train/atom_top1_depth{depth_index}",
                 f"train/coeff_cross_entropy_depth{depth_index}",
                 f"train/coeff_bin_mae_depth{depth_index}",
+                f"train/coeff_expected_mae_depth{depth_index}",
+                f"train/coeff_expected_physical_mae_depth{depth_index}",
             )
         if uses_inception_score(args.dataset):
             metric_names += ("val/inception_score", "val/inception_score_std")
         for metric_name in metric_names:
             wb.define_metric(metric_name, step_metric="train/global_step")
-        (args.output / "launch_config.json").write_text(json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
+        if args.fid_reference_stats is not None:
+            wb.define_metric(
+                "val/fid_rqvae_imagenet_train", step_metric="train/global_step"
+            )
+            wb.summary["evaluation/fid_reference"] = "rqvae/imagenet_256_train"
+            wb.summary["evaluation/fid_reference_stats"] = str(
+                args.fid_reference_stats.resolve()
+            )
+            with args.fid_reference_stats.open("rb") as reference_stream:
+                wb.summary["evaluation/fid_reference_sha256"] = (
+                    hashlib.file_digest(reference_stream, "sha256").hexdigest()
+                )
+            wb.summary["evaluation/fid_num_generated_samples"] = int(
+                args.fid_num_samples
+            )
+            wb.summary["evaluation/fid_feature_extractor"] = (
+                "rqvae TensorFlow-FID-compatible InceptionV3 pool3/2048"
+            )
+            wb.summary["evaluation/imagenet_class_sampling"] = (
+                "uniform, exactly 50 generated samples per class"
+            )
+            wb.summary["evaluation/inception_score"] = (
+                "RQ-VAE 1008-logit Inception, shuffled, 10 splits"
+            )
+        (args.output / "launch_config.json").write_text(
+            json.dumps({k: str(v) for k, v in runtime_config.items()}, indent=2)
+        )
         if args.upload_token_cache:
             if args.token_cache is None:
                 raise ValueError("--upload-token-cache requires --token-cache")
@@ -1879,9 +2696,24 @@ def main():
         if not uses_inception_score(args.dataset):
             best_inception = []
         saved_config = resume_payload.get("config", {})
-        old_batch_size = int(saved_config.get("batch_size", args.batch_size))
-        if resume_batch_idx and old_batch_size != args.batch_size:
-            resume_batch_idx = (resume_batch_idx * old_batch_size) // args.batch_size
+        saved_batch_idx = resume_batch_idx
+        resume_batch_idx, old_world_size = remap_resume_batch_index(
+            resume_batch_idx,
+            saved_config=saved_config,
+            batch_size=args.batch_size,
+            world_size=world,
+            total_batch_size=args.total_batch_size,
+            global_step=global_step,
+            start_epoch=start_epoch,
+            optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        )
+        if rank() == 0 and resume_batch_idx != saved_batch_idx:
+            print(
+                "Remapped resume cursor for physical layout change: "
+                f"batch={saved_batch_idx}, world={old_world_size} -> "
+                f"batch={resume_batch_idx}, world={world}",
+                flush=True,
+            )
         if int(saved_config.get("fid_num_samples", -1)) != args.fid_num_samples:
             # FIDs from different real/fake sample counts are not comparable.
             best_fid = []
@@ -1890,32 +2722,80 @@ def main():
                 print("Reset prior best-FID history because the evaluation "
                       f"protocol changed from {saved_config.get('fid_num_samples')} "
                       f"to {args.fid_num_samples} samples", flush=True)
+        previous_reference = saved_config.get("fid_reference_stats")
+        if previous_reference is not None:
+            previous_reference = str(previous_reference)
+        current_reference = (
+            None if args.fid_reference_stats is None
+            else str(args.fid_reference_stats)
+        )
+        if previous_reference != current_reference:
+            best_fid = []
+            if rank() == 0:
+                print(
+                    "Reset prior best-FID history because the reference changed "
+                    f"from {previous_reference or 'online dataset split'} to "
+                    f"{current_reference or 'online dataset split'}",
+                    flush=True,
+                )
         if rank() == 0:
             print(f"Resumed from {resume_checkpoint}: epoch={start_epoch}, "
                   f"batch={resume_batch_idx}, step={global_step}", flush=True)
+            if (
+                args.upload_checkpoints
+                and args.checkpoint_upload_mode == "files"
+            ):
+                # Re-queue the recovered checkpoint immediately. This closes
+                # the gap when a previous process was stopped just after its
+                # atomic local save but before W&B finished the replacement.
+                upload_selected_checkpoint_files(
+                    wb,
+                    last_checkpoint=last_checkpoint,
+                    best_fid=best_fid,
+                    upload_dir=args.output / "wandb_checkpoints",
+                )
     scheduler = None
-    if args.lr_schedule == "cosine":
+    if args.lr_schedule in {"cosine", "warmup-linear"}:
         schedule_steps = args.lr_schedule_epochs * optimizer_steps_per_epoch
         scheduler_state = None if resume_payload is None else resume_payload.get("scheduler")
+        schedule_completed_steps = (
+            int(scheduler_state.get("last_epoch", 0))
+            if scheduler_state is not None
+            else start_epoch * optimizer_steps_per_epoch + resume_batch_idx // accumulation
+        )
         if scheduler_state is None:
             # Fresh runs start at the requested base LR. Legacy resumptions are
-            # mapped onto the curve using their already-completed global steps.
+            # mapped by data progress so changing physical batch size does not
+            # incorrectly reinterpret the W&B/checkpoint global-step counter.
             for param_group in optimizer.param_groups:
                 param_group["lr"] = args.lr
-        scheduler = create_cosine_lr_scheduler(
-            optimizer,
-            initial_lr=args.lr,
-            min_lr=args.min_lr,
-            total_steps=schedule_steps,
-            completed_steps=global_step,
-            state_dict=scheduler_state,
-        )
+        if args.lr_schedule == "cosine":
+            scheduler = create_cosine_lr_scheduler(
+                optimizer,
+                initial_lr=args.lr,
+                min_lr=args.min_lr,
+                total_steps=schedule_steps,
+                completed_steps=schedule_completed_steps,
+                state_dict=scheduler_state,
+            )
+        else:
+            scheduler = create_warmup_linear_lr_scheduler(
+                optimizer,
+                initial_lr=args.lr,
+                min_lr=args.min_lr,
+                total_steps=schedule_steps,
+                warmup_steps=round(args.warmup_epochs * optimizer_steps_per_epoch),
+                warmup_start_ratio=args.warmup_start_ratio,
+                completed_steps=schedule_completed_steps,
+                state_dict=scheduler_state,
+            )
         if rank() == 0:
             source = "checkpointed" if scheduler_state is not None else (
-                "legacy-backfilled" if global_step else "fresh"
+                "legacy-backfilled" if schedule_completed_steps else "fresh"
             )
             print(
-                f"Cosine LR schedule ({source}): step={global_step}/{schedule_steps}, "
+                f"{args.lr_schedule} LR schedule ({source}): "
+                f"schedule_step={schedule_completed_steps}/{schedule_steps}, "
                 f"lr={optimizer.param_groups[0]['lr']:.8g}, min_lr={args.min_lr:.8g}",
                 flush=True,
             )
@@ -1938,6 +2818,7 @@ def main():
                             num_condition_classes=num_condition_classes,
                             num_samples=args.sample_grid_size,
                             sample_batch_size=args.sample_grid_batch_size,
+                            samples_per_class=args.sample_grid_samples_per_class,
                             **setting,
                         )
                         print(f"Saved startup samples: {target}", flush=True)
@@ -1953,7 +2834,7 @@ def main():
                 labels = torch.arange(args.fid_batch_size, device=device).remainder(
                     num_condition_classes
                 )
-                if isinstance(generation_model, CompoundLaserRQTransformer):
+                if isinstance(generation_model, (CompoundLaserRQTransformer, LevelwiseLaserVAR)):
                     atoms, coeff_ids = generation_model.sample_compound(
                         args.fid_batch_size,
                         aux,
@@ -2006,7 +2887,7 @@ def main():
         model.train()
         for batch_idx, batch in enumerate(loader):
             absolute_batch_idx = batch_idx + batch_offset
-            if batch_idx >= complete_microbatches:
+            if absolute_batch_idx >= complete_microbatches:
                 break
             if args.token_cache:
                 atoms, coeffs, labels = batch
@@ -2094,8 +2975,11 @@ def main():
                             target_coeff_probs,
                             target_physical,
                             atom_weight=args.atom_loss_weight,
+                            coeff_regression_weight=args.coeff_regression_weight,
+                            coeff_crps_weight=args.coeff_crps_weight,
                             geometry_weight=geometry_weight,
                             accumulation=accumulation,
+                            coefficient_bins=aux.coeff_bins,
                             distribution_geometry=args.compound_distribution_geometry,
                             geometry_dictionary=aux.dictionary,
                             geometry_coeff_bins=aux.coeff_bins,
@@ -2115,11 +2999,36 @@ def main():
                             )
                             pred_values = aux.coeff_bins[pred_coeff_ids] * pair_scales
                             target_values = aux.coeff_bins[target_coeff_ids] * pair_scales
+                            predicted_coefficients = objective["predicted_coefficients"]
+                            target_coefficients = objective["target_coefficients"]
+                            if predicted_coefficients is None:
+                                predicted_coefficients = (
+                                    coeff_logits.float().softmax(dim=-1)
+                                    * aux.coeff_bins.float()
+                                ).sum(dim=-1)
+                                target_coefficients = (
+                                    target_coeff_probs.float()
+                                    * aux.coeff_bins.float()
+                                ).sum(dim=-1)
+                            expected_abs_error = (
+                                predicted_coefficients - target_coefficients
+                            ).abs()
+                            expected_physical_abs_error = expected_abs_error * pair_scales
                             diagnostic_metrics = {
                                 "train/atom_nll": float(atom_loss.mean()),
                                 "train/coeff_cross_entropy": float(coeff_loss.mean()),
                                 "train/coeff_target_entropy": float(coeff_entropy.mean()),
                                 "train/coeff_kl": float((coeff_loss - coeff_entropy).mean()),
+                                "train/coeff_regression_loss": float(
+                                    objective["coefficient_regression"]
+                                ),
+                                "train/coeff_crps": float(
+                                    objective["coefficient_crps"]
+                                ),
+                                "train/coeff_expected_mae": float(expected_abs_error.mean()),
+                                "train/coeff_expected_physical_mae": float(
+                                    expected_physical_abs_error.mean()
+                                ),
                                 "train/classification_loss": float(objective["classification"]),
                                 "train/geometry_loss": float(objective["geometry"]),
                                 "train/geometry_weight": geometry_weight,
@@ -2149,6 +3058,12 @@ def main():
                                             pred_values[..., depth_index]
                                             - target_values[..., depth_index]
                                         ).abs().mean()
+                                    ),
+                                    f"train/coeff_expected_mae_depth{depth_index}": float(
+                                        expected_abs_error[..., depth_index].mean()
+                                    ),
+                                    f"train/coeff_expected_physical_mae_depth{depth_index}": float(
+                                        expected_physical_abs_error[..., depth_index].mean()
                                     ),
                                 })
                     else:
@@ -2223,7 +3138,7 @@ def main():
                             "state_dict": model_state,
                             "optimizer": optimizer_state,
                             "scheduler": None if scheduler is None else scheduler.state_dict(),
-                            "config": vars(args),
+                            "config": runtime_config,
                             "best_fid": best_fid,
                             "best_inception": best_inception,
                         }
@@ -2259,6 +3174,7 @@ def main():
                                         num_condition_classes=num_condition_classes,
                                         num_samples=args.sample_grid_size,
                                         sample_batch_size=args.sample_grid_batch_size,
+                                        samples_per_class=args.sample_grid_samples_per_class,
                                         **setting,
                                     )
                                     print(f"Saved preview samples: {target}", flush=True)
@@ -2311,6 +3227,8 @@ def main():
                         coeff_top_k=args.coeff_top_k,
                         coeff_top_p=args.coeff_top_p,
                         compute_inception_score=uses_inception_score(args.dataset),
+                        metric_backend=args.metric_backend,
+                        fid_reference_stats=args.fid_reference_stats,
                     )
                 cuda_memory_report(device, f"epoch {epoch + 1} FID generation")
         best_path = None
@@ -2322,6 +3240,8 @@ def main():
                     "train/epoch": epoch + 1,
                     "train/global_step": global_step,
                 }
+                if args.fid_reference_stats is not None:
+                    evaluation_payload["val/fid_rqvae_imagenet_train"] = fid
                 if inception_score is not None:
                     evaluation_payload.update({
                         "val/inception_score": inception_score,
@@ -2366,7 +3286,7 @@ def main():
                     "inception_score_std": inception_score_std,
                     "state_dict": model_state, "optimizer": optimizer_state,
                     "scheduler": None if scheduler is None else scheduler.state_dict(),
-                    "config": vars(args), "best_fid": best_fid,
+                    "config": runtime_config, "best_fid": best_fid,
                     "best_inception": best_inception,
                 }
                 atomic_torch_save(snapshot, last_checkpoint)

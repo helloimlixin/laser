@@ -82,6 +82,63 @@ def test_compound_objective_penalizes_pair_and_spatial_geometry():
     assert values["geometry"] > 0
 
 
+def test_compound_objective_directly_regresses_expected_coefficient():
+    atom_logits = torch.zeros(1, 1, 1, 1, 2)
+    coeff_logits = torch.tensor([[[[[-5.0, 0.0, 5.0]]]]], requires_grad=True)
+    target_atoms = torch.zeros(1, 1, 1, 1, dtype=torch.long)
+    target_coeff_probs = torch.tensor([[[[[1.0, 0.0, 0.0]]]]])
+    bins = torch.tensor([-1.0, 0.0, 1.0])
+
+    loss, values = compound_objective(
+        atom_logits,
+        coeff_logits,
+        None,
+        target_atoms,
+        target_coeff_probs,
+        None,
+        atom_weight=1.0,
+        coeff_regression_weight=2.0,
+        geometry_weight=0.0,
+        accumulation=1,
+        coefficient_bins=bins,
+    )
+    loss.backward()
+
+    assert values["coefficient_regression"] > 0
+    assert values["predicted_coefficients"] > values["target_coefficients"]
+    assert coeff_logits.grad is not None
+    assert torch.isfinite(coeff_logits.grad).all()
+
+
+def test_compound_objective_crps_respects_coefficient_bin_distance():
+    atom_logits = torch.zeros(1, 1, 1, 1, 2)
+    target_atoms = torch.zeros(1, 1, 1, 1, dtype=torch.long)
+    target_coeff_probs = torch.tensor([[[[[1.0, 0.0, 0.0]]]]])
+    bins = torch.tensor([-1.0, 0.0, 1.0])
+
+    def crps_for(logits):
+        _, values = compound_objective(
+            atom_logits,
+            torch.tensor([[[[[*logits]]]]], requires_grad=True),
+            None,
+            target_atoms,
+            target_coeff_probs,
+            None,
+            atom_weight=1.0,
+            coeff_crps_weight=1.0,
+            geometry_weight=0.0,
+            accumulation=1,
+            coefficient_bins=bins,
+        )
+        return values["coefficient_crps"]
+
+    adjacent = crps_for([-10.0, 10.0, -10.0])
+    distant = crps_for([-10.0, -10.0, 10.0])
+
+    assert adjacent > 0
+    assert distant > adjacent
+
+
 def test_distribution_geometry_uses_sampling_logits_and_backpropagates():
     atom_logits = torch.tensor(
         [[[[[20.0, -20.0, -20.0], [-20.0, 20.0, -20.0]]]]],

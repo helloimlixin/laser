@@ -6,10 +6,12 @@ import torch
 
 from scripts.train_official_rqtransformer_laser_stage2 import (
     create_cosine_lr_scheduler,
+    create_warmup_linear_lr_scheduler,
     optimizer_state_to_ids,
     optimizer_state_to_names,
     optimizer_state_uses_names,
     persistent_checkpoint_dir,
+    remap_resume_batch_index,
     snapshot_checkpoint,
     uses_inception_score,
 )
@@ -35,6 +37,42 @@ def test_checkpoint_snapshot_reuses_storage(tmp_path):
 
     assert target.read_bytes() == source.read_bytes()
     assert target.stat().st_ino == source.stat().st_ino
+
+
+def test_resume_cursor_remaps_legacy_four_rank_checkpoint_to_two_ranks():
+    remapped, old_world_size = remap_resume_batch_index(
+        8_000,
+        saved_config={"batch_size": 32, "total_batch_size": 2_048},
+        batch_size=32,
+        world_size=2,
+        total_batch_size=2_048,
+        global_step=13_000,
+        start_epoch=20,
+        optimizer_steps_per_epoch=625,
+    )
+
+    assert old_world_size == 4
+    assert remapped == 16_000
+
+
+def test_resume_cursor_uses_recorded_world_size_and_new_microbatch():
+    remapped, old_world_size = remap_resume_batch_index(
+        4_000,
+        saved_config={
+            "batch_size": 64,
+            "total_batch_size": 2_048,
+            "world_size": 2,
+        },
+        batch_size=16,
+        world_size=4,
+        total_batch_size=2_048,
+        global_step=13_000,
+        start_epoch=20,
+        optimizer_steps_per_epoch=625,
+    )
+
+    assert old_world_size == 2
+    assert remapped == 8_000
 
 
 def test_inception_score_is_only_used_for_imagenet():
@@ -78,6 +116,58 @@ def test_cosine_lr_scheduler_round_trips_checkpoint_state():
         initial_lr=5e-4,
         min_lr=0.0,
         total_steps=100,
+        completed_steps=17,
+        state_dict=scheduler.state_dict(),
+    )
+
+    assert resumed.last_epoch == 17
+    assert resumed_optimizer.param_groups[0]["lr"] == pytest.approx(
+        optimizer.param_groups[0]["lr"]
+    )
+
+
+def test_var_warmup_linear_schedule_warms_then_decays_to_floor():
+    optimizer = make_optimizer(lr=3.2e-4)
+    scheduler = create_warmup_linear_lr_scheduler(
+        optimizer,
+        initial_lr=3.2e-4,
+        min_lr=3.2e-6,
+        total_steps=100,
+        warmup_steps=10,
+        warmup_start_ratio=0.005,
+    )
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.6e-6)
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3.2e-4)
+    for _ in range(90):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3.2e-6)
+
+
+def test_var_warmup_linear_schedule_round_trips_state():
+    optimizer = make_optimizer(lr=3.2e-4)
+    scheduler = create_warmup_linear_lr_scheduler(
+        optimizer,
+        initial_lr=3.2e-4,
+        min_lr=3.2e-6,
+        total_steps=100,
+        warmup_steps=10,
+    )
+    for _ in range(17):
+        optimizer.step()
+        scheduler.step()
+
+    resumed_optimizer = make_optimizer(lr=optimizer.param_groups[0]["lr"])
+    resumed = create_warmup_linear_lr_scheduler(
+        resumed_optimizer,
+        initial_lr=3.2e-4,
+        min_lr=3.2e-6,
+        total_steps=100,
+        warmup_steps=10,
         completed_steps=17,
         state_dict=scheduler.state_dict(),
     )

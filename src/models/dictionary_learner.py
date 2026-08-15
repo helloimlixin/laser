@@ -19,6 +19,7 @@ class DictionaryLearning(nn.Module):
         sparsity_level=5,
         commitment_cost=0.25,
         dict_learning_rate=None,
+        progressive_loss=False,
         patch_based=False,
         patch_size=1,
         patch_stride=None,
@@ -39,6 +40,7 @@ class DictionaryLearning(nn.Module):
         self.commitment_cost = float(commitment_cost)
         self.epsilon = float(epsilon)
         self.dict_learning_rate = dict_learning_rate
+        self.progressive_loss = bool(progressive_loss)
         self.data_init_from_first_batch = bool(data_init_from_first_batch)
         self.dead_atom_revival = bool(dead_atom_revival)
         self.dead_atom_revival_interval = max(1, int(dead_atom_revival_interval))
@@ -108,6 +110,7 @@ class DictionaryLearning(nn.Module):
         self._last_dl_latent_loss = None
         self._last_e_latent_loss = None
         self._last_dictionary_loss = torch.zeros(())
+        self._last_final_dictionary_loss = torch.zeros(())
         self._last_commitment_loss = torch.zeros(())
         self._last_dictionary_loss_for_backward = None
         self._last_bottleneck_objective_for_backward = None
@@ -147,7 +150,13 @@ class DictionaryLearning(nn.Module):
                 f"sparsity_level ({int(self.sparsity_level)}) must be <= num_atoms ({int(D.size(1))})"
             )
 
-    def _batch_omp_cholesky_with_support(self, signals, dictionary, debug=False):
+    def _batch_omp_cholesky_with_support(
+        self,
+        signals,
+        dictionary,
+        debug=False,
+        return_prefix_values=False,
+    ):
         """Batch OMP using a shared Gram matrix and progressive Cholesky solves."""
         embedding_dim, num_signals = signals.shape
         if int(embedding_dim) != int(dictionary.size(0)):
@@ -165,6 +174,7 @@ class DictionaryLearning(nn.Module):
         support = torch.zeros(num_signals, 0, dtype=torch.long, device=signals.device)
         omega = torch.ones_like(corr_init, dtype=torch.bool)
         signal_idx = torch.arange(num_signals, device=signals.device)
+        prefix_values = [] if return_prefix_values else None
 
         for k in range(1, int(self.sparsity_level) + 1):
             scores = corr.abs().masked_fill(~omega, -1.0)
@@ -207,6 +217,8 @@ class DictionaryLearning(nn.Module):
             )
             gamma_active = torch.cholesky_solve(corr_active, L).squeeze(-1)
             gamma[signal_idx.unsqueeze(1), support[signal_idx]] = gamma_active
+            if prefix_values is not None:
+                prefix_values.append(gamma_active.clone())
 
             active = gamma[signal_idx.unsqueeze(1), support[signal_idx]]
             beta = active.unsqueeze(1).bmm(gram_matrix[support[signal_idx], :]).squeeze(1)
@@ -217,6 +229,8 @@ class DictionaryLearning(nn.Module):
                 print(f"Step {k}, max residual correlation: {float(residual_proxy):.4f}")
 
         values = gamma[signal_idx.unsqueeze(1), support[signal_idx]]
+        if prefix_values is not None:
+            return support, values, gamma.t(), tuple(prefix_values)
         return support, values, gamma.t()
 
     def update_gamma(self, signals, dictionary, debug=False):
@@ -238,6 +252,23 @@ class DictionaryLearning(nn.Module):
         D = torch.nan_to_num(D)
         support, values, _ = self._batch_omp_cholesky_with_support(X, D)
         return support, torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def batch_omp_with_support_and_prefixes(self, X, D):
+        """Return final OMP codes and re-fitted coefficients at every depth."""
+        self._validate_omp_inputs(X, D)
+        X = torch.nan_to_num(X)
+        D = torch.nan_to_num(D)
+        support, values, _, prefix_values = self._batch_omp_cholesky_with_support(
+            X,
+            D,
+            return_prefix_values=True,
+        )
+        values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        prefix_values = tuple(
+            torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            for value in prefix_values
+        )
+        return support, values, prefix_values
 
     def _distributed_is_initialized(self):
         return torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -574,14 +605,41 @@ class DictionaryLearning(nn.Module):
             eps=max(float(self.epsilon), 1e-8),
         )
         with torch.no_grad():
-            support, values = self.batch_omp_with_support(signals, dictionary)
-        support = support.view(batch_size, grid_h, grid_w, self.sparsity_level)
+            if self.progressive_loss:
+                support_flat, values, prefix_values = (
+                    self.batch_omp_with_support_and_prefixes(signals, dictionary)
+                )
+            else:
+                support_flat, values = self.batch_omp_with_support(signals, dictionary)
+                prefix_values = None
+        support = support_flat.view(batch_size, grid_h, grid_w, self.sparsity_level)
         values = values.view(batch_size, grid_h, grid_w, self.sparsity_level).float()
         self._record_atom_usage_(support, signals)
 
         z_dl = self._reconstruct_sparse(support, values, latent_h, latent_w).float()
-        dl_latent_loss = F.mse_loss(z_dl, z_e_work.detach())
-        e_latent_loss = F.mse_loss(z_dl.detach(), z_e_work)
+        final_dictionary_loss = F.mse_loss(z_dl, z_e_work.detach())
+        final_commitment_loss = F.mse_loss(z_dl.detach(), z_e_work)
+        if self.progressive_loss:
+            signal_targets = signals.t()
+            dictionary_t = dictionary.t()
+            dictionary_losses = []
+            commitment_losses = []
+            for depth, prefix_coefficients in enumerate(prefix_values, start=1):
+                prefix_atoms = dictionary_t[support_flat[:, :depth]]
+                prefix_reconstruction = (
+                    prefix_atoms * prefix_coefficients.unsqueeze(-1)
+                ).sum(dim=1)
+                dictionary_losses.append(
+                    F.mse_loss(prefix_reconstruction, signal_targets.detach())
+                )
+                commitment_losses.append(
+                    F.mse_loss(prefix_reconstruction.detach(), signal_targets)
+                )
+            dl_latent_loss = torch.stack(dictionary_losses).mean()
+            e_latent_loss = torch.stack(commitment_losses).mean()
+        else:
+            dl_latent_loss = final_dictionary_loss
+            e_latent_loss = final_commitment_loss
         dictionary_loss = dl_latent_loss
         commitment_loss = float(self.commitment_cost) * e_latent_loss
         bottleneck_loss = commitment_loss
@@ -590,6 +648,7 @@ class DictionaryLearning(nn.Module):
         self._last_dl_latent_loss = dl_latent_loss.detach()
         self._last_e_latent_loss = e_latent_loss.detach()
         self._last_dictionary_loss = dictionary_loss.detach()
+        self._last_final_dictionary_loss = final_dictionary_loss.detach()
         self._last_commitment_loss = commitment_loss.detach()
         self._last_dictionary_loss_for_backward = dictionary_loss
         self._last_bottleneck_objective_for_backward = objective
