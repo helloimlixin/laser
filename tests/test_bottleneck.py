@@ -129,6 +129,38 @@ def test_dictionary_learning_data_initializes_from_first_batch():
     )
 
 
+def test_dictionary_learning_resume_does_not_reinitialize_loaded_dictionary():
+    torch.manual_seed(0)
+    trained = DictionaryLearning(
+        num_embeddings=8,
+        embedding_dim=2,
+        sparsity_level=1,
+        data_init_from_first_batch=True,
+        dead_atom_revival=True,
+    )
+    trained(torch.randn(1, 2, 2, 4))
+    with torch.no_grad():
+        trained._revival_step.fill_(37)
+        trained._atom_unused_intervals.copy_(torch.arange(8))
+
+    resumed = DictionaryLearning(
+        num_embeddings=8,
+        embedding_dim=2,
+        sparsity_level=1,
+        data_init_from_first_batch=True,
+        dead_atom_revival=True,
+    )
+    resumed.load_state_dict(trained.state_dict())
+    loaded_dictionary = resumed.dictionary.detach().clone()
+
+    resumed(torch.randn(1, 2, 2, 4))
+
+    assert bool(resumed._data_initialized.item())
+    assert torch.equal(resumed.dictionary.detach(), loaded_dictionary)
+    assert int(resumed._revival_step.item()) == 37
+    assert torch.equal(resumed._atom_unused_intervals, torch.arange(8))
+
+
 def test_dictionary_learning_revives_dead_atoms_after_optimizer_step():
     torch.manual_seed(0)
     dl = DictionaryLearning(
@@ -327,6 +359,31 @@ def test_patch_dictionary_learning_rejects_overlap_reconstruction_modes():
             patch_stride=4,
             patch_reconstruction="hann",
         )
+
+
+def test_dictionary_learning_rejects_unknown_omp_compute_precision():
+    with pytest.raises(ValueError, match="omp_compute_precision"):
+        DictionaryLearning(omp_compute_precision="float16")
+
+
+def test_bfloat16_omp_uses_fp32_coefficients_and_preserves_clear_support():
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=4,
+        sparsity_level=2,
+        omp_compute_precision="bfloat16",
+    )
+    dictionary = torch.eye(4)
+    signals = torch.tensor(
+        [[3.0, 0.0], [0.0, -4.0], [1.5, 2.0], [0.0, 0.5]],
+        dtype=torch.float32,
+    )
+
+    support, values = dl.batch_omp_with_support(signals, dictionary)
+
+    assert support.tolist() == [[0, 2], [1, 2]]
+    assert values.dtype == torch.float32
+    assert torch.allclose(values, torch.tensor([[3.0, 1.5], [-4.0, 2.0]]))
 
 
 def test_patch_dictionary_learning_preserves_latent_shape():

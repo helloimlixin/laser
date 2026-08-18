@@ -144,6 +144,17 @@ class RQTransformer(Stage2Model):
         xs_emb, _ = model_aux.get_code_emb_with_depth(xs)
         return xs_emb
 
+    def embed_depth_with_model_aux(self, xs, model_aux):
+        """Embed prior depth codes for the within-site autoregressive head.
+
+        Most quantizers use the same representation for completed spatial
+        tokens and for a partially generated depth stack.  Structured tokens
+        may override this method when only part of an event is causal within a
+        site (for example, a sparse atom whose final OMP coefficient is not
+        known until the complete support has been selected).
+        """
+        return self.embed_with_model_aux(xs, model_aux)
+
     def classify_head_outputs(self, head_outputs):
         """Classify depth outputs; subclasses may return a compact representation."""
         return self.classifier(head_outputs)
@@ -192,7 +203,7 @@ class RQTransformer(Stage2Model):
 
             # compute the embeddings for head
             if self.config.head_emb_vqvae:
-                depth_ctx = self.embed_with_model_aux(xs, model_aux)
+                depth_ctx = self.embed_depth_with_model_aux(xs, model_aux)
 
                 if self.config.cumsum_depth_ctx:
                     depth_ctx = torch.cumsum(depth_ctx, dim=-2)
@@ -285,7 +296,7 @@ class RQTransformer(Stage2Model):
 
             # compute the embeddings for head
             if self.config.head_emb_vqvae:
-                depth_ctx = self.embed_with_model_aux(xs, model_aux)
+                depth_ctx = self.embed_depth_with_model_aux(xs, model_aux)
 
                 if self.config.cumsum_depth_ctx:
                     depth_ctx = torch.cumsum(depth_ctx, dim=-2)

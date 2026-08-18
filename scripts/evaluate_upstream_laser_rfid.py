@@ -8,13 +8,17 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 from torchvision import datasets
 from torchmetrics.image.fid import FrechetInceptionDistance
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.train_official_rqtransformer_laser_stage2 import LaserAux, val_image_transform
+from scripts.train_official_rqtransformer_laser_stage2 import (
+    LaserAux,
+    source_image_dataset,
+    val_image_transform,
+)
 
 
 class FlatImages(Dataset):
@@ -51,6 +55,22 @@ class IndexedSubset(Dataset):
     def __getitem__(self, index):
         image, _ = self.dataset[index]
         return image, index
+
+
+class ExactDistributedSampler(Sampler):
+    """Shard indices without DistributedSampler's tail duplication."""
+
+    def __init__(self, dataset: Dataset, num_replicas: int, process_rank: int):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.process_rank = int(process_rank)
+
+    def __iter__(self):
+        return iter(range(self.process_rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.process_rank
+        return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
 
 
 def native_fid_model(device):
@@ -119,7 +139,9 @@ def main():
         ),
     )
     p.add_argument(
-        "--dataset", choices=("imagenet", "celebahq", "ffhq"), default="imagenet"
+        "--dataset",
+        choices=("imagenet", "celebahq", "ffhq", "lsun_church"),
+        default="imagenet",
     )
     p.add_argument("--num-images", type=int, default=50_000)
     p.add_argument("--num-atoms", type=int, default=16_384)
@@ -150,6 +172,11 @@ def main():
     if args.dataset in {"celebahq", "ffhq"}:
         full_dataset = FlatImages(args.data, transform=val_image_transform())
         split_name = f"{args.dataset}_full_{args.num_images}"
+    elif args.dataset == "lsun_church":
+        full_dataset = source_image_dataset(
+            "lsun_church", args.data, val_image_transform(), split="train"
+        )
+        split_name = f"lsun_church_train_{args.num_images}"
     else:
         full_dataset = datasets.ImageFolder(
             args.data / "val", transform=val_image_transform()
@@ -179,7 +206,10 @@ def main():
         dataset = IndexedSubset(full_dataset, args.num_images)
     else:
         dataset = Subset(full_dataset, range(args.num_images))
-    sampler = DistributedSampler(dataset, shuffle=False, drop_last=False) if world > 1 else None
+    sampler = (
+        ExactDistributedSampler(dataset, num_replicas=world, process_rank=dist.get_rank())
+        if world > 1 else None
+    )
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
                         num_workers=8, pin_memory=True, persistent_workers=True)
     # Native DictionaryLearning.forward() leaves its OMP coefficients

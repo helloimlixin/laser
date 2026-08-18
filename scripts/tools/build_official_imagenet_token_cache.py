@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an ordered ImageNet, CelebA-HQ, or FFHQ LASER sparse cache."""
+"""Build an ordered ImageNet, face, or LSUN-Church LASER sparse cache."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,11 @@ from torchvision import datasets
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.train_official_rqtransformer_laser_stage2 import LaserAux, val_image_transform
+from scripts.train_official_rqtransformer_laser_stage2 import (
+    LaserAux,
+    source_image_dataset,
+    val_image_transform,
+)
 
 
 class WithIndex(Dataset):
@@ -53,7 +57,11 @@ def main():
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--dataset", choices=("imagenet", "celebahq", "ffhq"), default="imagenet")
+    p.add_argument(
+        "--dataset",
+        choices=("imagenet", "celebahq", "ffhq", "lsun_church"),
+        default="imagenet",
+    )
     p.add_argument(
         "--max-items", type=int, default=0,
         help="Optional deterministic cap after sorting; 0 uses the full dataset",
@@ -76,6 +84,14 @@ def main():
     p.add_argument("--verify-samples", type=int, default=256)
     p.add_argument("--compound", action="store_true",
                    help="Label cache as paired (atom, coefficient) events and validate pair decoding")
+    p.add_argument(
+        "--causal-prefixes",
+        action="store_true",
+        help=(
+            "Store the triangular physical least-squares coefficients after "
+            "every OMP support selection"
+        ),
+    )
     args = p.parse_args()
     if args.sparsity_level <= 0:
         p.error("--sparsity-level must be positive")
@@ -98,10 +114,9 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     torch.set_float32_matmul_precision("high")
-    if args.dataset == "ffhq":
-        base = FlatImages(args.data, transform=val_image_transform())
-    else:
-        base = datasets.ImageFolder(args.data / "train", transform=val_image_transform())
+    base = source_image_dataset(
+        args.dataset, args.data, val_image_transform(), split="train"
+    )
     if args.max_items:
         if len(base) < args.max_items:
             raise ValueError(
@@ -126,15 +141,27 @@ def main():
     if shard.is_file():
         print(f"rank {rank}: reusing completed shard {shard}", flush=True)
     else:
-        atoms, coeffs, labels, rows = [], [], [], []
+        atoms, coeffs, prefix_coeffs, labels, rows = [], [], [], [], []
         with torch.inference_mode():
             for step, (images, target, index) in enumerate(loader):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    a, c = aux.encode_sparse_components(images.to(device, non_blocking=True))
+                    encoded = aux.encode_sparse_components(
+                        images.to(device, non_blocking=True),
+                        return_prefix_coeffs=args.causal_prefixes,
+                    )
+                if args.causal_prefixes:
+                    a, c, prefix = encoded
+                    prefix_coeffs.append(prefix.to(torch.float16).cpu())
+                else:
+                    a, c = encoded
                 atoms.append(a.to(torch.int16).cpu())
                 coeffs.append(c.to(torch.float16).cpu())
                 labels.append(
-                    (torch.zeros_like(target) if args.dataset in {"celebahq", "ffhq"} else target).to(
+                    (
+                        torch.zeros_like(target)
+                        if args.dataset in {"celebahq", "ffhq", "lsun_church"}
+                        else target
+                    ).to(
                         torch.int16
                     )
                 )
@@ -142,8 +169,13 @@ def main():
                 if rank == 0 and step % 100 == 0:
                     print(f"cache rank 0: {sum(x.shape[0] for x in rows):,}/{len(indices):,}", flush=True)
         shard.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"atoms": torch.cat(atoms), "coeffs": torch.cat(coeffs),
-                    "labels": torch.cat(labels), "indices": torch.cat(rows)}, shard)
+        shard_payload = {
+            "atoms": torch.cat(atoms), "coeffs": torch.cat(coeffs),
+            "labels": torch.cat(labels), "indices": torch.cat(rows),
+        }
+        if args.causal_prefixes:
+            shard_payload["prefix_coeffs"] = torch.cat(prefix_coeffs)
+        torch.save(shard_payload, shard)
     dist.barrier()
     if rank == 0:
         parts = [torch.load(args.output.with_suffix(f".rank{r:02d}.pt"), weights_only=True) for r in range(world)]
@@ -173,7 +205,12 @@ def main():
             "atoms": torch.cat([x["atoms"] for x in parts])[order].contiguous(),
             "coeffs": merged_coeffs.to(torch.float16).contiguous(),
             "labels": torch.cat([x["labels"] for x in parts])[order].contiguous(),
-            "meta": {"format": ("laser_compound_pairs_v1" if args.compound else "laser_sparse_components_v1"), "dataset": args.dataset,
+            "meta": {"format": (
+                         "laser_compound_causal_prefix_v2"
+                         if args.compound and args.causal_prefixes
+                         else "laser_compound_pairs_v1"
+                         if args.compound else "laser_sparse_components_v1"
+                     ), "dataset": args.dataset,
                      "transform": "resize256_center_crop256", "items": len(base),
                      "shape": [8, 8, args.sparsity_level], "num_atoms": args.num_atoms,
                      "coeff_vocab_size": args.coeff_vocab_size, "coeff_max": args.coeff_max,
@@ -181,16 +218,33 @@ def main():
                      "coeff_scales": [float(x) for x in coeff_scales],
                      "auto_coeff_scales_percentile": args.auto_coeff_scales_percentile,
                      "stage1_checkpoint": str(args.checkpoint.resolve()),
+                     "causal_prefix_coeffs": args.causal_prefixes,
+                     "causal_prefix_coeff_units": (
+                         "physical_omp_least_squares" if args.causal_prefixes else None
+                     ),
                      "world_size": world},
         }
+        if args.causal_prefixes:
+            if any("prefix_coeffs" not in part for part in parts):
+                raise RuntimeError("a cache shard is missing causal prefix coefficients")
+            merged["prefix_coeffs"] = torch.cat(
+                [part["prefix_coeffs"] for part in parts]
+            )[order].contiguous()
         torch.save(merged, args.output)
         # Structural and numerical verification against a fresh direct encoding.
         n = min(args.verify_samples, len(base))
         verify_loader = DataLoader(Subset(base, range(n)), batch_size=min(args.batch_size, n), shuffle=False)
-        direct_a, direct_c, verify_images = [], [], []
+        direct_a, direct_c, direct_prefix, verify_images = [], [], [], []
         for images, _ in verify_loader:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                a, c = aux.encode_sparse_components(images.to(device))
+                encoded = aux.encode_sparse_components(
+                    images.to(device), return_prefix_coeffs=args.causal_prefixes
+                )
+            if args.causal_prefixes:
+                a, c, prefix = encoded
+                direct_prefix.append(prefix.cpu())
+            else:
+                a, c = encoded
             direct_a.append(a.cpu()); direct_c.append(c.cpu())
             verify_images.append(images)
         direct_a, direct_c = torch.cat(direct_a), torch.cat(direct_c)
@@ -204,6 +258,27 @@ def main():
                   "label_min": int(merged["labels"].min()), "label_max": int(merged["labels"].max()),
                   "coeff_scales": [float(x) for x in coeff_scales],
                   "auto_coeff_scales_percentile": args.auto_coeff_scales_percentile}
+        if args.causal_prefixes:
+            direct_prefix = torch.cat(direct_prefix)
+            cached_prefix = merged["prefix_coeffs"][:n].float()
+            prefix_error = (direct_prefix - cached_prefix).abs()
+            final_physical = cached_c * coeff_scales.view(
+                1, 1, 1, args.sparsity_level
+            )
+            report.update({
+                "causal_prefix_coeff_shape": list(merged["prefix_coeffs"].shape),
+                "causal_prefix_coeff_mae": float(prefix_error.mean()),
+                "causal_prefix_coeff_max_error": float(prefix_error.max()),
+                "causal_prefix_final_coeff_mae": float(
+                    (cached_prefix[..., -1, :] - final_physical).abs().mean()
+                ),
+                "causal_prefix_upper_triangle_zero": bool(
+                    torch.equal(
+                        torch.triu(cached_prefix, diagonal=1),
+                        torch.zeros_like(cached_prefix),
+                    )
+                ),
+            })
         if args.compound:
             with torch.inference_mode():
                 coeff_ids, _ = aux.compound_coeff_ids(cached_c.to(device), stochastic=False)
@@ -247,8 +322,15 @@ def main():
             })
             if args.sparsity_level == 2:
                 report["duplicate_atom_within_pair_fraction"] = duplicate_fraction
-        max_label = 0 if args.dataset in {"celebahq", "ffhq"} else 999
+        max_label = 0 if args.dataset in {"celebahq", "ffhq", "lsun_church"} else 999
         report["passed"] = report["atom_exact_fraction"] == 1.0 and report["coeff_max_error"] < 0.02 and report["coeff_finite"] and report["atom_min"] >= 0 and report["atom_max"] < args.num_atoms and report["label_min"] >= 0 and report["label_max"] <= max_label
+        if args.causal_prefixes:
+            report["passed"] = (
+                report["passed"]
+                and report["causal_prefix_coeff_max_error"] < 0.02
+                and report["causal_prefix_final_coeff_mae"] < 0.02
+                and report["causal_prefix_upper_triangle_zero"]
+            )
         args.output.with_suffix(".validation.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2), flush=True)
         if not report["passed"]: raise RuntimeError("token cache validation failed")

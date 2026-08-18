@@ -30,6 +30,7 @@ class DictionaryLearning(nn.Module):
         dead_atom_revival_max_fraction=0.05,
         dead_atom_revival_noise=0.05,
         dead_atom_revival_patience=5,
+        omp_compute_precision="float32",
         epsilon=1e-10,
     ):
         super().__init__()
@@ -47,6 +48,12 @@ class DictionaryLearning(nn.Module):
         self.dead_atom_revival_max_fraction = float(dead_atom_revival_max_fraction)
         self.dead_atom_revival_noise = max(0.0, float(dead_atom_revival_noise))
         self.dead_atom_revival_patience = max(1, int(dead_atom_revival_patience))
+        self.omp_compute_precision = str(omp_compute_precision).strip().lower()
+        if self.omp_compute_precision not in {"float32", "bfloat16"}:
+            raise ValueError(
+                "omp_compute_precision must be 'float32' or 'bfloat16', got "
+                f"{omp_compute_precision!r}"
+            )
 
         if self.num_embeddings <= 0:
             raise ValueError(f"num_embeddings must be positive, got {self.num_embeddings}")
@@ -164,13 +171,34 @@ class DictionaryLearning(nn.Module):
                 f"Signal dim ({int(embedding_dim)}) must match dictionary dim "
                 f"({int(dictionary.size(0))})"
             )
-        dictionary_t = dictionary.t()
-        gram_matrix = dictionary_t.mm(dictionary)
-        corr_init = dictionary_t.mm(signals).t()
-        gamma = torch.zeros_like(corr_init)
+        # CUDA does not implement BF16 triangular_solve or cholesky_solve.  In
+        # BF16 mode only the large OMP matrix products use BF16; the tiny
+        # per-signal Cholesky systems (at most sparsity_level square) and the
+        # returned coefficients stay in FP32.
+        if self.omp_compute_precision == "bfloat16":
+            if signals.is_cuda and not torch.cuda.is_bf16_supported():
+                raise RuntimeError(
+                    "omp_compute_precision='bfloat16' requires CUDA BF16 support"
+                )
+            matrix_dtype = torch.bfloat16
+            solve_dtype = torch.float32
+        else:
+            matrix_dtype = signals.dtype
+            solve_dtype = signals.dtype
+
+        matrix_dictionary = dictionary.to(dtype=matrix_dtype)
+        matrix_signals = signals.to(dtype=matrix_dtype)
+        dictionary_t = matrix_dictionary.t()
+        gram_matrix = dictionary_t.mm(matrix_dictionary)
+        corr_init = dictionary_t.mm(matrix_signals).t()
+        gamma = torch.zeros(
+            corr_init.shape,
+            device=corr_init.device,
+            dtype=solve_dtype,
+        )
 
         corr = corr_init
-        L = torch.ones(num_signals, 1, 1, device=signals.device, dtype=signals.dtype)
+        L = torch.ones(num_signals, 1, 1, device=signals.device, dtype=solve_dtype)
         support = torch.zeros(num_signals, 0, dtype=torch.long, device=signals.device)
         omega = torch.ones_like(corr_init, dtype=torch.bool)
         signal_idx = torch.arange(num_signals, device=signals.device)
@@ -185,7 +213,11 @@ class DictionaryLearning(nn.Module):
             if k > 1:
                 prev_support = support[signal_idx, :]
                 new_atoms = next_atoms[expanded_signal_idx[..., :-1]]
-                gram_cross = gram_matrix[prev_support, new_atoms].view(num_signals, k - 1, 1)
+                gram_cross = gram_matrix[prev_support, new_atoms].view(
+                    num_signals,
+                    k - 1,
+                    1,
+                ).to(dtype=solve_dtype)
                 w = torch.linalg.solve_triangular(L, gram_cross, upper=False).view(
                     num_signals,
                     1,
@@ -199,7 +231,7 @@ class DictionaryLearning(nn.Module):
                     k - 1,
                     1,
                     device=signals.device,
-                    dtype=signals.dtype,
+                    dtype=solve_dtype,
                 )
                 L = torch.cat(
                     (
@@ -214,14 +246,16 @@ class DictionaryLearning(nn.Module):
                 num_signals,
                 k,
                 1,
-            )
+            ).to(dtype=solve_dtype)
             gamma_active = torch.cholesky_solve(corr_active, L).squeeze(-1)
             gamma[signal_idx.unsqueeze(1), support[signal_idx]] = gamma_active
             if prefix_values is not None:
                 prefix_values.append(gamma_active.clone())
 
             active = gamma[signal_idx.unsqueeze(1), support[signal_idx]]
-            beta = active.unsqueeze(1).bmm(gram_matrix[support[signal_idx], :]).squeeze(1)
+            beta = active.to(dtype=matrix_dtype).unsqueeze(1).bmm(
+                gram_matrix[support[signal_idx], :]
+            ).squeeze(1)
             corr = corr_init - beta
 
             if debug:

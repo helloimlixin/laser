@@ -1,14 +1,53 @@
 import torch
+from types import SimpleNamespace
 from omegaconf import OmegaConf
 
 from src.models.rqtransformer.configs import RQTransformerConfig
 from scripts.train_official_rqtransformer_laser_stage2 import (
     CompoundLaserRQTransformer,
     LaserAux,
+    SparseTokenCacheDataset,
     build_model,
     compound_objective,
     scheduled_geometry_weight,
 )
+
+
+def tiny_compound_config(depth=2):
+    return RQTransformerConfig.create(OmegaConf.create({
+        "type": "rq-transformer",
+        "block_size": [1, 1, depth],
+        "embed_dim": 12,
+        "input_embed_dim": 4,
+        "shared_tok_emb": True,
+        "shared_cls_emb": True,
+        "input_emb_vqvae": True,
+        "head_emb_vqvae": True,
+        "cumsum_depth_ctx": True,
+        "vocab_size": 7,
+        "vocab_size_cond": 1,
+        "block_size_cond": 1,
+        "body": {"n_layer": 1, "block": {"n_head": 3, "resid_pdrop": 0.0}},
+        "head": {"n_layer": 1, "block": {"n_head": 3, "resid_pdrop": 0.0}},
+    }))
+
+
+def tiny_compound_aux(depth=2):
+    dictionary = torch.randn(4, 7)
+    coeff_bins = torch.linspace(-1.0, 1.0, 5)
+    scales = torch.ones(depth)
+
+    def compound_embeddings(atoms, coeff_ids):
+        vectors = dictionary.t()[atoms.long()]
+        coefficients = coeff_bins[coeff_ids.long()] * scales
+        return vectors * coefficients[..., None]
+
+    return SimpleNamespace(
+        dictionary=dictionary,
+        coeff_bins=coeff_bins,
+        coeff_scales=scales,
+        compound_embeddings=compound_embeddings,
+    )
 
 
 def test_hard_compound_targets_use_nearest_custom_coefficient_center():
@@ -27,6 +66,155 @@ def test_hard_compound_targets_use_nearest_custom_coefficient_center():
         probabilities,
         torch.tensor([[[[[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]]]),
     )
+
+
+def test_compound_soft_targets_measure_distance_in_physical_coefficient_space():
+    aux = LaserAux.__new__(LaserAux)
+    torch.nn.Module.__init__(aux)
+    aux.coeff_vocab_size = 3
+    aux.sparsity_level = 2
+    aux.soft_target_physical = True
+    aux.register_buffer("coeff_bins", torch.tensor([-1.0, 0.0, 1.0]))
+    aux.register_buffer("coeff_scales", torch.tensor([10.0, 1.0]))
+    coefficients = torch.zeros(1, 1, 1, 2)
+
+    _, probabilities = aux.compound_coeff_ids(
+        coefficients, stochastic=False, temp=0.5
+    )
+
+    # Equal normalized offsets have different physical distances.  The large
+    # first-depth scale must produce a much sharper target around zero.
+    assert probabilities[0, 0, 0, 0, 1] > 0.999
+    assert probabilities[0, 0, 0, 1, 1] < 0.8
+
+
+def test_compound_depth_history_does_not_leak_final_omp_coefficients():
+    model = CompoundLaserRQTransformer(
+        tiny_compound_config(), num_atoms=7, coeff_vocab_size=5
+    ).eval()
+    aux = tiny_compound_aux()
+    atoms = torch.tensor([[[[2, 4]]]])
+    first = atoms * 5 + torch.tensor([[[[0, 2]]]])
+    second = atoms * 5 + torch.tensor([[[[4, 2]]]])
+
+    with torch.no_grad():
+        first_logits = model(first, model_aux=aux)["atom_logits"]
+        second_logits = model(second, model_aux=aux)["atom_logits"]
+
+    # At a single spatial site, depth 1 may depend on atom 0 but not on atom
+    # 0's final OMP coefficient, which was only determined after atom 1.
+    assert torch.equal(first_logits[..., 1, :], second_logits[..., 1, :])
+
+
+def test_encode_sparse_components_returns_every_causal_omp_prefix():
+    aux = LaserAux.__new__(LaserAux)
+    torch.nn.Module.__init__(aux)
+    aux.encoder = torch.nn.Identity()
+    aux.quant_conv = torch.nn.Identity()
+    aux.sparsity_level = 2
+    aux.coeff_max = 10.0
+    aux.clamp_coeffs = False
+    aux.register_buffer("dictionary", torch.eye(2))
+    aux.register_buffer("coeff_scales", torch.ones(2))
+    images = torch.tensor([[[[3.0]], [[2.0]]]])
+
+    atoms, final_coeffs, prefixes = aux.encode_sparse_components(
+        images, return_prefix_coeffs=True
+    )
+
+    assert atoms.tolist() == [[[[0, 1]]]]
+    assert torch.allclose(final_coeffs, torch.tensor([[[[3.0, 2.0]]]]))
+    assert torch.allclose(
+        prefixes,
+        torch.tensor([[[[[3.0, 0.0], [3.0, 2.0]]]]]),
+    )
+    reconstructed = aux.causal_prefix_reconstructions(atoms, prefixes)
+    assert torch.allclose(
+        reconstructed,
+        torch.tensor([[[[[3.0, 0.0], [3.0, 2.0]]]]]),
+    )
+
+
+def test_sparse_cache_requires_and_returns_causal_prefixes(tmp_path):
+    target = tmp_path / "cache.pt"
+    payload = {
+        "atoms": torch.zeros(2, 1, 1, 2, dtype=torch.int16),
+        "coeffs": torch.zeros(2, 1, 1, 2, dtype=torch.float16),
+        "prefix_coeffs": torch.zeros(2, 1, 1, 2, 2, dtype=torch.float16),
+        "labels": torch.zeros(2, dtype=torch.int16),
+        "meta": {"format": "laser_compound_causal_prefix_v2"},
+    }
+    torch.save(payload, target)
+
+    cache = SparseTokenCacheDataset(target, include_prefix_coeffs=True)
+
+    assert len(cache[0]) == 4
+    assert cache[0][2].shape == (1, 1, 2, 2)
+
+
+def test_causal_prefix_depth_context_uses_past_but_not_future_state():
+    torch.manual_seed(0)
+    model = CompoundLaserRQTransformer(
+        tiny_compound_config(), num_atoms=7, coeff_vocab_size=5,
+        causal_prefix_state=True,
+    ).eval()
+    aux = tiny_compound_aux()
+    tokens = torch.tensor([[[[2 * 5 + 1, 4 * 5 + 3]]]])
+    base = torch.zeros(1, 1, 1, 2, 4)
+    changed_future = base.clone()
+    changed_future[..., 1, :] = 100.0
+    changed_past = base.clone()
+    changed_past[..., 0, :] = 100.0
+
+    with torch.no_grad():
+        baseline = model(
+            tokens, model_aux=aux, causal_prefix_reconstructions=base
+        )
+        future = model(
+            tokens, model_aux=aux, causal_prefix_reconstructions=changed_future
+        )
+        past = model(
+            tokens, model_aux=aux, causal_prefix_reconstructions=changed_past
+        )
+
+    # Atom 1 is conditioned on prefix 0. Prefix 1 is a target produced only
+    # after atom 1, so changing it cannot affect the atom-1 logits.
+    assert torch.equal(
+        baseline["atom_logits"][..., 1, :], future["atom_logits"][..., 1, :]
+    )
+    assert not torch.equal(
+        baseline["atom_logits"][..., 1, :], past["atom_logits"][..., 1, :]
+    )
+    assert baseline["causal_prefix_prediction"].shape == (1, 1, 1, 2, 4)
+
+
+def test_compound_objective_trains_causal_prefix_prediction():
+    atom_logits = torch.zeros(1, 1, 1, 2, 2)
+    coeff_logits = torch.zeros(1, 1, 1, 2, 2)
+    target_atoms = torch.zeros(1, 1, 1, 2, dtype=torch.long)
+    target_coeff_probs = torch.full((1, 1, 1, 2, 2), 0.5)
+    target_prefix = torch.ones(1, 1, 1, 2, 4)
+    predicted_prefix = torch.zeros_like(target_prefix, requires_grad=True)
+
+    loss, values = compound_objective(
+        atom_logits,
+        coeff_logits,
+        None,
+        target_atoms,
+        target_coeff_probs,
+        None,
+        atom_weight=1.0,
+        causal_prefix_prediction=predicted_prefix,
+        target_causal_prefix=target_prefix,
+        causal_prefix_weight=0.25,
+        geometry_weight=0.0,
+        accumulation=1,
+    )
+    loss.backward()
+
+    assert torch.allclose(values["causal_prefix"], torch.tensor(1.0))
+    assert predicted_prefix.grad is not None
+    assert torch.isfinite(predicted_prefix.grad).all()
 
 
 def test_compound_objective_weights_atoms_and_zeroes_exact_geometry():
