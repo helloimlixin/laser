@@ -1,0 +1,135 @@
+{
+  "checkpoint": {
+    "bottleneck": "LASER",
+    "checkpoint_id": "79b8d064b03b4274a7aedf03bb7cf672",
+    "dictionary_size": 16384,
+    "dictionary_update_step": 80500,
+    "global_step": 80375,
+    "path": "/workspace/Projects/laser/outputs/imagenet-laser-rfid4587-bypass-alt-gate-20260824-171305/in256-rqvae-laser-8x8-a16384-k4-paired-alternating/24082026_171305/step80375_dictionary_catchup125.pt",
+    "sha256": "2174f9d5ccc70896dd03e2979058790262ae55a1d5107dd0f935f105242ec504",
+    "sparsity": 4
+  },
+  "figure": {
+    "columns": 8,
+    "dpi": 300,
+    "height_pixels": 524,
+    "padding_pixels": 4,
+    "pdf": "/workspace/Projects/laser/paper/figures/imagenet_laser_rfid4p569_reconstruction_grid.pdf",
+    "pdf_sha256": "152fa45ef7fcd9074c655e06a980d335dda8d8e11a9f053f8fb8186d9ccdefaf",
+    "png": "/workspace/Projects/laser/paper/figures/imagenet_laser_rfid4p569_reconstruction_grid.png",
+    "png_sha256": "b535a99daa3c9dc3e1f52409d294728ba1af601f16361ed146ca915b78310ebb",
+    "rows": [
+      "original",
+      "LASER reconstruction"
+    ],
+    "width_pixels": 2084
+  },
+  "grid_reconstruction": {
+    "mse_mean": 0.008523492142558098,
+    "psnr_mean_db": 21.316116333007812
+  },
+  "items": [
+    {
+      "class_name": "pill bottle",
+      "column": 0,
+      "mse": 0.007666334044188261,
+      "psnr_db": 21.154125213623047,
+      "source_path": "/workspace/Projects/data/imagenet/val/n03937543/ILSVRC2012_val_00043519.JPEG",
+      "target": 720,
+      "unique_atoms": 253,
+      "validation_index": 36044,
+      "wnid": "n03937543"
+    },
+    {
+      "class_name": "scuba diver",
+      "column": 1,
+      "mse": 0.006981901358813047,
+      "psnr_db": 21.560264587402344,
+      "source_path": "/workspace/Projects/data/imagenet/val/n10565667/ILSVRC2012_val_00020135.JPEG",
+      "target": 983,
+      "unique_atoms": 253,
+      "validation_index": 49165,
+      "wnid": "n10565667"
+    },
+    {
+      "class_name": "rain barrel",
+      "column": 2,
+      "mse": 0.010487668216228485,
+      "psnr_db": 19.793210983276367,
+      "source_path": "/workspace/Projects/data/imagenet/val/n04049303/ILSVRC2012_val_00010379.JPEG",
+      "target": 756,
+      "unique_atoms": 252,
+      "validation_index": 37807,
+      "wnid": "n04049303"
+    },
+    {
+      "class_name": "briard",
+      "column": 3,
+      "mse": 0.005634272005409002,
+      "psnr_db": 22.491622924804688,
+      "source_path": "/workspace/Projects/data/imagenet/val/n02105251/ILSVRC2012_val_00046402.JPEG",
+      "target": 226,
+      "unique_atoms": 254,
+      "validation_index": 11341,
+      "wnid": "n02105251"
+    },
+    {
+      "class_name": "king crab, Alaska crab, Alaskan king crab, Alaska king crab, Paralithodes camtschatica",
+      "column": 4,
+      "mse": 0.009891925379633904,
+      "psnr_db": 20.047191619873047,
+      "source_path": "/workspace/Projects/data/imagenet/val/n01981276/ILSVRC2012_val_00037684.JPEG",
+      "target": 121,
+      "unique_atoms": 249,
+      "validation_index": 6091,
+      "wnid": "n01981276"
+    },
+    {
+      "class_name": "guinea pig, Cavia cobaya",
+      "column": 5,
+      "mse": 0.002385407453402877,
+      "psnr_db": 26.224374771118164,
+      "source_path": "/workspace/Projects/data/imagenet/val/n02364673/ILSVRC2012_val_00004030.JPEG",
+      "target": 338,
+      "unique_atoms": 248,
+      "validation_index": 16904,
+      "wnid": "n02364673"
+    },
+    {
+      "class_name": "pitcher, ewer",
+      "column": 6,
+      "mse": 0.006294652819633484,
+      "psnr_db": 22.010284423828125,
+      "source_path": "/workspace/Projects/data/imagenet/val/n03950228/ILSVRC2012_val_00045016.JPEG",
+      "target": 725,
+      "unique_atoms": 241,
+      "validation_index": 36293,
+      "wnid": "n03950228"
+    },
+    {
+      "class_name": "football helmet",
+      "column": 7,
+      "mse": 0.018845772370696068,
+      "psnr_db": 17.247861862182617,
+      "source_path": "/workspace/Projects/data/imagenet/val/n03379051/ILSVRC2012_val_00029117.JPEG",
+      "target": 560,
+      "unique_atoms": 250,
+      "validation_index": 28026,
+      "wnid": "n03379051"
+    }
+  ],
+  "metric": {
+    "backend": "original-rqvae",
+    "log": "/workspace/Projects/laser/outputs/imagenet-laser-rfid4587-bypass-alt-gate-20260824-171305/in256-rqvae-laser-8x8-a16384-k4-paired-alternating/24082026_171305/val/24082026_173908/train.log",
+    "name": "rFID",
+    "validation_images": 50000,
+    "value": 4.569274
+  },
+  "selection": {
+    "method": "first columns of torch.randperm over the full validation split",
+    "quality_filtering": false,
+    "seed": 0,
+    "transform": "Resize(256), CenterCrop(256), Resize(256x256), normalize to [-1,1]",
+    "validation_split_size": 50000
+  }
+}

@@ -221,6 +221,71 @@ def test_ste_keeps_encoder_grad_and_loss_trains_dictionary():
     assert dl.dictionary.grad.abs().sum() > 0
 
 
+def test_alternating_residual_update_freezes_dictionary_and_improves_fixed_codes():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=1,
+        dictionary_update_mode="alternating_residual",
+        dictionary_update_relaxation=1.0,
+        dictionary_update_max_atoms_per_step=2,
+        dictionary_update_min_usage=1,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(torch.eye(2))
+    z = torch.tensor(
+        [[
+            [[1.0, 1.0], [0.4, 0.5]],
+            [[0.5, 0.4], [1.0, 1.0]],
+        ]],
+        requires_grad=True,
+    )
+
+    z_out, _loss, _codes = dl(z)
+    cached = dl._last_dictionary_update_batch
+    signals = cached["signals"]
+    support = cached["support"]
+    values = cached["values"]
+
+    def fixed_code_error(dictionary):
+        atoms = dictionary.t()[support]
+        reconstruction = (atoms * values.unsqueeze(-1)).sum(dim=1).t()
+        return (signals - reconstruction).square().sum()
+
+    before_dictionary = dl.dictionary.detach().clone()
+    before_error = fixed_code_error(before_dictionary)
+    (z_out.square().mean() + dl._last_bottleneck_objective_for_backward).backward()
+
+    assert z.grad is not None
+    assert float(z.grad.abs().sum()) > 0.0
+    assert torch.allclose(
+        dl._last_bottleneck_objective_for_backward.detach(),
+        dl._last_commitment_loss,
+    )
+    assert not dl.dictionary.requires_grad
+    assert dl.dictionary.grad is None
+
+    updated = dl.alternating_dictionary_update_after_step_()
+    after_dictionary = dl.dictionary.detach().clone()
+    after_error = fixed_code_error(after_dictionary)
+
+    assert updated == 2
+    assert not torch.allclose(after_dictionary, before_dictionary)
+    assert after_error <= before_error + 1e-6
+    assert torch.allclose(
+        after_dictionary.norm(dim=0),
+        torch.ones(2),
+        atol=1e-6,
+    )
+    assert int(dl._dictionary_update_step.item()) == 1
+    assert float(dl._last_dictionary_update_relative_improvement.item()) > 0.0
+
+
+def test_dictionary_learning_rejects_unknown_update_mode():
+    with pytest.raises(ValueError, match="dictionary_update_mode"):
+        DictionaryLearning(dictionary_update_mode="adam-but-not-really")
+
+
 def test_batch_omp_support_matches_abs_correlations_on_orthogonal_dictionary():
     torch.manual_seed(0)
     dl = DictionaryLearning(

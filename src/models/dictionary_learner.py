@@ -31,6 +31,11 @@ class DictionaryLearning(nn.Module):
         dead_atom_revival_noise=0.05,
         dead_atom_revival_patience=5,
         omp_compute_precision="float32",
+        dictionary_update_mode="gradient",
+        dictionary_update_relaxation=0.25,
+        dictionary_update_max_atoms_per_step=512,
+        dictionary_update_min_usage=2,
+        dictionary_update_max_backtracks=6,
         epsilon=1e-10,
     ):
         super().__init__()
@@ -53,6 +58,38 @@ class DictionaryLearning(nn.Module):
             raise ValueError(
                 "omp_compute_precision must be 'float32' or 'bfloat16', got "
                 f"{omp_compute_precision!r}"
+            )
+        self.dictionary_update_mode = str(dictionary_update_mode).strip().lower()
+        if self.dictionary_update_mode not in {"gradient", "alternating_residual"}:
+            raise ValueError(
+                "dictionary_update_mode must be 'gradient' or "
+                f"'alternating_residual', got {dictionary_update_mode!r}"
+            )
+        self.dictionary_update_relaxation = float(dictionary_update_relaxation)
+        self.dictionary_update_max_atoms_per_step = int(
+            dictionary_update_max_atoms_per_step
+        )
+        self.dictionary_update_min_usage = int(dictionary_update_min_usage)
+        self.dictionary_update_max_backtracks = int(dictionary_update_max_backtracks)
+        if not 0.0 < self.dictionary_update_relaxation <= 1.0:
+            raise ValueError(
+                "dictionary_update_relaxation must be in (0, 1], got "
+                f"{self.dictionary_update_relaxation}"
+            )
+        if self.dictionary_update_max_atoms_per_step <= 0:
+            raise ValueError(
+                "dictionary_update_max_atoms_per_step must be positive, got "
+                f"{self.dictionary_update_max_atoms_per_step}"
+            )
+        if self.dictionary_update_min_usage <= 0:
+            raise ValueError(
+                "dictionary_update_min_usage must be positive, got "
+                f"{self.dictionary_update_min_usage}"
+            )
+        if self.dictionary_update_max_backtracks < 0:
+            raise ValueError(
+                "dictionary_update_max_backtracks must be non-negative, got "
+                f"{self.dictionary_update_max_backtracks}"
             )
 
         if self.num_embeddings <= 0:
@@ -98,7 +135,10 @@ class DictionaryLearning(nn.Module):
         self.patch_reconstruction = "tile"
 
         self.patch_dim = self.embedding_dim * self.patch_size * self.patch_size
-        self.dictionary = nn.Parameter(torch.randn(self.patch_dim, self.num_embeddings) * 0.02)
+        self.dictionary = nn.Parameter(
+            torch.randn(self.patch_dim, self.num_embeddings) * 0.02,
+            requires_grad=self.dictionary_update_mode == "gradient",
+        )
 
         self.register_buffer("_data_initialized", torch.tensor(False, dtype=torch.bool))
         self.register_buffer("_atom_usage_window", torch.zeros(self.num_embeddings))
@@ -111,7 +151,19 @@ class DictionaryLearning(nn.Module):
         self.register_buffer("_last_revived_atom_count", torch.zeros((), dtype=torch.long))
         self.register_buffer("_last_active_atom_count", torch.zeros((), dtype=torch.long))
         self.register_buffer("_last_revival_check_step", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_dictionary_update_step", torch.zeros((), dtype=torch.long))
+        self.register_buffer(
+            "_last_dictionary_updated_atom_count", torch.zeros((), dtype=torch.long)
+        )
+        self.register_buffer(
+            "_last_dictionary_update_relaxation", torch.zeros((), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "_last_dictionary_update_relative_improvement",
+            torch.zeros((), dtype=torch.float32),
+        )
         self._revival_candidate_atoms = None
+        self._last_dictionary_update_batch = None
 
         self.normalize_dictionary_()
         self._last_dl_latent_loss = None
@@ -142,6 +194,224 @@ class DictionaryLearning(nn.Module):
             grad = torch.nan_to_num(self.dictionary.grad)
             radial = (atoms * grad).sum(dim=0, keepdim=True)
             self.dictionary.grad.copy_(torch.nan_to_num(grad - atoms * radial))
+
+    @torch.no_grad()
+    def alternating_dictionary_update_after_step_(self) -> int:
+        """Update active atoms with fixed codes after the backbone Adam step.
+
+        The preceding forward caches detached encoder signals and their OMP
+        codes. With those codes fixed, each selected atom has a closed-form
+        residual least-squares target. Active atoms are moved toward those
+        targets together; a global fixed-code reconstruction check backtracks
+        the relaxation when cross-atom interactions would increase error.
+        """
+        if self.dictionary_update_mode != "alternating_residual":
+            return 0
+
+        batch = self._last_dictionary_update_batch
+        self._last_dictionary_update_batch = None
+        self._dictionary_update_step.add_(1)
+        self._last_dictionary_updated_atom_count.zero_()
+        self._last_dictionary_update_relaxation.zero_()
+        self._last_dictionary_update_relative_improvement.zero_()
+        if not batch:
+            return 0
+
+        signals = batch["signals"].to(
+            device=self.dictionary.device,
+            dtype=torch.float32,
+        )
+        support = batch["support"].to(
+            device=self.dictionary.device,
+            dtype=torch.long,
+        )
+        values = batch["values"].to(
+            device=self.dictionary.device,
+            dtype=torch.float32,
+        )
+        if (
+            signals.ndim != 2
+            or support.ndim != 2
+            or values.shape != support.shape
+            or int(signals.size(1)) != int(support.size(0))
+            or support.numel() == 0
+        ):
+            return 0
+
+        dictionary = _normalize_dictionary(
+            self.dictionary.detach().float(),
+            eps=max(float(self.epsilon), 1e-8),
+        )
+        support = support.clamp(0, self.num_embeddings - 1)
+        atoms = dictionary.t()[support]
+        reconstruction = (atoms * values.unsqueeze(-1)).sum(dim=1).t().contiguous()
+        residual = torch.nan_to_num(
+            signals - reconstruction,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        flat_support = support.reshape(-1)
+        flat_values = values.reshape(-1)
+        counts = torch.bincount(flat_support, minlength=self.num_embeddings).to(
+            device=self.dictionary.device,
+            dtype=torch.long,
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        active = torch.nonzero(
+            counts >= int(self.dictionary_update_min_usage),
+            as_tuple=False,
+        ).flatten()
+        if active.numel() == 0:
+            return 0
+        active_counts = counts.index_select(0, active)
+        order = torch.argsort(active_counts, descending=True, stable=True)
+        active = active.index_select(
+            0,
+            order[: int(self.dictionary_update_max_atoms_per_step)],
+        )
+
+        lookup = torch.full(
+            (self.num_embeddings,),
+            -1,
+            device=self.dictionary.device,
+            dtype=torch.long,
+        )
+        lookup[active] = torch.arange(
+            int(active.numel()),
+            device=self.dictionary.device,
+            dtype=torch.long,
+        )
+        active_columns = lookup[flat_support]
+        selected = active_columns >= 0
+        if not bool(selected.any()):
+            return 0
+        active_columns = active_columns[selected]
+        selected_values = flat_values[selected]
+        signal_ids = (
+            torch.arange(
+                int(support.size(0)),
+                device=self.dictionary.device,
+                dtype=torch.long,
+            )
+            .unsqueeze(1)
+            .expand_as(support)
+            .reshape(-1)[selected]
+        )
+
+        residual_correlation = torch.zeros(
+            self.patch_dim,
+            int(active.numel()),
+            device=self.dictionary.device,
+            dtype=torch.float32,
+        )
+        residual_correlation.index_add_(
+            1,
+            active_columns,
+            residual.index_select(1, signal_ids) * selected_values.unsqueeze(0),
+        )
+        coefficient_energy = torch.zeros(
+            int(active.numel()),
+            device=self.dictionary.device,
+            dtype=torch.float32,
+        )
+        coefficient_energy.index_add_(
+            0,
+            active_columns,
+            selected_values.square(),
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(
+                residual_correlation,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            torch.distributed.all_reduce(
+                coefficient_energy,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+
+        old_atoms = dictionary.index_select(1, active)
+        sufficient_statistic = (
+            residual_correlation
+            + old_atoms * coefficient_energy.unsqueeze(0)
+        )
+        valid_atoms = (
+            coefficient_energy > max(float(self.epsilon), 1e-8)
+        ) & (
+            sufficient_statistic.norm(dim=0) > max(float(self.epsilon), 1e-8)
+        )
+        if not bool(valid_atoms.any()):
+            return 0
+        targets = old_atoms.clone()
+        targets[:, valid_atoms] = F.normalize(
+            sufficient_statistic[:, valid_atoms],
+            p=2,
+            dim=0,
+            eps=max(float(self.epsilon), 1e-8),
+        )
+
+        baseline_error = residual.square().sum()
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(
+                baseline_error,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        accepted_atoms = None
+        accepted_error = None
+        accepted_relaxation = 0.0
+        relaxation = float(self.dictionary_update_relaxation)
+        tolerance = max(float(baseline_error.item()), 1.0) * 1e-7
+        for _ in range(int(self.dictionary_update_max_backtracks) + 1):
+            trial_atoms = F.normalize(
+                old_atoms.lerp(targets, relaxation),
+                p=2,
+                dim=0,
+                eps=max(float(self.epsilon), 1e-8),
+            )
+            delta_atoms = trial_atoms - old_atoms
+            delta_reconstruction = torch.zeros_like(residual)
+            delta_reconstruction.index_add_(
+                1,
+                signal_ids,
+                delta_atoms[:, active_columns] * selected_values.unsqueeze(0),
+            )
+            trial_error = (residual - delta_reconstruction).square().sum()
+            if self._distributed_is_initialized():
+                torch.distributed.all_reduce(
+                    trial_error,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+            if float(trial_error.item()) <= float(baseline_error.item()) + tolerance:
+                accepted_atoms = trial_atoms
+                accepted_error = trial_error
+                accepted_relaxation = relaxation
+                break
+            relaxation *= 0.5
+
+        if accepted_atoms is None:
+            return 0
+        self.dictionary.data.index_copy_(
+            1,
+            active,
+            accepted_atoms.to(dtype=self.dictionary.dtype),
+        )
+        self.normalize_dictionary_()
+        updated_count = int(valid_atoms.sum().item())
+        self._last_dictionary_updated_atom_count.fill_(updated_count)
+        self._last_dictionary_update_relaxation.fill_(accepted_relaxation)
+        relative_improvement = (
+            (baseline_error - accepted_error)
+            / baseline_error.clamp_min(max(float(self.epsilon), 1e-8))
+        )
+        self._last_dictionary_update_relative_improvement.copy_(
+            relative_improvement.to(
+                device=self._last_dictionary_update_relative_improvement.device,
+                dtype=self._last_dictionary_update_relative_improvement.dtype,
+            )
+        )
+        return updated_count
 
     def _validate_omp_inputs(self, X, D):
         if X.ndim != 2 or D.ndim != 2:
@@ -547,7 +817,22 @@ class DictionaryLearning(nn.Module):
             return
         if bool(self._data_initialized.item()):
             return
-        atoms = self._signal_atoms(self._all_gather_signal_columns(signals), self.num_embeddings)
+        world_size = (
+            int(torch.distributed.get_world_size())
+            if self._distributed_is_initialized()
+            else 1
+        )
+        max_local_columns = max(
+            2048,
+            int(math.ceil(float(self.num_embeddings) / float(world_size))),
+        )
+        atoms = self._signal_atoms(
+            self._all_gather_signal_columns(
+                signals,
+                max_local_columns=max_local_columns,
+            ),
+            self.num_embeddings,
+        )
         if atoms is not None:
             self.dictionary.copy_(atoms)
             self.normalize_dictionary_()
@@ -648,6 +933,12 @@ class DictionaryLearning(nn.Module):
                 prefix_values = None
         support = support_flat.view(batch_size, grid_h, grid_w, self.sparsity_level)
         values = values.view(batch_size, grid_h, grid_w, self.sparsity_level).float()
+        if self.training and self.dictionary_update_mode == "alternating_residual":
+            self._last_dictionary_update_batch = {
+                "signals": signals.detach(),
+                "support": support_flat.detach(),
+                "values": values.detach().reshape(-1, self.sparsity_level),
+            }
         self._record_atom_usage_(support, signals)
 
         z_dl = self._reconstruct_sparse(support, values, latent_h, latent_w).float()
@@ -677,7 +968,14 @@ class DictionaryLearning(nn.Module):
         dictionary_loss = dl_latent_loss
         commitment_loss = float(self.commitment_cost) * e_latent_loss
         bottleneck_loss = commitment_loss
-        objective = dictionary_loss + bottleneck_loss
+        # In alternating mode the dictionary objective is optimized by the
+        # explicit fixed-code residual step, not autograd. Keeping it out of
+        # the backbone loss also makes LASER's encoder commitment numerically
+        # match RQ-VAE's depth-averaged commitment objective.
+        if self.dictionary_update_mode == "alternating_residual":
+            objective = bottleneck_loss
+        else:
+            objective = dictionary_loss + bottleneck_loss
 
         self._last_dl_latent_loss = dl_latent_loss.detach()
         self._last_e_latent_loss = e_latent_loss.detach()

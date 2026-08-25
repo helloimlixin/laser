@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an ordered ImageNet, face, or LSUN-Church LASER sparse cache."""
+"""Build an ordered ImageNet, face, or LSUN LASER sparse cache."""
 from __future__ import annotations
 
 import argparse
@@ -59,7 +59,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument(
         "--dataset",
-        choices=("imagenet", "celebahq", "ffhq", "lsun_church"),
+        choices=("imagenet", "celebahq", "ffhq", "lsun_bedroom", "lsun_church"),
         default="imagenet",
     )
     p.add_argument(
@@ -159,7 +159,9 @@ def main():
                 labels.append(
                     (
                         torch.zeros_like(target)
-                        if args.dataset in {"celebahq", "ffhq", "lsun_church"}
+                        if args.dataset in {
+                            "celebahq", "ffhq", "lsun_bedroom", "lsun_church"
+                        }
                         else target
                     ).to(
                         torch.int16
@@ -184,7 +186,13 @@ def main():
         if calibrating:
             absolute = merged_coeffs.abs().reshape(-1, args.sparsity_level)
             quantile = float(args.auto_coeff_scales_percentile) / 100.0
-            coeff_scales = torch.quantile(absolute, quantile, dim=0) / args.coeff_max
+            # torch.quantile rejects very large inputs.  Percentile 100 is
+            # exactly the per-depth maximum and does not require sorting the
+            # hundreds of millions of LSUN coefficients.
+            if quantile == 1.0:
+                coeff_scales = absolute.amax(dim=0) / args.coeff_max
+            else:
+                coeff_scales = torch.quantile(absolute, quantile, dim=0) / args.coeff_max
             if not torch.isfinite(coeff_scales).all() or (coeff_scales <= 0).any():
                 raise RuntimeError(f"invalid calibrated coefficient scales: {coeff_scales}")
             merged_coeffs = (
@@ -322,7 +330,11 @@ def main():
             })
             if args.sparsity_level == 2:
                 report["duplicate_atom_within_pair_fraction"] = duplicate_fraction
-        max_label = 0 if args.dataset in {"celebahq", "ffhq", "lsun_church"} else 999
+        max_label = (
+            0
+            if args.dataset in {"celebahq", "ffhq", "lsun_bedroom", "lsun_church"}
+            else 999
+        )
         report["passed"] = report["atom_exact_fraction"] == 1.0 and report["coeff_max_error"] < 0.02 and report["coeff_finite"] and report["atom_min"] >= 0 and report["atom_max"] < args.num_atoms and report["label_min"] >= 0 and report["label_max"] <= max_label
         if args.causal_prefixes:
             report["passed"] = (

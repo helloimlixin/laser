@@ -27,6 +27,7 @@ from scripts.train_official_rqtransformer_laser_stage2 import (  # noqa: E402
     build_model,
     evaluate_generation_metrics,
     rank,
+    sample_class_grid,
 )
 
 
@@ -39,6 +40,15 @@ SAMPLERS = (
         "coeff_temperature": 1.0,
         "coeff_top_k": 250,
         "coeff_top_p": 1.0,
+    },
+    {
+        "name": "coeff_nucleus_at1_k250_p1__ct1_k0_p075",
+        "atom_temperature": 1.0,
+        "atom_top_k": 250,
+        "atom_top_p": 1.0,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.75,
     },
     {
         "name": "coeff_nucleus_at1_k250_p1__ct1_k0_p085",
@@ -57,6 +67,81 @@ SAMPLERS = (
         "coeff_temperature": 1.0,
         "coeff_top_k": 0,
         "coeff_top_p": 0.92,
+    },
+    {
+        "name": "coeff_tempered_at1_k250_p1__ct085_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 250,
+        "atom_top_p": 1.0,
+        "coeff_temperature": 0.85,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+    },
+    {
+        "name": "atom_nucleus_at1_k0_p092__ct1_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 0,
+        "atom_top_p": 0.92,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+    },
+    {
+        "name": "atom_nucleus_at1_k0_p085__ct1_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 0,
+        "atom_top_p": 0.85,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+    },
+    {
+        "name": "atom_topk_at1_k100_p1__ct1_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 100,
+        "atom_top_p": 1.0,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+    },
+    {
+        "name": "atom_tempered_at09_k250_p1__ct1_k0_p092",
+        "atom_temperature": 0.9,
+        "atom_top_k": 250,
+        "atom_top_p": 1.0,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+    },
+    {
+        "name": "prefix_accumulated_at1_k0_p092__ct1_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 0,
+        "atom_top_p": 0.92,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+        "causal_prefix_sampling": "accumulated",
+    },
+    {
+        "name": "prefix_zero_at1_k0_p092__ct1_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 0,
+        "atom_top_p": 0.92,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+        "causal_prefix_sampling": "zero",
+    },
+    {
+        "name": "prefix_accumulated_at1_k250_p1__ct1_k0_p092",
+        "atom_temperature": 1.0,
+        "atom_top_k": 250,
+        "atom_top_p": 1.0,
+        "coeff_temperature": 1.0,
+        "coeff_top_k": 0,
+        "coeff_top_p": 0.92,
+        "causal_prefix_sampling": "accumulated",
     },
     {
         "name": "joint_nucleus_at09_k0_p092__ct1_k0_p085",
@@ -89,6 +174,14 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=250)
     parser.add_argument("--seed", type=int, default=20260817)
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Write matched sampling grids instead of computing FID",
+    )
+    parser.add_argument("--preview-num-samples", type=int, default=64)
+    parser.add_argument("--preview-batch-size", type=int, default=8)
+    parser.add_argument("--preview-samples-per-row", type=int, default=8)
     parser.add_argument(
         "--settings",
         nargs="+",
@@ -128,6 +221,17 @@ def validate_inputs(args):
         raise ValueError("--batch-size must be positive")
     if args.seed < 0:
         raise ValueError("--seed cannot be negative")
+    if args.preview_num_samples <= 0:
+        raise ValueError("--preview-num-samples must be positive")
+    if args.preview_batch_size <= 0:
+        raise ValueError("--preview-batch-size must be positive")
+    if (
+        args.preview_samples_per_row <= 0
+        or args.preview_num_samples % args.preview_samples_per_row
+    ):
+        raise ValueError(
+            "--preview-num-samples must be divisible by --preview-samples-per-row"
+        )
 
 
 def main():
@@ -239,6 +343,7 @@ def main():
         "world_size": world,
         "seed_per_setting": args.seed,
         "matched_seed": True,
+        "preview_only": args.preview_only,
         "results": [],
     }
     if rank() == 0:
@@ -257,39 +362,73 @@ def main():
         started = time.monotonic()
         if rank() == 0:
             print(f"START {setting['name']}", flush=True)
-        fid, _, _ = evaluate_generation_metrics(
-            model,
-            aux,
-            val_loader=None,
-            num_samples=args.num_samples,
-            batch_size=args.batch_size,
-            num_condition_classes=1,
-            compute_inception_score=False,
-            metric_backend="original-rqvae",
-            fid_reference_stats=args.fid_reference_stats,
-            **{key: value for key, value in setting.items() if key != "name"},
-        )
+        if args.preview_only:
+            if world != 1:
+                raise ValueError("--preview-only must be run as a single process")
+            target = sample_class_grid(
+                model,
+                aux,
+                class_names=[],
+                output_dir=args.output,
+                step=checkpoint_metadata["global_step"],
+                num_condition_classes=1,
+                num_samples=args.preview_num_samples,
+                sample_batch_size=args.preview_batch_size,
+                samples_per_class=args.preview_samples_per_row,
+                setting_name=setting["name"],
+                **{key: value for key, value in setting.items() if key != "name"},
+            )
+            fid = None
+        else:
+            fid, _, _ = evaluate_generation_metrics(
+                model,
+                aux,
+                val_loader=None,
+                num_samples=args.num_samples,
+                batch_size=args.batch_size,
+                num_condition_classes=1,
+                compute_inception_score=False,
+                metric_backend="original-rqvae",
+                fid_reference_stats=args.fid_reference_stats,
+                **{key: value for key, value in setting.items() if key != "name"},
+            )
         elapsed = time.monotonic() - started
-        result = {**setting, "fid": float(fid), "elapsed_seconds": elapsed}
+        result = {**setting, "elapsed_seconds": elapsed}
+        if args.preview_only:
+            result["preview"] = str(target.resolve())
+        else:
+            result["fid"] = float(fid)
         if rank() == 0:
             results["results"].append(result)
-            results["results"].sort(key=lambda item: item["fid"])
+            if not args.preview_only:
+                results["results"].sort(key=lambda item: item["fid"])
             atomic_write_json(results, results_path)
-            print(
-                f"DONE {setting['name']} fid={fid:.6f} elapsed={elapsed:.1f}s",
-                flush=True,
-            )
+            if args.preview_only:
+                print(
+                    f"DONE {setting['name']} preview={target} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"DONE {setting['name']} fid={fid:.6f} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
         gc.collect()
         torch.cuda.empty_cache()
 
     if rank() == 0:
-        winner = results["results"][0]
-        results["winner"] = winner
+        if not args.preview_only:
+            winner = results["results"][0]
+            results["winner"] = winner
         atomic_write_json(results, results_path)
-        print(
-            f"WINNER {winner['name']} fid={winner['fid']:.6f}; results={results_path}",
-            flush=True,
-        )
+        if args.preview_only:
+            print(f"PREVIEWS results={results_path}", flush=True)
+        else:
+            print(
+                f"WINNER {winner['name']} fid={winner['fid']:.6f}; "
+                f"results={results_path}",
+                flush=True,
+            )
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

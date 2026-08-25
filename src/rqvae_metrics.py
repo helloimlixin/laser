@@ -162,9 +162,13 @@ class DistributedOriginalRQVAEMetrics:
     num_logits = 1008
 
     def __init__(self, device: torch.device, *, compute_inception_score: bool = False,
-                 reference_stats_path=None):
+                 reference_stats_path=None, inception=None):
         self.device = torch.device(device)
-        self.inception = OriginalRQVAEInception().to(self.device).eval()
+        self.inception = (
+            OriginalRQVAEInception().to(self.device).eval()
+            if inception is None
+            else inception
+        )
         self.compute_inception_score = bool(compute_inception_score)
         self.reference_stats_path = (
             None if reference_stats_path is None else Path(reference_stats_path)

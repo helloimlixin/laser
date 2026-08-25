@@ -51,6 +51,8 @@ def _trainer_stub(result_path):
     trainer.lineage_exact = True
     trainer.lineage_origin = "test"
     trainer._last_checkpoint_id = None
+    trainer.quantizer_step_offset = 0
+    trainer.dictionary_calibration = None
     return trainer
 
 
@@ -154,6 +156,39 @@ def test_full_topk_rotation_does_not_exceed_existing_checkpoint_footprint(
     ) == 4
 
 
+def test_best_bypass_checkpoint_tracks_backbone_ceiling_independently(tmp_path):
+    last_path = tmp_path / "last_model.pt"
+    last_path.write_bytes(b"epoch1")
+    trainer = _trainer_stub(tmp_path)
+
+    best = trainer._update_best_bypass_checkpoint(
+        last_path, epoch=1, bypass_rfid=5.0
+    )
+    assert best[0]["epoch"] == 1
+    assert (tmp_path / "best_bypass_rfid_model.pt").read_bytes() == b"epoch1"
+
+    next_path = tmp_path / "next_model.pt"
+    next_path.write_bytes(b"epoch2")
+    next_path.replace(last_path)
+    unchanged = trainer._update_best_bypass_checkpoint(
+        last_path, epoch=2, bypass_rfid=5.1
+    )
+    assert unchanged[0]["epoch"] == 1
+    assert (tmp_path / "best_bypass_rfid_model.pt").read_bytes() == b"epoch1"
+
+    improved_path = tmp_path / "improved_model.pt"
+    improved_path.write_bytes(b"epoch3")
+    improved_path.replace(last_path)
+    improved = trainer._update_best_bypass_checkpoint(
+        last_path, epoch=3, bypass_rfid=4.8
+    )
+    assert improved[0]["epoch"] == 3
+    assert (tmp_path / "best_bypass_rfid_model.pt").read_bytes() == b"epoch3"
+    policy = json.loads((tmp_path / "bypass_checkpoint_policy.json").read_text())
+    assert policy["monitor"] == "valid/bypass_rfid"
+    assert policy["best"]["bypass_rfid"] == 4.8
+
+
 def test_saved_checkpoint_contains_all_training_and_rng_state(tmp_path):
     trainer = _trainer_stub(tmp_path)
     trainer.loader_trn = [None] * 5
@@ -216,6 +251,7 @@ def test_saved_checkpoint_contains_all_training_and_rng_state(tmp_path):
         "lineage_exact": True,
         "lineage_origin": "test",
         "checkpoint_id": checkpoint["checkpoint_id"],
+        "quantizer_step_offset": 0,
         "warnings": [],
     }
 
@@ -230,6 +266,87 @@ def test_saved_checkpoint_contains_all_training_and_rng_state(tmp_path):
     assert actual[0] == expected[0]
     assert actual[1] == expected[1]
     assert torch.equal(actual[2], expected[2])
+
+
+def _dictionary_calibrated_checkpoint():
+    return {
+        "checkpoint_format_version": 5,
+        "checkpoint_id": "calibrated-checkpoint",
+        "lineage_exact": False,
+        "lineage_origin": "test|dictionary_only_calibration_125_steps",
+        "checkpoint_world_size": 1,
+        "epoch": 2,
+        "batch_idx": 3,
+        "global_step": 23,
+        "steps_per_epoch": 10,
+        "quantizer_step_offset": 125,
+        "dictionary_calibration": {
+            "steps": 125,
+            "updated_state_scope": "quantizer.* only",
+            "dictionary_update_step_before": 23,
+            "dictionary_update_step_after": 148,
+            "quantizer_step_offset_before": 0,
+            "quantizer_step_offset_after": 125,
+        },
+        "state_dict": {
+            "quantizer._revival_step": torch.tensor(148),
+            "quantizer._dictionary_update_step": torch.tensor(148),
+        },
+        "optimizer": {"state": {}},
+        "scheduler": {"last_epoch": 23},
+        "rng_state_by_rank": [{}],
+        "epoch_start_rng_state_by_rank": [{}],
+        "train_accumulator_state_by_rank": [{"counter": 3}],
+        "resume_signature": {"sha256": "same"},
+    }
+
+
+def test_resume_validation_accepts_recorded_dictionary_calibration_offset():
+    metadata = validate_resume_checkpoint(
+        _dictionary_calibrated_checkpoint(),
+        steps_per_epoch=10,
+        world_size=1,
+        expected_resume_signature={"sha256": "same"},
+    )
+    assert metadata["quantizer_step_offset"] == 125
+    assert metadata["warnings"] == [
+        "accepted a recorded dictionary-only calibration offset of 125 quantizer steps"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda checkpoint: checkpoint["state_dict"].__setitem__(
+                "quantizer._revival_step", torch.tensor(147)
+            ),
+            "global step 23 plus recorded offset 125",
+        ),
+        (
+            lambda checkpoint: checkpoint.__setitem__(
+                "quantizer_step_offset", 124
+            ),
+            "does not match the checkpoint offset",
+        ),
+        (
+            lambda checkpoint: checkpoint.pop("dictionary_calibration"),
+            "requires dictionary calibration provenance",
+        ),
+    ],
+)
+def test_resume_validation_rejects_invalid_dictionary_calibration_offset(
+    mutation, error
+):
+    checkpoint = _dictionary_calibrated_checkpoint()
+    mutation(checkpoint)
+    with pytest.raises(RuntimeError, match=error):
+        validate_resume_checkpoint(
+            checkpoint,
+            steps_per_epoch=10,
+            world_size=1,
+            expected_resume_signature={"sha256": "same"},
+        )
 
 
 def test_resume_validation_rejects_cursor_state_mismatch():

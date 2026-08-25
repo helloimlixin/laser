@@ -10,7 +10,6 @@ import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 from torchvision import datasets
-from torchmetrics.image.fid import FrechetInceptionDistance
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,6 +18,7 @@ from scripts.train_official_rqtransformer_laser_stage2 import (
     source_image_dataset,
     val_image_transform,
 )
+from src.coefficient_pattern_codec import decode_coefficient_patterns
 
 
 class FlatImages(Dataset):
@@ -132,15 +132,18 @@ def main():
         help="Decode row-aligned cache entries instead of re-encoding source images",
     )
     p.add_argument(
-        "--cache-coeff-mode", choices=("continuous", "quantized"), default="quantized",
+        "--cache-coeff-mode",
+        choices=("continuous", "quantized", "pattern"),
+        default="quantized",
         help=(
             "For --token-cache, decode cached coefficients directly or through "
-            "the Stage-2 nearest-bin tokenizer"
+            "the Stage-2 nearest-bin tokenizer, or decode a joint coefficient-"
+            "pattern cache"
         ),
     )
     p.add_argument(
         "--dataset",
-        choices=("imagenet", "celebahq", "ffhq", "lsun_church"),
+        choices=("imagenet", "celebahq", "ffhq", "lsun_bedroom", "lsun_church"),
         default="imagenet",
     )
     p.add_argument("--num-images", type=int, default=50_000)
@@ -166,17 +169,22 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
     if world > 1:
-        dist.init_process_group("nccl", timeout=timedelta(minutes=45))
+        # Native FID only communicates the final sufficient statistics.  Keep
+        # that reduction on CPU/Gloo: the dataloader workers are forked after
+        # process-group initialization, and making the first NCCL collective
+        # after a long CUDA decoding pass is fragile on some runtimes.
+        distributed_backend = "gloo" if args.backend == "native" else "nccl"
+        dist.init_process_group(distributed_backend, timeout=timedelta(minutes=45))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     if args.dataset in {"celebahq", "ffhq"}:
         full_dataset = FlatImages(args.data, transform=val_image_transform())
         split_name = f"{args.dataset}_full_{args.num_images}"
-    elif args.dataset == "lsun_church":
+    elif args.dataset in {"lsun_bedroom", "lsun_church"}:
         full_dataset = source_image_dataset(
-            "lsun_church", args.data, val_image_transform(), split="train"
+            args.dataset, args.data, val_image_transform(), split="train"
         )
-        split_name = f"lsun_church_train_{args.num_images}"
+        split_name = f"{args.dataset}_train_{args.num_images}"
     else:
         full_dataset = datasets.ImageFolder(
             args.data / "val", transform=val_image_transform()
@@ -189,11 +197,15 @@ def main():
         )
     cache_payload = None
     cache_meta = None
+    orthogonal_cache = False
     if args.token_cache is not None:
         cache_payload = torch.load(
             args.token_cache, map_location="cpu", weights_only=True, mmap=True
         )
         cache_meta = dict(cache_payload["meta"])
+        orthogonal_cache = (
+            cache_meta.get("format") == "laser_orthogonal_compound_v1"
+        )
         if cache_meta.get("dataset") != args.dataset:
             raise ValueError(
                 f"token cache dataset mismatch: {cache_meta.get('dataset')!r} != {args.dataset!r}"
@@ -202,6 +214,21 @@ def main():
             raise ValueError(
                 f"token cache has {len(cache_payload['atoms']):,} rows, fewer than "
                 f"the requested {args.num_images:,}"
+            )
+        if args.cache_coeff_mode == "pattern":
+            for key in ("coefficient_pattern_ids", "coefficient_patterns"):
+                if key not in cache_payload:
+                    raise ValueError(
+                        f"pattern coefficient mode requires cache key {key!r}"
+                    )
+            if cache_meta.get("format") != "laser_coefficient_patterns_v1":
+                raise ValueError(
+                    "pattern coefficient mode requires a "
+                    "laser_coefficient_patterns_v1 cache"
+                )
+        elif "coeffs" not in cache_payload:
+            raise ValueError(
+                f"{args.cache_coeff_mode} coefficient mode requires cached coeffs"
             )
         dataset = IndexedSubset(full_dataset, args.num_images)
     else:
@@ -231,9 +258,16 @@ def main():
         ),
         sparsity_level=sparsity_level,
     ).to(device).eval()
+    coefficient_patterns = (
+        cache_payload["coefficient_patterns"].to(device=device, dtype=torch.float32)
+        if cache_payload is not None and args.cache_coeff_mode == "pattern"
+        else None
+    )
     metric = None
     inception = None
     if args.backend == "torchmetrics":
+        from torchmetrics.image.fid import FrechetInceptionDistance
+
         metric = FrechetInceptionDistance(feature=2048, normalize=True,
                                           sync_on_compute=world > 1).to(device)
     else:
@@ -260,18 +294,44 @@ def main():
             else:
                 indices = row_indices.long()
                 atoms = cache_payload["atoms"][indices].to(device, dtype=torch.long)
-                coeffs = cache_payload["coeffs"][indices].to(device, dtype=torch.float32)
-                if args.cache_coeff_mode == "quantized":
+                if args.cache_coeff_mode == "pattern":
+                    pattern_ids = cache_payload["coefficient_pattern_ids"][indices].to(
+                        device=device, dtype=torch.long
+                    )
+                    physical_coeffs = decode_coefficient_patterns(
+                        pattern_ids, coefficient_patterns
+                    )
+                    vectors = aux.dictionary.t()[atoms]
+                    z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
+                    z_q = aux.post_quant_conv(
+                        z_q.permute(0, 3, 1, 2).contiguous()
+                    )
+                    decoded = aux.decoder(z_q).clamp(-1.0, 1.0)
+                elif args.cache_coeff_mode == "quantized":
+                    coeffs = cache_payload["coeffs"][indices].to(
+                        device, dtype=torch.float32
+                    )
                     coeff_ids, _ = aux.compound_coeff_ids(
                         coeffs, stochastic=False, hard=True
                     )
-                    decoded = aux.decode_compound(atoms, coeff_ids)
+                    decoded = (
+                        aux.decode_orthogonal(atoms, coeff_ids)
+                        if orthogonal_cache
+                        else aux.decode_compound(atoms, coeff_ids)
+                    )
                 else:
-                    vectors = aux.dictionary.t()[atoms]
+                    coeffs = cache_payload["coeffs"][indices].to(
+                        device, dtype=torch.float32
+                    )
                     physical_coeffs = coeffs * aux.coeff_scales.view(
                         1, 1, 1, sparsity_level
                     )
-                    z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
+                    if orthogonal_cache:
+                        basis, _ = aux.orthogonal_basis(atoms)
+                        z_q = (basis * physical_coeffs[..., None]).sum(dim=-2)
+                    else:
+                        vectors = aux.dictionary.t()[atoms]
+                        z_q = (vectors * physical_coeffs[..., None]).sum(dim=-2)
                     z_q = aux.post_quant_conv(
                         z_q.permute(0, 3, 1, 2).contiguous()
                     )
@@ -302,6 +362,12 @@ def main():
         value = float(metric.compute().item())
     else:
         count = torch.tensor(float(seen), device=device, dtype=torch.float64)
+        if dist.is_initialized() and dist.get_backend() == "gloo":
+            real_sum = real_sum.cpu()
+            fake_sum = fake_sum.cpu()
+            real_cross = real_cross.cpu()
+            fake_cross = fake_cross.cpu()
+            count = count.cpu()
         for tensor in (real_sum, fake_sum, real_cross, fake_cross, count):
             if dist.is_initialized():
                 dist.all_reduce(tensor)
@@ -320,8 +386,12 @@ def main():
                    ),
                    "coeff_quantization": (
                        (
-                           cache_meta.get("coeff_quantization", "uniform")
-                           if args.cache_coeff_mode == "quantized" else "continuous-cache"
+                           cache_meta.get(
+                               "coeff_quantization",
+                               "orthogonal-uniform" if orthogonal_cache else "uniform",
+                           )
+                           if args.cache_coeff_mode in {"quantized", "pattern"}
+                           else "continuous-cache"
                        )
                        if cache_meta is not None else "continuous"
                    )}

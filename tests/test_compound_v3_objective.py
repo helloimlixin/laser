@@ -188,6 +188,119 @@ def test_causal_prefix_depth_context_uses_past_but_not_future_state():
     assert baseline["causal_prefix_prediction"].shape == (1, 1, 1, 2, 4)
 
 
+def test_compound_training_masks_atoms_already_selected_in_each_support():
+    torch.manual_seed(1)
+    model = CompoundLaserRQTransformer(
+        tiny_compound_config(depth=3), num_atoms=7, coeff_vocab_size=5
+    ).eval()
+    aux = tiny_compound_aux(depth=3)
+    atoms = torch.tensor([[[[2, 4, 6]]]])
+    tokens = atoms * 5 + torch.tensor([[[[1, 2, 3]]]])
+
+    with torch.no_grad():
+        atom_logits = model(tokens, model_aux=aux)["atom_logits"]
+
+    assert torch.isfinite(atom_logits[..., 0, :]).all()
+    assert torch.isneginf(atom_logits[..., 1, 2]).all()
+    assert torch.isneginf(atom_logits[..., 2, 2]).all()
+    assert torch.isneginf(atom_logits[..., 2, 4]).all()
+    assert torch.isfinite(atom_logits[..., 2, 6]).all()
+
+
+def test_causal_prefix_prediction_conditions_on_current_compound_coefficient():
+    torch.manual_seed(2)
+    model = CompoundLaserRQTransformer(
+        tiny_compound_config(), num_atoms=7, coeff_vocab_size=5,
+        causal_prefix_state=True,
+    ).eval()
+    aux = tiny_compound_aux()
+    atoms = torch.tensor([[[[2, 4]]]])
+    low = atoms * 5 + torch.tensor([[[[0, 0]]]])
+    high = atoms * 5 + torch.tensor([[[[4, 4]]]])
+    prefixes = torch.zeros(1, 1, 1, 2, 4)
+
+    with torch.no_grad():
+        low_outputs = model(
+            low, model_aux=aux, causal_prefix_reconstructions=prefixes
+        )
+        high_outputs = model(
+            high, model_aux=aux, causal_prefix_reconstructions=prefixes
+        )
+
+    # Atom and coefficient logits at a site remain causal, while the state
+    # emitted after each complete pair must include its chosen coefficient.
+    assert torch.equal(
+        low_outputs["atom_logits"][..., 0, :],
+        high_outputs["atom_logits"][..., 0, :],
+    )
+    assert not torch.equal(
+        low_outputs["causal_prefix_prediction"][..., 0, :],
+        high_outputs["causal_prefix_prediction"][..., 0, :],
+    )
+
+
+def test_compound_cached_logits_match_teacher_forced_logits():
+    torch.manual_seed(3)
+    model = CompoundLaserRQTransformer(
+        tiny_compound_config(), num_atoms=7, coeff_vocab_size=5,
+        causal_prefix_state=True,
+    ).eval()
+    aux = tiny_compound_aux()
+    atoms = torch.tensor([[[[2, 4]]]])
+    tokens = atoms * 5 + torch.tensor([[[[1, 3]]]])
+    prefixes = torch.randn(1, 1, 1, 2, 4)
+
+    with torch.no_grad():
+        teacher = model(
+            tokens, model_aux=aux, causal_prefix_reconstructions=prefixes
+        )
+        model._active_prefix_reconstructions = prefixes
+        model.init_cache()
+        cached_atoms = []
+        cached_coefficients = []
+        try:
+            for depth_index in range(2):
+                hidden = model.cached_head_output(
+                    tokens, aux, None, (0, 0, depth_index), amp=False
+                )
+                atom_logits = model.classifier(hidden)
+                if depth_index:
+                    atom_logits = atom_logits.clone()
+                    atom_logits.scatter_(
+                        1,
+                        atoms[..., :depth_index].reshape(1, depth_index),
+                        -float("inf"),
+                    )
+                cached_atoms.append(atom_logits)
+                atom_vectors = aux.dictionary.t()[
+                    atoms[..., depth_index].reshape(-1)
+                ]
+                cached_coefficients.append(
+                    model.coefficient_logits(
+                        hidden, atom_vectors, depth_index=depth_index
+                    )
+                )
+        finally:
+            model._active_prefix_reconstructions = None
+            model.init_cache()
+
+    cached_atom_logits = torch.stack(cached_atoms, dim=1).reshape(
+        1, 1, 1, 2, 7
+    )
+    cached_coefficient_logits = torch.stack(
+        cached_coefficients, dim=1
+    ).reshape(1, 1, 1, 2, 5)
+    assert torch.allclose(
+        cached_atom_logits, teacher["atom_logits"], atol=2e-7, rtol=1e-6
+    )
+    assert torch.allclose(
+        cached_coefficient_logits,
+        teacher["coeff_logits"],
+        atol=2e-7,
+        rtol=1e-6,
+    )
+
+
 def test_compound_objective_trains_causal_prefix_prediction():
     atom_logits = torch.zeros(1, 1, 1, 2, 2)
     coeff_logits = torch.zeros(1, 1, 1, 2, 2)
