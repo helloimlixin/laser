@@ -1,7 +1,7 @@
 import os
 from types import SimpleNamespace
 
-import train
+from src.training import common as train
 
 
 class _Experiment:

@@ -1,0 +1,6377 @@
+#!/usr/bin/env python3
+"""Train the vendored KakaoBrain RQ-Transformer on LASER sparse codes.
+
+The transformer implementation lives in ``src.models.rqtransformer``.
+The stage-1 auxiliary embedding keeps OMP supports discrete. Coefficients can
+be scalar-quantized per atom, or generated support-first as one joint physical
+coefficient-pattern id after the complete support is known.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from contextlib import contextmanager
+from dataclasses import make_dataclass
+from datetime import timedelta
+from functools import partial
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import shutil
+import tempfile
+import time
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageFont
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    FullOptimStateDictConfig,
+    FullStateDictConfig,
+    FullyShardedDataParallel as FSDP,
+    OptimStateKeyType,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
+from torchvision import datasets, transforms
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "third_party" / "rq-vae-transformer"))
+
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.base import ContainerMetadata, Metadata
+from omegaconf.nodes import AnyNode, BooleanNode, BytesNode, FloatNode, IntegerNode, StringNode
+from src.models.rqtransformer.configs import RQTransformerConfig
+from src.models.rqtransformer.attentions import AttentionBlock, AttentionStack
+from src.models.rqtransformer.transformers import RQTransformer, sample_from_logits
+from rqvae.img_datasets.lsun import LSUNClass
+from rqvae.models.rqvae.rqvae import RQVAE
+from src.data.imagenet_labels import class_names_for_dataset
+from src.orthogonal_sparse_codec import ordered_support_basis
+
+
+FACE_DATASETS = frozenset({"celebahq", "ffhq"})
+UNCONDITIONAL_DATASETS = frozenset(
+    {*FACE_DATASETS, "lsun_bedroom", "lsun_church"}
+)
+
+
+def load_stage1_checkpoint(path: Path):
+    """Load trusted tensor/config state without importing the legacy rqvae package."""
+    import numpy as np
+    from typing import Any
+
+    dist_env = make_dataclass(
+        "DistEnv",
+        [
+            ("world_size", int), ("world_rank", int), ("local_rank", int),
+            ("num_gpus", int), ("master", bool), ("device_name", str),
+        ],
+    )
+    dist_env.__module__ = "rqvae.utils.dist"
+    torch.serialization.add_safe_globals([
+        Any, list, dict, tuple, set, int, str, float, bool, bytes, defaultdict,
+        DictConfig, ListConfig, ContainerMetadata, Metadata, AnyNode, BooleanNode,
+        BytesNode, FloatNode, IntegerNode, StringNode, dist_env,
+        np.dtype, np.ndarray, np.core.multiarray._reconstruct,
+        type(np.dtype(np.float32)), type(np.dtype(np.float64)),
+        type(np.dtype(np.int64)), type(np.dtype(np.uint32)),
+    ])
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def rank() -> int:
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def uses_inception_score(dataset: str) -> bool:
+    """Inception Score is only part of the ImageNet generation protocol."""
+    return dataset == "imagenet"
+
+
+def unwrap(model):
+    return model.module if isinstance(model, (DDP, FSDP)) else model
+
+
+def is_fsdp_model(model) -> bool:
+    return isinstance(model, FSDP)
+
+
+def wrap_distributed_model(model, backend: str, device: torch.device, world_size: int):
+    """Wrap the trainable stage-2 model without touching the frozen stage-1 model."""
+    if world_size <= 1:
+        if backend == "fsdp":
+            raise ValueError("--distributed-backend fsdp requires more than one process")
+        return model
+    if backend == "ddp":
+        return DDP(model, device_ids=[device.index], broadcast_buffers=False)
+    if backend != "fsdp":
+        raise ValueError(f"unsupported distributed backend: {backend}")
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={AttentionBlock, LevelwiseVARBlock},
+    )
+    return FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=device,
+        sync_module_states=True,
+        limit_all_gathers=True,
+    )
+
+
+def optimizer_state_uses_names(optimizer_state) -> bool:
+    state = optimizer_state.get("state", {})
+    if state:
+        return isinstance(next(iter(state)), str)
+    groups = optimizer_state.get("param_groups", [])
+    return bool(groups and groups[0].get("params") and isinstance(groups[0]["params"][0], str))
+
+
+def optimizer_state_to_names(optimizer_state, unwrapped_model):
+    """Convert a legacy DDP optimizer checkpoint to FSDP's full named format."""
+    if optimizer_state_uses_names(optimizer_state):
+        return optimizer_state
+    return FSDP.rekey_optim_state_dict(
+        optimizer_state,
+        OptimStateKeyType.PARAM_NAME,
+        unwrapped_model,
+    )
+
+
+def optimizer_state_to_ids(optimizer_state, parameter_names):
+    """Return the standard ID-keyed optimizer format consumed by non-FSDP AdamW."""
+    if not optimizer_state_uses_names(optimizer_state):
+        return optimizer_state
+    name_to_id = {name: index for index, name in enumerate(parameter_names)}
+    unknown = set(optimizer_state.get("state", {})) - set(name_to_id)
+    for group in optimizer_state.get("param_groups", []):
+        unknown.update(name for name in group.get("params", []) if name not in name_to_id)
+    if unknown:
+        preview = ", ".join(sorted(unknown)[:5])
+        raise KeyError(f"optimizer checkpoint contains unknown parameters: {preview}")
+    converted = dict(optimizer_state)
+    converted["state"] = {
+        name_to_id[name]: value for name, value in optimizer_state.get("state", {}).items()
+    }
+    converted_groups = []
+    for group in optimizer_state.get("param_groups", []):
+        group_names = set(group.get("params", []))
+        ordered_ids = [name_to_id[name] for name in parameter_names if name in group_names]
+        converted_groups.append({**group, "params": ordered_ids})
+    converted["param_groups"] = converted_groups
+    return converted
+
+
+def optimizer_state_for_unwrapped_load(optimizer_state, unwrapped_model):
+    if not optimizer_state_uses_names(optimizer_state):
+        return optimizer_state
+    return FSDP.rekey_optim_state_dict(
+        optimizer_state,
+        OptimStateKeyType.PARAM_ID,
+        unwrapped_model,
+    )
+
+
+def full_checkpoint_states(model, optimizer, parameter_names):
+    """Gather one DDP-compatible full checkpoint on rank zero only."""
+    if not is_fsdp_model(model):
+        if rank() != 0:
+            return None, None
+        return unwrap(model).state_dict(), optimizer.state_dict()
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        model_state = model.state_dict()
+        optimizer_state = FSDP.optim_state_dict(model, optimizer)
+    if rank() == 0:
+        optimizer_state = optimizer_state_to_ids(optimizer_state, parameter_names)
+    return model_state, optimizer_state
+
+
+def gather_rank_rng_states(device: torch.device):
+    """Capture the exact CPU/CUDA PyTorch RNG stream for every training rank."""
+    local_state = {"torch_cpu": torch.get_rng_state()}
+    if device.type == "cuda":
+        local_state["torch_cuda"] = torch.cuda.get_rng_state(device)
+    if not dist.is_initialized():
+        return [local_state]
+    gathered = [None] * dist.get_world_size() if rank() == 0 else None
+    dist.gather_object(local_state, gathered, dst=0)
+    return gathered
+
+
+def restore_rank_rng_state(resume_payload, device: torch.device, seed: int) -> bool:
+    """Restore this rank's stream, or deterministically seed a legacy checkpoint."""
+    states = None if resume_payload is None else resume_payload.get("rng_state_by_rank")
+    if states is None:
+        rank_seed = int(seed) + rank()
+        torch.manual_seed(rank_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed(rank_seed)
+        return False
+    expected_world = dist.get_world_size() if dist.is_initialized() else 1
+    if len(states) != expected_world:
+        raise ValueError(
+            "exact RNG resume requires the checkpoint world size to match: "
+            f"checkpoint={len(states)}, launch={expected_world}"
+        )
+    local_state = states[rank()]
+    torch.set_rng_state(local_state["torch_cpu"])
+    if device.type == "cuda":
+        if "torch_cuda" not in local_state:
+            raise ValueError("CUDA resume checkpoint is missing its CUDA RNG state")
+        torch.cuda.set_rng_state(local_state["torch_cuda"], device=device)
+    return True
+
+
+@contextmanager
+def model_for_custom_methods(model):
+    """Expose sampling methods safely while FSDP parameters are sharded."""
+    if is_fsdp_model(model):
+        with FSDP.summon_full_params(
+            model, recurse=True, writeback=False, rank0_only=False, offload_to_cpu=False
+        ):
+            # Cached autoregressive methods are not routed through FSDP.forward().
+            # Once all parameters are summoned, temporarily expose each wrapped
+            # block's underlying module. Otherwise ordinary calls made by the
+            # coefficient micro-transformer reshard a nested block mid-context.
+            replacements = []
+
+            def expose_unwrapped_children(module):
+                for name, child in list(module.named_children()):
+                    if isinstance(child, FSDP):
+                        replacements.append((module, name, child))
+                        module._modules[name] = unwrap(child)
+                        expose_unwrapped_children(module._modules[name])
+                    else:
+                        expose_unwrapped_children(child)
+
+            exposed_model = unwrap(model)
+            expose_unwrapped_children(exposed_model)
+            try:
+                yield exposed_model
+            finally:
+                for parent, name, wrapper in reversed(replacements):
+                    parent._modules[name] = wrapper
+    else:
+        yield unwrap(model)
+
+
+def cuda_memory_report(device: torch.device, phase: str):
+    """Collect peak CUDA usage from every rank and print it once on rank zero."""
+    torch.cuda.synchronize(device)
+    local = torch.tensor(
+        [torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
+        dtype=torch.float64,
+        device=device,
+    )
+    if dist.is_initialized():
+        gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local)
+    else:
+        gathered = [local]
+    values = [(float(item[0]) / 2**30, float(item[1]) / 2**30) for item in gathered]
+    if rank() == 0:
+        summary = "; ".join(
+            f"rank {index}: allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB"
+            for index, (allocated, reserved) in enumerate(values)
+        )
+        print(f"CUDA memory ({phase}) — {summary}", flush=True)
+    return values
+
+
+def move_optimizer_state(optimizer, device):
+    """Move Adam state tensors without changing parameter or group identity."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+
+
+@contextmanager
+def optimizer_state_offloaded_for_generation(model, optimizer, device):
+    """Free optimizer memory while autoregressive sampling needs a large batch."""
+    move_optimizer_state(optimizer, torch.device("cpu"))
+    torch.cuda.empty_cache()
+    try:
+        yield
+    finally:
+        move_optimizer_state(optimizer, device)
+
+
+def persistent_checkpoint_dir(output: Path, configured: Path | None) -> Path:
+    """Resolve checkpoint storage and reject ephemeral/out-of-workspace targets."""
+    target = (configured or (output / "checkpoints")).expanduser().resolve()
+    workspace = Path("/workspace")
+    resolved_workspace = workspace.resolve()
+    output_uses_workspace = output.expanduser().resolve().is_relative_to(resolved_workspace)
+    if (workspace.is_dir() or output_uses_workspace) and not target.is_relative_to(resolved_workspace):
+        raise ValueError(
+            f"Checkpoint directory must be under /workspace so it survives restarts; got {target}"
+        )
+    return target
+
+
+def create_cosine_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    initial_lr: float,
+    min_lr: float,
+    total_steps: int,
+    completed_steps: int = 0,
+    state_dict=None,
+):
+    """Create the original RQ-Transformer stepwise cosine LR schedule.
+
+    Legacy checkpoints do not contain scheduler state.  In that case,
+    ``completed_steps`` places the scheduler directly at the matching point on
+    the global curve, so relaunching for another few epochs cannot restart it.
+    """
+    if total_steps <= 0:
+        raise ValueError("cosine schedule requires a positive number of total steps")
+    if not 0 <= completed_steps <= total_steps:
+        raise ValueError(
+            f"completed optimizer steps ({completed_steps}) must be in [0, {total_steps}]"
+        )
+    for param_group in optimizer.param_groups:
+        param_group["initial_lr"] = float(initial_lr)
+
+    if state_dict is None:
+        # _LRScheduler performs its initial step in the constructor.  Seeding
+        # last_epoch one step behind lands exactly on ``completed_steps``.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(total_steps),
+            eta_min=float(min_lr),
+            last_epoch=int(completed_steps) - 1,
+        )
+        # PyTorch releases differ on whether the constructor immediately
+        # writes the closed-form LR for a nonzero last_epoch. Make the resumed
+        # legacy-checkpoint position explicit and version-independent.
+        progress = float(completed_steps) / float(total_steps)
+        resumed_lr = float(min_lr) + 0.5 * (float(initial_lr) - float(min_lr)) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = resumed_lr
+        scheduler._last_lr = [resumed_lr for _ in optimizer.param_groups]
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=int(total_steps), eta_min=float(min_lr)
+        )
+        scheduler.load_state_dict(state_dict)
+        if scheduler.last_epoch != completed_steps:
+            raise ValueError(
+                "scheduler/checkpoint step mismatch: "
+                f"scheduler={scheduler.last_epoch}, checkpoint={completed_steps}"
+            )
+        if scheduler.T_max != total_steps or scheduler.eta_min != min_lr:
+            raise ValueError(
+                "resumed scheduler settings differ from this launch: "
+                f"checkpoint T_max={scheduler.T_max}, eta_min={scheduler.eta_min}; "
+                f"launch T_max={total_steps}, eta_min={min_lr}"
+            )
+    return scheduler
+
+
+def create_warmup_linear_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    initial_lr: float,
+    min_lr: float,
+    total_steps: int,
+    warmup_steps: int,
+    warmup_start_ratio: float = 0.005,
+    completed_steps: int = 0,
+    state_dict=None,
+):
+    """FoundationVision VAR-style warmup followed by linear LR decay."""
+    if total_steps <= 0:
+        raise ValueError("warmup-linear schedule requires a positive step count")
+    if not 0 <= warmup_steps < total_steps:
+        raise ValueError("warmup steps must be in [0, total_steps)")
+    if not 0 < warmup_start_ratio <= 1:
+        raise ValueError("warmup start ratio must be in (0, 1]")
+    if not 0 <= min_lr <= initial_lr:
+        raise ValueError("minimum LR must be between zero and the initial LR")
+    if not 0 <= completed_steps <= total_steps:
+        raise ValueError(
+            f"completed optimizer steps ({completed_steps}) must be in [0, {total_steps}]"
+        )
+
+    min_ratio = float(min_lr) / float(initial_lr)
+
+    def lr_multiplier(step: int) -> float:
+        step = min(max(int(step), 0), int(total_steps))
+        if warmup_steps > 0 and step < warmup_steps:
+            progress = float(step) / float(warmup_steps)
+            return warmup_start_ratio + (1.0 - warmup_start_ratio) * progress
+        decay_steps = max(int(total_steps) - int(warmup_steps), 1)
+        progress = float(step - warmup_steps) / float(decay_steps)
+        return 1.0 - (1.0 - min_ratio) * min(max(progress, 0.0), 1.0)
+
+    schedule_config = {
+        "initial_lr": float(initial_lr),
+        "min_lr": float(min_lr),
+        "total_steps": int(total_steps),
+        "warmup_steps": int(warmup_steps),
+        "warmup_start_ratio": float(warmup_start_ratio),
+    }
+    for param_group in optimizer.param_groups:
+        param_group["initial_lr"] = float(initial_lr)
+
+    if state_dict is None:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lr_multiplier,
+            last_epoch=int(completed_steps) - 1,
+        )
+        scheduler._laser_schedule_config = schedule_config
+        current_lr = float(initial_lr) * lr_multiplier(completed_steps)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+        scheduler.last_epoch = int(completed_steps)
+        scheduler._last_lr = [current_lr for _ in optimizer.param_groups]
+    else:
+        saved_config = state_dict.get("_laser_schedule_config")
+        if saved_config is not None and saved_config != schedule_config:
+            raise ValueError(
+                "resumed warmup-linear settings differ from this launch: "
+                f"checkpoint={saved_config}, launch={schedule_config}"
+            )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lr_multiplier
+        )
+        scheduler._laser_schedule_config = schedule_config
+        scheduler.load_state_dict(state_dict)
+        if scheduler.last_epoch != completed_steps:
+            raise ValueError(
+                "scheduler/checkpoint step mismatch: "
+                f"scheduler={scheduler.last_epoch}, checkpoint={completed_steps}"
+            )
+        current_lr = float(initial_lr) * lr_multiplier(completed_steps)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+        scheduler._last_lr = [current_lr for _ in optimizer.param_groups]
+    return scheduler
+
+
+def remap_resume_batch_index(
+    batch_index: int,
+    *,
+    saved_config,
+    batch_size: int,
+    world_size: int,
+    total_batch_size: int,
+    global_step: int,
+    start_epoch: int,
+    optimizer_steps_per_epoch: int,
+):
+    """Map a saved per-rank cursor onto the current physical batch layout.
+
+    Recovery checkpoints store a per-rank dataloader batch index.  Preserving
+    only that integer replays or skips data when either the microbatch or world
+    size changes.  Convert through the global number of samples already seen
+    in the epoch instead.  Older checkpoints did not record their world size,
+    so infer it from their synchronized accumulation boundary.
+    """
+    batch_index = int(batch_index)
+    if batch_index <= 0:
+        return 0, int(saved_config.get("world_size", world_size))
+
+    old_batch_size = int(saved_config.get("batch_size", batch_size))
+    old_total_batch_size = int(
+        saved_config.get("total_batch_size", total_batch_size)
+    )
+    old_world_size = saved_config.get("world_size")
+    if old_world_size is None:
+        completed_steps_in_epoch = int(global_step) - (
+            int(start_epoch) * int(optimizer_steps_per_epoch)
+        )
+        if completed_steps_in_epoch <= 0 or batch_index % completed_steps_in_epoch:
+            raise ValueError(
+                "cannot infer the world size of this legacy mid-epoch checkpoint"
+            )
+        old_accumulation = batch_index // completed_steps_in_epoch
+        old_global_microbatch = old_batch_size * old_accumulation
+        if (
+            old_global_microbatch <= 0
+            or old_total_batch_size % old_global_microbatch
+        ):
+            raise ValueError(
+                "legacy checkpoint cursor is inconsistent with its total batch size"
+            )
+        old_world_size = old_total_batch_size // old_global_microbatch
+    old_world_size = int(old_world_size)
+    if old_world_size <= 0:
+        raise ValueError("checkpoint world size must be positive")
+
+    completed_samples = batch_index * old_batch_size * old_world_size
+    current_global_microbatch = int(batch_size) * int(world_size)
+    if current_global_microbatch <= 0 or completed_samples % current_global_microbatch:
+        raise ValueError(
+            "checkpoint data cursor cannot be represented by the current physical batch"
+        )
+    remapped = completed_samples // current_global_microbatch
+    if total_batch_size % current_global_microbatch:
+        raise ValueError("total batch size must divide the current physical batch")
+    current_accumulation = total_batch_size // current_global_microbatch
+    if remapped % current_accumulation:
+        raise ValueError(
+            "remapped checkpoint cursor is not on an optimizer-step boundary"
+        )
+    return remapped, old_world_size
+
+
+class ResumableDistributedSampler(DistributedSampler):
+    """Distributed sampler that starts at a saved per-rank sample cursor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    def set_start_index(self, start_index: int):
+        self.start_index = max(0, int(start_index))
+
+    def __iter__(self):
+        return iter(list(super().__iter__())[self.start_index:])
+
+    def __len__(self):
+        return max(0, super().__len__() - self.start_index)
+
+
+class LaserAux(nn.Module):
+    """Frozen stage-1 encoder and sparse dictionary expected by RQTransformer."""
+
+    def __init__(self, checkpoint: Path, num_atoms: int, coeff_vocab_size: int,
+                 coeff_max: float, coeff_scale: float = 1.0,
+                 attn_resolutions=(8,), coeff_scales=None,
+                 soft_target_physical=False, clamp_coeffs=True,
+                 coeff_bin_centers=None, sparsity_level: int = 2,
+                 coefficient_patterns=None, prefix_patterns=None,
+                 prefix_pattern_vocab_sizes=None):
+        super().__init__()
+        self.sparsity_level = int(sparsity_level)
+        if self.sparsity_level <= 0:
+            raise ValueError("sparsity_level must be positive")
+        stage1 = RQVAE(
+            embed_dim=256,
+            n_embed=num_atoms,
+            decay=0.99,
+            loss_type="mse",
+            latent_loss_weight=0.25,
+            bottleneck_type="rq",
+            ddconfig=dict(
+                double_z=False, z_channels=256, resolution=256, in_channels=3,
+                out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4, 4],
+                num_res_blocks=2, attn_resolutions=list(attn_resolutions), dropout=0.0,
+            ),
+            latent_shape=[8, 8, 256], code_shape=[8, 8, self.sparsity_level],
+            shared_codebook=True, restart_unused_codes=True,
+        )
+        payload = load_stage1_checkpoint(checkpoint)
+        state = payload["state_dict"]
+        # Accept both native RQ-VAE checkpoints and maintained LASER Lightning
+        # checkpoints.  The latter uses descriptive projection/bottleneck names.
+        filtered = {}
+        for key, value in state.items():
+            if key.startswith(("encoder.", "decoder.", "quant_conv.", "post_quant_conv.")):
+                filtered[key] = value
+            elif key.startswith("pre_bottleneck."):
+                filtered["quant_conv." + key.removeprefix("pre_bottleneck.")] = value
+            elif key.startswith("post_bottleneck."):
+                filtered["post_quant_conv." + key.removeprefix("post_bottleneck.")] = value
+        missing, unexpected = stage1.load_state_dict(filtered, strict=False)
+        bad_missing = [k for k in missing if not k.startswith("quantizer.")]
+        if bad_missing or unexpected:
+            raise RuntimeError(f"stage-1 mismatch: missing={bad_missing}, unexpected={unexpected}")
+        self.encoder = stage1.encoder
+        self.quant_conv = stage1.quant_conv
+        self.post_quant_conv = stage1.post_quant_conv
+        self.decoder = stage1.decoder
+        dictionary_key = (
+            "quantizer.dictionary"
+            if "quantizer.dictionary" in state
+            else "bottleneck.dictionary"
+        )
+        if dictionary_key not in state:
+            raise RuntimeError("stage-1 checkpoint has no sparse dictionary")
+        self.register_buffer("dictionary", F.normalize(state[dictionary_key].float(), dim=0))
+        if coeff_bin_centers is None:
+            coefficient_bins = torch.linspace(-coeff_max, coeff_max, coeff_vocab_size)
+        else:
+            coefficient_bins = torch.as_tensor(coeff_bin_centers, dtype=torch.float32)
+            if coefficient_bins.ndim != 1 or coefficient_bins.numel() != coeff_vocab_size:
+                raise ValueError(
+                    "custom coefficient-bin centers must be a one-dimensional "
+                    f"sequence of length {coeff_vocab_size}"
+                )
+            if not torch.isfinite(coefficient_bins).all():
+                raise ValueError("custom coefficient-bin centers must be finite")
+            if not torch.all(coefficient_bins[1:] > coefficient_bins[:-1]):
+                raise ValueError("custom coefficient-bin centers must be strictly increasing")
+        self.register_buffer("coeff_bins", coefficient_bins)
+        self.num_atoms = int(num_atoms)
+        self.coeff_vocab_size = int(coeff_vocab_size)
+        self.vocab_size = self.num_atoms + self.coeff_vocab_size
+        self.coeff_max = float(coeff_max)
+        scales = (
+            coeff_scales
+            if coeff_scales is not None
+            else [coeff_scale] * self.sparsity_level
+        )
+        if len(scales) != self.sparsity_level:
+            raise ValueError(
+                f"LASER k={self.sparsity_level} requires exactly "
+                f"{self.sparsity_level} coefficient scales"
+            )
+        self.register_buffer("coeff_scales", torch.tensor(scales, dtype=torch.float32))
+        if coefficient_patterns is None:
+            pattern_tensor = None
+        else:
+            pattern_tensor = torch.as_tensor(
+                coefficient_patterns, dtype=torch.float32
+            )
+            if pattern_tensor.ndim != 2 or pattern_tensor.shape[1] != self.sparsity_level:
+                raise ValueError(
+                    "coefficient patterns must have shape "
+                    f"[vocab, {self.sparsity_level}]"
+                )
+            if pattern_tensor.shape[0] <= 1 or not torch.isfinite(pattern_tensor).all():
+                raise ValueError("coefficient patterns must contain finite values")
+        self.register_buffer("coefficient_patterns", pattern_tensor)
+        if prefix_patterns is None:
+            prefix_pattern_tensor = None
+            prefix_vocab_tensor = None
+        else:
+            prefix_pattern_tensor = torch.as_tensor(
+                prefix_patterns, dtype=torch.float32
+            )
+            prefix_vocab_tensor = torch.as_tensor(
+                prefix_pattern_vocab_sizes, dtype=torch.long
+            )
+            expected_prefix_shape = (
+                self.sparsity_level,
+                prefix_pattern_tensor.shape[1],
+                self.sparsity_level,
+            ) if prefix_pattern_tensor.ndim == 3 else None
+            if (
+                expected_prefix_shape is None
+                or tuple(prefix_pattern_tensor.shape) != expected_prefix_shape
+            ):
+                raise ValueError(
+                    "prefix patterns must have shape [K,max_vocab,K]"
+                )
+            if tuple(prefix_vocab_tensor.shape) != (self.sparsity_level,):
+                raise ValueError(
+                    "prefix pattern vocabulary sizes must have shape [K]"
+                )
+            if (
+                (prefix_vocab_tensor <= 1).any()
+                or (prefix_vocab_tensor > prefix_pattern_tensor.shape[1]).any()
+            ):
+                raise ValueError("prefix pattern vocabulary sizes are invalid")
+            if not torch.isfinite(prefix_pattern_tensor).all():
+                raise ValueError("prefix patterns must contain finite values")
+            for depth_index in range(self.sparsity_level):
+                valid = int(prefix_vocab_tensor[depth_index])
+                if (
+                    depth_index + 1 < self.sparsity_level
+                    and prefix_pattern_tensor[
+                        depth_index, :valid, depth_index + 1 :
+                    ].abs().max() > 0
+                ):
+                    raise ValueError(
+                        "prefix patterns must be zero above their causal depth"
+                    )
+        self.register_buffer("prefix_patterns", prefix_pattern_tensor)
+        self.register_buffer("prefix_pattern_vocab_sizes", prefix_vocab_tensor)
+        self.coeff_scale = float(coeff_scale)  # Backward-compatible metadata.
+        self.soft_target_physical = bool(soft_target_physical)
+        self.clamp_coeffs = bool(clamp_coeffs)
+        if (self.coeff_scales <= 0).any():
+            raise ValueError("coeff_scale must be positive")
+        self.eval().requires_grad_(False)
+
+    @torch.no_grad()
+    def encode_sparse_components(
+        self, images: torch.Tensor, *, return_prefix_coeffs: bool = False
+    ):
+        z = self.quant_conv(self.encoder(images)).permute(0, 2, 3, 1).float()
+        b, h, w, c = z.shape
+        signals = z.reshape(-1, c)
+        # Cache extraction runs the encoder under BF16 autocast, but OMP's
+        # Cholesky solve must remain FP32 for dtype consistency and stability.
+        with torch.autocast(device_type=signals.device.type, enabled=False):
+            signals = signals.float()
+            dictionary = self.dictionary.float()
+            gram = dictionary.t() @ dictionary
+            corr_init = signals @ dictionary
+            corr = corr_init
+            num_signals = signals.shape[0]
+            signal_idx = torch.arange(num_signals, device=signals.device)
+            available = torch.ones_like(corr_init, dtype=torch.bool)
+            support = torch.empty(num_signals, 0, dtype=torch.long, device=signals.device)
+            chol = torch.ones(num_signals, 1, 1, device=signals.device, dtype=signals.dtype)
+            active_coeffs = None
+            prefix_coeffs = (
+                signals.new_zeros(
+                    num_signals, self.sparsity_level, self.sparsity_level
+                )
+                if return_prefix_coeffs else None
+            )
+            for depth in range(1, self.sparsity_level + 1):
+                scores = corr.abs().masked_fill(~available, -1.0)
+                next_atoms = scores.argmax(dim=1)
+                available[signal_idx, next_atoms] = False
+                expanded_idx = signal_idx[:, None].expand(num_signals, depth)
+                if depth > 1:
+                    previous = support
+                    repeated_new = next_atoms[:, None].expand(num_signals, depth - 1)
+                    gram_cross = gram[previous, repeated_new].unsqueeze(-1)
+                    solved = torch.linalg.solve_triangular(
+                        chol, gram_cross, upper=False
+                    ).transpose(1, 2)
+                    bottom_right = (
+                        1.0 - solved.square().sum(dim=2, keepdim=True)
+                    ).clamp_min(1e-10).sqrt()
+                    zeros = torch.zeros(
+                        num_signals, depth - 1, 1,
+                        device=signals.device, dtype=signals.dtype,
+                    )
+                    chol = torch.cat(
+                        (
+                            torch.cat((chol, zeros), dim=2),
+                            torch.cat((solved, bottom_right), dim=2),
+                        ),
+                        dim=1,
+                    )
+                support = torch.cat((support, next_atoms[:, None]), dim=1)
+                active_corr = corr_init[expanded_idx, support]
+                active_coeffs = torch.cholesky_solve(
+                    active_corr.unsqueeze(-1), chol
+                ).squeeze(-1)
+                if prefix_coeffs is not None:
+                    prefix_coeffs[:, depth - 1, :depth] = active_coeffs
+                corr = corr_init - active_coeffs.unsqueeze(1).bmm(gram[support]).squeeze(1)
+        atoms = support.view(b, h, w, self.sparsity_level)
+        physical_coeffs = active_coeffs.view(b, h, w, self.sparsity_level)
+        scales = self.coeff_scales.view(1, 1, 1, self.sparsity_level)
+        coeffs = physical_coeffs / scales
+        if self.clamp_coeffs:
+            coeffs = coeffs.clamp(-self.coeff_max, self.coeff_max)
+        if prefix_coeffs is not None:
+            return (
+                atoms,
+                coeffs,
+                prefix_coeffs.view(
+                    b, h, w, self.sparsity_level, self.sparsity_level
+                ),
+            )
+        return atoms, coeffs
+
+    @torch.no_grad()
+    def sparse_targets(self, atoms: torch.Tensor, coeffs: torch.Tensor, *, temp: float = 0.5,
+                       stochastic: bool = True, compact: bool = False,
+                       hard: bool = False):
+        atoms = atoms.long()
+        coeffs = coeffs.float()
+        coeff_tokens = (coeffs[..., None] - self.coeff_bins).abs().argmin(dim=-1)
+        # The official stage-2 recipe trains against stage-1 soft codes.  For
+        # LASER, atom support is discrete OMP while the continuous coefficient
+        # posterior is discretized into a temperature-controlled 16K density.
+        if getattr(self, "soft_target_physical", False):
+            target_values = (
+                coeffs * self.coeff_scales.view(1, 1, 1, self.sparsity_level)
+            )[..., None]
+            bin_values = (
+                self.coeff_bins.view(1, 1, 1, 1, -1)
+                * self.coeff_scales.view(1, 1, 1, self.sparsity_level, 1)
+            )
+        else:
+            target_values = coeffs[..., None]
+            bin_values = self.coeff_bins
+        coeff_logits = -(target_values - bin_values).square() / max(float(temp), 1e-6)
+        if hard:
+            coeff_probs = F.one_hot(
+                coeff_tokens, num_classes=self.coeff_vocab_size
+            ).to(coeff_logits.dtype)
+        else:
+            coeff_probs = coeff_logits.softmax(dim=-1)
+        if stochastic and not hard:
+            coeff_tokens = torch.multinomial(
+                coeff_probs.reshape(-1, self.coeff_vocab_size), 1
+            ).reshape_as(coeff_tokens)
+        b, h, w, _ = atoms.shape
+        scalar_depth = 2 * self.sparsity_level
+        tokens = torch.empty(b, h, w, scalar_depth, device=atoms.device, dtype=torch.long)
+        tokens[..., 0::2] = atoms
+        tokens[..., 1::2] = coeff_tokens + self.num_atoms
+        if compact:
+            return tokens, (atoms, coeff_probs)
+        soft_targets = torch.zeros(b, h, w, scalar_depth, self.vocab_size,
+                                   device=atoms.device, dtype=coeff_probs.dtype)
+        soft_targets[..., 0::2, :self.num_atoms].scatter_(-1, atoms[..., None], 1.0)
+        soft_targets[..., 1::2, self.num_atoms:] = coeff_probs
+        return tokens, soft_targets
+
+    @torch.no_grad()
+    def encode_sparse(self, images: torch.Tensor, *, temp: float = 0.5,
+                      stochastic: bool = True, hard: bool = False):
+        atoms, coeffs = self.encode_sparse_components(images)
+        return self.sparse_targets(
+            atoms, coeffs, temp=temp, stochastic=stochastic, hard=hard
+        )
+
+    @torch.no_grad()
+    def get_code_emb_with_depth(self, tokens: torch.Tensor):
+        out = torch.empty(*tokens.shape, 256, device=tokens.device, dtype=self.dictionary.dtype)
+        atom_vectors = self.dictionary.t()[tokens[..., 0::2]]
+        out[..., 0::2, :] = atom_vectors
+        coeff_ids = (tokens[..., 1::2] - self.num_atoms).clamp(0, self.coeff_vocab_size - 1)
+        coeff = self.coeff_bins[coeff_ids] * self.coeff_scales.view(
+            1, 1, 1, self.sparsity_level
+        )
+        out[..., 1::2, :] = (coeff[..., None] - 1.0) * atom_vectors
+        return out, None
+
+    @torch.no_grad()
+    def decode_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        atoms = tokens[..., 0::2].long()
+        coeff_ids = (tokens[..., 1::2].long() - self.num_atoms).clamp(0, self.coeff_vocab_size - 1)
+        coeffs = self.coeff_bins[coeff_ids] * self.coeff_scales.view(
+            1, 1, 1, self.sparsity_level
+        )
+        atom_vectors = self.dictionary.t()[atoms]
+        z_q = (atom_vectors * coeffs[..., None]).sum(dim=-2)
+        z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+        return self.decoder(z_q).clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def compound_coeff_ids(self, coeffs: torch.Tensor, *, stochastic: bool = True,
+                           temp: float = 0.5, hard: bool = False):
+        """Quantize real coefficients for compound (atom, coefficient) events."""
+        if getattr(self, "soft_target_physical", False):
+            # OMP coefficients are stored after division by a depth-specific
+            # scale.  Applying the official soft-target temperature in that
+            # normalized space makes the depth-0 distribution enormously
+            # wider in the actual Stage-1 latent geometry (for Church the
+            # scale is ~18.7).  Measure distance in physical coefficient units,
+            # just as sparse_targets() does for the scalar-token baseline.
+            scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level, 1]
+            scales = self.coeff_scales.view(*scale_shape)
+            target_values = coeffs.float()[..., None] * scales
+            bin_values = self.coeff_bins.view(
+                *([1] * coeffs.ndim), self.coeff_vocab_size
+            ) * scales
+        else:
+            target_values = coeffs.float()[..., None]
+            bin_values = self.coeff_bins
+        logits = -(target_values - bin_values).square() / max(float(temp), 1e-6)
+        nearest = logits.argmax(dim=-1)
+        if hard:
+            probs = F.one_hot(nearest, num_classes=self.coeff_vocab_size).to(logits.dtype)
+        else:
+            probs = logits.softmax(dim=-1)
+        if stochastic and not hard:
+            ids = torch.multinomial(probs.reshape(-1, self.coeff_vocab_size), 1)
+            ids = ids.reshape(coeffs.shape)
+        else:
+            ids = nearest
+        return ids.long(), probs
+
+    @torch.no_grad()
+    def compound_embeddings(self, atoms: torch.Tensor, coeff_ids: torch.Tensor):
+        """Physical latent contribution of every compound sparse event."""
+        atom_vectors = self.dictionary.t()[atoms.long()]
+        coeffs = self.coeff_bins[coeff_ids.long().clamp(0, self.coeff_vocab_size - 1)]
+        scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level]
+        coeffs = coeffs * self.coeff_scales.view(*scale_shape)
+        return atom_vectors * coeffs[..., None]
+
+    @torch.no_grad()
+    def orthogonal_basis(self, atoms: torch.Tensor):
+        """Prefix-stable basis induced by an ordered sparse support."""
+        atom_vectors = self.dictionary.t()[atoms.long()]
+        basis, lower = ordered_support_basis(atom_vectors)
+        return basis.to(atom_vectors.dtype), lower
+
+    @torch.no_grad()
+    def orthogonal_embeddings(
+        self, atoms: torch.Tensor, coeff_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Physical contributions gamma_d q_d in causal orthogonal coordinates."""
+        basis, _ = self.orthogonal_basis(atoms)
+        coeffs = self.coeff_bins[
+            coeff_ids.long().clamp(0, self.coeff_vocab_size - 1)
+        ]
+        scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level]
+        gamma = coeffs * self.coeff_scales.view(*scale_shape)
+        return basis * gamma[..., None]
+
+    @torch.no_grad()
+    def physical_orthogonal_contributions(
+        self, atoms: torch.Tensor, coeffs: torch.Tensor
+    ) -> torch.Tensor:
+        """Continuous physical gamma_d q_d contribution for every event."""
+        basis, _ = self.orthogonal_basis(atoms)
+        scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level]
+        gamma = coeffs.float() * self.coeff_scales.view(*scale_shape)
+        return basis * gamma[..., None]
+
+    @torch.no_grad()
+    def physical_contributions(self, atoms: torch.Tensor, coeffs: torch.Tensor):
+        """Continuous physical LASER contribution c_i d_{a_i} for each pair."""
+        atom_vectors = self.dictionary.t()[atoms.long()]
+        scale_shape = [1] * (coeffs.ndim - 1) + [self.sparsity_level]
+        physical_coeffs = coeffs.float() * self.coeff_scales.view(*scale_shape)
+        return atom_vectors * physical_coeffs[..., None]
+
+    @torch.no_grad()
+    def causal_prefix_reconstructions(
+        self, atoms: torch.Tensor, prefix_coeffs: torch.Tensor
+    ):
+        """Reconstruct every causal OMP prefix in the Stage-1 latent space.
+
+        ``prefix_coeffs[..., d, i]`` is the physical least-squares coefficient
+        of support atom ``i`` after OMP has selected atoms ``0..d``. Entries
+        above the causal triangle are zero.
+        """
+        expected = (*atoms.shape, self.sparsity_level)
+        if tuple(prefix_coeffs.shape) != expected:
+            raise ValueError(
+                "causal prefix coefficient shape mismatch: "
+                f"got {tuple(prefix_coeffs.shape)}, expected {expected}"
+            )
+        with torch.autocast(device_type=atoms.device.type, enabled=False):
+            atom_vectors = self.dictionary.float().t()[atoms.long()]
+            return torch.einsum(
+                "...di,...ic->...dc", prefix_coeffs.float(), atom_vectors
+            )
+
+    @torch.no_grad()
+    def decode_compound(self, atoms: torch.Tensor, coeff_ids: torch.Tensor) -> torch.Tensor:
+        z_q = self.compound_embeddings(atoms, coeff_ids).sum(dim=-2)
+        z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+        return self.decoder(z_q).clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def decode_orthogonal(
+        self, atoms: torch.Tensor, coeff_ids: torch.Tensor
+    ) -> torch.Tensor:
+        z_q = self.orthogonal_embeddings(atoms, coeff_ids).sum(dim=-2)
+        z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+        return self.decoder(z_q).clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def coefficient_pattern_latents(
+        self, atoms: torch.Tensor, pattern_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode one joint physical coefficient code on a selected support."""
+        if self.coefficient_patterns is None:
+            raise RuntimeError("coefficient patterns were not configured")
+        atoms = atoms.long()
+        pattern_ids = pattern_ids.long()
+        if atoms.shape[:-1] != pattern_ids.shape:
+            raise ValueError(
+                "atom support and coefficient-pattern ids must share site axes"
+            )
+        if atoms.shape[-1] != self.sparsity_level:
+            raise ValueError(
+                f"expected support depth {self.sparsity_level}, got {atoms.shape[-1]}"
+            )
+        vectors = self.dictionary.t()[atoms]
+        coefficients = self.coefficient_patterns[pattern_ids]
+        return (vectors * coefficients.unsqueeze(-1)).sum(dim=-2)
+
+    @torch.no_grad()
+    def decode_coefficient_patterns(
+        self, atoms: torch.Tensor, pattern_ids: torch.Tensor
+    ) -> torch.Tensor:
+        z_q = self.coefficient_pattern_latents(atoms, pattern_ids)
+        z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+        return self.decoder(z_q).clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def prefix_pattern_coefficients(
+        self, pattern_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Look up every causal prefix's zero-padded physical coefficients."""
+        if self.prefix_patterns is None or self.prefix_pattern_vocab_sizes is None:
+            raise RuntimeError("causal prefix patterns were not configured")
+        if pattern_ids.shape[-1] != self.sparsity_level:
+            raise ValueError(
+                f"expected {self.sparsity_level} prefix ids per site, got "
+                f"{pattern_ids.shape[-1]}"
+            )
+        values = []
+        for depth_index in range(self.sparsity_level):
+            local_ids = pattern_ids[..., depth_index].long()
+            vocab_size = int(self.prefix_pattern_vocab_sizes[depth_index])
+            if local_ids.numel() and (
+                int(local_ids.min()) < 0 or int(local_ids.max()) >= vocab_size
+            ):
+                raise ValueError(
+                    f"prefix pattern ids at depth {depth_index} exceed vocabulary"
+                )
+            values.append(self.prefix_patterns[depth_index, local_ids])
+        return torch.stack(values, dim=-2)
+
+    @torch.no_grad()
+    def prefix_pattern_latents(
+        self, atoms: torch.Tensor, pattern_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Reconstruct the physical latent after every causal OMP prefix."""
+        if tuple(atoms.shape) != tuple(pattern_ids.shape):
+            raise ValueError("atom and prefix-pattern grids must have equal shape")
+        coefficients = self.prefix_pattern_coefficients(pattern_ids)
+        atom_vectors = self.dictionary.t()[atoms.long()]
+        return torch.einsum(
+            "...di,...ic->...dc", coefficients, atom_vectors
+        )
+
+    @torch.no_grad()
+    def decode_prefix_patterns(
+        self, atoms: torch.Tensor, pattern_ids: torch.Tensor
+    ) -> torch.Tensor:
+        prefix_latents = self.prefix_pattern_latents(atoms, pattern_ids)
+        z_q = prefix_latents[..., -1, :]
+        z_q = self.post_quant_conv(z_q.permute(0, 3, 1, 2).contiguous())
+        return self.decoder(z_q).clamp(-1.0, 1.0)
+
+
+class SparseTokenCacheDataset(torch.utils.data.Dataset):
+    """Memory-mapped-at-load sparse components; no source image access in stage 2."""
+
+    def __init__(self, path: Path, *, include_prefix_coeffs: bool = False):
+        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        self.atoms = payload["atoms"]
+        self.coeffs = payload["coeffs"]
+        self.labels = payload["labels"]
+        self.meta = payload["meta"]
+        self.prefix_coeffs = payload.get("prefix_coeffs")
+        self.include_prefix_coeffs = bool(include_prefix_coeffs)
+        if not (len(self.atoms) == len(self.coeffs) == len(self.labels)):
+            raise ValueError("token-cache tensors have inconsistent row counts")
+        if self.include_prefix_coeffs:
+            if self.prefix_coeffs is None:
+                raise ValueError("token cache does not contain causal OMP prefix coefficients")
+            if len(self.prefix_coeffs) != len(self.labels):
+                raise ValueError("token-cache prefix coefficients have an inconsistent row count")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        if self.include_prefix_coeffs:
+            return (
+                self.atoms[index], self.coeffs[index], self.prefix_coeffs[index],
+                self.labels[index],
+            )
+        return self.atoms[index], self.coeffs[index], self.labels[index]
+
+
+class CoefficientPatternCacheDataset(torch.utils.data.Dataset):
+    """Memory-mapped support ids plus one joint coefficient code per site."""
+
+    def __init__(self, path: Path):
+        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        self.atoms = payload["atoms"]
+        self.pattern_ids = payload["coefficient_pattern_ids"]
+        self.coefficient_patterns = payload["coefficient_patterns"]
+        self.labels = payload["labels"]
+        self.meta = payload["meta"]
+        if self.meta.get("format") != "laser_coefficient_patterns_v1":
+            raise ValueError(
+                "support-first training requires a laser_coefficient_patterns_v1 cache"
+            )
+        if not (len(self.atoms) == len(self.pattern_ids) == len(self.labels)):
+            raise ValueError("coefficient-pattern cache tensors have inconsistent row counts")
+        if self.pattern_ids.shape != self.atoms.shape[:-1]:
+            raise ValueError(
+                "coefficient-pattern ids must have one token per spatial support"
+            )
+        if (
+            self.coefficient_patterns.ndim != 2
+            or self.coefficient_patterns.shape[1] != self.atoms.shape[-1]
+        ):
+            raise ValueError(
+                "coefficient-pattern table depth does not match atom supports"
+            )
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        return self.atoms[index], self.pattern_ids[index], self.labels[index]
+
+
+class CausalPrefixPatternCacheDataset(torch.utils.data.Dataset):
+    """Memory-mapped atom ids and one joint coefficient code per OMP prefix."""
+
+    def __init__(self, path: Path):
+        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        self.atoms = payload["atoms"]
+        self.pattern_ids = payload["prefix_pattern_ids"]
+        self.prefix_patterns = payload["prefix_patterns"]
+        self.pattern_vocab_sizes = payload["prefix_pattern_vocab_sizes"].long()
+        self.labels = payload["labels"]
+        self.meta = payload["meta"]
+        if self.meta.get("format") != "laser_causal_prefix_patterns_v1":
+            raise ValueError(
+                "causal prefix-pattern training requires a "
+                "laser_causal_prefix_patterns_v1 cache"
+            )
+        if not (len(self.atoms) == len(self.pattern_ids) == len(self.labels)):
+            raise ValueError("prefix-pattern cache tensors have inconsistent rows")
+        if tuple(self.pattern_ids.shape) != tuple(self.atoms.shape):
+            raise ValueError("prefix-pattern ids must have one code per OMP depth")
+        depth = int(self.atoms.shape[-1])
+        if (
+            self.prefix_patterns.ndim != 3
+            or self.prefix_patterns.shape[0] != depth
+            or self.prefix_patterns.shape[2] != depth
+            or tuple(self.pattern_vocab_sizes.shape) != (depth,)
+        ):
+            raise ValueError("prefix-pattern tables do not match atom supports")
+        if (
+            (self.pattern_vocab_sizes <= 1).any()
+            or (self.pattern_vocab_sizes > self.prefix_patterns.shape[1]).any()
+        ):
+            raise ValueError("prefix-pattern vocabulary sizes are invalid")
+        for depth_index, vocab_size in enumerate(self.pattern_vocab_sizes.tolist()):
+            ids = self.pattern_ids[..., depth_index]
+            if ids.numel() and (int(ids.min()) < 0 or int(ids.max()) >= vocab_size):
+                raise ValueError(
+                    f"prefix-pattern ids at depth {depth_index} exceed vocabulary"
+                )
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        return self.atoms[index], self.pattern_ids[index], self.labels[index]
+
+
+class FlatImages(Dataset):
+    """Recursively load an unconditional image dataset from flat files."""
+
+    def __init__(self, root: Path, transform):
+        self.files = sorted(
+            path
+            for path in root.rglob("*")
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        if not self.files:
+            raise ValueError(f"no images found below {root}")
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        with Image.open(self.files[index]) as image:
+            return self.transform(image.convert("RGB")), 0
+
+
+def source_image_dataset(dataset: str, root: Path, transform, *, split: str = "train"):
+    """Build the source-image view matching each official stage-2 dataset."""
+    if dataset == "ffhq":
+        return FlatImages(root, transform=transform)
+    if dataset in {"lsun_bedroom", "lsun_church"}:
+        if split != "train":
+            raise ValueError("LSUN stage 2 uses the official training population")
+        category_name = "bedroom" if dataset == "lsun_bedroom" else "church"
+        return LSUNClass(root, category_name=category_name, transform=transform)
+    return datasets.ImageFolder(root / split, transform=transform)
+
+def _preview_font(size: int):
+    """Load a stable readable font while retaining a Pillow-only fallback."""
+    candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=int(size))
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_class_name(draw, class_name: str, font, max_width: int):
+    """Wrap a class name to the label column using measured pixel widths."""
+    words = str(class_name).replace("_", " ").split()
+    if not words:
+        return ["unknown"]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _class_name_layout(draw, class_name: str, max_width: int, max_height: int):
+    """Choose the largest font whose wrapped class name fits one image row."""
+    for size in range(30, 13, -1):
+        font = _preview_font(size)
+        lines = _wrap_class_name(draw, class_name, font, max_width)
+        text = "\n".join(lines)
+        bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=4)
+        if bbox[2] - bbox[0] <= max_width and bbox[3] - bbox[1] <= max_height:
+            return text, font, bbox
+    font = _preview_font(13)
+    text = "\n".join(_wrap_class_name(draw, class_name, font, max_width))
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=3)
+    return text, font, bbox
+
+
+def save_class_labeled_grid(images: torch.Tensor, chosen_classes: torch.Tensor,
+                            class_names, target: Path, *, samples_per_class: int = 8,
+                            label_width: int = 256):
+    """Save paper-style class rows with an adjacent left-hand label column.
+
+    Image tiles are pasted edge-to-edge: there is no padding between columns,
+    no padding between rows, and no margin around the image mosaic.
+    """
+    images = images.detach().cpu().to(torch.float32).clamp(0, 1)
+    samples_per_class = int(samples_per_class)
+    chosen = [int(value) for value in chosen_classes.detach().cpu().tolist()]
+    expected = len(chosen) * samples_per_class
+    if images.ndim != 4 or images.shape[0] != expected:
+        raise ValueError(
+            f"expected {expected} BCHW preview images for {len(chosen)} class rows, "
+            f"got {tuple(images.shape)}"
+        )
+    if images.shape[1] not in (1, 3):
+        raise ValueError(f"preview images need 1 or 3 channels, got {images.shape[1]}")
+    tile_height, tile_width = int(images.shape[2]), int(images.shape[3])
+    label_width = max(1, int(label_width))
+    canvas = Image.new(
+        "RGB",
+        (label_width + samples_per_class * tile_width, len(chosen) * tile_height),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    for row, class_index in enumerate(chosen):
+        row_y = row * tile_height
+        class_name = (
+            str(class_names[class_index])
+            if class_names is not None and 0 <= class_index < len(class_names)
+            else f"class {class_index}"
+        )
+        text, font, bbox = _class_name_layout(
+            draw, class_name, max_width=label_width - 24, max_height=tile_height - 24
+        )
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        text_x = max(12, (label_width - text_width) // 2)
+        text_y = row_y + max(12, (tile_height - text_height) // 2 - bbox[1])
+        draw.multiline_text(
+            (text_x, text_y), text, font=font, fill="black", spacing=4, align="center"
+        )
+        for column in range(samples_per_class):
+            index = row * samples_per_class + column
+            array = images[index].mul(255).round().to(torch.uint8)
+            array = array.permute(1, 2, 0).contiguous().numpy()
+            if array.shape[-1] == 1:
+                tile = Image.fromarray(array[..., 0], mode="L").convert("RGB")
+            else:
+                tile = Image.fromarray(array, mode="RGB")
+            canvas.paste(
+                tile,
+                (label_width + column * tile_width, row_y),
+            )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(target)
+    return target
+
+
+def save_unlabeled_grid(images: torch.Tensor, target: Path, *, nrow: int = 8):
+    """Save an image-only grid with no labels, padding, gutters, or margin."""
+    images = images.detach().cpu().to(torch.float32).clamp(0, 1)
+    nrow = int(nrow)
+    if images.ndim != 4 or images.shape[0] <= 0:
+        raise ValueError(f"expected non-empty BCHW preview images, got {tuple(images.shape)}")
+    if images.shape[1] not in (1, 3):
+        raise ValueError(f"preview images need 1 or 3 channels, got {images.shape[1]}")
+    if nrow <= 0 or images.shape[0] % nrow:
+        raise ValueError("preview image count must divide into complete grid rows")
+
+    tile_height, tile_width = int(images.shape[2]), int(images.shape[3])
+    num_rows = int(images.shape[0]) // nrow
+    canvas = Image.new("RGB", (nrow * tile_width, num_rows * tile_height))
+    for index, image in enumerate(images):
+        array = image.mul(255).round().to(torch.uint8)
+        array = array.permute(1, 2, 0).contiguous().numpy()
+        if array.shape[-1] == 1:
+            tile = Image.fromarray(array[..., 0], mode="L").convert("RGB")
+        else:
+            tile = Image.fromarray(array, mode="RGB")
+        canvas.paste(tile, ((index % nrow) * tile_width, (index // nrow) * tile_height))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(target)
+    return target
+
+
+@torch.no_grad()
+def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=None,
+                      num_condition_classes=1000,
+                      num_samples=64,
+                      sample_batch_size=8,
+                      samples_per_class=8,
+                      setting_name="default",
+                      atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
+                      coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92,
+                      causal_prefix_sampling="predicted"):
+    device = next(model.parameters()).device
+    num_samples = int(num_samples)
+    samples_per_class = int(samples_per_class)
+    if samples_per_class <= 0 or num_samples <= 0 or num_samples % samples_per_class:
+        raise ValueError("preview sample count must be divisible by samples per class")
+    num_class_rows = num_samples // samples_per_class
+    if num_condition_classes == 1:
+        chosen = torch.zeros(num_class_rows, device=device, dtype=torch.long)
+    else:
+        chosen = torch.randperm(num_condition_classes, device=device)[:num_class_rows]
+    labels = chosen.repeat_interleave(samples_per_class)
+    was_training = model.training
+    model.eval()
+    image_batches = []
+    for start in range(0, num_samples, sample_batch_size):
+        stop = min(start + sample_batch_size, num_samples)
+        batch_labels = labels[start:stop]
+        current = stop - start
+        if isinstance(
+            model,
+            (
+                CompoundLaserRQTransformer,
+                LevelwiseLaserVAR,
+                SupportFirstLaserRQTransformer,
+                CausalPrefixPatternLaserRQTransformer,
+            ),
+        ):
+            sampling_kwargs = {}
+            if isinstance(model, CompoundLaserRQTransformer):
+                sampling_kwargs["causal_prefix_sampling"] = causal_prefix_sampling
+            coefficient_vocab_size = getattr(
+                model, "coefficient_pattern_vocab_size", aux.coeff_vocab_size
+            )
+            atoms, coeff_ids = model.sample_compound(
+                current, aux, cond=batch_labels,
+                atom_temperature=atom_temperature,
+                atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
+                coeff_temperature=coeff_temperature,
+                coeff_top_k=coeff_top_k or coefficient_vocab_size,
+                coeff_top_p=coeff_top_p,
+                amp=True,
+                **sampling_kwargs,
+            )
+            batch_images = (
+                aux.decode_orthogonal(atoms, coeff_ids)
+                if isinstance(model, OrthogonalCompoundLaserRQTransformer)
+                else aux.decode_coefficient_patterns(atoms, coeff_ids)
+                if isinstance(model, SupportFirstLaserRQTransformer)
+                else aux.decode_prefix_patterns(atoms, coeff_ids)
+                if isinstance(model, CausalPrefixPatternLaserRQTransformer)
+                else aux.decode_compound(atoms, coeff_ids)
+            )
+        else:
+            tokens = model.sample_sparse(
+                current,
+                aux,
+                cond=batch_labels,
+                atom_temperature=atom_temperature,
+                atom_top_k=atom_top_k,
+                atom_top_p=atom_top_p,
+                coeff_temperature=coeff_temperature,
+                coeff_top_k=coeff_top_k,
+                coeff_top_p=coeff_top_p,
+                amp=True,
+            )
+            batch_images = aux.decode_tokens(tokens)
+        image_batches.append(((batch_images.float().cpu() + 1.0) * 0.5).clamp(0, 1))
+    images = torch.cat(image_batches)
+    sample_dir = output_dir / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    target = sample_dir / f"step_{step:07d}_{setting_name}.png"
+    if num_condition_classes == 1:
+        save_unlabeled_grid(images, target, nrow=samples_per_class)
+    else:
+        save_class_labeled_grid(
+            images,
+            chosen,
+            class_names,
+            target,
+            samples_per_class=samples_per_class,
+        )
+    if wb is not None:
+        import wandb
+        wb.log({
+            f"samples/{setting_name}": wandb.Image(str(target)),
+            "train/global_step": step,
+        })
+    if was_training:
+        model.train()
+    return target
+
+
+def preview_sampling_settings(args):
+    original = {
+        "setting_name": "at1_k250_p1__ct1_k250_p1",
+        "atom_temperature": 1.0, "atom_top_k": 250, "atom_top_p": 1.0,
+        "coeff_temperature": 1.0, "coeff_top_k": 250, "coeff_top_p": 1.0,
+    }
+    configured = {
+        "setting_name": (
+            f"at{args.atom_temperature:g}_k{args.atom_top_k}_p{args.atom_top_p:g}"
+            f"__ct{args.coeff_temperature:g}_k{args.coeff_top_k}_p{args.coeff_top_p:g}"
+        ),
+        "atom_temperature": args.atom_temperature,
+        "atom_top_k": args.atom_top_k,
+        "atom_top_p": args.atom_top_p,
+        "coeff_temperature": args.coeff_temperature,
+        "coeff_top_k": args.coeff_top_k,
+        "coeff_top_p": args.coeff_top_p,
+    }
+    if args.sample_grid_compare_original:
+        return (
+            [configured]
+            if configured["setting_name"] == original["setting_name"]
+            else [configured, original]
+        )
+    if not args.sample_grid_sweep:
+        return [configured]
+    return [
+        original,
+        {
+            "setting_name": "at0.85_k250_p1__ct0.85_k250_p1",
+            "atom_temperature": 0.85, "atom_top_k": 250, "atom_top_p": 1.0,
+            "coeff_temperature": 0.85, "coeff_top_k": 250, "coeff_top_p": 1.0,
+        },
+        {
+            "setting_name": "at0.9_k0_p0.92__ct1_k0_p0.85",
+            "atom_temperature": 0.9, "atom_top_k": 0, "atom_top_p": 0.92,
+            "coeff_temperature": 1.0, "coeff_top_k": 0, "coeff_top_p": 0.85,
+        },
+        {
+            "setting_name": "at0.95_k250_p0.95__ct0.9_k250_p0.95",
+            "atom_temperature": 0.95, "atom_top_k": 250, "atom_top_p": 0.95,
+            "coeff_temperature": 0.9, "coeff_top_k": 250, "coeff_top_p": 0.95,
+        },
+    ]
+
+
+@torch.no_grad()
+def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_size: int = 64,
+                                num_condition_classes=1000,
+                                atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
+                                coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92,
+                                causal_prefix_sampling="predicted",
+                                compute_inception_score=True,
+                                metric_backend="original-rqvae",
+                                fid_reference_stats=None):
+
+    device = next(model.parameters()).device
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    process_rank = dist.get_rank() if dist.is_initialized() else 0
+    local_samples = int(num_samples) // world + (process_rank < int(num_samples) % world)
+    metric_backend = str(metric_backend).lower()
+    original_metrics = metric_backend == "original-rqvae"
+    if original_metrics:
+        from src.rqvae_metrics import DistributedOriginalRQVAEMetrics
+        fid_metric = DistributedOriginalRQVAEMetrics(
+            device,
+            compute_inception_score=compute_inception_score,
+            reference_stats_path=fid_reference_stats,
+        )
+    elif metric_backend == "torchmetrics":
+        if fid_reference_stats is not None:
+            raise ValueError(
+                "precomputed RQ-VAE reference statistics require "
+                "--metric-backend original-rqvae"
+            )
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        fid_metric = FrechetInceptionDistance(
+            feature=2048, normalize=True, sync_on_compute=dist.is_initialized()
+        ).to(device)
+    else:
+        raise ValueError(f"unsupported metric backend: {metric_backend}")
+    inception_metric = None
+    if compute_inception_score and not original_metrics:
+        from torchmetrics.image.inception import InceptionScore
+        inception_metric = InceptionScore(
+            normalize=True, splits=10, sync_on_compute=dist.is_initialized()
+        ).to(device)
+    if fid_reference_stats is None:
+        if val_loader is None:
+            raise ValueError("FID needs either a real-image loader or reference statistics")
+        seen = 0
+        for images, _ in val_loader:
+            images = ((images.to(device, non_blocking=True).float() + 1.0) * 0.5).clamp(0, 1)
+            keep = min(images.size(0), local_samples - seen)
+            fid_metric.update(images[:keep], real=True)
+            seen += keep
+            if seen >= local_samples:
+                break
+    generated = 0
+    was_training = model.training
+    model.eval()
+    while generated < local_samples:
+        current = min(int(batch_size), local_samples - generated)
+        # ImageNet uses the exact uniform class prior. Face models have a
+        # single unconditional embedding and therefore receive all-zero ids.
+        local_indices = torch.arange(
+            generated, generated + current, device=device, dtype=torch.long
+        )
+        labels = (local_indices * world + process_rank).remainder(num_condition_classes)
+        if isinstance(
+            model,
+            (
+                CompoundLaserRQTransformer,
+                LevelwiseLaserVAR,
+                SupportFirstLaserRQTransformer,
+                CausalPrefixPatternLaserRQTransformer,
+            ),
+        ):
+            sampling_kwargs = {}
+            if isinstance(model, CompoundLaserRQTransformer):
+                sampling_kwargs["causal_prefix_sampling"] = causal_prefix_sampling
+            coefficient_vocab_size = getattr(
+                model, "coefficient_pattern_vocab_size", aux.coeff_vocab_size
+            )
+            atoms, coeff_ids = model.sample_compound(
+                current, aux, cond=labels,
+                atom_temperature=atom_temperature,
+                atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
+                coeff_temperature=coeff_temperature,
+                coeff_top_k=coeff_top_k or coefficient_vocab_size,
+                coeff_top_p=coeff_top_p,
+                amp=True,
+                **sampling_kwargs,
+            )
+            decoded = (
+                aux.decode_orthogonal(atoms, coeff_ids)
+                if isinstance(model, OrthogonalCompoundLaserRQTransformer)
+                else aux.decode_coefficient_patterns(atoms, coeff_ids)
+                if isinstance(model, SupportFirstLaserRQTransformer)
+                else aux.decode_prefix_patterns(atoms, coeff_ids)
+                if isinstance(model, CausalPrefixPatternLaserRQTransformer)
+                else aux.decode_compound(atoms, coeff_ids)
+            )
+            images = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+        else:
+            tokens = model.sample_sparse(
+                current,
+                aux,
+                cond=labels,
+                atom_temperature=atom_temperature,
+                atom_top_k=atom_top_k,
+                atom_top_p=atom_top_p,
+                coeff_temperature=coeff_temperature,
+                coeff_top_k=coeff_top_k,
+                coeff_top_p=coeff_top_p,
+                amp=True,
+            )
+            images = ((aux.decode_tokens(tokens).float() + 1.0) * 0.5).clamp(0, 1)
+        fid_metric.update(images, real=False)
+        if inception_metric is not None:
+            inception_metric.update(images)
+        generated += current
+    if original_metrics:
+        fid, inception_mean, inception_std = fid_metric.compute(
+            shuffle_for_inception=True
+        )
+    else:
+        fid = float(fid_metric.compute().item())
+        if inception_metric is None:
+            inception_mean = inception_std = None
+        else:
+            inception_mean, inception_std = (
+                float(value.item()) for value in inception_metric.compute()
+            )
+    if was_training:
+        model.train()
+    return fid, inception_mean, inception_std
+
+
+def atomic_torch_save(payload, target: Path):
+    """Persist a checkpoint without exposing a partial destination file.
+
+    Network filesystems can fail in the middle of PyTorch's multi-gigabyte zip
+    serialization.  When ``LASER_CHECKPOINT_STAGING_DIR`` is set, serialize
+    once to local storage and retry only the copy to the persistent filesystem.
+    The existing checkpoint remains untouched until a complete copy is ready.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    staging_root = os.environ.get("LASER_CHECKPOINT_STAGING_DIR")
+    if staging_root:
+        local_dir = Path(staging_root).expanduser()
+        local_dir.mkdir(parents=True, exist_ok=True)
+        file_descriptor, local_name = tempfile.mkstemp(
+            prefix=f"{target.name}.", suffix=".staging", dir=local_dir
+        )
+        os.close(file_descriptor)
+        serialized = Path(local_name)
+    else:
+        serialized = temporary
+
+    try:
+        temporary.unlink(missing_ok=True)
+        torch.save(payload, serialized)
+        if serialized == temporary:
+            os.replace(temporary, target)
+            return
+
+        serialized_size = serialized.stat().st_size
+        copy_attempts = 3
+        for attempt in range(1, copy_attempts + 1):
+            try:
+                temporary.unlink(missing_ok=True)
+                shutil.copyfile(serialized, temporary)
+                copied_size = temporary.stat().st_size
+                if copied_size != serialized_size:
+                    raise OSError(
+                        f"checkpoint copy size mismatch: local={serialized_size}, "
+                        f"persistent={copied_size}"
+                    )
+                os.replace(temporary, target)
+                break
+            except OSError as error:
+                temporary.unlink(missing_ok=True)
+                if attempt == copy_attempts:
+                    raise
+                delay = 5 * attempt
+                print(
+                    f"Checkpoint copy attempt {attempt}/{copy_attempts} failed: "
+                    f"{error}; retrying in {delay}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+    finally:
+        if serialized != temporary:
+            serialized.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+
+
+def snapshot_checkpoint(source: Path, target: Path):
+    """Create an atomic, space-efficient snapshot of an immutable checkpoint."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".snapshot.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        # Hard links can fail when a custom checkpoint directory crosses filesystems.
+        shutil.copy2(source, temporary)
+    os.replace(temporary, target)
+
+
+def model_only_best_snapshot(snapshot):
+    """Drop resume-only state from a best checkpoint retained for evaluation."""
+    retained = {
+        key: snapshot[key]
+        for key in (
+            "epoch", "global_step", "fid", "inception_score",
+            "inception_score_std", "state_dict", "config", "best_fid",
+            "best_inception",
+        )
+        if key in snapshot
+    }
+    retained.update({
+        "checkpoint_kind": "model_only_best",
+        "resume_capable": False,
+    })
+    return retained
+
+
+def upload_checkpoints(wb, paths: list[Path], *, artifact_name: str, aliases, metadata):
+    import wandb
+    artifact = wandb.Artifact(artifact_name, type="model", metadata=metadata)
+    for path in paths:
+        artifact.add_file(str(path), name=path.name)
+    logged = wb.log_artifact(artifact, aliases=list(aliases))
+    logged.wait()
+    print(f"Uploaded checkpoint artifact {logged.name}", flush=True)
+
+
+def upload_checkpoint(wb, path: Path, *, artifact_name: str, aliases, metadata):
+    """Backward-compatible single-checkpoint artifact upload."""
+    upload_checkpoints(
+        wb, [path], artifact_name=artifact_name, aliases=aliases, metadata=metadata
+    )
+
+
+def _replace_hard_link(source: Path, destination: Path):
+    """Atomically point a fixed upload slot at an immutable checkpoint inode."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        shutil.copy2(source, temporary)
+    try:
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def upload_selected_checkpoint_files(
+    wb,
+    *,
+    last_checkpoint: Path,
+    best_fid,
+    upload_dir: Path,
+):
+    """Replace fixed W&B run-file slots with last plus the best three FIDs.
+
+    Artifact versions are immutable and therefore accumulate indefinitely.
+    Run files keep stable online names, matching the Stage-1 retention policy,
+    while the local hard links avoid another multi-gigabyte checkpoint copy.
+    """
+    sources = [("last.pt", last_checkpoint)]
+    sources.extend(
+        (f"best-fid-{rank_index:02d}.pt", Path(saved_path))
+        for rank_index, (_, saved_path) in enumerate(
+            sorted(best_fid, key=lambda item: float(item[0]))[:3], start=1
+        )
+    )
+    sources = [(slot, source.resolve()) for slot, source in sources if source.is_file()]
+    if not sources:
+        return []
+
+    upload_dir = upload_dir.expanduser().resolve()
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    active_names = {slot for slot, _ in sources}
+    for stale in upload_dir.glob("best-fid-*.pt"):
+        if stale.name not in active_names:
+            stale.unlink(missing_ok=True)
+
+    uploaded = []
+    for slot, source in sources:
+        destination = upload_dir / slot
+        _replace_hard_link(source, destination)
+        wb.save(str(destination), base_path=str(upload_dir), policy="now")
+        uploaded.append(destination)
+    print(
+        "Queued fixed W&B checkpoint files: "
+        + ", ".join(path.name for path in uploaded),
+        flush=True,
+    )
+    return uploaded
+
+
+def upload_token_cache_once(wb, token_cache: Path, output_dir: Path):
+    """Upload the immutable cache once, with a persistent local receipt."""
+    import wandb
+
+    receipt = output_dir / "token_cache_artifact.json"
+    if receipt.is_file():
+        return
+    payload = torch.load(token_cache, map_location="cpu", weights_only=True, mmap=True)
+    metadata = dict(payload.get("meta", {}))
+    artifact = wandb.Artifact(f"{wb.id}-token-cache", type="dataset", metadata=metadata)
+    artifact.add_file(str(token_cache), name=token_cache.name)
+    logged = wb.log_artifact(artifact, aliases=["latest", "training-cache"])
+    logged.wait()
+    receipt.write_text(json.dumps({
+        "artifact": f"{wb.id}-token-cache",
+        "version": logged.version,
+        "file": str(token_cache.resolve()),
+    }, indent=2) + "\n")
+    print(f"Uploaded token cache artifact {logged.name}", flush=True)
+
+
+def image_transform():
+    return transforms.Compose([
+        transforms.Resize(256), transforms.RandomCrop(256), transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(), transforms.Normalize([0.5] * 3, [0.5] * 3),
+    ])
+
+
+def val_image_transform():
+    return transforms.Compose([
+        transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor(),
+        transforms.Normalize([0.5] * 3, [0.5] * 3),
+    ])
+
+
+class LaserRQTransformer(RQTransformer):
+    """Upstream model with depth-wise validity masks for the combined vocabulary."""
+
+    def __init__(self, config, num_atoms: int):
+        super().__init__(config)
+        self.num_atoms = int(num_atoms)
+
+    def _mask_depth_vocab(self, logits):
+        logits = logits.clone()
+        mask_value = torch.finfo(logits.dtype).min
+        logits[..., 0::2, self.num_atoms:] = mask_value
+        logits[..., 1::2, :self.num_atoms] = mask_value
+        return logits
+
+    def classify_head_outputs(self, head_outputs):
+        """Avoid computing invalid vocabulary halves at alternating depths."""
+        normalized = self.classifier.layer_norm(head_outputs)
+        linear = self.classifier.linear
+        atom_logits = F.linear(
+            normalized[..., 0::2, :], linear.weight[: self.num_atoms],
+            None if linear.bias is None else linear.bias[: self.num_atoms],
+        )
+        coeff_logits = F.linear(
+            normalized[..., 1::2, :], linear.weight[self.num_atoms :],
+            None if linear.bias is None else linear.bias[self.num_atoms :],
+        )
+        return {"atom_logits": atom_logits, "coeff_logits": coeff_logits}
+
+    def forward(self, *args, **kwargs):
+        out = super().forward(*args, **kwargs)
+        if isinstance(out, dict):
+            return out
+        if isinstance(out, tuple) and out and isinstance(out[0], dict):
+            return out
+        if isinstance(out, tuple):
+            return self._mask_depth_vocab(out[0]), out[1]
+        return self._mask_depth_vocab(out)
+
+    def cached_forward(self, *args, sample_loc=(0, 0, 0), **kwargs):
+        logits = super().cached_forward(*args, sample_loc=sample_loc, **kwargs)
+        mask_value = torch.finfo(logits.dtype).min
+        d = int(sample_loc[2])
+        if d % 2 == 0:
+            logits[:, self.num_atoms:] = mask_value
+        else:
+            logits[:, :self.num_atoms] = mask_value
+        return logits
+
+    @torch.no_grad()
+    def sample_sparse(
+        self,
+        batch_size,
+        model_aux,
+        cond=None,
+        *,
+        atom_temperature=1.0,
+        atom_top_k=0,
+        atom_top_p=0.92,
+        coeff_temperature=1.0,
+        coeff_top_k=0,
+        coeff_top_p=0.92,
+        amp=True,
+    ):
+        """Sample the legacy ``atom, coefficient, ...`` scalar stream.
+
+        The generic upstream sampler takes one temperature/top-k/top-p setting
+        for every depth.  LASER alternates two disjoint vocabularies, so keep
+        the eight-slot autoregressive stream explicit and apply the atom and
+        coefficient controls to their respective positions.
+        """
+        height, width, scalar_depth = self.block_size
+        expected_depth = 2 * int(model_aux.sparsity_level)
+        if scalar_depth != expected_depth:
+            raise ValueError(
+                "legacy scalar sampling requires two slots per sparse component: "
+                f"model depth={scalar_depth}, expected={expected_depth}"
+            )
+        device = next(self.parameters()).device
+        tokens = torch.zeros(
+            int(batch_size), height, width, scalar_depth,
+            device=device, dtype=torch.long,
+        )
+        # Future values are causally masked, but a valid coefficient placeholder
+        # keeps every intermediate tensor inside its assigned vocabulary.
+        tokens[..., 1::2] = (
+            int(model_aux.num_atoms) + int(model_aux.coeff_vocab_size) // 2
+        )
+        self.init_cache()
+        try:
+            for h in range(height):
+                for w in range(width):
+                    for d in range(scalar_depth):
+                        logits = self.cached_forward(
+                            tokens[:, : h + 1],
+                            model_aux,
+                            cond=cond,
+                            amp=amp,
+                            sample_loc=(h, w, d),
+                        )
+                        is_atom = d % 2 == 0
+                        sampled = sample_from_logits(
+                            logits,
+                            temperature=(
+                                float(atom_temperature)
+                                if is_atom else float(coeff_temperature)
+                            ),
+                            top_k=(
+                                int(atom_top_k) or int(model_aux.num_atoms)
+                                if is_atom
+                                else int(coeff_top_k) or int(model_aux.coeff_vocab_size)
+                            ),
+                            top_p=(
+                                float(atom_top_p)
+                                if is_atom else float(coeff_top_p)
+                            ),
+                        )
+                        tokens[:, h, w, d] = sampled
+        finally:
+            self.init_cache()
+        return tokens
+
+
+class AtomConditionedRefinerBlock(nn.Module):
+    """Residual pair-local refinement after an atom identity is known."""
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        hidden_dim = 2 * int(embed_dim)
+        self.net = nn.Sequential(
+            nn.LayerNorm(3 * embed_dim),
+            nn.Linear(3 * embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, hidden, atom_context):
+        fused = torch.cat((hidden, atom_context, hidden * atom_context), dim=-1)
+        return hidden + self.net(fused)
+
+
+class LevelwiseVARSelfAttention(nn.Module):
+    """Self-attention with an explicit VAR-style block-causal level mask."""
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        if embed_dim % num_heads:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.dropout = float(dropout)
+        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim)
+        self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_drop = nn.Dropout(self.dropout)
+
+    def forward(self, inputs: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+        batch, length, channels = inputs.shape
+        qkv = self.qkv(inputs).reshape(
+            batch, length, 3, self.num_heads, self.head_dim
+        ).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv.unbind(dim=0)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=allowed[:length, :length].view(1, 1, length, length),
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch, length, channels)
+        return self.proj_drop(self.proj(attended))
+
+
+class LevelwiseVARBlock(nn.Module):
+    """Pre-normalized transformer block used by the next-level prior."""
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn_norm = nn.LayerNorm(embed_dim)
+        self.attn = LevelwiseVARSelfAttention(embed_dim, num_heads, dropout)
+        self.mlp_norm = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, inputs: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+        inputs = inputs + self.attn(self.attn_norm(inputs), allowed)
+        return inputs + self.mlp(self.mlp_norm(inputs))
+
+
+class LevelwiseLaserVAR(nn.Module):
+    """VAR-style next-sparsity-level prior over LASER coefficient maps.
+
+    One autoregressive stage is one complete ``H x W`` OMP-depth map. All
+    spatial pairs in a stage are predicted in parallel, and stage ``d`` is
+    conditioned only on the accumulated physical reconstruction from stages
+    ``< d``. During teacher forcing, the block-causal mask allows all positions
+    in the same stage to attend to one another without exposing its targets.
+    """
+
+    def __init__(
+        self,
+        *,
+        height: int,
+        width: int,
+        sparsity_level: int,
+        input_dim: int,
+        embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        num_atoms: int,
+        coeff_vocab_size: int,
+        num_condition_classes: int,
+        dropout: float = 0.0,
+        refiner_layers: int = 0,
+        micro_transformer_layers: int = 0,
+        depth_specific_coeff_heads: bool = False,
+        geometry_head: bool = False,
+        micro_transformer_config=None,
+    ):
+        super().__init__()
+        if min(height, width, sparsity_level, input_dim, embed_dim, num_layers, num_heads) <= 0:
+            raise ValueError("levelwise VAR dimensions must be positive")
+        if refiner_layers > 0 and micro_transformer_layers > 0:
+            raise ValueError("MLP refiner and micro-transformer are mutually exclusive")
+        self.block_size = torch.Size((height, width, sparsity_level))
+        self.num_atoms = int(num_atoms)
+        self.coeff_vocab_size = int(coeff_vocab_size)
+        self.embed_dim = int(embed_dim)
+        self.input_dim = int(input_dim)
+        self.num_condition_classes = int(num_condition_classes)
+        self.refiner_layers = int(refiner_layers)
+        self.micro_transformer_layers = int(micro_transformer_layers)
+        self.depth_specific_coeff_heads = bool(depth_specific_coeff_heads)
+
+        spatial_tokens = int(height) * int(width)
+        level_ids = torch.arange(sparsity_level).repeat_interleave(spatial_tokens)
+        # Rows are queries and columns are keys. A level can see all positions
+        # from its own level and all earlier levels, exactly as in VAR.
+        self.register_buffer(
+            "level_attention_allowed",
+            level_ids[:, None] >= level_ids[None, :],
+            persistent=False,
+        )
+        self.input_projection = nn.Linear(input_dim, embed_dim)
+        self.condition_embedding = nn.Embedding(num_condition_classes, embed_dim)
+        self.start_position = nn.Parameter(torch.empty(1, spatial_tokens, embed_dim))
+        self.spatial_position = nn.Parameter(torch.empty(1, 1, spatial_tokens, embed_dim))
+        self.level_embedding = nn.Embedding(sparsity_level, embed_dim)
+        self.input_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([
+            LevelwiseVARBlock(embed_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        self.output_norm = nn.LayerNorm(embed_dim)
+        self.atom_classifier = nn.Linear(embed_dim, num_atoms)
+        self.coeff_atom_proj = nn.Linear(input_dim, embed_dim, bias=False)
+
+        if self.micro_transformer_layers > 0:
+            if micro_transformer_config is None:
+                raise ValueError("micro-transformer configuration is required")
+            config = micro_transformer_config.copy()
+            config.n_layer = self.micro_transformer_layers
+            self.coeff_micro_transformer = AttentionStack(config)
+            self.coeff_micro_pos = nn.Parameter(torch.empty(1, 2, embed_dim))
+            nn.init.normal_(self.coeff_micro_pos, mean=0.0, std=0.02)
+        elif self.refiner_layers > 0:
+            self.coeff_refiner = nn.ModuleList([
+                AtomConditionedRefinerBlock(embed_dim)
+                for _ in range(self.refiner_layers)
+            ])
+        else:
+            self.coeff_fusion = nn.Sequential(
+                nn.LayerNorm(3 * embed_dim),
+                nn.Linear(3 * embed_dim, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+
+        def make_coeff_classifier():
+            return nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, coeff_vocab_size),
+            )
+
+        if self.depth_specific_coeff_heads:
+            self.coeff_classifier = nn.ModuleList([
+                make_coeff_classifier() for _ in range(sparsity_level)
+            ])
+        else:
+            self.coeff_classifier = make_coeff_classifier()
+        self.contribution_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, input_dim),
+        ) if geometry_head else None
+
+        nn.init.normal_(self.start_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.spatial_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.level_embedding.weight, mean=0.0, std=0.02)
+
+    def unpack(self, packed: torch.Tensor):
+        atoms = packed.div(self.coeff_vocab_size, rounding_mode="floor")
+        return atoms, packed.remainder(self.coeff_vocab_size)
+
+    def refine_coefficient_hidden(self, hidden, atom_vectors):
+        atom_context = self.coeff_atom_proj(atom_vectors)
+        if self.micro_transformer_layers > 0:
+            pair = torch.stack((hidden, atom_context), dim=-2)
+            pair = pair + self.coeff_micro_pos
+            refined = self.coeff_micro_transformer(
+                pair.reshape(-1, 2, pair.shape[-1])
+            ).reshape_as(pair)
+            return hidden + refined[..., -1, :]
+        if self.refiner_layers > 0:
+            for block in self.coeff_refiner:
+                hidden = block(hidden, atom_context)
+            return hidden
+        fused = torch.cat((hidden, atom_context, hidden * atom_context), dim=-1)
+        return hidden + self.coeff_fusion(fused)
+
+    def classify_coefficients(self, refined, depth_index=None):
+        if not self.depth_specific_coeff_heads:
+            return self.coeff_classifier(refined)
+        if depth_index is not None:
+            return self.coeff_classifier[int(depth_index)](refined)
+        if refined.shape[-2] != len(self.coeff_classifier):
+            raise ValueError("depth-specific coefficient heads require an explicit depth axis")
+        return torch.stack([
+            head(refined[..., depth, :])
+            for depth, head in enumerate(self.coeff_classifier)
+        ], dim=-2)
+
+    def coefficient_logits(self, hidden, atom_vectors, depth_index=None):
+        refined = self.refine_coefficient_hidden(hidden, atom_vectors)
+        return self.classify_coefficients(refined, depth_index=depth_index)
+
+    def single_level_contributions(self, model_aux, atoms, coeff_ids, level: int):
+        """Decode one sampled level without broadcasting every depth scale."""
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        coefficients = model_aux.coeff_bins[coeff_ids.long()]
+        physical_coefficients = coefficients * model_aux.coeff_scales[int(level)]
+        return atom_vectors * physical_coefficients.unsqueeze(-1)
+
+    def _level_inputs(self, contributions: torch.Tensor) -> torch.Tensor:
+        cumulative = contributions.cumsum(dim=-2)
+        previous = torch.cat(
+            (torch.zeros_like(contributions[..., :1, :]), cumulative[..., :-1, :]),
+            dim=-2,
+        )
+        return previous.permute(0, 3, 1, 2, 4).contiguous()
+
+    def level_hidden(self, level_inputs: torch.Tensor, cond=None) -> torch.Tensor:
+        batch, levels, height, width, channels = level_inputs.shape
+        if (height, width) != tuple(self.block_size[:2]) or channels != self.input_dim:
+            raise ValueError(
+                "levelwise input shape mismatch: "
+                f"got {(height, width, channels)}, expected "
+                f"{(*self.block_size[:2], self.input_dim)}"
+            )
+        if not 0 < levels <= self.block_size[-1]:
+            raise ValueError("invalid number of sparsity levels")
+        if cond is None:
+            cond = torch.zeros(batch, device=level_inputs.device, dtype=torch.long)
+        cond = cond.reshape(batch)
+        spatial_tokens = height * width
+        inputs = level_inputs.reshape(batch, levels, spatial_tokens, channels)
+        hidden = self.input_projection(inputs.float())
+        hidden = hidden + self.condition_embedding(cond)[:, None, None, :]
+        hidden = hidden + self.spatial_position[:, :, :spatial_tokens]
+        level_ids = torch.arange(levels, device=hidden.device)
+        hidden = hidden + self.level_embedding(level_ids)[None, :, None, :]
+        hidden[:, 0] = hidden[:, 0] + self.start_position[:, :spatial_tokens]
+        hidden = self.input_dropout(hidden.reshape(batch, levels * spatial_tokens, -1))
+        allowed = self.level_attention_allowed[:hidden.shape[1], :hidden.shape[1]]
+        for block in self.blocks:
+            hidden = block(hidden, allowed)
+        hidden = self.output_norm(hidden)
+        return hidden.reshape(batch, levels, height, width, -1)
+
+    def forward(self, packed, model_aux=None, cond=None, amp=False):
+        if model_aux is None:
+            raise ValueError("levelwise VAR requires the frozen LASER auxiliary model")
+        atoms, coeff_ids = self.unpack(packed)
+        contributions = model_aux.compound_embeddings(atoms, coeff_ids)
+        hidden = self.level_hidden(self._level_inputs(contributions), cond=cond)
+        hidden = hidden.permute(0, 2, 3, 1, 4).contiguous()
+        atom_logits = self.atom_classifier(hidden)
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        refined = self.refine_coefficient_hidden(hidden, atom_vectors)
+        outputs = {
+            "atom_logits": atom_logits,
+            "coeff_logits": self.classify_coefficients(refined),
+        }
+        if self.contribution_head is not None:
+            outputs["physical_contribution"] = self.contribution_head(refined)
+        return outputs
+
+    @torch.no_grad()
+    def sample_compound(
+        self,
+        batch_size,
+        model_aux,
+        cond=None,
+        temperature=1.0,
+        atom_top_k=16384,
+        atom_top_p=0.92,
+        coeff_top_p=0.92,
+        coeff_top_k=0,
+        atom_temperature=None,
+        coeff_temperature=None,
+        amp=True,
+    ):
+        height, width, depth = self.block_size
+        device = next(self.parameters()).device
+        atoms = torch.zeros(batch_size, height, width, depth, device=device, dtype=torch.long)
+        coeff_ids = torch.full_like(atoms, self.coeff_vocab_size // 2)
+        accumulated = model_aux.dictionary.new_zeros(
+            batch_size, height, width, self.input_dim
+        )
+        prior_level_inputs = []
+        atom_temperature = float(temperature if atom_temperature is None else atom_temperature)
+        coeff_temperature = float(temperature if coeff_temperature is None else coeff_temperature)
+        for level in range(depth):
+            prior_level_inputs.append(accumulated.clone())
+            level_inputs = torch.stack(prior_level_inputs, dim=1)
+            with torch.amp.autocast("cuda", enabled=amp):
+                hidden = self.level_hidden(level_inputs, cond=cond)[:, level]
+                atom_logits = self.atom_classifier(hidden).reshape(-1, self.num_atoms)
+                if level > 0:
+                    previous_atoms = atoms[..., :level].reshape(-1, level)
+                    atom_logits = atom_logits.clone()
+                    atom_logits.scatter_(1, previous_atoms, -float("inf"))
+                sampled_atoms = sample_from_logits(
+                    atom_logits,
+                    temperature=atom_temperature,
+                    top_k=min(atom_top_k, self.num_atoms),
+                    top_p=atom_top_p,
+                ).reshape(batch_size, height, width)
+                atom_vectors = model_aux.dictionary.t()[sampled_atoms]
+                coeff_logits = self.coefficient_logits(
+                    hidden, atom_vectors, depth_index=level
+                ).reshape(-1, self.coeff_vocab_size)
+                sampled_coeffs = sample_from_logits(
+                    coeff_logits,
+                    temperature=coeff_temperature,
+                    top_k=min(coeff_top_k or self.coeff_vocab_size, self.coeff_vocab_size),
+                    top_p=coeff_top_p,
+                ).reshape(batch_size, height, width)
+            atoms[..., level] = sampled_atoms
+            coeff_ids[..., level] = sampled_coeffs
+            accumulated.add_(
+                self.single_level_contributions(
+                    model_aux, sampled_atoms, sampled_coeffs, level
+                )
+            )
+        return atoms, coeff_ids
+
+
+class CompoundLaserRQTransformer(RQTransformer):
+    """AR model with one depth position per (atom, coefficient) pair.
+
+    The joint distribution is factorized without expanding the vocabulary:
+    p(atom, coeff | history) = p(atom | history) p(coeff | history, atom).
+    Packed integer inputs are only a transport representation; embeddings are
+    reconstructed from the frozen LASER dictionary and coefficient bins.
+    """
+
+    def __init__(self, config, num_atoms: int, coeff_vocab_size: int,
+                 refiner_layers: int = 0, geometry_head: bool = False,
+                 micro_transformer_layers: int = 0,
+                 depth_specific_coeff_heads: bool = False,
+                 causal_prefix_state: bool = False,
+                 pair_autoregressive: bool = False):
+        super().__init__(config)
+        self.num_atoms = int(num_atoms)
+        self.coeff_vocab_size = int(coeff_vocab_size)
+        input_dim = int(config.input_embed_dim)
+        embed_dim = int(config.embed_dim)
+        self.coeff_token_embedding = nn.Embedding(self.coeff_vocab_size, input_dim)
+        self.pair_embedding_adapter = nn.Sequential(
+            nn.LayerNorm(3 * input_dim),
+            nn.Linear(3 * input_dim, input_dim),
+            nn.SiLU(),
+            nn.Linear(input_dim, input_dim),
+        )
+        self.coeff_atom_proj = nn.Linear(input_dim, embed_dim, bias=False)
+        self.refiner_layers = int(refiner_layers)
+        self.micro_transformer_layers = int(micro_transformer_layers)
+        if self.refiner_layers > 0 and self.micro_transformer_layers > 0:
+            raise ValueError("MLP refiner and micro-transformer are mutually exclusive")
+        if self.micro_transformer_layers > 0:
+            micro_config = config.head.copy()
+            micro_config.n_layer = self.micro_transformer_layers
+            self.coeff_micro_transformer = AttentionStack(micro_config)
+            self.coeff_micro_pos = nn.Parameter(torch.zeros(1, 2, embed_dim))
+            self.coeff_micro_pos.data.normal_(mean=0.0, std=0.02)
+        elif self.refiner_layers > 0:
+            self.coeff_refiner = nn.ModuleList([
+                AtomConditionedRefinerBlock(embed_dim)
+                for _ in range(self.refiner_layers)
+            ])
+        else:
+            self.coeff_fusion = nn.Sequential(
+                nn.LayerNorm(3 * embed_dim),
+                nn.Linear(3 * embed_dim, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+        self.depth_specific_coeff_heads = bool(depth_specific_coeff_heads)
+        self.causal_prefix_state = bool(causal_prefix_state)
+        self.pair_autoregressive = bool(pair_autoregressive)
+        if self.causal_prefix_state and self.pair_autoregressive:
+            raise ValueError(
+                "causal-prefix and full-pair autoregressive depth states are "
+                "mutually exclusive"
+            )
+        if self.causal_prefix_state:
+            self.causal_depth_adapter = nn.Sequential(
+                nn.LayerNorm(2 * input_dim),
+                nn.Linear(2 * input_dim, input_dim),
+                nn.SiLU(),
+                nn.Linear(input_dim, input_dim),
+            )
+            self.causal_prefix_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, input_dim),
+            )
+
+        def make_coeff_classifier():
+            return nn.Sequential(
+                nn.LayerNorm(config.embed_dim),
+                nn.Linear(config.embed_dim, self.coeff_vocab_size),
+            )
+
+        if self.depth_specific_coeff_heads:
+            self.coeff_classifier = nn.ModuleList([
+                make_coeff_classifier() for _ in range(self.block_size[-1])
+            ])
+        else:
+            self.coeff_classifier = make_coeff_classifier()
+        self.contribution_head = nn.Sequential(
+            nn.LayerNorm(config.embed_dim),
+            nn.Linear(config.embed_dim, config.embed_dim),
+            nn.SiLU(),
+            nn.Linear(config.embed_dim, input_dim),
+        ) if geometry_head else None
+        self._teacher_atoms = None
+        self._teacher_coeff_ids = None
+        self._active_prefix_reconstructions = None
+
+    def unpack(self, packed):
+        return packed.div(self.coeff_vocab_size, rounding_mode="floor"), packed.remainder(self.coeff_vocab_size)
+
+    def compound_pair_embeddings(
+        self, model_aux, atoms, coeff_ids, *, depth_index=None
+    ):
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        coeff_embedding = self.coeff_token_embedding(coeff_ids.long())
+        if depth_index is None:
+            contribution = model_aux.compound_embeddings(atoms, coeff_ids)
+        else:
+            coefficient = (
+                model_aux.coeff_bins[coeff_ids.long()]
+                * model_aux.coeff_scales[int(depth_index)]
+            )
+            contribution = atom_vectors * coefficient.unsqueeze(-1)
+        features = torch.cat((atom_vectors, coeff_embedding, contribution), dim=-1)
+        # Preserve the physical latent contribution while adding a learned
+        # representation that keeps atom identity and coefficient identity.
+        return contribution + self.pair_embedding_adapter(features)
+
+    def embed_with_model_aux(self, packed, model_aux):
+        atoms, coeff_ids = self.unpack(packed)
+        return self.compound_pair_embeddings(model_aux, atoms, coeff_ids)
+
+    def embed_depth_with_model_aux(self, packed, model_aux):
+        """Use causal support history inside one OMP site.
+
+        ``encode_sparse_components`` stores coefficients after the final OMP
+        least-squares solve.  A coefficient attached to an early atom therefore
+        depends on atoms selected later in the same site.  Feeding those final
+        values to the depth head leaks future support information during teacher
+        forcing.  Atom identities are causal, while completed earlier spatial
+        sites can still use the full pair embedding through
+        ``embed_with_model_aux``.
+        """
+        atoms, coeff_ids = self.unpack(packed)
+        if self.pair_autoregressive:
+            # The upstream head shifts this tensor by one depth before the
+            # causal transformer.  Consequently the state used for event d
+            # contains exactly the completed pairs < d, including their
+            # discrete coefficients, and never the current/future pair.
+            # This is the exact chain-rule factorization
+            #   p(a_d | pairs_<d) p(c_d | pairs_<d, a_d).
+            return self.compound_pair_embeddings(model_aux, atoms, coeff_ids)
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        if not self.causal_prefix_state:
+            return atom_vectors
+        if self._active_prefix_reconstructions is None:
+            raise RuntimeError("causal prefix reconstructions were not provided")
+        batch, sequence, depth = packed.shape[:3]
+        prefix = self._active_prefix_reconstructions.reshape(
+            batch, -1, depth, atom_vectors.shape[-1]
+        )[:, :sequence].to(atom_vectors.dtype)
+        state = prefix + self.causal_depth_adapter(
+            torch.cat((atom_vectors, prefix), dim=-1)
+        )
+        # The upstream depth path cumulatively sums its per-token embeddings.
+        # Return state deltas so the context used to predict atom d is exactly
+        # the learned representation of the causal OMP reconstruction at d-1.
+        return torch.cat(
+            (state[..., :1, :], state[..., 1:, :] - state[..., :-1, :]),
+            dim=-2,
+        )
+
+    def refine_coefficient_hidden(self, hidden, atom_vectors):
+        atom_context = self.coeff_atom_proj(atom_vectors)
+        if self.micro_transformer_layers > 0:
+            pair = torch.stack((hidden, atom_context), dim=-2)
+            pair = pair + self.coeff_micro_pos
+            micro_output = self.coeff_micro_transformer(
+                pair.reshape(-1, 2, pair.shape[-1])
+            ).reshape_as(pair)
+            return hidden + micro_output[..., -1, :]
+        if self.refiner_layers > 0:
+            for block in self.coeff_refiner:
+                hidden = block(hidden, atom_context)
+            return hidden
+        fused = torch.cat((hidden, atom_context, hidden * atom_context), dim=-1)
+        return hidden + self.coeff_fusion(fused)
+
+    def classify_coefficients(self, refined, depth_index=None):
+        if not self.depth_specific_coeff_heads:
+            return self.coeff_classifier(refined)
+        if depth_index is not None:
+            return self.coeff_classifier[int(depth_index)](refined)
+        if refined.shape[-2] != len(self.coeff_classifier):
+            raise ValueError("depth-specific coefficient heads require an explicit depth axis")
+        return torch.stack([
+            head(refined[..., depth, :])
+            for depth, head in enumerate(self.coeff_classifier)
+        ], dim=-2)
+
+    def coefficient_logits(self, hidden, atom_vectors, depth_index=None):
+        refined = self.refine_coefficient_hidden(hidden, atom_vectors)
+        return self.classify_coefficients(refined, depth_index=depth_index)
+
+    def predict_causal_prefix(self, refined, pair_embedding):
+        if not self.causal_prefix_state:
+            raise RuntimeError("causal prefix state is disabled")
+        # The state produced after a compound event must depend on both pieces
+        # of that event. Previously this head saw the selected atom but not its
+        # coefficient, while generation fed its output into the next depth.
+        return self.causal_prefix_head(refined + self.head_mlp(pair_embedding))
+
+    @staticmethod
+    def mask_seen_atoms(atom_logits, atoms):
+        """Match the distinct-support constraint used by OMP and generation."""
+        if atoms.shape[-1] <= 1:
+            return atom_logits
+        masked = atom_logits.clone()
+        for depth_index in range(1, atoms.shape[-1]):
+            masked[..., depth_index, :].scatter_(
+                -1,
+                atoms[..., :depth_index].long(),
+                -float("inf"),
+            )
+        return masked
+
+    def classify_head_outputs(self, head_outputs):
+        atoms = self._teacher_atoms
+        coeff_ids = self._teacher_coeff_ids
+        if atoms is None or coeff_ids is None:
+            raise RuntimeError("compound teacher atoms were not set")
+        atom_logits = self.mask_seen_atoms(self.classifier(head_outputs), atoms)
+        atom_vectors = self._model_aux.dictionary.t()[atoms.long()]
+        refined = self.refine_coefficient_hidden(head_outputs, atom_vectors)
+        outputs = {
+            "atom_logits": atom_logits,
+            "coeff_logits": self.classify_coefficients(refined),
+        }
+        if self.causal_prefix_state:
+            pair_embedding = self.compound_pair_embeddings(
+                self._model_aux, atoms, coeff_ids
+            )
+            outputs["causal_prefix_prediction"] = self.predict_causal_prefix(
+                refined, pair_embedding
+            )
+        if self.contribution_head is not None:
+            outputs["physical_contribution"] = self.contribution_head(refined)
+        return outputs
+
+    def forward(
+        self,
+        packed,
+        model_aux=None,
+        cond=None,
+        amp=False,
+        causal_prefix_reconstructions=None,
+    ):
+        if self.causal_prefix_state and causal_prefix_reconstructions is None:
+            raise ValueError("causal prefix state requires prefix reconstructions")
+        if not self.causal_prefix_state and causal_prefix_reconstructions is not None:
+            raise ValueError("prefix reconstructions were provided to a non-causal model")
+        self._teacher_atoms, self._teacher_coeff_ids = self.unpack(packed)
+        self._model_aux = model_aux
+        self._active_prefix_reconstructions = causal_prefix_reconstructions
+        try:
+            return super().forward(packed, model_aux=model_aux, cond=cond, amp=amp)
+        finally:
+            self._teacher_atoms = None
+            self._teacher_coeff_ids = None
+            self._model_aux = None
+            self._active_prefix_reconstructions = None
+
+    @torch.no_grad()
+    def cached_head_output(self, packed, model_aux, cond, sample_loc, amp=True):
+        h, w, d = sample_loc
+        B, H, W, D = packed.shape
+        sampling_idx = h * W + w
+        xs = packed.reshape(B, -1, D)[:, :sampling_idx + 1]
+        with torch.amp.autocast("cuda", enabled=amp):
+            if cond is None:
+                cond = torch.zeros(B, self.block_size_cond, device=xs.device, dtype=torch.long)
+            else:
+                cond = cond.reshape(B, self.block_size_cond)
+            seq_len, cond_len = xs.shape[1], cond.shape[1]
+            if d == 0:
+                xs_emb = self.input_mlp(self.embed_with_model_aux(xs, model_aux))
+                conds_emb = self.cond_emb(cond) + self.pos_emb_cond[:, :cond_len]
+                spatial_inputs = xs_emb.sum(dim=-2) + self.pos_emb_hw[:, :seq_len]
+                latents = torch.cat((conds_emb, spatial_inputs[:, :-1]), dim=1)
+                latents = self.embed_drop(latents)[:, :cond_len + sampling_idx]
+                if self._cache["spatial_ctx_hw"] is None:
+                    spatial_ctx = self.body_transformer.cached_forward(latents)[:, -1:].contiguous()
+                else:
+                    spatial_ctx = self.body_transformer.cached_forward(latents[:, -1:])
+                self._cache["spatial_ctx_hw"] = spatial_ctx
+            spatial_ctx = self._cache["spatial_ctx_hw"]
+            depth_ctx = self.embed_depth_with_model_aux(xs, model_aux)
+            if self.config.cumsum_depth_ctx:
+                depth_ctx = torch.cumsum(depth_ctx, dim=-2)
+            depth_ctx = self.head_mlp(depth_ctx)[:, sampling_idx]
+            full = torch.cat((spatial_ctx, depth_ctx[:, :-1]), dim=1)
+            full = full + self.pos_emb_d[:, :D]
+            if d == 0:
+                self.head_transformer.init_cache()
+            return self.head_transformer.cached_forward(full[:, d:d + 1]).reshape(B, -1)
+
+    @torch.no_grad()
+    def sample_compound(self, batch_size, model_aux, cond=None, temperature=1.0,
+                        atom_top_k=16384, atom_top_p=0.92, coeff_top_p=0.92,
+                        coeff_top_k=0, atom_temperature=None,
+                        coeff_temperature=None, amp=True,
+                        causal_prefix_sampling="predicted"):
+        H, W, D = self.block_size
+        device = next(self.parameters()).device
+        atoms = torch.zeros(batch_size, H, W, D, device=device, dtype=torch.long)
+        coeff_ids = torch.full_like(atoms, self.coeff_vocab_size // 2)
+        packed = atoms * self.coeff_vocab_size + coeff_ids
+        atom_temperature = float(temperature if atom_temperature is None else atom_temperature)
+        coeff_temperature = float(temperature if coeff_temperature is None else coeff_temperature)
+        prefix_reconstructions = (
+            torch.zeros(
+                batch_size, H, W, D, model_aux.dictionary.shape[0],
+                device=device, dtype=torch.float32,
+            )
+            if self.causal_prefix_state else None
+        )
+        causal_prefix_sampling = str(causal_prefix_sampling)
+        if causal_prefix_sampling not in {"predicted", "accumulated", "zero"}:
+            raise ValueError(
+                "causal prefix sampling must be predicted, accumulated, or zero"
+            )
+        self._active_prefix_reconstructions = prefix_reconstructions
+        self.init_cache()
+        try:
+            for h in range(H):
+                for w in range(W):
+                    for d in range(D):
+                        hidden = self.cached_head_output(
+                            packed, model_aux, cond, (h, w, d), amp=amp
+                        )
+                        atom_logits = self.classifier(hidden)
+                        if d > 0:
+                            # OMP supports contain distinct atoms; enforce the same
+                            # invariant during generation instead of wasting a pair.
+                            atom_logits = atom_logits.clone()
+                            atom_logits.scatter_(1, atoms[:, h, w, :d], -float("inf"))
+                        atom = sample_from_logits(
+                            atom_logits, temperature=atom_temperature,
+                            top_k=min(atom_top_k, self.num_atoms), top_p=atom_top_p,
+                        )
+                        atom_vec = model_aux.dictionary.t()[atom.long()]
+                        refined = self.refine_coefficient_hidden(hidden, atom_vec)
+                        coeff_logits = self.classify_coefficients(
+                            refined, depth_index=d
+                        )
+                        coeff_id = sample_from_logits(
+                            coeff_logits, temperature=coeff_temperature,
+                            top_k=coeff_top_k or self.coeff_vocab_size,
+                            top_p=coeff_top_p,
+                        )
+                        atoms[:, h, w, d] = atom
+                        coeff_ids[:, h, w, d] = coeff_id
+                        packed[:, h, w, d] = atom * self.coeff_vocab_size + coeff_id
+                        if prefix_reconstructions is not None:
+                            if causal_prefix_sampling == "predicted":
+                                pair_embedding = self.compound_pair_embeddings(
+                                    model_aux,
+                                    atom,
+                                    coeff_id,
+                                    depth_index=d,
+                                )
+                                prefix_reconstructions[:, h, w, d] = (
+                                    self.predict_causal_prefix(
+                                        refined, pair_embedding
+                                    ).float()
+                                )
+                            elif causal_prefix_sampling == "accumulated":
+                                coefficient = (
+                                    model_aux.coeff_bins[coeff_id.long()].float()
+                                    * model_aux.coeff_scales[d].float()
+                                )
+                                contribution = atom_vec.float() * coefficient[:, None]
+                                if d:
+                                    contribution = (
+                                        prefix_reconstructions[:, h, w, d - 1]
+                                        + contribution
+                                    )
+                                prefix_reconstructions[:, h, w, d] = contribution
+        finally:
+            self._active_prefix_reconstructions = None
+            self.init_cache()
+        return atoms, coeff_ids
+
+
+class OrthogonalCompoundLaserRQTransformer(CompoundLaserRQTransformer):
+    """Compound prior in causal ordered-orthogonal sparse coordinates.
+
+    The event order remains ``8 x 8 x K``.  At depth ``d`` the atom head sees
+    all earlier ``(atom, gamma)`` events through their exact prefix
+    reconstruction.  The coefficient head predicts ``gamma_d`` along the
+    prefix-stable orthogonal direction ``q_d`` induced by the selected support.
+    """
+
+    def __init__(self, config, num_atoms: int, coeff_vocab_size: int,
+                 refiner_layers: int = 0, geometry_head: bool = False,
+                 micro_transformer_layers: int = 0,
+                 depth_specific_coeff_heads: bool = False,
+                 causal_prefix_state: bool = False,
+                 closed_loop_coefficients: bool = False,
+                 closed_loop_coeff_state: str = "expected",
+                 closed_loop_gumbel_temperature: float = 1.0):
+        super().__init__(
+            config,
+            num_atoms=num_atoms,
+            coeff_vocab_size=coeff_vocab_size,
+            refiner_layers=refiner_layers,
+            geometry_head=geometry_head,
+            micro_transformer_layers=micro_transformer_layers,
+            depth_specific_coeff_heads=depth_specific_coeff_heads,
+            causal_prefix_state=causal_prefix_state,
+        )
+        self.closed_loop_coefficients = bool(closed_loop_coefficients)
+        self.closed_loop_coeff_state = str(closed_loop_coeff_state)
+        if self.closed_loop_coeff_state not in {"expected", "straight-through"}:
+            raise ValueError(
+                "closed-loop coefficient state must be expected or straight-through"
+            )
+        self.closed_loop_gumbel_temperature = float(
+            closed_loop_gumbel_temperature
+        )
+        if self.closed_loop_gumbel_temperature <= 0:
+            raise ValueError("closed-loop Gumbel temperature must be positive")
+        if self.closed_loop_coefficients and not self.causal_prefix_state:
+            raise ValueError(
+                "closed-loop orthogonal coefficients require causal prefix state"
+            )
+
+    def orthogonal_pair_embeddings(self, model_aux, atoms, coeff_ids):
+        raw_atoms = model_aux.dictionary.t()[atoms.long()]
+        basis, _ = model_aux.orthogonal_basis(atoms)
+        coeff_embedding = self.coeff_token_embedding(coeff_ids.long())
+        contribution = model_aux.orthogonal_embeddings(atoms, coeff_ids)
+        features = torch.cat((raw_atoms, coeff_embedding, contribution), dim=-1)
+        return contribution + self.pair_embedding_adapter(features)
+
+    def embed_with_model_aux(self, packed, model_aux):
+        atoms, coeff_ids = self.unpack(packed)
+        return self.orthogonal_pair_embeddings(model_aux, atoms, coeff_ids)
+
+    def embed_depth_with_model_aux(self, packed, model_aux):
+        if self.causal_prefix_state:
+            # Keep the pair-hard checkpoint's learned causal-depth pathway.
+            # In orthogonal coordinates the exact prefix after depth d is just
+            # sum_{i<=d} gamma_i q_i, so unlike final OMP coefficients it is
+            # available without leaking any future support decisions.
+            return CompoundLaserRQTransformer.embed_depth_with_model_aux(
+                self, packed, model_aux
+            )
+        # Unlike final dictionary coefficients, gamma_d q_d is a causal prefix
+        # contribution and can safely condition every later depth decision.
+        atoms, coeff_ids = self.unpack(packed)
+        return self.orthogonal_pair_embeddings(model_aux, atoms, coeff_ids)
+
+    def classify_head_outputs(self, head_outputs):
+        atoms = self._teacher_atoms
+        coeff_ids = self._teacher_coeff_ids
+        if atoms is None or coeff_ids is None:
+            raise RuntimeError("orthogonal compound teacher pairs were not set")
+        atom_logits = self.mask_seen_atoms(self.classifier(head_outputs), atoms)
+        basis, _ = self._model_aux.orthogonal_basis(atoms)
+        refined = self.refine_coefficient_hidden(head_outputs, basis)
+        outputs = {
+            "atom_logits": atom_logits,
+            "coeff_logits": self.classify_coefficients(refined),
+        }
+        if self.causal_prefix_state:
+            pair_embedding = self.orthogonal_pair_embeddings(
+                self._model_aux, atoms, coeff_ids
+            )
+            outputs["causal_prefix_prediction"] = self.predict_causal_prefix(
+                refined, pair_embedding
+            )
+        if self.contribution_head is not None:
+            outputs["physical_contribution"] = self.contribution_head(refined)
+        return outputs
+
+    def _closed_loop_normalized_coefficient(self, coeff_logits):
+        """Differentiable coefficient used as the next autoregressive state."""
+        logits = coeff_logits.float()
+        if self.closed_loop_coeff_state == "straight-through":
+            weights = F.gumbel_softmax(
+                logits,
+                tau=self.closed_loop_gumbel_temperature,
+                hard=True,
+                dim=-1,
+            )
+        else:
+            weights = logits.softmax(dim=-1)
+        return (weights * self._model_aux.coeff_bins.float()).sum(dim=-1)
+
+    def _closed_loop_forward(
+        self,
+        packed,
+        model_aux,
+        cond,
+        *,
+        causal_prefix_reconstructions,
+        amp=False,
+    ):
+        """Unroll atom -> coefficient -> prefix for every sparse depth.
+
+        The ordinary teacher-forced forward computes all depth states from the
+        target prefix in parallel. Here the coefficient distribution predicted
+        at depth d constructs the physical prefix consumed at depth d + 1, so
+        future atom losses backpropagate through earlier coefficient decisions.
+        Completed spatial sites remain teacher-forced, exactly as in a standard
+        autoregressive transformer.
+        """
+        if causal_prefix_reconstructions is None:
+            raise ValueError(
+                "closed-loop coefficients require target prefixes for the "
+                "auxiliary prefix objective"
+            )
+        batch, height, width, depth = packed.shape
+        if depth != self.block_size[-1]:
+            raise ValueError(
+                f"expected sparse depth {self.block_size[-1]}, got {depth}"
+            )
+        atoms, coeff_ids = self.unpack(packed)
+        sequence = height * width
+        flat_packed = packed.reshape(batch, sequence, depth)
+        flat_atoms = atoms.reshape(batch, sequence, depth)
+        flat_coeff_ids = coeff_ids.reshape(batch, sequence, depth)
+        if cond is None:
+            cond = torch.zeros(
+                batch,
+                self.block_size_cond,
+                device=packed.device,
+                dtype=torch.long,
+            )
+        else:
+            cond = cond.reshape(batch, self.block_size_cond)
+        condition_length = cond.shape[1]
+
+        self._teacher_atoms = atoms
+        self._teacher_coeff_ids = coeff_ids
+        self._model_aux = model_aux
+        try:
+            with torch.amp.autocast("cuda", enabled=amp):
+                spatial_tokens = self.input_mlp(
+                    self.embed_with_model_aux(flat_packed, model_aux)
+                )
+                spatial_tokens = (
+                    spatial_tokens.sum(dim=-2)
+                    + self.pos_emb_hw[:, :sequence]
+                )
+                condition_tokens = (
+                    self.cond_emb(cond)
+                    + self.pos_emb_cond[:, :condition_length]
+                )
+                body_inputs = torch.cat(
+                    (condition_tokens, spatial_tokens[:, :-1]), dim=1
+                )
+                body_outputs = self.body_transformer(
+                    self.embed_drop(body_inputs)
+                )
+                spatial_context = body_outputs[:, condition_length - 1:]
+                if condition_length > 1:
+                    condition_logits = self.cond_classifier(
+                        body_outputs[:, :condition_length - 1]
+                    )
+
+                sites = batch * sequence
+                raw_atoms = model_aux.dictionary.t()[flat_atoms.long()].reshape(
+                    sites, depth, -1
+                )
+                basis, _ = model_aux.orthogonal_basis(flat_atoms)
+                basis = basis.reshape(sites, depth, -1)
+                flat_target_coeff_ids = flat_coeff_ids.reshape(sites, depth)
+                prefix = basis.new_zeros(sites, basis.shape[-1]).float()
+                head_input = spatial_context.reshape(sites, -1)
+                atom_logits_by_depth = []
+                coeff_logits_by_depth = []
+                prefix_predictions = []
+                closed_loop_prefixes = []
+                physical_predictions = []
+
+                self.head_transformer.init_cache()
+                for depth_index in range(depth):
+                    positioned = (
+                        head_input
+                        + self.pos_emb_d[:, depth_index].to(head_input.dtype)
+                    )
+                    hidden = self.head_transformer.cached_forward(
+                        positioned.unsqueeze(1)
+                    ).squeeze(1)
+                    atom_logits = self.classifier(hidden)
+                    if depth_index:
+                        atom_logits = atom_logits.clone()
+                        atom_logits.scatter_(
+                            1,
+                            flat_atoms[:, :, :depth_index].reshape(
+                                sites, depth_index
+                            ).long(),
+                            -float("inf"),
+                        )
+                    direction = basis[:, depth_index]
+                    refined = self.refine_coefficient_hidden(hidden, direction)
+                    coeff_logits = self.classify_coefficients(
+                        refined, depth_index=depth_index
+                    )
+                    normalized_coefficient = (
+                        self._closed_loop_normalized_coefficient(coeff_logits)
+                    )
+                    physical_coefficient = (
+                        normalized_coefficient
+                        * model_aux.coeff_scales[depth_index].float()
+                    )
+                    prefix = (
+                        prefix
+                        + direction.float()
+                        * physical_coefficient.unsqueeze(-1)
+                    )
+
+                    target_coeff_id = flat_target_coeff_ids[:, depth_index]
+                    target_contribution = direction * (
+                        model_aux.coeff_bins[target_coeff_id.long()]
+                        * model_aux.coeff_scales[depth_index]
+                    ).unsqueeze(-1)
+                    target_pair = target_contribution + self.pair_embedding_adapter(
+                        torch.cat(
+                            (
+                                raw_atoms[:, depth_index],
+                                self.coeff_token_embedding(target_coeff_id.long()),
+                                target_contribution,
+                            ),
+                            dim=-1,
+                        )
+                    )
+                    prefix_predictions.append(
+                        self.predict_causal_prefix(refined, target_pair)
+                    )
+                    closed_loop_prefixes.append(prefix)
+                    atom_logits_by_depth.append(atom_logits)
+                    coeff_logits_by_depth.append(coeff_logits)
+                    if self.contribution_head is not None:
+                        physical_predictions.append(
+                            self.contribution_head(refined)
+                        )
+
+                    state = prefix.to(raw_atoms.dtype) + self.causal_depth_adapter(
+                        torch.cat(
+                            (raw_atoms[:, depth_index], prefix.to(raw_atoms.dtype)),
+                            dim=-1,
+                        )
+                    )
+                    head_input = self.head_mlp(state)
+
+                outputs = {
+                    "atom_logits": torch.stack(
+                        atom_logits_by_depth, dim=1
+                    ).reshape(batch, height, width, depth, self.num_atoms),
+                    "coeff_logits": torch.stack(
+                        coeff_logits_by_depth, dim=1
+                    ).reshape(
+                        batch,
+                        height,
+                        width,
+                        depth,
+                        self.coeff_vocab_size,
+                    ),
+                    "causal_prefix_prediction": torch.stack(
+                        prefix_predictions, dim=1
+                    ).reshape(
+                        batch, height, width, depth, basis.shape[-1]
+                    ),
+                    "closed_loop_prefix": torch.stack(
+                        closed_loop_prefixes, dim=1
+                    ).reshape(
+                        batch, height, width, depth, basis.shape[-1]
+                    ),
+                }
+                if physical_predictions:
+                    outputs["physical_contribution"] = torch.stack(
+                        physical_predictions, dim=1
+                    ).reshape(
+                        batch, height, width, depth, basis.shape[-1]
+                    )
+                if condition_length > 1:
+                    return outputs, condition_logits
+                return outputs
+        finally:
+            self._teacher_atoms = None
+            self._teacher_coeff_ids = None
+            self._model_aux = None
+            self.head_transformer.init_cache()
+
+    def forward(
+        self,
+        packed,
+        model_aux=None,
+        cond=None,
+        amp=False,
+        causal_prefix_reconstructions=None,
+    ):
+        if not self.closed_loop_coefficients:
+            return super().forward(
+                packed,
+                model_aux=model_aux,
+                cond=cond,
+                amp=amp,
+                causal_prefix_reconstructions=causal_prefix_reconstructions,
+            )
+        return self._closed_loop_forward(
+            packed,
+            model_aux,
+            cond,
+            causal_prefix_reconstructions=causal_prefix_reconstructions,
+            amp=amp,
+        )
+
+    @torch.no_grad()
+    def sample_compound(self, batch_size, model_aux, cond=None, temperature=1.0,
+                        atom_top_k=16384, atom_top_p=0.92, coeff_top_p=0.92,
+                        coeff_top_k=0, atom_temperature=None,
+                        coeff_temperature=None, amp=True, **_unused):
+        height, width, depth = self.block_size
+        device = next(self.parameters()).device
+        atoms = torch.zeros(
+            batch_size, height, width, depth,
+            device=device, dtype=torch.long,
+        )
+        coeff_ids = torch.full_like(atoms, self.coeff_vocab_size // 2)
+        packed = atoms * self.coeff_vocab_size + coeff_ids
+        atom_temperature = float(
+            temperature if atom_temperature is None else atom_temperature
+        )
+        coeff_temperature = float(
+            temperature if coeff_temperature is None else coeff_temperature
+        )
+        prefix_reconstructions = (
+            torch.zeros(
+                batch_size, height, width, depth,
+                model_aux.dictionary.shape[0],
+                device=device, dtype=torch.float32,
+            )
+            if self.causal_prefix_state else None
+        )
+        self._active_prefix_reconstructions = prefix_reconstructions
+        self.init_cache()
+        try:
+            for h in range(height):
+                for w in range(width):
+                    for d in range(depth):
+                        hidden = self.cached_head_output(
+                            packed, model_aux, cond, (h, w, d), amp=amp
+                        )
+                        atom_logits = self.classifier(hidden)
+                        if d:
+                            atom_logits = atom_logits.clone()
+                            atom_logits.scatter_(
+                                1, atoms[:, h, w, :d], -float("inf")
+                            )
+                        atom = sample_from_logits(
+                            atom_logits,
+                            temperature=atom_temperature,
+                            top_k=min(atom_top_k, self.num_atoms),
+                            top_p=atom_top_p,
+                        )
+                        atoms[:, h, w, d] = atom
+                        prefix_basis, _ = model_aux.orthogonal_basis(
+                            atoms[:, h, w, : d + 1]
+                        )
+                        direction = prefix_basis[:, -1]
+                        refined = self.refine_coefficient_hidden(hidden, direction)
+                        coeff_logits = self.classify_coefficients(
+                            refined, depth_index=d
+                        )
+                        coeff_id = sample_from_logits(
+                            coeff_logits,
+                            temperature=coeff_temperature,
+                            top_k=coeff_top_k or self.coeff_vocab_size,
+                            top_p=coeff_top_p,
+                        )
+                        coeff_ids[:, h, w, d] = coeff_id
+                        packed[:, h, w, d] = (
+                            atom * self.coeff_vocab_size + coeff_id
+                        )
+                        if prefix_reconstructions is not None:
+                            gamma = (
+                                model_aux.coeff_bins[coeff_id.long()].float()
+                                * model_aux.coeff_scales[d].float()
+                            )
+                            prefix = direction.float() * gamma[:, None]
+                            if d:
+                                prefix = (
+                                    prefix_reconstructions[:, h, w, d - 1]
+                                    + prefix
+                                )
+                            prefix_reconstructions[:, h, w, d] = prefix
+        finally:
+            self._active_prefix_reconstructions = None
+            self.init_cache()
+        return atoms, coeff_ids
+
+
+class SupportFirstLaserRQTransformer(RQTransformer):
+    """Generate an OMP support first, then one joint coefficient pattern.
+
+    The final transport token packs ``(last_atom, pattern_id)`` so the upstream
+    RQ-Transformer still operates on exactly ``K`` depth positions.  The atom
+    head at depth ``d`` only sees atoms ``< d``.  Once the last atom is known,
+    a second classifier reuses that final hidden state and conditions on the
+    complete support to model ``p(pattern | support, spatial_history)``.
+    """
+
+    def __init__(
+        self,
+        config,
+        num_atoms: int,
+        coefficient_pattern_vocab_size: int,
+    ):
+        super().__init__(config)
+        self.num_atoms = int(num_atoms)
+        self.coefficient_pattern_vocab_size = int(
+            coefficient_pattern_vocab_size
+        )
+        if self.coefficient_pattern_vocab_size <= 1:
+            raise ValueError("coefficient pattern vocabulary must exceed one")
+        input_dim = int(config.input_embed_dim)
+        embed_dim = int(config.embed_dim)
+        self.pattern_support_proj = nn.Linear(input_dim, embed_dim, bias=False)
+        self.pattern_fusion = nn.Sequential(
+            nn.LayerNorm(3 * embed_dim),
+            nn.Linear(3 * embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.pattern_classifier = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, self.coefficient_pattern_vocab_size),
+        )
+        self._teacher_atoms = None
+        self._model_aux = None
+
+    def pack(self, atoms: torch.Tensor, pattern_ids: torch.Tensor) -> torch.Tensor:
+        if atoms.shape[:-1] != pattern_ids.shape:
+            raise ValueError(
+                "atom support and coefficient-pattern ids must share site axes"
+            )
+        if atoms.shape[-1] != self.block_size[-1]:
+            raise ValueError(
+                f"expected support depth {self.block_size[-1]}, got {atoms.shape[-1]}"
+            )
+        packed = atoms.long().clone()
+        packed[..., -1] = (
+            atoms[..., -1].long() * self.coefficient_pattern_vocab_size
+            + pattern_ids.long()
+        )
+        return packed
+
+    def unpack(self, packed: torch.Tensor):
+        atoms = packed.long().clone()
+        final = atoms[..., -1]
+        pattern_ids = final.remainder(self.coefficient_pattern_vocab_size)
+        atoms[..., -1] = final.div(
+            self.coefficient_pattern_vocab_size, rounding_mode="floor"
+        )
+        return atoms, pattern_ids
+
+    def embed_with_model_aux(self, packed, model_aux):
+        """Make each completed spatial-site embedding equal its decoded latent."""
+        atoms, pattern_ids = self.unpack(packed)
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        reconstruction = model_aux.coefficient_pattern_latents(
+            atoms, pattern_ids
+        )
+        embeddings = atom_vectors.clone()
+        embeddings[..., -1, :] += reconstruction - atom_vectors.sum(dim=-2)
+        return embeddings
+
+    def embed_depth_with_model_aux(self, packed, model_aux):
+        # Pattern ids are deliberately excluded: all within-site atom logits
+        # are causal functions of the already selected support only.
+        atoms, _ = self.unpack(packed)
+        return model_aux.dictionary.t()[atoms.long()]
+
+    def refine_pattern_hidden(self, hidden, atom_vectors):
+        support_context = self.pattern_support_proj(atom_vectors.sum(dim=-2))
+        fused = torch.cat(
+            (hidden, support_context, hidden * support_context), dim=-1
+        )
+        return hidden + self.pattern_fusion(fused)
+
+    def coefficient_pattern_logits(self, hidden, atom_vectors):
+        return self.pattern_classifier(
+            self.refine_pattern_hidden(hidden, atom_vectors)
+        )
+
+    def classify_head_outputs(self, head_outputs):
+        if self._teacher_atoms is None or self._model_aux is None:
+            raise RuntimeError("support-first teacher support was not set")
+        atom_logits = CompoundLaserRQTransformer.mask_seen_atoms(
+            self.classifier(head_outputs), self._teacher_atoms
+        )
+        atom_vectors = self._model_aux.dictionary.t()[
+            self._teacher_atoms.long()
+        ]
+        pattern_logits = self.coefficient_pattern_logits(
+            head_outputs[..., -1, :], atom_vectors
+        )
+        return {
+            "atom_logits": atom_logits,
+            "pattern_logits": pattern_logits,
+        }
+
+    def forward(self, packed, model_aux=None, cond=None, amp=False):
+        self._teacher_atoms, _ = self.unpack(packed)
+        self._model_aux = model_aux
+        try:
+            return super().forward(
+                packed, model_aux=model_aux, cond=cond, amp=amp
+            )
+        finally:
+            self._teacher_atoms = None
+            self._model_aux = None
+
+    @torch.no_grad()
+    def cached_head_output(self, packed, model_aux, cond, sample_loc, amp=True):
+        h, w, d = sample_loc
+        batch, _, width, depth = packed.shape
+        sampling_idx = h * width + w
+        xs = packed.reshape(batch, -1, depth)[:, :sampling_idx + 1]
+        with torch.amp.autocast("cuda", enabled=amp):
+            if cond is None:
+                cond = torch.zeros(
+                    batch,
+                    self.block_size_cond,
+                    device=xs.device,
+                    dtype=torch.long,
+                )
+            else:
+                cond = cond.reshape(batch, self.block_size_cond)
+            seq_len, cond_len = xs.shape[1], cond.shape[1]
+            if d == 0:
+                xs_emb = self.input_mlp(
+                    self.embed_with_model_aux(xs, model_aux)
+                )
+                conds_emb = (
+                    self.cond_emb(cond) + self.pos_emb_cond[:, :cond_len]
+                )
+                spatial_inputs = (
+                    xs_emb.sum(dim=-2) + self.pos_emb_hw[:, :seq_len]
+                )
+                latents = torch.cat(
+                    (conds_emb, spatial_inputs[:, :-1]), dim=1
+                )
+                latents = self.embed_drop(latents)[
+                    :, :cond_len + sampling_idx
+                ]
+                if self._cache["spatial_ctx_hw"] is None:
+                    spatial_ctx = self.body_transformer.cached_forward(
+                        latents
+                    )[:, -1:].contiguous()
+                else:
+                    spatial_ctx = self.body_transformer.cached_forward(
+                        latents[:, -1:]
+                    )
+                self._cache["spatial_ctx_hw"] = spatial_ctx
+            spatial_ctx = self._cache["spatial_ctx_hw"]
+            depth_ctx = self.embed_depth_with_model_aux(xs, model_aux)
+            if self.config.cumsum_depth_ctx:
+                depth_ctx = torch.cumsum(depth_ctx, dim=-2)
+            depth_ctx = self.head_mlp(depth_ctx)[:, sampling_idx]
+            full = torch.cat((spatial_ctx, depth_ctx[:, :-1]), dim=1)
+            full = full + self.pos_emb_d[:, :depth]
+            if d == 0:
+                self.head_transformer.init_cache()
+            return self.head_transformer.cached_forward(
+                full[:, d:d + 1]
+            ).reshape(batch, -1)
+
+    @torch.no_grad()
+    def sample_compound(
+        self,
+        batch_size,
+        model_aux,
+        cond=None,
+        temperature=1.0,
+        atom_top_k=16384,
+        atom_top_p=0.92,
+        coeff_top_p=0.92,
+        coeff_top_k=0,
+        atom_temperature=None,
+        coeff_temperature=None,
+        amp=True,
+        **_unused,
+    ):
+        height, width, depth = self.block_size
+        device = next(self.parameters()).device
+        atoms = torch.zeros(
+            batch_size, height, width, depth,
+            device=device, dtype=torch.long,
+        )
+        pattern_ids = torch.zeros(
+            batch_size, height, width, device=device, dtype=torch.long
+        )
+        packed = self.pack(atoms, pattern_ids)
+        atom_temperature = float(
+            temperature if atom_temperature is None else atom_temperature
+        )
+        pattern_temperature = float(
+            temperature if coeff_temperature is None else coeff_temperature
+        )
+        self.init_cache()
+        try:
+            for h in range(height):
+                for w in range(width):
+                    for d in range(depth):
+                        hidden = self.cached_head_output(
+                            packed, model_aux, cond, (h, w, d), amp=amp
+                        )
+                        atom_logits = self.classifier(hidden)
+                        if d:
+                            atom_logits = atom_logits.clone()
+                            atom_logits.scatter_(
+                                1, atoms[:, h, w, :d], -float("inf")
+                            )
+                        atom = sample_from_logits(
+                            atom_logits,
+                            temperature=atom_temperature,
+                            top_k=min(atom_top_k or self.num_atoms, self.num_atoms),
+                            top_p=atom_top_p,
+                        )
+                        atoms[:, h, w, d] = atom
+                        if d + 1 < depth:
+                            packed[:, h, w, d] = atom
+                            continue
+                        atom_vectors = model_aux.dictionary.t()[
+                            atoms[:, h, w].long()
+                        ]
+                        pattern_logits = self.coefficient_pattern_logits(
+                            hidden, atom_vectors
+                        )
+                        pattern_id = sample_from_logits(
+                            pattern_logits,
+                            temperature=pattern_temperature,
+                            top_k=min(
+                                coeff_top_k
+                                or self.coefficient_pattern_vocab_size,
+                                self.coefficient_pattern_vocab_size,
+                            ),
+                            top_p=coeff_top_p,
+                        )
+                        pattern_ids[:, h, w] = pattern_id
+                        packed[:, h, w, d] = (
+                            atom * self.coefficient_pattern_vocab_size
+                            + pattern_id
+                        )
+        finally:
+            self.init_cache()
+        return atoms, pattern_ids
+
+
+class CausalPrefixPatternLaserRQTransformer(RQTransformer):
+    """Generate an atom and a valid joint coefficient code at every OMP depth.
+
+    Prefix pattern ``q_d`` represents the exact least-squares coefficient
+    vector after atoms ``a_0..a_d`` have been selected.  It is therefore safe
+    context for predicting ``a_{d+1}``, unlike a coefficient copied from the
+    final K-atom solve.  The depth-K pattern is the sparse code decoded for the
+    completed site.
+    """
+
+    def __init__(
+        self,
+        config,
+        num_atoms: int,
+        coeff_vocab_size: int,
+        prefix_pattern_vocab_sizes,
+        micro_transformer_layers: int = 2,
+    ):
+        super().__init__(config)
+        self.num_atoms = int(num_atoms)
+        self.coeff_vocab_size = int(coeff_vocab_size)
+        self.prefix_pattern_vocab_sizes = tuple(
+            int(value) for value in prefix_pattern_vocab_sizes
+        )
+        if len(self.prefix_pattern_vocab_sizes) != self.block_size[-1]:
+            raise ValueError("one prefix-pattern vocabulary is required per depth")
+        if any(value <= 1 for value in self.prefix_pattern_vocab_sizes):
+            raise ValueError("prefix-pattern vocabularies must exceed one")
+        self.coefficient_pattern_vocab_size = max(
+            self.prefix_pattern_vocab_sizes
+        )
+        self.transport_stride = self.coefficient_pattern_vocab_size
+
+        input_dim = int(config.input_embed_dim)
+        embed_dim = int(config.embed_dim)
+        # These modules intentionally retain the compound model's names and
+        # shapes.  A pair-hard checkpoint can initialize the complete spatial
+        # and atom-support backbone while only the new pattern classifiers
+        # start fresh.
+        self.coeff_token_embedding = nn.Embedding(
+            self.coeff_vocab_size, input_dim
+        )
+        self.pair_embedding_adapter = nn.Sequential(
+            nn.LayerNorm(3 * input_dim),
+            nn.Linear(3 * input_dim, input_dim),
+            nn.SiLU(),
+            nn.Linear(input_dim, input_dim),
+        )
+        self.causal_depth_adapter = nn.Sequential(
+            nn.LayerNorm(2 * input_dim),
+            nn.Linear(2 * input_dim, input_dim),
+            nn.SiLU(),
+            nn.Linear(input_dim, input_dim),
+        )
+        self.coeff_atom_proj = nn.Linear(input_dim, embed_dim, bias=False)
+        self.micro_transformer_layers = int(micro_transformer_layers)
+        if self.micro_transformer_layers < 0:
+            raise ValueError("micro-transformer layer count cannot be negative")
+        if self.micro_transformer_layers:
+            micro_config = config.head.copy()
+            micro_config.n_layer = self.micro_transformer_layers
+            self.coeff_micro_transformer = AttentionStack(micro_config)
+            self.coeff_micro_pos = nn.Parameter(torch.zeros(1, 2, embed_dim))
+            self.coeff_micro_pos.data.normal_(mean=0.0, std=0.02)
+        else:
+            self.coeff_fusion = nn.Sequential(
+                nn.LayerNorm(3 * embed_dim),
+                nn.Linear(3 * embed_dim, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+        self.prefix_pattern_classifier = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, vocab_size),
+            )
+            for vocab_size in self.prefix_pattern_vocab_sizes
+        ])
+        self._teacher_atoms = None
+        self._model_aux = None
+
+    def pack(self, atoms: torch.Tensor, pattern_ids: torch.Tensor) -> torch.Tensor:
+        if tuple(atoms.shape) != tuple(pattern_ids.shape):
+            raise ValueError("atom and prefix-pattern grids must have equal shape")
+        if atoms.shape[-1] != self.block_size[-1]:
+            raise ValueError(
+                f"expected support depth {self.block_size[-1]}, got {atoms.shape[-1]}"
+            )
+        return atoms.long() * self.transport_stride + pattern_ids.long()
+
+    def unpack(self, packed: torch.Tensor):
+        return (
+            packed.long().div(self.transport_stride, rounding_mode="floor"),
+            packed.long().remainder(self.transport_stride),
+        )
+
+    def final_compound_coeff_ids(self, pattern_ids, model_aux):
+        coefficients = model_aux.prefix_pattern_coefficients(pattern_ids)[
+            ..., -1, :
+        ]
+        scales = model_aux.coeff_scales.view(
+            *([1] * (coefficients.ndim - 1)), -1
+        )
+        normalized = coefficients / scales
+        return (
+            normalized[..., None] - model_aux.coeff_bins
+        ).abs().argmin(dim=-1)
+
+    def compound_pair_embeddings(self, model_aux, atoms, coeff_ids):
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        coeff_embedding = self.coeff_token_embedding(coeff_ids.long())
+        contribution = model_aux.compound_embeddings(atoms, coeff_ids)
+        features = torch.cat(
+            (atom_vectors, coeff_embedding, contribution), dim=-1
+        )
+        return contribution + self.pair_embedding_adapter(features)
+
+    def embed_with_model_aux(self, packed, model_aux):
+        """Preserve the pair-hard spatial representation from the final code."""
+        atoms, pattern_ids = self.unpack(packed)
+        final_coeff_ids = self.final_compound_coeff_ids(pattern_ids, model_aux)
+        return self.compound_pair_embeddings(model_aux, atoms, final_coeff_ids)
+
+    def embed_depth_with_model_aux(self, packed, model_aux):
+        """Return deltas whose cumulative sum is the causal prefix state."""
+        atoms, pattern_ids = self.unpack(packed)
+        atom_vectors = model_aux.dictionary.t()[atoms.long()]
+        prefix = model_aux.prefix_pattern_latents(atoms, pattern_ids).to(
+            atom_vectors.dtype
+        )
+        states = prefix + self.causal_depth_adapter(
+            torch.cat((atom_vectors, prefix), dim=-1)
+        )
+        return torch.cat(
+            (states[..., :1, :], states[..., 1:, :] - states[..., :-1, :]),
+            dim=-2,
+        )
+
+    def refine_pattern_hidden(self, hidden, atom_vectors):
+        atom_context = self.coeff_atom_proj(atom_vectors)
+        if self.micro_transformer_layers:
+            pair = torch.stack((hidden, atom_context), dim=-2)
+            pair = pair + self.coeff_micro_pos
+            micro_output = self.coeff_micro_transformer(
+                pair.reshape(-1, 2, pair.shape[-1])
+            ).reshape_as(pair)
+            return hidden + micro_output[..., -1, :]
+        fused = torch.cat((hidden, atom_context, hidden * atom_context), dim=-1)
+        return hidden + self.coeff_fusion(fused)
+
+    def prefix_pattern_logits(self, hidden, atom_vectors, depth_index: int):
+        refined = self.refine_pattern_hidden(hidden, atom_vectors)
+        return self.prefix_pattern_classifier[int(depth_index)](refined)
+
+    def classify_head_outputs(self, head_outputs):
+        if self._teacher_atoms is None or self._model_aux is None:
+            raise RuntimeError("causal prefix-pattern teacher support was not set")
+        atom_logits = CompoundLaserRQTransformer.mask_seen_atoms(
+            self.classifier(head_outputs), self._teacher_atoms
+        )
+        atom_vectors = self._model_aux.dictionary.t()[
+            self._teacher_atoms.long()
+        ]
+        refined = self.refine_pattern_hidden(head_outputs, atom_vectors)
+        pattern_logits = refined.new_full(
+            (*refined.shape[:-1], self.coefficient_pattern_vocab_size),
+            -float("inf"),
+        )
+        for depth_index, classifier in enumerate(
+            self.prefix_pattern_classifier
+        ):
+            local = classifier(refined[..., depth_index, :])
+            pattern_logits[
+                ..., depth_index, : self.prefix_pattern_vocab_sizes[depth_index]
+            ] = local
+        return {
+            "atom_logits": atom_logits,
+            "pattern_logits": pattern_logits,
+        }
+
+    def forward(self, packed, model_aux=None, cond=None, amp=False):
+        self._teacher_atoms, _ = self.unpack(packed)
+        self._model_aux = model_aux
+        try:
+            return super().forward(
+                packed, model_aux=model_aux, cond=cond, amp=amp
+            )
+        finally:
+            self._teacher_atoms = None
+            self._model_aux = None
+
+    @torch.no_grad()
+    def cached_head_output(self, packed, model_aux, cond, sample_loc, amp=True):
+        h, w, depth_index = sample_loc
+        batch, _, width, depth = packed.shape
+        sampling_index = h * width + w
+        xs = packed.reshape(batch, -1, depth)[:, : sampling_index + 1]
+        with torch.amp.autocast("cuda", enabled=amp):
+            if cond is None:
+                cond = torch.zeros(
+                    batch,
+                    self.block_size_cond,
+                    device=xs.device,
+                    dtype=torch.long,
+                )
+            else:
+                cond = cond.reshape(batch, self.block_size_cond)
+            sequence_length, condition_length = xs.shape[1], cond.shape[1]
+            if depth_index == 0:
+                xs_emb = self.input_mlp(
+                    self.embed_with_model_aux(xs, model_aux)
+                )
+                condition_embedding = (
+                    self.cond_emb(cond)
+                    + self.pos_emb_cond[:, :condition_length]
+                )
+                spatial_inputs = (
+                    xs_emb.sum(dim=-2)
+                    + self.pos_emb_hw[:, :sequence_length]
+                )
+                latents = torch.cat(
+                    (condition_embedding, spatial_inputs[:, :-1]), dim=1
+                )
+                latents = self.embed_drop(latents)[
+                    :, : condition_length + sampling_index
+                ]
+                if self._cache["spatial_ctx_hw"] is None:
+                    spatial_context = self.body_transformer.cached_forward(
+                        latents
+                    )[:, -1:].contiguous()
+                else:
+                    spatial_context = self.body_transformer.cached_forward(
+                        latents[:, -1:]
+                    )
+                self._cache["spatial_ctx_hw"] = spatial_context
+            spatial_context = self._cache["spatial_ctx_hw"]
+            depth_context = self.embed_depth_with_model_aux(xs, model_aux)
+            if self.config.cumsum_depth_ctx:
+                depth_context = torch.cumsum(depth_context, dim=-2)
+            depth_context = self.head_mlp(depth_context)[:, sampling_index]
+            full = torch.cat(
+                (spatial_context, depth_context[:, :-1]), dim=1
+            )
+            full = full + self.pos_emb_d[:, :depth]
+            if depth_index == 0:
+                self.head_transformer.init_cache()
+            return self.head_transformer.cached_forward(
+                full[:, depth_index : depth_index + 1]
+            ).reshape(batch, -1)
+
+    @torch.no_grad()
+    def sample_compound(
+        self,
+        batch_size,
+        model_aux,
+        cond=None,
+        temperature=1.0,
+        atom_top_k=16384,
+        atom_top_p=0.92,
+        coeff_top_p=0.92,
+        coeff_top_k=0,
+        atom_temperature=None,
+        coeff_temperature=None,
+        amp=True,
+        **_unused,
+    ):
+        height, width, depth = self.block_size
+        device = next(self.parameters()).device
+        atoms = torch.zeros(
+            batch_size, height, width, depth,
+            device=device, dtype=torch.long,
+        )
+        pattern_ids = torch.zeros_like(atoms)
+        packed = self.pack(atoms, pattern_ids)
+        atom_temperature = float(
+            temperature if atom_temperature is None else atom_temperature
+        )
+        pattern_temperature = float(
+            temperature if coeff_temperature is None else coeff_temperature
+        )
+        self.init_cache()
+        try:
+            for h in range(height):
+                for w in range(width):
+                    for depth_index in range(depth):
+                        hidden = self.cached_head_output(
+                            packed,
+                            model_aux,
+                            cond,
+                            (h, w, depth_index),
+                            amp=amp,
+                        )
+                        atom_logits = self.classifier(hidden)
+                        if depth_index:
+                            atom_logits = atom_logits.clone()
+                            atom_logits.scatter_(
+                                1,
+                                atoms[:, h, w, :depth_index],
+                                -float("inf"),
+                            )
+                        atom = sample_from_logits(
+                            atom_logits,
+                            temperature=atom_temperature,
+                            top_k=min(
+                                atom_top_k or self.num_atoms, self.num_atoms
+                            ),
+                            top_p=atom_top_p,
+                        )
+                        atom_vector = model_aux.dictionary.t()[atom.long()]
+                        local_pattern_logits = self.prefix_pattern_logits(
+                            hidden, atom_vector, depth_index
+                        )
+                        vocab_size = self.prefix_pattern_vocab_sizes[depth_index]
+                        pattern_id = sample_from_logits(
+                            local_pattern_logits,
+                            temperature=pattern_temperature,
+                            top_k=min(coeff_top_k or vocab_size, vocab_size),
+                            top_p=coeff_top_p,
+                        )
+                        atoms[:, h, w, depth_index] = atom
+                        pattern_ids[:, h, w, depth_index] = pattern_id
+                        packed[:, h, w, depth_index] = (
+                            atom * self.transport_stride + pattern_id
+                        )
+        finally:
+            self.init_cache()
+        return atoms, pattern_ids
+
+
+def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
+                orthogonal_compound=False,
+                closed_loop_orthogonal=False,
+                closed_loop_coeff_state="expected",
+                closed_loop_gumbel_temperature=1.0,
+                levelwise_var=False,
+                coeff_vocab_size=2048, compound_refiner_layers=0,
+                compound_geometry_head=False,
+                compound_micro_transformer_layers=0,
+                compound_depth_specific_coeff_heads=False,
+                compound_causal_prefix_state=False,
+                compound_pair_autoregressive=False,
+                support_first_patterns=False, causal_prefix_patterns=False,
+                coefficient_pattern_vocab_size=None,
+                prefix_pattern_vocab_sizes=None,
+                sparsity_level=2,
+                model_preset="imagenet-1400m"):
+    if (compound or orthogonal_compound) and (
+        support_first_patterns or causal_prefix_patterns
+    ):
+        raise ValueError(
+            "compound scalar coefficients and coefficient-pattern modes are mutually exclusive"
+        )
+    if support_first_patterns and causal_prefix_patterns:
+        raise ValueError("coefficient-pattern modes are mutually exclusive")
+    if compound and orthogonal_compound:
+        raise ValueError("dictionary and orthogonal compound modes are mutually exclusive")
+    if levelwise_var and (support_first_patterns or causal_prefix_patterns):
+        raise ValueError("levelwise VAR does not implement coefficient patterns")
+    presets = {
+        "imagenet-1400m": {
+            "embed_dim": 1536, "vocab_size_cond": 1000,
+            "body_layers": 42, "body_heads": 24,
+            "head_layers": 6, "head_heads": 24,
+        },
+        # Exact body/head geometry from KakaoBrain's
+        # ffhq256-rqtransformer-8x8x4-350M.yaml. Compound mode changes only
+        # the depth axis from scalar slots to sparse compound events.
+        "ffhq-350m": {
+            "embed_dim": 1024, "vocab_size_cond": 1,
+            "body_layers": 24, "body_heads": 16,
+            "head_layers": 4, "head_heads": 16,
+        },
+        # Exact geometry from KakaoBrain's
+        # lsun-church256-sqgan-8x8x4-350M-simp.yaml.
+        "lsun-church-350m": {
+            "embed_dim": 1024, "vocab_size_cond": 1,
+            "body_layers": 24, "body_heads": 16,
+            "head_layers": 4, "head_heads": 16,
+        },
+        # Exact geometry from KakaoBrain's
+        # bedroom256-rqtransformer-8x8x4-600M.yaml.
+        "lsun-bedroom-600m": {
+            "embed_dim": 1280, "vocab_size_cond": 1,
+            "body_layers": 26, "body_heads": 20,
+            "head_layers": 4, "head_heads": 20,
+        },
+    }
+    try:
+        preset = presets[model_preset]
+    except KeyError as error:
+        raise ValueError(f"unknown model preset: {model_preset}") from error
+    structured_depth = (
+        compound or orthogonal_compound
+        or support_first_patterns or causal_prefix_patterns
+    )
+    cfg = OmegaConf.create({
+        "type": "rq-transformer",
+        "block_size": [
+            8, 8, sparsity_level if structured_depth else 2 * sparsity_level
+        ],
+        "embed_dim": preset["embed_dim"],
+        "input_embed_dim": 256, "shared_tok_emb": True, "shared_cls_emb": True,
+        "input_emb_vqvae": True, "head_emb_vqvae": True, "cumsum_depth_ctx": True,
+        "vocab_size": num_atoms if structured_depth else total_vocab_size,
+        "vocab_size_cond": preset["vocab_size_cond"], "block_size_cond": 1,
+        "body": {"n_layer": preset["body_layers"], "block": {"n_head": preset["body_heads"]}},
+        "head": {"n_layer": preset["head_layers"], "block": {"n_head": preset["head_heads"]}},
+    })
+    if support_first_patterns:
+        if coefficient_pattern_vocab_size is None:
+            raise ValueError(
+                "support-first patterns require a coefficient-pattern vocabulary size"
+            )
+        return SupportFirstLaserRQTransformer(
+            RQTransformerConfig.create(cfg),
+            num_atoms=num_atoms,
+            coefficient_pattern_vocab_size=coefficient_pattern_vocab_size,
+        )
+    if causal_prefix_patterns:
+        if prefix_pattern_vocab_sizes is None:
+            raise ValueError(
+                "causal prefix patterns require one vocabulary size per depth"
+            )
+        return CausalPrefixPatternLaserRQTransformer(
+            RQTransformerConfig.create(cfg),
+            num_atoms=num_atoms,
+            coeff_vocab_size=coeff_vocab_size,
+            prefix_pattern_vocab_sizes=prefix_pattern_vocab_sizes,
+            micro_transformer_layers=compound_micro_transformer_layers,
+        )
+    if compound or orthogonal_compound:
+        if levelwise_var:
+            if model_preset not in {
+                "ffhq-350m", "lsun-bedroom-600m", "lsun-church-350m"
+            }:
+                raise ValueError("levelwise VAR requires an unconditional preset")
+            rq_config = RQTransformerConfig.create(cfg)
+            return LevelwiseLaserVAR(
+                height=8,
+                width=8,
+                sparsity_level=sparsity_level,
+                input_dim=256,
+                embed_dim=preset["embed_dim"],
+                # The official FFHQ RQ-Transformer has 24 spatial plus four
+                # depth blocks. With no separate depth decoder, all 28 blocks
+                # become the approximately 350M next-level VAR backbone.
+                num_layers=preset["body_layers"] + preset["head_layers"],
+                num_heads=preset["body_heads"],
+                num_atoms=num_atoms,
+                coeff_vocab_size=coeff_vocab_size,
+                num_condition_classes=preset["vocab_size_cond"],
+                refiner_layers=compound_refiner_layers,
+                geometry_head=compound_geometry_head,
+                micro_transformer_layers=compound_micro_transformer_layers,
+                depth_specific_coeff_heads=compound_depth_specific_coeff_heads,
+                micro_transformer_config=rq_config.head,
+            )
+        compound_class = (
+            OrthogonalCompoundLaserRQTransformer
+            if orthogonal_compound else CompoundLaserRQTransformer
+        )
+        return compound_class(
+            RQTransformerConfig.create(cfg), num_atoms=num_atoms,
+            coeff_vocab_size=coeff_vocab_size,
+            refiner_layers=compound_refiner_layers,
+            geometry_head=compound_geometry_head,
+            micro_transformer_layers=compound_micro_transformer_layers,
+            depth_specific_coeff_heads=compound_depth_specific_coeff_heads,
+            causal_prefix_state=compound_causal_prefix_state,
+            **({
+                "pair_autoregressive": compound_pair_autoregressive,
+            } if compound_class is CompoundLaserRQTransformer else {}),
+            **({
+                "closed_loop_coefficients": closed_loop_orthogonal,
+                "closed_loop_coeff_state": closed_loop_coeff_state,
+                "closed_loop_gumbel_temperature": (
+                    closed_loop_gumbel_temperature
+                ),
+            } if orthogonal_compound else {}),
+        )
+    return LaserRQTransformer(RQTransformerConfig.create(cfg), num_atoms=num_atoms)
+
+
+def support_first_objective(
+    atom_logits,
+    pattern_logits,
+    target_atoms,
+    target_pattern_ids,
+    *,
+    atom_weight: float = 1.0,
+    pattern_weight: float = 1.0,
+    accumulation: int = 1,
+):
+    """Cross-entropy for ``p(support) p(pattern | support)``."""
+    atom_log_probs = F.log_softmax(atom_logits.float(), dim=-1)
+    pattern_log_probs = F.log_softmax(pattern_logits.float(), dim=-1)
+    atom_nll = -atom_log_probs.gather(
+        -1, target_atoms.long().unsqueeze(-1)
+    ).squeeze(-1)
+    pattern_nll = -pattern_log_probs.gather(
+        -1, target_pattern_ids.long().unsqueeze(-1)
+    ).squeeze(-1)
+    depth = target_atoms.shape[-1]
+    classification = (
+        atom_weight * atom_nll.sum(dim=-1) + pattern_weight * pattern_nll
+    ).mean() / (atom_weight * depth + pattern_weight)
+    return classification / accumulation, {
+        "atom_nll": atom_nll,
+        "pattern_nll": pattern_nll,
+        "classification": classification,
+    }
+
+
+def causal_prefix_pattern_objective(
+    atom_logits,
+    pattern_logits,
+    target_atoms,
+    target_pattern_ids,
+    *,
+    atom_weight: float = 1.0,
+    pattern_weight: float = 1.0,
+    accumulation: int = 1,
+):
+    """Cross-entropy for causal ``(atom_d, prefix_pattern_d)`` events."""
+    if tuple(target_atoms.shape) != tuple(target_pattern_ids.shape):
+        raise ValueError("atom and prefix-pattern targets must have equal shape")
+    if pattern_logits.shape[:-1] != target_pattern_ids.shape:
+        raise ValueError("prefix-pattern logits do not match target axes")
+    atom_log_probs = F.log_softmax(atom_logits.float(), dim=-1)
+    pattern_log_probs = F.log_softmax(pattern_logits.float(), dim=-1)
+    atom_nll = -atom_log_probs.gather(
+        -1, target_atoms.long().unsqueeze(-1)
+    ).squeeze(-1)
+    pattern_nll = -pattern_log_probs.gather(
+        -1, target_pattern_ids.long().unsqueeze(-1)
+    ).squeeze(-1)
+    depth = target_atoms.shape[-1]
+    classification = (
+        atom_weight * atom_nll.sum(dim=-1)
+        + pattern_weight * pattern_nll.sum(dim=-1)
+    ).mean() / ((atom_weight + pattern_weight) * depth)
+    return classification / accumulation, {
+        "atom_nll": atom_nll,
+        "pattern_nll": pattern_nll,
+        "classification": classification,
+    }
+
+
+def compound_objective(
+    atom_logits,
+    coeff_logits,
+    physical_prediction,
+    target_atoms,
+    target_coeff_probs,
+    target_physical,
+    *,
+    atom_weight: float,
+    causal_prefix_prediction=None,
+    target_causal_prefix=None,
+    causal_prefix_weight: float = 0.0,
+    coeff_regression_weight: float = 0.0,
+    coeff_crps_weight: float = 0.0,
+    geometry_weight: float,
+    accumulation: int,
+    coefficient_bins=None,
+    distribution_geometry: bool = False,
+    geometry_dictionary=None,
+    geometry_coeff_bins=None,
+    geometry_coeff_scales=None,
+    geometry_top_k: int = 4,
+    geometry_orthogonal: bool = False,
+):
+    """Weighted token objective plus normalized physical latent geometry.
+
+    V3 learns geometry through an auxiliary contribution head.  V4 instead
+    constructs the physical contribution from the atom/coeff distributions
+    used at sampling time, so the auxiliary objective cannot be solved by an
+    inference-time-unused shortcut.
+    """
+    atom_log_probs = F.log_softmax(atom_logits.float(), dim=-1)
+    coeff_log_probs = F.log_softmax(coeff_logits.float(), dim=-1)
+    atom_nll = -atom_log_probs.gather(
+        -1, target_atoms.long().unsqueeze(-1)
+    ).squeeze(-1)
+    coeff_cross_entropy = -(target_coeff_probs * coeff_log_probs).sum(dim=-1)
+    depth = target_atoms.shape[-1]
+    classification = (
+        atom_weight * atom_nll.sum(dim=-1) + coeff_cross_entropy.sum(dim=-1)
+    ).mean() / ((atom_weight + 1.0) * depth)
+
+    coefficient_regression = atom_logits.new_zeros((), dtype=torch.float32)
+    coefficient_crps = atom_logits.new_zeros((), dtype=torch.float32)
+    predicted_coefficients = target_coefficients = None
+    if coeff_regression_weight > 0 or coeff_crps_weight > 0:
+        if coefficient_bins is None:
+            raise ValueError(
+                "coefficient regression/CRPS requires coefficient bin centers"
+            )
+        bins = coefficient_bins.float()
+    if coeff_regression_weight > 0:
+        predicted_coefficients = (coeff_log_probs.exp() * bins).sum(dim=-1)
+        target_coefficients = (target_coeff_probs.float() * bins).sum(dim=-1)
+        coefficient_regression = F.smooth_l1_loss(
+            predicted_coefficients, target_coefficients
+        )
+    if coeff_crps_weight > 0:
+        if bins.ndim != 1 or bins.numel() < 2:
+            raise ValueError("coefficient CRPS requires at least two ordered bins")
+        bin_widths = bins[1:] - bins[:-1]
+        if (bin_widths <= 0).any():
+            raise ValueError("coefficient CRPS bins must be strictly increasing")
+        # Discrete approximation to integral (F_pred(x) - F_target(x))^2 dx.
+        # Unlike expected-value regression, CRPS is a proper scoring rule for
+        # the complete ordered coefficient distribution.
+        predicted_cdf = coeff_log_probs.exp().cumsum(dim=-1)[..., :-1]
+        target_cdf = target_coeff_probs.float().cumsum(dim=-1)[..., :-1]
+        coefficient_crps = (
+            (predicted_cdf - target_cdf).square() * bin_widths
+        ).sum(dim=-1).mean()
+
+    geometry = atom_logits.new_zeros((), dtype=torch.float32)
+    pair_mse = atom_logits.new_zeros((), dtype=torch.float32)
+    spatial_mse = atom_logits.new_zeros((), dtype=torch.float32)
+    if geometry_weight > 0:
+        if target_physical is None:
+            raise ValueError("physical contribution target required for geometry loss")
+        if distribution_geometry:
+            if geometry_dictionary is None or geometry_coeff_bins is None or geometry_coeff_scales is None:
+                raise ValueError("distribution geometry requires dictionary, bins, and depth scales")
+            candidate_count = min(max(int(geometry_top_k), 1), atom_logits.shape[-1])
+            candidate_logits, candidate_atoms = atom_logits.float().topk(candidate_count, dim=-1)
+            target_atom_logits = atom_logits.float().gather(
+                -1, target_atoms.long().unsqueeze(-1)
+            )
+            target_is_candidate = (candidate_atoms == target_atoms.long().unsqueeze(-1)).any(
+                dim=-1, keepdim=True
+            )
+            target_atom_logits = target_atom_logits.masked_fill(
+                target_is_candidate, -float("inf")
+            )
+            candidate_logits = torch.cat((candidate_logits, target_atom_logits), dim=-1)
+            candidate_atoms = torch.cat(
+                (candidate_atoms, target_atoms.long().unsqueeze(-1)), dim=-1
+            )
+            candidate_weights = candidate_logits.softmax(dim=-1)
+            dictionary = geometry_dictionary.float().t()
+            candidate_vectors = dictionary[candidate_atoms]
+            if geometry_orthogonal:
+                # q_d for a proposed atom depends only on the ground-truth
+                # support prefix a_{<d} and that proposal. Project every
+                # top-k candidate away from the already selected orthogonal
+                # basis instead of incorrectly treating raw dictionary atoms
+                # as gamma directions.
+                target_vectors = dictionary[target_atoms.long()]
+                target_basis, _ = ordered_support_basis(target_vectors)
+                projections = torch.einsum(
+                    "...djc,...ic->...dji",
+                    candidate_vectors,
+                    target_basis,
+                )
+                depth_mask = torch.tril(
+                    torch.ones(
+                        depth, depth,
+                        device=projections.device,
+                        dtype=projections.dtype,
+                    ),
+                    diagonal=-1,
+                )
+                projections = projections * depth_mask.view(
+                    *([1] * (projections.ndim - 3)), depth, 1, depth
+                )
+                candidate_vectors = candidate_vectors - torch.einsum(
+                    "...dji,...ic->...djc", projections, target_basis
+                )
+                candidate_vectors = candidate_vectors / candidate_vectors.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-4)
+            expected_atom = (
+                candidate_weights.unsqueeze(-1) * candidate_vectors
+            ).sum(dim=-2)
+            coeff_bins = geometry_coeff_bins.float()
+            expected_coeff = (coeff_log_probs.exp() * coeff_bins).sum(dim=-1)
+            scales = geometry_coeff_scales.float().view(
+                *([1] * (expected_coeff.ndim - 1)), -1
+            )
+            prediction = expected_atom * (expected_coeff * scales).unsqueeze(-1)
+        else:
+            if physical_prediction is None:
+                raise ValueError("auxiliary-head geometry requires physical prediction")
+            prediction = physical_prediction.float()
+        target = target_physical.float()
+        pair_mse = F.mse_loss(prediction, target)
+        predicted_spatial = prediction.sum(dim=-2)
+        target_spatial = target.sum(dim=-2)
+        spatial_mse = F.mse_loss(predicted_spatial, target_spatial)
+        pair_energy = target.square().mean().detach().clamp_min(1e-6)
+        spatial_energy = target_spatial.square().mean().detach().clamp_min(1e-6)
+        geometry = 0.5 * (pair_mse / pair_energy + spatial_mse / spatial_energy)
+
+    causal_prefix = atom_logits.new_zeros((), dtype=torch.float32)
+    causal_prefix_mse = atom_logits.new_zeros((), dtype=torch.float32)
+    if causal_prefix_weight > 0:
+        if causal_prefix_prediction is None or target_causal_prefix is None:
+            raise ValueError(
+                "causal prefix loss requires predicted and target prefix reconstructions"
+            )
+        prediction = causal_prefix_prediction.float()
+        target = target_causal_prefix.float()
+        if prediction.shape != target.shape:
+            raise ValueError(
+                "causal prefix prediction shape mismatch: "
+                f"{tuple(prediction.shape)} != {tuple(target.shape)}"
+            )
+        causal_prefix_mse = F.mse_loss(prediction, target)
+        prefix_energy = target.square().mean().detach().clamp_min(1e-6)
+        causal_prefix = causal_prefix_mse / prefix_energy
+
+    total = (
+        classification
+        + coeff_regression_weight * coefficient_regression
+        + coeff_crps_weight * coefficient_crps
+        + geometry_weight * geometry
+        + causal_prefix_weight * causal_prefix
+    ) / accumulation
+    return total, {
+        "atom_nll": atom_nll,
+        "coeff_cross_entropy": coeff_cross_entropy,
+        "classification": classification,
+        "coefficient_regression": coefficient_regression,
+        "coefficient_crps": coefficient_crps,
+        "predicted_coefficients": predicted_coefficients,
+        "target_coefficients": target_coefficients,
+        "geometry": geometry,
+        "geometry_pair_mse": pair_mse,
+        "geometry_spatial_mse": spatial_mse,
+        "causal_prefix": causal_prefix,
+        "causal_prefix_mse": causal_prefix_mse,
+    }
+
+
+def scheduled_geometry_weight(
+    target_weight: float,
+    progress_epochs: float,
+    start_epoch: float = 0.0,
+    warmup_epochs: float = 0.0,
+) -> float:
+    """Delay distribution geometry until token predictions have useful support."""
+    if target_weight <= 0 or progress_epochs <= start_epoch:
+        return 0.0
+    if warmup_epochs <= 0:
+        return float(target_weight)
+    fraction = min(1.0, (progress_epochs - start_epoch) / warmup_epochs)
+    return float(target_weight) * max(0.0, fraction)
+
+
+def initialize_causal_prefix_pattern_from_compound(
+    model: CausalPrefixPatternLaserRQTransformer,
+    source_state: dict,
+) -> dict:
+    """Load every shape-compatible pair-hard parameter except new classifiers."""
+    target_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in source_state.items()
+        if key in target_state and tuple(value.shape) == tuple(target_state[key].shape)
+    }
+    result = model.load_state_dict(compatible, strict=False)
+    invalid_missing = [
+        key for key in result.missing_keys
+        if not key.startswith("prefix_pattern_classifier.")
+    ]
+    if invalid_missing or result.unexpected_keys:
+        raise RuntimeError(
+            "compound checkpoint is not compatible with the causal prefix-pattern "
+            f"backbone: missing={invalid_missing}, unexpected={result.unexpected_keys}"
+        )
+    copied_parameters = sum(
+        int(target_state[key].numel()) for key in compatible
+    )
+    total_parameters = sum(int(value.numel()) for value in target_state.values())
+    return {
+        "copied_tensors": len(compatible),
+        "copied_parameters": copied_parameters,
+        "total_parameters": total_parameters,
+        "new_tensors": list(result.missing_keys),
+        "ignored_source_tensors": sorted(set(source_state) - set(compatible)),
+    }
+
+
+def initialize_orthogonal_from_compound(
+    model: OrthogonalCompoundLaserRQTransformer,
+    source_state: dict,
+) -> dict:
+    """Transfer a dictionary-coordinate prior into orthogonal coordinates.
+
+    A causal-prefix orthogonal target retains every pair-hard module and must
+    therefore receive every source tensor. A non-causal target may explicitly
+    omit only the two causal-prefix modules. Every other tensor must be present
+    with exactly the same shape.
+    """
+    target_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in source_state.items()
+        if key in target_state and tuple(value.shape) == tuple(target_state[key].shape)
+    }
+    result = model.load_state_dict(compatible, strict=False)
+    ignored_source_tensors = sorted(set(source_state) - set(compatible))
+    invalid_ignored = [
+        key for key in ignored_source_tensors
+        if not key.startswith(("causal_depth_adapter.", "causal_prefix_head."))
+    ]
+    if result.missing_keys or result.unexpected_keys or invalid_ignored:
+        raise RuntimeError(
+            "compound checkpoint is not compatible with the orthogonal model: "
+            f"missing={result.missing_keys}, unexpected={result.unexpected_keys}, "
+            f"invalid_ignored={invalid_ignored}"
+        )
+    copied_parameters = sum(int(target_state[key].numel()) for key in compatible)
+    total_parameters = sum(int(value.numel()) for value in target_state.values())
+    return {
+        "copied_tensors": len(compatible),
+        "copied_parameters": copied_parameters,
+        "total_parameters": total_parameters,
+        "new_tensors": [],
+        "ignored_source_tensors": ignored_source_tensors,
+    }
+
+
+def build_parser():
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--data", type=Path, required=True)
+    p.add_argument("--token-cache", type=Path, default=None,
+                   help="Precomputed atoms/coefficients/labels; disables image loading and encoding")
+    p.add_argument(
+        "--cache-rfid-preflight", type=Path, nargs="+", default=None,
+        metavar="RESULT_JSON",
+        help=(
+            "Validated continuous/quantized reconstruction-rFID results, plus "
+            "the final-pattern result for coefficient-pattern runs"
+        ),
+    )
+    p.add_argument("--resume-checkpoint", type=Path, default=None,
+                   help="Explicit source stage-2 checkpoint (allows a new output/run)")
+    p.add_argument(
+        "--init-stage2-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Initialize only model weights from a stage-2 checkpoint while "
+            "starting a fresh optimizer, schedule, epoch, and RNG trajectory"
+        ),
+    )
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument(
+        "--dataset",
+        choices=("imagenet", "celebahq", "ffhq", "lsun_bedroom", "lsun_church"),
+        default="imagenet",
+    )
+    p.add_argument(
+        "--model-preset",
+        choices=(
+            "imagenet-1400m", "ffhq-350m", "lsun-bedroom-600m",
+            "lsun-church-350m",
+        ),
+        default="imagenet-1400m",
+    )
+    p.add_argument(
+        "--fid-real-split", choices=("train", "val"), default=None,
+        help="Reference split; defaults to val for ImageNet and train for CelebA-HQ/FFHQ",
+    )
+    p.add_argument(
+        "--fid-reference-stats", type=Path, default=None,
+        help=(
+            "Precomputed original RQ-VAE mu/sigma NPZ. For paper-comparable "
+            "ImageNet FID use assets/fid_stats/imagenet_256_train.npz"
+        ),
+    )
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--total-batch-size", type=int, default=2048)
+    p.add_argument(
+        "--distributed-backend", choices=("ddp", "fsdp"), default="ddp",
+        help="Multi-GPU wrapper; FSDP uses transformer-block FULL_SHARD",
+    )
+    p.add_argument("--num-atoms", type=int, default=16384)
+    p.add_argument("--sparsity-level", type=int, default=2)
+    p.add_argument("--coeff-vocab-size", type=int, default=2048)
+    p.add_argument("--coeff-max", type=float, default=20.0)
+    p.add_argument("--coeff-scale", type=float, default=6.4)
+    p.add_argument("--coeff-scales", type=float, nargs="+")
+    p.add_argument(
+        "--coeff-target-mode", choices=("soft", "hard"), default="soft",
+        help="Use stochastic soft coefficient targets or deterministic nearest-bin targets",
+    )
+    p.add_argument(
+        "--coeff-target-temperature", type=float, default=0.5,
+        help="Squared-distance soft-target temperature; ignored in hard mode",
+    )
+    p.add_argument(
+        "--compound-tokens", action=argparse.BooleanOptionalAction, default=False,
+        help="Use one compound (atom, coefficient) AR event per sparse component",
+    )
+    p.add_argument(
+        "--compound-pair-autoregressive",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Condition every later within-site event on the exact completed "
+            "(atom, coefficient) pairs; this gives the full discrete chain "
+            "rule without a learned prefix-state surrogate"
+        ),
+    )
+    p.add_argument(
+        "--orthogonal-compound-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use one causal (atom, ordered-orthogonal coefficient) event per "
+            "sparse component"
+        ),
+    )
+    p.add_argument(
+        "--closed-loop-orthogonal-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Unroll orthogonal depths during training and construct each next "
+            "atom state from the model-predicted coefficient distribution"
+        ),
+    )
+    p.add_argument(
+        "--closed-loop-coeff-state",
+        choices=("expected", "straight-through"),
+        default="expected",
+        help=(
+            "Use the distribution mean or a straight-through Gumbel sample "
+            "as the coefficient state consumed by the next depth"
+        ),
+    )
+    p.add_argument(
+        "--closed-loop-gumbel-temperature",
+        type=float,
+        default=1.0,
+        help="Gumbel-softmax temperature for straight-through coefficient states",
+    )
+    p.add_argument(
+        "--support-first-pattern-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Generate the complete atom support causally, then one joint "
+            "coefficient-pattern id conditioned on that support"
+        ),
+    )
+    p.add_argument(
+        "--causal-prefix-pattern-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Generate an atom followed by a joint least-squares coefficient "
+            "pattern for every causal OMP prefix"
+        ),
+    )
+    p.add_argument(
+        "--levelwise-var", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "Predict one complete spatial sparse-coefficient level at a time "
+            "with FoundationVision VAR-style block-causal next-level training"
+        ),
+    )
+    p.add_argument("--compound-refiner-layers", type=int, default=0)
+    p.add_argument("--compound-micro-transformer-layers", type=int, default=0)
+    p.add_argument(
+        "--compound-depth-specific-coeff-heads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    p.add_argument(
+        "--causal-prefix-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Condition each within-site atom on the predicted causal OMP prefix "
+            "reconstruction instead of final refitted coefficients"
+        ),
+    )
+    p.add_argument(
+        "--causal-prefix-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of normalized causal-prefix reconstruction regression",
+    )
+    p.add_argument(
+        "--compound-distribution-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    p.add_argument("--geometry-top-k", type=int, default=4)
+    p.add_argument("--atom-loss-weight", type=float, default=1.0)
+    p.add_argument(
+        "--pattern-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the one joint coefficient-pattern decision; setting "
+            "this to sparsity level balances it like K scalar coefficients"
+        ),
+    )
+    p.add_argument(
+        "--coeff-regression-weight", type=float, default=0.0,
+        help="Smooth-L1 weight on the expected normalized coefficient value",
+    )
+    p.add_argument(
+        "--coeff-crps-weight", type=float, default=0.0,
+        help=(
+            "Weight for coefficient-bin CRPS, an ordinal proper scoring rule "
+            "over the full predicted coefficient distribution"
+        ),
+    )
+    p.add_argument("--geometry-loss-weight", type=float, default=0.0)
+    p.add_argument("--geometry-start-epoch", type=float, default=0.0)
+    p.add_argument("--geometry-warmup-epochs", type=float, default=0.0)
+    p.add_argument("--atom-temperature", type=float, default=1.0)
+    p.add_argument("--atom-top-k", type=int, default=0,
+                   help="0 keeps all atom logits")
+    p.add_argument("--atom-top-p", type=float, default=0.92)
+    p.add_argument("--coeff-temperature", type=float, default=1.0)
+    p.add_argument("--coeff-top-k", type=int, default=0,
+                   help="0 keeps all coefficient logits")
+    p.add_argument("--coeff-top-p", type=float, default=0.92)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--seed", type=int, default=0,
+                   help="Base seed; distributed ranks use seed + rank")
+    p.add_argument(
+        "--lr-schedule", choices=("cosine", "warmup-linear", "constant"), default="cosine",
+        help=(
+            "Optimizer-step LR schedule; warmup-linear matches FoundationVision VAR"
+        ),
+    )
+    p.add_argument(
+        "--lr-schedule-epochs", type=int, default=100,
+        help="Global cosine horizon; independent of the target epoch for this relaunch",
+    )
+    p.add_argument(
+        "--lr-schedule-restart-id",
+        default=None,
+        help=(
+            "Non-empty identifier for a new LR phase. On resume, start the schedule "
+            "from --lr only when this differs from the checkpoint's identifier. The "
+            "identifier is saved in subsequent checkpoints, so interrupted launches "
+            "resume the phase; use a new identifier for a later restart."
+        ),
+    )
+    p.add_argument("--min-lr", type=float, default=0.0)
+    p.add_argument(
+        "--warmup-epochs", type=float, default=0.0,
+        help="Warmup duration for --lr-schedule warmup-linear",
+    )
+    p.add_argument(
+        "--warmup-start-ratio", type=float, default=0.005,
+        help="Initial/peak LR ratio for --lr-schedule warmup-linear",
+    )
+    p.add_argument("--wandb-project", default="laser")
+    p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--wandb-name", default="imagenet-rqtransformer-laser-a16384-k2-stage2")
+    p.add_argument("--wandb-id", default=None)
+    p.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"), default="online",
+        help="Disable W&B for local memory smoke tests with --wandb-mode disabled",
+    )
+    p.add_argument("--fid-num-samples", type=int, default=2048)
+    p.add_argument("--fid-batch-size", type=int, default=64)
+    p.add_argument(
+        "--metric-backend",
+        choices=("original-rqvae", "torchmetrics"),
+        default="original-rqvae",
+        help=(
+            "original-rqvae uses the vendored TensorFlow-FID Inception weights, "
+            "SciPy Frechet equation, and upstream ten-split Inception Score"
+        ),
+    )
+    p.add_argument("--fid-every", type=int, default=1,
+                   help="Run full FID every N epochs; 0 disables evaluation")
+    p.add_argument("--save-ckpt-freq", type=int, default=2,
+                   help="Save the full training checkpoint every N epochs")
+    p.add_argument(
+        "--keep-best-checkpoints", type=int, default=3,
+        help="Number of full best-FID/IS checkpoints to retain locally",
+    )
+    p.add_argument(
+        "--model-only-best-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Retain compact evaluation-only best files; last.pt remains fully resumable",
+    )
+    p.add_argument("--save-step-freq", type=int, default=0,
+                   help="Atomically overwrite last.pt every N optimizer steps; 0 disables")
+    p.add_argument("--checkpoint-dir", type=Path, default=None,
+                   help="Persistent checkpoint directory under /workspace")
+    p.add_argument("--sample-grid-every", type=int, default=100,
+                   help="Generate the expensive 64-image class grid every N optimizer steps; 0 disables it")
+    p.add_argument("--sample-grid-size", type=int, default=64,
+                   help="Total preview images; must divide into complete class rows")
+    p.add_argument("--sample-grid-samples-per-class", type=int, default=8,
+                   help="Number of adjacent samples in each labeled class row")
+    p.add_argument("--sample-grid-batch-size", type=int, default=8,
+                   help="Memory-safe generation minibatch used to assemble a preview grid")
+    p.add_argument(
+        "--sample-grid-sweep", action=argparse.BooleanOptionalAction, default=False,
+        help="Write one grid for each built-in atom/coefficient sampling preset",
+    )
+    p.add_argument(
+        "--sample-grid-compare-original",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Write matched grids for the configured sampler and the original "
+            "RQ-VAE temperature-1/top-k-250 sampler"
+        ),
+    )
+    p.add_argument(
+        "--sample-grid-seed", type=int, default=0,
+        help="Shared RNG seed for matched startup sampling grids",
+    )
+    p.add_argument(
+        "--sample-grid-on-start", action=argparse.BooleanOptionalAction, default=False,
+        help="Generate one preview after initialization/resume, before training",
+    )
+    p.add_argument(
+        "--upload-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload 16+ GB checkpoints as W&B artifacts (disabled by default)",
+    )
+    p.add_argument(
+        "--checkpoint-upload-mode",
+        choices=("artifact", "files"),
+        default="artifact",
+        help=(
+            "artifact creates immutable versions; files replaces fixed last and "
+            "best-FID slots on the W&B run"
+        ),
+    )
+    p.add_argument(
+        "--upload-token-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload the immutable token cache once as a W&B dataset artifact",
+    )
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--max-optimizer-steps", type=int, default=0,
+        help="Stop after this many optimizer steps in this launch; 0 runs all epochs",
+    )
+    p.add_argument(
+        "--smoke-test", action="store_true",
+        help="Synchronize/step after one microbatch while preserving the configured global schedule",
+    )
+    p.add_argument(
+        "--generation-smoke-test", action="store_true",
+        help="Generate and decode one FID-sized batch, report peak memory, and exit",
+    )
+    p.add_argument(
+        "--fid-only", action="store_true",
+        help=(
+            "Evaluate the resumed checkpoint with the configured FID protocol, "
+            "write a JSON result, and exit without training"
+        ),
+    )
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    cache_rfid_preflight = None
+    if args.cache_rfid_preflight is not None:
+        expected_modes = (
+            ("continuous", "quantized", "pattern")
+            if len(args.cache_rfid_preflight) == 3
+            else ("continuous", "quantized")
+            if len(args.cache_rfid_preflight) == 2
+            else None
+        )
+        if expected_modes is None:
+            raise ValueError(
+                "--cache-rfid-preflight requires two results, or three for patterns"
+            )
+        if (
+            args.support_first_pattern_tokens
+            or args.causal_prefix_pattern_tokens
+        ) and len(expected_modes) != 3:
+            raise ValueError(
+                "coefficient-pattern runs require continuous, quantized, and "
+                "pattern rFID results"
+            )
+        cache_rfid_preflight = {}
+        for expected_mode, result_path in zip(
+            expected_modes, args.cache_rfid_preflight
+        ):
+            result = json.loads(result_path.read_text())
+            value = float(result.get("rfid", float("nan")))
+            if (
+                result.get("cache_coeff_mode") != expected_mode
+                or not math.isfinite(value)
+            ):
+                raise ValueError(
+                    f"invalid {expected_mode} cache-rFID preflight: {result_path}"
+                )
+            cache_rfid_preflight[expected_mode] = value
+    if args.sparsity_level <= 0:
+        raise ValueError("--sparsity-level must be positive")
+    if args.coeff_scales is not None and len(args.coeff_scales) != args.sparsity_level:
+        raise ValueError(
+            f"--coeff-scales requires {args.sparsity_level} values for "
+            f"k={args.sparsity_level}"
+        )
+    if args.compound_refiner_layers < 0:
+        raise ValueError("--compound-refiner-layers cannot be negative")
+    if args.compound_micro_transformer_layers < 0:
+        raise ValueError("--compound-micro-transformer-layers cannot be negative")
+    if args.compound_refiner_layers > 0 and args.compound_micro_transformer_layers > 0:
+        raise ValueError("compound MLP refiner and micro-transformer are mutually exclusive")
+    if sum((
+        bool(args.compound_tokens),
+        bool(args.orthogonal_compound_tokens),
+        bool(args.support_first_pattern_tokens),
+        bool(args.causal_prefix_pattern_tokens),
+    )) > 1:
+        raise ValueError(
+            "compound scalar, orthogonal compound, support-first, and causal "
+            "prefix-pattern modes "
+            "are mutually exclusive"
+        )
+    if (
+        args.support_first_pattern_tokens
+        or args.causal_prefix_pattern_tokens
+    ) and args.token_cache is None:
+        raise ValueError("coefficient-pattern token modes require --token-cache")
+    if args.orthogonal_compound_tokens and args.token_cache is None:
+        raise ValueError("orthogonal compound mode requires --token-cache")
+    if args.levelwise_var and not args.compound_tokens:
+        raise ValueError("--levelwise-var requires --compound-tokens")
+    if args.support_first_pattern_tokens and (
+        args.compound_refiner_layers
+        or args.compound_micro_transformer_layers
+        or args.compound_depth_specific_coeff_heads
+    ):
+        raise ValueError(
+            "compound coefficient refiners do not apply to support-first patterns"
+        )
+    if args.causal_prefix_pattern_tokens and (
+        args.compound_refiner_layers
+        or args.compound_depth_specific_coeff_heads
+    ):
+        raise ValueError(
+            "causal prefix-pattern tokens support only the compound "
+            "micro-transformer refiner"
+        )
+    if args.geometry_top_k <= 0:
+        raise ValueError("--geometry-top-k must be positive")
+    if args.atom_loss_weight <= 0:
+        raise ValueError("--atom-loss-weight must be positive")
+    if args.pattern_loss_weight <= 0:
+        raise ValueError("--pattern-loss-weight must be positive")
+    if args.coeff_regression_weight < 0:
+        raise ValueError("--coeff-regression-weight cannot be negative")
+    if args.coeff_crps_weight < 0:
+        raise ValueError("--coeff-crps-weight cannot be negative")
+    if args.causal_prefix_loss_weight < 0:
+        raise ValueError("--causal-prefix-loss-weight cannot be negative")
+    if args.closed_loop_gumbel_temperature <= 0:
+        raise ValueError("--closed-loop-gumbel-temperature must be positive")
+    if args.geometry_loss_weight < 0:
+        raise ValueError("--geometry-loss-weight cannot be negative")
+    if args.geometry_start_epoch < 0:
+        raise ValueError("--geometry-start-epoch cannot be negative")
+    if args.geometry_warmup_epochs < 0:
+        raise ValueError("--geometry-warmup-epochs cannot be negative")
+    if args.save_step_freq < 0:
+        raise ValueError("--save-step-freq cannot be negative")
+    if args.seed < 0:
+        raise ValueError("--seed cannot be negative")
+    if args.keep_best_checkpoints <= 0:
+        raise ValueError("--keep-best-checkpoints must be positive")
+    if (args.sample_grid_size <= 0 or args.sample_grid_samples_per_class <= 0 or
+            args.sample_grid_size % args.sample_grid_samples_per_class != 0):
+        raise ValueError(
+            "--sample-grid-size must be positive and divisible by "
+            "--sample-grid-samples-per-class"
+        )
+    if not 0 < args.sample_grid_batch_size <= args.sample_grid_size:
+        raise ValueError("--sample-grid-batch-size must be in [1, --sample-grid-size]")
+    if args.sample_grid_seed < 0:
+        raise ValueError("--sample-grid-seed cannot be negative")
+    if args.fid_every < 0:
+        raise ValueError("--fid-every cannot be negative")
+    if args.fid_reference_stats is not None:
+        from src.rqvae_metrics import load_reference_statistics
+        load_reference_statistics(args.fid_reference_stats)
+        if args.metric_backend != "original-rqvae":
+            raise ValueError(
+                "--fid-reference-stats requires --metric-backend original-rqvae"
+            )
+    if args.max_optimizer_steps < 0:
+        raise ValueError("--max-optimizer-steps cannot be negative")
+    if args.smoke_test and args.max_optimizer_steps <= 0:
+        raise ValueError("--smoke-test requires --max-optimizer-steps")
+    if args.smoke_test and args.generation_smoke_test:
+        raise ValueError("training and generation smoke modes are mutually exclusive")
+    if args.fid_only and (args.smoke_test or args.generation_smoke_test):
+        raise ValueError("--fid-only is mutually exclusive with smoke-test modes")
+    if args.lr <= 0:
+        raise ValueError("--lr must be positive")
+    if args.lr_schedule_epochs <= 0:
+        raise ValueError("--lr-schedule-epochs must be positive")
+    if not 0 <= args.min_lr <= args.lr:
+        raise ValueError("--min-lr must be between zero and --lr")
+    if args.warmup_epochs < 0:
+        raise ValueError("--warmup-epochs cannot be negative")
+    if not 0 < args.warmup_start_ratio <= 1:
+        raise ValueError("--warmup-start-ratio must be in (0, 1]")
+    if args.resume_checkpoint is not None and args.init_stage2_checkpoint is not None:
+        raise ValueError(
+            "--resume-checkpoint and --init-stage2-checkpoint are mutually exclusive"
+        )
+    if (
+        args.init_stage2_checkpoint is not None
+        and not args.init_stage2_checkpoint.is_file()
+    ):
+        raise FileNotFoundError(args.init_stage2_checkpoint)
+    if args.lr_schedule == "warmup-linear" and args.warmup_epochs >= args.lr_schedule_epochs:
+        raise ValueError("--warmup-epochs must be shorter than the LR schedule")
+    if (
+        args.lr_schedule in {"cosine", "warmup-linear"}
+        and not args.lr_schedule_restart_id
+        and args.epochs > args.lr_schedule_epochs
+    ):
+        raise ValueError("--epochs cannot exceed the global cosine schedule horizon")
+    expected_unconditional_preset = {
+        "celebahq": "ffhq-350m",
+        "ffhq": "ffhq-350m",
+        "lsun_bedroom": "lsun-bedroom-600m",
+        "lsun_church": "lsun-church-350m",
+    }
+    expected_preset = expected_unconditional_preset.get(args.dataset, "imagenet-1400m")
+    if args.model_preset != expected_preset:
+        raise ValueError(
+            f"{args.dataset} requires --model-preset {expected_preset}"
+        )
+    compound_scalar_mode = (
+        args.compound_tokens or args.orthogonal_compound_tokens
+    )
+    if args.geometry_loss_weight > 0 and not compound_scalar_mode:
+        raise ValueError("geometry contribution loss requires --compound-tokens")
+    if args.compound_distribution_geometry and args.geometry_loss_weight <= 0:
+        raise ValueError("distribution geometry requires a positive geometry loss weight")
+    if args.compound_depth_specific_coeff_heads and not compound_scalar_mode:
+        raise ValueError("depth-specific coefficient heads require --compound-tokens")
+    if args.compound_pair_autoregressive and not args.compound_tokens:
+        raise ValueError(
+            "full-pair autoregression requires dictionary --compound-tokens"
+        )
+    if args.compound_pair_autoregressive and args.causal_prefix_state:
+        raise ValueError(
+            "full-pair autoregression and causal-prefix state are mutually exclusive"
+        )
+    if args.compound_pair_autoregressive and args.levelwise_var:
+        raise ValueError(
+            "full-pair autoregression is defined for the within-site RQ transformer"
+        )
+    if args.causal_prefix_state and not compound_scalar_mode:
+        raise ValueError(
+            "causal prefix state requires compound or orthogonal compound tokens"
+        )
+    if args.closed_loop_orthogonal_training and not (
+        args.orthogonal_compound_tokens and args.causal_prefix_state
+    ):
+        raise ValueError(
+            "closed-loop orthogonal training requires "
+            "--orthogonal-compound-tokens and --causal-prefix-state"
+        )
+    if args.causal_prefix_state and args.levelwise_var:
+        raise ValueError("causal prefix state is defined for the within-site RQ transformer")
+    if args.causal_prefix_state and args.causal_prefix_loss_weight <= 0:
+        raise ValueError("causal prefix state requires a positive prefix loss weight")
+    if args.causal_prefix_loss_weight > 0 and not args.causal_prefix_state:
+        raise ValueError("causal prefix loss requires --causal-prefix-state")
+    if (
+        args.support_first_pattern_tokens
+        or args.causal_prefix_pattern_tokens
+    ) and (
+        args.coeff_regression_weight > 0 or args.coeff_crps_weight > 0
+    ):
+        raise ValueError(
+            "scalar coefficient regression and CRPS do not apply to joint patterns"
+        )
+    if args.atom_temperature <= 0 or args.coeff_temperature <= 0:
+        raise ValueError("sampling temperatures must be positive")
+    if args.coeff_target_temperature <= 0:
+        raise ValueError("coefficient target temperature must be positive")
+    if args.atom_top_k < 0 or args.coeff_top_k < 0:
+        raise ValueError("sampling top-k values cannot be negative")
+    if not 0 < args.atom_top_p <= 1 or not 0 < args.coeff_top_p <= 1:
+        raise ValueError("sampling top-p values must be in (0, 1]")
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > 1:
+        # Some H100 pod allocations expose NVSwitch P2P but do not permit
+        # NCCL's multicast NVLS transport. Keep regular NVLink collectives.
+        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+        # Rank 0 periodically writes a ~16 GB recovery checkpoint to network
+        # storage.  Allow that I/O to outlive NCCL's short default watchdog.
+        dist.init_process_group("nccl", timeout=timedelta(minutes=45))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    rank_seed = args.seed + rank()
+    torch.manual_seed(rank_seed)
+    torch.cuda.manual_seed(rank_seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    args.output.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = persistent_checkpoint_dir(args.output, args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_checkpoint = checkpoint_dir / "last.pt"
+    resume_checkpoint = args.resume_checkpoint or last_checkpoint
+
+    cache_meta = None
+    cached_bin_centers = None
+    coefficient_patterns = None
+    coefficient_pattern_vocab_size = None
+    prefix_patterns = None
+    prefix_pattern_vocab_sizes = None
+    if args.token_cache:
+        if args.causal_prefix_pattern_tokens:
+            dataset = CausalPrefixPatternCacheDataset(args.token_cache)
+            prefix_patterns = dataset.prefix_patterns
+            prefix_pattern_vocab_sizes = [
+                int(value) for value in dataset.pattern_vocab_sizes.tolist()
+            ]
+        elif args.support_first_pattern_tokens:
+            dataset = CoefficientPatternCacheDataset(args.token_cache)
+            coefficient_patterns = dataset.coefficient_patterns
+            coefficient_pattern_vocab_size = int(
+                coefficient_patterns.shape[0]
+            )
+        else:
+            dataset = SparseTokenCacheDataset(
+                args.token_cache,
+                include_prefix_coeffs=(
+                    args.causal_prefix_state
+                    and not args.orthogonal_compound_tokens
+                ),
+            )
+        cache_meta = dataset.meta
+        expected_cache = {
+            "dataset": args.dataset,
+            "num_atoms": args.num_atoms,
+            "coeff_vocab_size": args.coeff_vocab_size,
+            "shape": [8, 8, args.sparsity_level],
+        }
+        for key, expected in expected_cache.items():
+            actual = cache_meta.get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"token cache {key} mismatch: cache={actual!r}, launch={expected!r}"
+                )
+        if (
+            args.orthogonal_compound_tokens
+            and cache_meta.get("format") != "laser_orthogonal_compound_v1"
+        ):
+            raise ValueError(
+                "orthogonal compound training requires a "
+                "laser_orthogonal_compound_v1 cache"
+            )
+        if args.support_first_pattern_tokens:
+            cached_pattern_vocab_size = int(
+                cache_meta.get("coefficient_pattern_vocab_size", -1)
+            )
+            if cached_pattern_vocab_size != coefficient_pattern_vocab_size:
+                raise ValueError(
+                    "coefficient-pattern vocabulary mismatch: "
+                    f"metadata={cached_pattern_vocab_size}, "
+                    f"table={coefficient_pattern_vocab_size}"
+                )
+            if cache_meta.get("coefficient_pattern_units") != (
+                "physical_omp_least_squares"
+            ):
+                raise ValueError(
+                    "coefficient-pattern cache must use physical OMP coefficients"
+                )
+        if args.causal_prefix_pattern_tokens:
+            metadata_vocab_sizes = [
+                int(value)
+                for value in cache_meta.get("prefix_pattern_vocab_sizes", ())
+            ]
+            if metadata_vocab_sizes != prefix_pattern_vocab_sizes:
+                raise ValueError(
+                    "prefix-pattern vocabulary mismatch: "
+                    f"metadata={metadata_vocab_sizes}, "
+                    f"table={prefix_pattern_vocab_sizes}"
+                )
+            if cache_meta.get("prefix_pattern_units") != (
+                "physical_omp_least_squares"
+            ):
+                raise ValueError(
+                    "prefix-pattern cache must use physical OMP coefficients"
+                )
+        if args.causal_prefix_state:
+            expected_prefix_format = (
+                "laser_orthogonal_compound_v1"
+                if args.orthogonal_compound_tokens
+                else "laser_compound_causal_prefix_v2"
+            )
+            expected_prefix_units = (
+                "orthogonal_projection"
+                if args.orthogonal_compound_tokens
+                else "physical_omp_least_squares"
+            )
+            if cache_meta.get("format") != expected_prefix_format:
+                raise ValueError(
+                    "causal prefix state cache format mismatch: "
+                    f"expected={expected_prefix_format!r}, "
+                    f"actual={cache_meta.get('format')!r}"
+                )
+            if cache_meta.get("causal_prefix_coeff_units") != expected_prefix_units:
+                raise ValueError(
+                    "token cache causal prefix coefficient units are invalid"
+                )
+        cached_coeff_max = float(cache_meta.get("coeff_max", args.coeff_max))
+        if not math.isclose(cached_coeff_max, args.coeff_max, rel_tol=0.0, abs_tol=1e-8):
+            raise ValueError(
+                "token cache coeff_max mismatch: "
+                f"cache={cached_coeff_max}, launch={args.coeff_max}"
+            )
+        cached_scales = cache_meta.get("coeff_scales")
+        if cached_scales is not None:
+            cached_scales = [float(value) for value in cached_scales]
+            if len(cached_scales) != args.sparsity_level:
+                raise ValueError(
+                    "token cache coefficient scale count mismatch: "
+                    f"cache={len(cached_scales)}, k={args.sparsity_level}"
+                )
+            if args.coeff_scales is None:
+                args.coeff_scales = cached_scales
+            elif any(
+                not math.isclose(float(given), cached, rel_tol=1e-6, abs_tol=1e-8)
+                for given, cached in zip(args.coeff_scales, cached_scales)
+            ):
+                raise ValueError(
+                    "token cache coeff_scales mismatch: "
+                    f"cache={cached_scales}, launch={args.coeff_scales}"
+                )
+        elif not math.isclose(
+            float(cache_meta.get("coeff_scale", args.coeff_scale)),
+            args.coeff_scale, rel_tol=1e-6, abs_tol=1e-8,
+        ):
+            raise ValueError("token cache coeff_scale does not match the launch")
+        cached_bin_centers = cache_meta.get("coeff_bin_centers")
+        if cached_bin_centers is not None:
+            if len(cached_bin_centers) != args.coeff_vocab_size:
+                raise ValueError(
+                    "token cache coefficient-bin count mismatch: "
+                    f"cache={len(cached_bin_centers)}, launch={args.coeff_vocab_size}"
+                )
+            cached_bin_centers = [float(value) for value in cached_bin_centers]
+        class_names = (
+            ["unconditional"] if args.dataset in UNCONDITIONAL_DATASETS
+            else class_names_for_dataset("imagenet")
+        )
+    else:
+        image_dataset = source_image_dataset(
+            args.dataset, args.data, image_transform(), split="train"
+        )
+        class_names = (
+            ["unconditional"] if args.dataset in UNCONDITIONAL_DATASETS
+            else class_names_for_dataset("imagenet", image_dataset.classes)
+        )
+        dataset = image_dataset
+    sampler = ResumableDistributedSampler(dataset, shuffle=True) if world > 1 else None
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                        shuffle=sampler is None, num_workers=8, pin_memory=True,
+                        persistent_workers=True, drop_last=True)
+    val_loader = None
+    if args.fid_every > 0 and args.fid_reference_stats is None:
+        if args.dataset in {"ffhq", "lsun_bedroom", "lsun_church"}:
+            val_dataset = source_image_dataset(
+                args.dataset, args.data, val_image_transform(), split="train"
+            )
+            # A full-dataset cache defines the matching real-reference corpus.
+            if args.token_cache is not None:
+                if len(val_dataset) < len(dataset):
+                    raise ValueError(
+                        f"source image corpus ({len(val_dataset):,}) is smaller than "
+                        f"the token cache ({len(dataset):,})"
+                    )
+                val_dataset = Subset(val_dataset, range(len(dataset)))
+        else:
+            fid_real_split = args.fid_real_split or (
+                "train" if args.dataset == "celebahq" else "val"
+            )
+            val_dataset = datasets.ImageFolder(
+                args.data / fid_real_split, transform=val_image_transform()
+            )
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world, rank=rank(), shuffle=False, drop_last=False
+        ) if world > 1 else None
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.fid_batch_size, sampler=val_sampler,
+            shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True,
+        )
+    total_vocab_size = args.num_atoms + args.coeff_vocab_size
+    num_condition_classes = (
+        1 if args.model_preset in {
+            "ffhq-350m", "lsun-bedroom-600m", "lsun-church-350m"
+        } else 1000
+    )
+    aux = LaserAux(args.checkpoint, args.num_atoms, args.coeff_vocab_size,
+                   args.coeff_max, args.coeff_scale,
+                   attn_resolutions=((16,) if args.dataset in FACE_DATASETS else (8,)),
+                   coeff_scales=args.coeff_scales,
+                   soft_target_physical=args.coeff_scales is not None,
+                   coeff_bin_centers=cached_bin_centers,
+                   sparsity_level=args.sparsity_level,
+                   coefficient_patterns=coefficient_patterns,
+                   prefix_patterns=prefix_patterns,
+                   prefix_pattern_vocab_sizes=prefix_pattern_vocab_sizes).to(device)
+    unwrapped_model = build_model(
+        total_vocab_size, args.num_atoms, compound=args.compound_tokens,
+        orthogonal_compound=args.orthogonal_compound_tokens,
+        closed_loop_orthogonal=args.closed_loop_orthogonal_training,
+        closed_loop_coeff_state=args.closed_loop_coeff_state,
+        closed_loop_gumbel_temperature=args.closed_loop_gumbel_temperature,
+        levelwise_var=args.levelwise_var,
+        coeff_vocab_size=args.coeff_vocab_size,
+        compound_refiner_layers=args.compound_refiner_layers,
+        compound_geometry_head=(
+            args.geometry_loss_weight > 0 and not args.compound_distribution_geometry
+        ),
+        compound_micro_transformer_layers=args.compound_micro_transformer_layers,
+        compound_depth_specific_coeff_heads=args.compound_depth_specific_coeff_heads,
+        compound_causal_prefix_state=args.causal_prefix_state,
+        compound_pair_autoregressive=args.compound_pair_autoregressive,
+        support_first_patterns=args.support_first_pattern_tokens,
+        causal_prefix_patterns=args.causal_prefix_pattern_tokens,
+        coefficient_pattern_vocab_size=coefficient_pattern_vocab_size,
+        prefix_pattern_vocab_sizes=prefix_pattern_vocab_sizes,
+        sparsity_level=args.sparsity_level,
+        model_preset=args.model_preset,
+    )
+    parameter_names = [name for name, _ in unwrapped_model.named_parameters()]
+
+    resume_payload = None
+    resume_optimizer_state = None
+    checkpoint_exists = args.resume and resume_checkpoint.is_file()
+    if checkpoint_exists and args.init_stage2_checkpoint is not None:
+        raise ValueError(
+            "weights-only initialization requires a new output directory or --no-resume"
+        )
+    if checkpoint_exists:
+        should_load = args.distributed_backend != "fsdp" or rank() == 0
+        if should_load:
+            raw_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+            unwrapped_model.load_state_dict(raw_payload["state_dict"], strict=True)
+            resume_optimizer_state = raw_payload["optimizer"]
+            resume_payload = {
+                key: value for key, value in raw_payload.items()
+                if key not in ("state_dict", "optimizer")
+            }
+            del raw_payload
+            if args.distributed_backend == "fsdp":
+                resume_optimizer_state = optimizer_state_to_names(
+                    resume_optimizer_state, unwrapped_model
+                )
+        if args.distributed_backend == "fsdp":
+            metadata = [resume_payload]
+            dist.broadcast_object_list(metadata, src=0)
+            resume_payload = metadata[0]
+    elif args.init_stage2_checkpoint is not None:
+        init_payload = torch.load(
+            args.init_stage2_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        init_transfer = None
+        if args.causal_prefix_pattern_tokens:
+            init_config = dict(init_payload.get("config", {}))
+            expected_source = {
+                "compound_tokens": True,
+                "causal_prefix_state": True,
+                "sparsity_level": args.sparsity_level,
+                "num_atoms": args.num_atoms,
+                "coeff_vocab_size": args.coeff_vocab_size,
+                "model_preset": args.model_preset,
+                "compound_micro_transformer_layers": (
+                    args.compound_micro_transformer_layers
+                ),
+            }
+            mismatches = {
+                key: (init_config.get(key), expected)
+                for key, expected in expected_source.items()
+                if init_config.get(key) != expected
+            }
+            if mismatches:
+                raise ValueError(
+                    "causal prefix-pattern initialization requires a matching "
+                    f"pair-hard causal-prefix checkpoint; mismatches={mismatches}"
+                )
+            init_transfer = initialize_causal_prefix_pattern_from_compound(
+                unwrapped_model, init_payload["state_dict"]
+            )
+        elif args.orthogonal_compound_tokens:
+            init_config = dict(init_payload.get("config", {}))
+            source_is_orthogonal = bool(
+                init_config.get("orthogonal_compound_tokens", False)
+            )
+            expected_source = {
+                (
+                    "orthogonal_compound_tokens"
+                    if source_is_orthogonal else "compound_tokens"
+                ): True,
+                "sparsity_level": args.sparsity_level,
+                "num_atoms": args.num_atoms,
+                "coeff_vocab_size": args.coeff_vocab_size,
+                "model_preset": args.model_preset,
+                "compound_micro_transformer_layers": (
+                    args.compound_micro_transformer_layers
+                ),
+                "compound_depth_specific_coeff_heads": (
+                    args.compound_depth_specific_coeff_heads
+                ),
+                "compound_distribution_geometry": (
+                    args.compound_distribution_geometry
+                ),
+            }
+            if source_is_orthogonal:
+                expected_source["compound_tokens"] = False
+            if args.causal_prefix_state:
+                expected_source["causal_prefix_state"] = True
+            mismatches = {
+                key: (init_config.get(key), expected)
+                for key, expected in expected_source.items()
+                if init_config.get(key) != expected
+            }
+            if mismatches:
+                raise ValueError(
+                    "orthogonal initialization requires a matching sparse "
+                    f"checkpoint; mismatches={mismatches}"
+                )
+            init_transfer = initialize_orthogonal_from_compound(
+                unwrapped_model, init_payload["state_dict"]
+            )
+        else:
+            unwrapped_model.load_state_dict(
+                init_payload["state_dict"], strict=True
+            )
+        init_fid = init_payload.get("fid")
+        init_metadata = {
+            "epoch": int(init_payload.get("epoch", -1)),
+            "global_step": int(init_payload.get("global_step", -1)),
+            "fid": float("nan") if init_fid is None else float(init_fid),
+        }
+        del init_payload
+        if rank() == 0:
+            print(
+                f"Initialized model weights from {args.init_stage2_checkpoint}: "
+                f"source_epoch={init_metadata['epoch']}, "
+                f"source_step={init_metadata['global_step']}, "
+                f"source_fid={init_metadata['fid']:.6f}; "
+                + (
+                    "compatible pair-hard backbone transfer="
+                    f"{init_transfer['copied_parameters']:,}/"
+                    f"{init_transfer['total_parameters']:,} state values; "
+                    f"{len(init_transfer['new_tensors'])} new classifier tensors; "
+                    if init_transfer is not None else ""
+                )
+                + "optimizer/scheduler/epoch/RNG start fresh",
+                flush=True,
+            )
+
+    unwrapped_model = unwrapped_model.to(device)
+    model = wrap_distributed_model(
+        unwrapped_model, args.distributed_backend, device, world
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=1e-4,
+        betas=(0.9, 0.95), fused=True,
+    )
+    if checkpoint_exists:
+        if is_fsdp_model(model):
+            sharded_optimizer_state = FSDP.scatter_full_optim_state_dict(
+                resume_optimizer_state if rank() == 0 else None,
+                model,
+                optim=optimizer,
+            )
+            optimizer.load_state_dict(sharded_optimizer_state)
+            del sharded_optimizer_state
+        else:
+            optimizer.load_state_dict(
+                optimizer_state_for_unwrapped_load(resume_optimizer_state, unwrap(model))
+            )
+        del resume_optimizer_state
+    accumulation = args.total_batch_size // (args.batch_size * world)
+    if accumulation * args.batch_size * world != args.total_batch_size:
+        raise ValueError("total batch size must be divisible by per-step global batch size")
+    complete_microbatches = (len(loader) // accumulation) * accumulation
+    optimizer_steps_per_epoch = complete_microbatches // accumulation
+    if optimizer_steps_per_epoch <= 0:
+        raise ValueError("training loader does not contain a complete optimizer step")
+    runtime_config = {
+        **vars(args),
+        "world_size": world,
+        "accumulation_steps": accumulation,
+    }
+    use_wandb = rank() == 0 and args.wandb_mode != "disabled"
+    wb = None
+    if use_wandb:
+        import wandb
+        wb = wandb.init(entity=args.wandb_entity, project=args.wandb_project,
+                        name=args.wandb_name,
+                        id=args.wandb_id, resume="allow" if args.wandb_id else None,
+                        mode=args.wandb_mode,
+                        config={**runtime_config, "architecture": (
+                            f"orthogonal-compound-closed-loop-{args.closed_loop_coeff_state}-rqtransformer-{args.model_preset}"
+                            if args.closed_loop_orthogonal_training
+                            else f"orthogonal-compound-causal-prefix-rqtransformer-{args.model_preset}"
+                            if args.orthogonal_compound_tokens and args.causal_prefix_state
+                            else f"orthogonal-compound-rqtransformer-{args.model_preset}"
+                            if args.orthogonal_compound_tokens
+                            else f"causal-prefix-pattern-rqtransformer-{args.model_preset}"
+                            if args.causal_prefix_pattern_tokens
+                            else f"support-first-pattern-rqtransformer-{args.model_preset}"
+                            if args.support_first_pattern_tokens
+                            else f"levelwise-var-micro{args.compound_micro_transformer_layers}-{args.model_preset}"
+                            if args.levelwise_var
+                            else
+                            f"compound-full-pair-ar-micro{args.compound_micro_transformer_layers}-rqtransformer-{args.model_preset}"
+                            if args.compound_tokens and args.compound_pair_autoregressive
+                            else
+                            f"compound-v6-causal-prefix-micro{args.compound_micro_transformer_layers}-rqtransformer-{args.model_preset}"
+                            if args.compound_tokens and args.causal_prefix_state
+                            else
+                            f"compound-v5-causal-atom-depth-physical-soft-micro{args.compound_micro_transformer_layers}-rqtransformer-{args.model_preset}"
+                            if args.compound_tokens and args.compound_micro_transformer_layers > 0
+                            else f"compound-v3-refiner{args.compound_refiner_layers}-rqtransformer-{args.model_preset}"
+                            if args.compound_tokens and args.compound_refiner_layers > 0
+                            else f"compound-rqtransformer-{args.model_preset}" if args.compound_tokens
+                            else f"official-rqtransformer-{args.model_preset}"
+                        ),
+                                "stochastic_codes": (
+                                    not args.support_first_pattern_tokens
+                                    and not args.causal_prefix_pattern_tokens
+                                    and args.coeff_target_mode == "soft"
+                                ),
+                                "temp": args.coeff_target_temperature, "top_p": 0.92,
+                                "coefficient_quantizer": (
+                                    None if cache_meta is None
+                                    else cache_meta.get("coeff_quantization", "uniform")
+                                ),
+                                "preview_sampling_settings": preview_sampling_settings(args)})
+        wb.define_metric("train/global_step")
+        if cache_rfid_preflight is not None:
+            continuous_rfid = cache_rfid_preflight["continuous"]
+            quantized_rfid = cache_rfid_preflight["quantized"]
+            for diagnostic_metric in (
+                "diagnostics/continuous_cache_reconstruction_rfid",
+                "diagnostics/quantized_cache_reconstruction_rfid",
+                "diagnostics/cache_quantization_rfid_delta",
+            ):
+                wb.define_metric(
+                    diagnostic_metric,
+                    step_metric="train/global_step",
+                    summary="last",
+                )
+            wb.summary["diagnostics/continuous_cache_reconstruction_rfid"] = continuous_rfid
+            wb.summary["diagnostics/quantized_cache_reconstruction_rfid"] = quantized_rfid
+            wb.summary["diagnostics/cache_quantization_rfid_delta"] = (
+                quantized_rfid - continuous_rfid
+            )
+            if "pattern" in cache_rfid_preflight:
+                pattern_rfid = cache_rfid_preflight["pattern"]
+                wb.summary[
+                    "diagnostics/pattern_cache_reconstruction_rfid"
+                ] = pattern_rfid
+                wb.summary[
+                    "diagnostics/pattern_cache_rfid_delta"
+                ] = pattern_rfid - continuous_rfid
+        metric_names = (
+            "train/loss", "train/atom_nll", "train/coeff_cross_entropy",
+            "train/pattern_nll", "train/pattern_perplexity",
+            "train/pattern_top1",
+            "train/coeff_target_entropy", "train/coeff_kl",
+            "train/coeff_regression_loss", "train/coeff_expected_mae",
+            "train/coeff_expected_physical_mae",
+            "train/coeff_crps",
+            "train/classification_loss", "train/geometry_loss",
+            "train/geometry_weight",
+            "train/geometry_pair_mse", "train/geometry_spatial_mse",
+            "train/causal_prefix_loss", "train/causal_prefix_mse",
+            "train/closed_loop_prefix_loss", "train/closed_loop_prefix_mse",
+            "train/atom_top1", "train/coeff_bin_mae", "train/grad_norm",
+            "train/images_per_second", "train/lr", "train/epoch", "val/fid",
+        )
+        for depth_index in range(args.sparsity_level):
+            metric_names += (
+                f"train/atom_nll_depth{depth_index}",
+                f"train/atom_top1_depth{depth_index}",
+                f"train/coeff_cross_entropy_depth{depth_index}",
+                f"train/coeff_bin_mae_depth{depth_index}",
+                f"train/coeff_expected_mae_depth{depth_index}",
+                f"train/coeff_expected_physical_mae_depth{depth_index}",
+                f"train/pattern_nll_depth{depth_index}",
+                f"train/pattern_top1_depth{depth_index}",
+            )
+        if uses_inception_score(args.dataset):
+            metric_names += ("val/inception_score", "val/inception_score_std")
+        for metric_name in metric_names:
+            wb.define_metric(metric_name, step_metric="train/global_step")
+        if args.fid_reference_stats is not None:
+            fid_metric_name = f"val/fid_rqvae_{args.dataset}_train"
+            wb.define_metric(
+                fid_metric_name, step_metric="train/global_step"
+            )
+            wb.summary["evaluation/fid_reference"] = f"rqvae/{args.dataset}_train"
+            wb.summary["evaluation/fid_reference_stats"] = str(
+                args.fid_reference_stats.resolve()
+            )
+            with args.fid_reference_stats.open("rb") as reference_stream:
+                wb.summary["evaluation/fid_reference_sha256"] = (
+                    hashlib.file_digest(reference_stream, "sha256").hexdigest()
+                )
+            wb.summary["evaluation/fid_num_generated_samples"] = int(
+                args.fid_num_samples
+            )
+            wb.summary["evaluation/fid_feature_extractor"] = (
+                "rqvae TensorFlow-FID-compatible InceptionV3 pool3/2048"
+            )
+            wb.summary["evaluation/generation_conditioning"] = (
+                "uniform, exactly 50 generated samples per class"
+                if args.dataset == "imagenet" else "unconditional"
+            )
+            wb.summary["evaluation/inception_score"] = (
+                "RQ-VAE 1008-logit Inception, shuffled, 10 splits"
+            )
+        (args.output / "launch_config.json").write_text(
+            json.dumps({k: str(v) for k, v in runtime_config.items()}, indent=2)
+        )
+        if args.upload_token_cache:
+            if args.token_cache is None:
+                raise ValueError("--upload-token-cache requires --token-cache")
+            upload_token_cache_once(wb, args.token_cache, args.output)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    global_step = 0
+    start_epoch = 0
+    resume_batch_idx = 0
+    best_fid = []
+    best_inception = []
+    if resume_payload is not None:
+        global_step = int(resume_payload.get("global_step", 0))
+        start_epoch = int(resume_payload.get("epoch", 0))
+        resume_batch_idx = int(resume_payload.get("batch_idx", 0))
+        best_fid = [(float(x[0]), str(x[1])) for x in resume_payload.get("best_fid", [])]
+        best_inception = [
+            (float(x[0]), str(x[1])) for x in resume_payload.get("best_inception", [])
+        ]
+        if not uses_inception_score(args.dataset):
+            best_inception = []
+        saved_config = resume_payload.get("config", {})
+        saved_batch_idx = resume_batch_idx
+        resume_batch_idx, old_world_size = remap_resume_batch_index(
+            resume_batch_idx,
+            saved_config=saved_config,
+            batch_size=args.batch_size,
+            world_size=world,
+            total_batch_size=args.total_batch_size,
+            global_step=global_step,
+            start_epoch=start_epoch,
+            optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        )
+        if rank() == 0 and resume_batch_idx != saved_batch_idx:
+            print(
+                "Remapped resume cursor for physical layout change: "
+                f"batch={saved_batch_idx}, world={old_world_size} -> "
+                f"batch={resume_batch_idx}, world={world}",
+                flush=True,
+            )
+        if int(saved_config.get("fid_num_samples", -1)) != args.fid_num_samples:
+            # FIDs from different real/fake sample counts are not comparable.
+            best_fid = []
+            best_inception = []
+            if rank() == 0:
+                print("Reset prior best-FID history because the evaluation "
+                      f"protocol changed from {saved_config.get('fid_num_samples')} "
+                      f"to {args.fid_num_samples} samples", flush=True)
+        previous_reference = saved_config.get("fid_reference_stats")
+        if previous_reference is not None:
+            previous_reference = str(previous_reference)
+        current_reference = (
+            None if args.fid_reference_stats is None
+            else str(args.fid_reference_stats)
+        )
+        if previous_reference != current_reference:
+            best_fid = []
+            if rank() == 0:
+                print(
+                    "Reset prior best-FID history because the reference changed "
+                    f"from {previous_reference or 'online dataset split'} to "
+                    f"{current_reference or 'online dataset split'}",
+                    flush=True,
+                )
+        if rank() == 0:
+            print(f"Resumed from {resume_checkpoint}: epoch={start_epoch}, "
+                  f"batch={resume_batch_idx}, step={global_step}", flush=True)
+            if (
+                args.upload_checkpoints
+                and args.checkpoint_upload_mode == "files"
+            ):
+                # Re-queue the recovered checkpoint immediately. This closes
+                # the gap when a previous process was stopped just after its
+                # atomic local save but before W&B finished the replacement.
+                upload_selected_checkpoint_files(
+                    wb,
+                    last_checkpoint=last_checkpoint,
+                    best_fid=best_fid,
+                    upload_dir=args.output / "wandb_checkpoints",
+                )
+    if wb is not None and cache_rfid_preflight is not None:
+        continuous_rfid = cache_rfid_preflight["continuous"]
+        quantized_rfid = cache_rfid_preflight["quantized"]
+        wb.log({
+            "train/global_step": global_step,
+            "diagnostics/continuous_cache_reconstruction_rfid": continuous_rfid,
+            "diagnostics/quantized_cache_reconstruction_rfid": quantized_rfid,
+            "diagnostics/cache_quantization_rfid_delta": (
+                quantized_rfid - continuous_rfid
+            ),
+        })
+        print(
+            "Logged cache reconstruction rFID diagnostics to W&B history: "
+            f"continuous={continuous_rfid:.6f}, "
+            f"quantized={quantized_rfid:.6f}, "
+            f"delta={quantized_rfid - continuous_rfid:+.6f}",
+            flush=True,
+        )
+    scheduler = None
+    if args.lr_schedule in {"cosine", "warmup-linear"}:
+        schedule_steps = args.lr_schedule_epochs * optimizer_steps_per_epoch
+        saved_config = {} if resume_payload is None else resume_payload.get("config", {})
+        restart_scheduler_now = (
+            bool(args.lr_schedule_restart_id)
+            and resume_payload is not None
+            and saved_config.get("lr_schedule_restart_id")
+            != args.lr_schedule_restart_id
+        )
+        if args.lr_schedule_restart_id and resume_payload is None:
+            raise ValueError("--lr-schedule-restart-id requires a resume checkpoint")
+        if restart_scheduler_now and args.epochs - start_epoch > args.lr_schedule_epochs:
+            raise ValueError(
+                "the restarted LR schedule must cover the remaining training: "
+                f"epochs={args.epochs}, resume_epoch={start_epoch}, "
+                f"lr_schedule_epochs={args.lr_schedule_epochs}"
+            )
+        scheduler_state = (
+            None
+            if resume_payload is None or restart_scheduler_now
+            else resume_payload.get("scheduler")
+        )
+        schedule_completed_steps = (
+            0
+            if restart_scheduler_now
+            else (
+                int(scheduler_state.get("last_epoch", 0))
+                if scheduler_state is not None
+                else start_epoch * optimizer_steps_per_epoch + resume_batch_idx // accumulation
+            )
+        )
+        if scheduler_state is None:
+            # Fresh runs start at the requested base LR. Legacy resumptions are
+            # mapped by data progress so changing physical batch size does not
+            # incorrectly reinterpret the W&B/checkpoint global-step counter.
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr
+        if args.lr_schedule == "cosine":
+            scheduler = create_cosine_lr_scheduler(
+                optimizer,
+                initial_lr=args.lr,
+                min_lr=args.min_lr,
+                total_steps=schedule_steps,
+                completed_steps=schedule_completed_steps,
+                state_dict=scheduler_state,
+            )
+        else:
+            scheduler = create_warmup_linear_lr_scheduler(
+                optimizer,
+                initial_lr=args.lr,
+                min_lr=args.min_lr,
+                total_steps=schedule_steps,
+                warmup_steps=round(args.warmup_epochs * optimizer_steps_per_epoch),
+                warmup_start_ratio=args.warmup_start_ratio,
+                completed_steps=schedule_completed_steps,
+                state_dict=scheduler_state,
+            )
+        if rank() == 0:
+            source = (
+                "restarted-on-resume"
+                if restart_scheduler_now
+                else (
+                    "checkpointed" if scheduler_state is not None else (
+                        "legacy-backfilled" if schedule_completed_steps else "fresh"
+                    )
+                )
+            )
+            print(
+                f"{args.lr_schedule} LR schedule ({source}): "
+                f"schedule_step={schedule_completed_steps}/{schedule_steps}, "
+                f"lr={optimizer.param_groups[0]['lr']:.8g}, min_lr={args.min_lr:.8g}",
+                flush=True,
+            )
+    elif resume_payload is not None:
+        # Constant-LR resumes intentionally honor the new launch value rather
+        # than whatever value was serialized by a previous schedule.
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr
+    optimizer.zero_grad(set_to_none=True)
+    if args.sample_grid_on_start:
+        if dist.is_initialized():
+            dist.barrier()
+        with optimizer_state_offloaded_for_generation(model, optimizer, device):
+            with model_for_custom_methods(model) as sampling_model:
+                if rank() == 0:
+                    for setting in preview_sampling_settings(args):
+                        devices = [device.index] if device.type == "cuda" else []
+                        with torch.random.fork_rng(devices=devices):
+                            torch.manual_seed(args.sample_grid_seed)
+                            target = sample_class_grid(
+                                sampling_model, aux, class_names, args.output,
+                                global_step, wb=wb,
+                                num_condition_classes=num_condition_classes,
+                                num_samples=args.sample_grid_size,
+                                sample_batch_size=args.sample_grid_batch_size,
+                                samples_per_class=args.sample_grid_samples_per_class,
+                                **setting,
+                            )
+                        print(f"Saved startup samples: {target}", flush=True)
+                if is_fsdp_model(model):
+                    dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
+    if args.generation_smoke_test:
+        with optimizer_state_offloaded_for_generation(model, optimizer, device):
+            torch.cuda.reset_peak_memory_stats(device)
+            with model_for_custom_methods(model) as generation_model:
+                generation_model.eval()
+                labels = torch.arange(args.fid_batch_size, device=device).remainder(
+                    num_condition_classes
+                )
+                if isinstance(
+                    generation_model,
+                    (
+                        CompoundLaserRQTransformer,
+                        LevelwiseLaserVAR,
+                        SupportFirstLaserRQTransformer,
+                        CausalPrefixPatternLaserRQTransformer,
+                    ),
+                ):
+                    coefficient_vocab_size = getattr(
+                        generation_model,
+                        "coefficient_pattern_vocab_size",
+                        aux.coeff_vocab_size,
+                    )
+                    atoms, coeff_ids = generation_model.sample_compound(
+                        args.fid_batch_size,
+                        aux,
+                        cond=labels,
+                        atom_temperature=args.atom_temperature,
+                        atom_top_k=args.atom_top_k or aux.num_atoms,
+                        atom_top_p=args.atom_top_p,
+                        coeff_temperature=args.coeff_temperature,
+                        coeff_top_k=args.coeff_top_k or coefficient_vocab_size,
+                        coeff_top_p=args.coeff_top_p,
+                        amp=True,
+                    )
+                    images = (
+                        aux.decode_orthogonal(atoms, coeff_ids)
+                        if isinstance(
+                            generation_model,
+                            OrthogonalCompoundLaserRQTransformer,
+                        )
+                        else aux.decode_coefficient_patterns(atoms, coeff_ids)
+                        if isinstance(
+                            generation_model, SupportFirstLaserRQTransformer
+                        )
+                        else aux.decode_prefix_patterns(atoms, coeff_ids)
+                        if isinstance(
+                            generation_model,
+                            CausalPrefixPatternLaserRQTransformer,
+                        )
+                        else aux.decode_compound(atoms, coeff_ids)
+                    )
+                else:
+                    tokens = generation_model.sample_sparse(
+                        args.fid_batch_size,
+                        aux,
+                        cond=labels,
+                        atom_temperature=args.atom_temperature,
+                        atom_top_k=args.atom_top_k,
+                        atom_top_p=args.atom_top_p,
+                        coeff_temperature=args.coeff_temperature,
+                        coeff_top_k=args.coeff_top_k,
+                        coeff_top_p=args.coeff_top_p,
+                        amp=True,
+                    )
+                    images = aux.decode_tokens(tokens)
+                if not torch.isfinite(images).all():
+                    raise RuntimeError("generation smoke test produced non-finite pixels")
+                del images
+            cuda_memory_report(device, f"generation smoke batch {args.fid_batch_size}")
+        if rank() == 0:
+            print("Generation smoke test passed", flush=True)
+        if wb is not None:
+            wb.finish()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
+    if resume_payload is not None:
+        restored_rng = restore_rank_rng_state(resume_payload, device, args.seed)
+        if rank() == 0:
+            print(
+                "RNG resume: "
+                + (
+                    "restored exact per-rank checkpoint streams"
+                    if restored_rng
+                    else "legacy checkpoint had no RNG state; applied deterministic rank seeds"
+                ),
+                flush=True,
+            )
+    if args.fid_only:
+        if resume_payload is None:
+            raise ValueError("--fid-only requires a resumable checkpoint")
+        with optimizer_state_offloaded_for_generation(model, optimizer, device):
+            torch.cuda.reset_peak_memory_stats(device)
+            with model_for_custom_methods(model) as generation_model:
+                fid, inception_score, inception_score_std = evaluate_generation_metrics(
+                    generation_model, aux, val_loader, args.fid_num_samples,
+                    args.fid_batch_size,
+                    num_condition_classes=num_condition_classes,
+                    atom_temperature=args.atom_temperature,
+                    atom_top_k=args.atom_top_k,
+                    atom_top_p=args.atom_top_p,
+                    coeff_temperature=args.coeff_temperature,
+                    coeff_top_k=args.coeff_top_k,
+                    coeff_top_p=args.coeff_top_p,
+                    compute_inception_score=uses_inception_score(args.dataset),
+                    metric_backend=args.metric_backend,
+                    fid_reference_stats=args.fid_reference_stats,
+                )
+            cuda_memory_report(device, f"step {global_step} catch-up FID generation")
+        progress_epoch = start_epoch + resume_batch_idx / complete_microbatches
+        result = {
+            "checkpoint": str(resume_checkpoint.resolve()),
+            "checkpoint_epoch": start_epoch,
+            "checkpoint_batch_idx": resume_batch_idx,
+            "progress_epoch": progress_epoch,
+            "global_step": global_step,
+            "fid": fid,
+            "inception_score": inception_score,
+            "inception_score_std": inception_score_std,
+            "num_generated_samples": args.fid_num_samples,
+            "metric_backend": args.metric_backend,
+            "fid_reference_stats": (
+                None if args.fid_reference_stats is None
+                else str(args.fid_reference_stats.resolve())
+            ),
+        }
+        if rank() == 0:
+            evaluation_dir = args.output / "evaluations"
+            evaluation_dir.mkdir(parents=True, exist_ok=True)
+            result_path = evaluation_dir / f"fid_step_{global_step:07d}.json"
+            result_path.write_text(json.dumps(result, indent=2) + "\n")
+            if wb is not None:
+                evaluation_payload = {
+                    "val/fid": fid,
+                    "train/epoch": progress_epoch,
+                    "train/global_step": global_step,
+                }
+                if args.fid_reference_stats is not None:
+                    evaluation_payload[
+                        f"val/fid_rqvae_{args.dataset}_train"
+                    ] = fid
+                if inception_score is not None:
+                    evaluation_payload.update({
+                        "val/inception_score": inception_score,
+                        "val/inception_score_std": inception_score_std,
+                    })
+                wb.log(evaluation_payload)
+            print(
+                f"Catch-up FID at step {global_step} "
+                f"(epoch progress {progress_epoch:.6f}): {fid:.6f}; "
+                f"wrote {result_path}",
+                flush=True,
+            )
+        if wb is not None:
+            wb.finish()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
+    last_perf_step = global_step
+    last_perf_time = time.monotonic()
+    launch_start_step = global_step
+    memory_reported = False
+    stop_training = False
+    torch.cuda.reset_peak_memory_stats(device)
+    for epoch in range(start_epoch, args.epochs):
+        batch_offset = resume_batch_idx if epoch == start_epoch else 0
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+            sampler.set_start_index(batch_offset * args.batch_size)
+        model.train()
+        for batch_idx, batch in enumerate(loader):
+            absolute_batch_idx = batch_idx + batch_offset
+            if absolute_batch_idx >= complete_microbatches:
+                break
+            causal_prefix_reconstructions = None
+            if args.token_cache:
+                if (
+                    args.support_first_pattern_tokens
+                    or args.causal_prefix_pattern_tokens
+                ):
+                    atoms, pattern_ids, labels = batch
+                    pattern_ids = pattern_ids.to(
+                        device=device, dtype=torch.long, non_blocking=True
+                    )
+                elif args.causal_prefix_state and not args.orthogonal_compound_tokens:
+                    atoms, coeffs, prefix_coeffs, labels = batch
+                    prefix_coeffs = prefix_coeffs.to(device, non_blocking=True)
+                else:
+                    atoms, coeffs, labels = batch
+                atoms = atoms.to(device, non_blocking=True)
+                if not (
+                    args.support_first_pattern_tokens
+                    or args.causal_prefix_pattern_tokens
+                ):
+                    coeffs = coeffs.to(device, non_blocking=True)
+                labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
+                if num_condition_classes == 1:
+                    labels.zero_()
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    if args.causal_prefix_pattern_tokens:
+                        tokens = (
+                            atoms.long() * max(prefix_pattern_vocab_sizes)
+                            + pattern_ids
+                        )
+                        compact_targets = (atoms.long(), pattern_ids)
+                    elif args.support_first_pattern_tokens:
+                        tokens = atoms.long().clone()
+                        tokens[..., -1] = (
+                            atoms[..., -1].long()
+                            * coefficient_pattern_vocab_size
+                            + pattern_ids
+                        )
+                        compact_targets = (atoms.long(), pattern_ids)
+                    elif args.compound_tokens or args.orthogonal_compound_tokens:
+                        coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
+                            coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            hard=args.coeff_target_mode == "hard",
+                        )
+                        tokens = atoms.long() * args.coeff_vocab_size + coeff_ids
+                        target_physical = (
+                            aux.physical_orthogonal_contributions(atoms, coeffs)
+                            if args.orthogonal_compound_tokens
+                            else aux.physical_contributions(atoms, coeffs)
+                        )
+                        if args.causal_prefix_state:
+                            causal_prefix_reconstructions = (
+                                target_physical.cumsum(dim=-2)
+                                if args.orthogonal_compound_tokens
+                                else aux.causal_prefix_reconstructions(
+                                    atoms, prefix_coeffs
+                                )
+                            )
+                        compact_targets = (atoms.long(), target_coeff_probs, target_physical)
+                    else:
+                        tokens, compact_targets = aux.sparse_targets(
+                            atoms,
+                            coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            compact=True,
+                            hard=args.coeff_target_mode == "hard",
+                        )
+            else:
+                images, labels = batch
+                images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+                if num_condition_classes == 1:
+                    labels.zero_()
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    if args.compound_tokens or args.orthogonal_compound_tokens:
+                        encoded = aux.encode_sparse_components(
+                            images,
+                            return_prefix_coeffs=(
+                                args.causal_prefix_state
+                                and not args.orthogonal_compound_tokens
+                            ),
+                        )
+                        if (
+                            args.causal_prefix_state
+                            and not args.orthogonal_compound_tokens
+                        ):
+                            atoms, coeffs, prefix_coeffs = encoded
+                            causal_prefix_reconstructions = (
+                                aux.causal_prefix_reconstructions(atoms, prefix_coeffs)
+                            )
+                        else:
+                            atoms, coeffs = encoded
+                        coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
+                            coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            hard=args.coeff_target_mode == "hard",
+                        )
+                        tokens = atoms.long() * args.coeff_vocab_size + coeff_ids
+                        target_physical = (
+                            aux.physical_orthogonal_contributions(atoms, coeffs)
+                            if args.orthogonal_compound_tokens
+                            else aux.physical_contributions(atoms, coeffs)
+                        )
+                        if (
+                            args.causal_prefix_state
+                            and args.orthogonal_compound_tokens
+                        ):
+                            causal_prefix_reconstructions = (
+                                target_physical.cumsum(dim=-2)
+                            )
+                        compact_targets = (atoms.long(), target_coeff_probs, target_physical)
+                    else:
+                        tokens, soft_targets = aux.encode_sparse(
+                            images,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            hard=args.coeff_target_mode == "hard",
+                        )
+            sync = args.smoke_test or ((absolute_batch_idx + 1) % accumulation == 0)
+            # FSDP deliberately reduce-scatters every microbatch. Its no_sync()
+            # retains full, unsharded gradients and is too memory-hungry for a
+            # 1.45B-parameter model on these 20 GB cards.
+            ctx = model.no_sync() if isinstance(model, DDP) and not sync else torch.enable_grad()
+            with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
+                if args.causal_prefix_state:
+                    logits = model(
+                        tokens,
+                        model_aux=aux,
+                        cond=labels,
+                        amp=False,
+                        causal_prefix_reconstructions=causal_prefix_reconstructions,
+                    )
+                else:
+                    logits = model(tokens, model_aux=aux, cond=labels, amp=False)
+                diagnostic_metrics = None
+                if (
+                    args.token_cache
+                    or args.compound_tokens
+                    or args.orthogonal_compound_tokens
+                ):
+                    if (
+                        args.support_first_pattern_tokens
+                        or args.causal_prefix_pattern_tokens
+                    ):
+                        atom_logits = logits["atom_logits"]
+                        pattern_logits = logits["pattern_logits"]
+                    elif isinstance(logits, dict):
+                        atom_logits = logits["atom_logits"]
+                        coeff_logits = logits["coeff_logits"]
+                    else:
+                        atom_logits = logits[..., 0::2, :args.num_atoms]
+                        coeff_logits = logits[..., 1::2, args.num_atoms:]
+                    if args.causal_prefix_pattern_tokens:
+                        target_atoms, target_pattern_ids = compact_targets
+                        loss, objective = causal_prefix_pattern_objective(
+                            atom_logits,
+                            pattern_logits,
+                            target_atoms,
+                            target_pattern_ids,
+                            atom_weight=args.atom_loss_weight,
+                            pattern_weight=args.pattern_loss_weight,
+                            accumulation=accumulation,
+                        )
+                        atom_loss = objective["atom_nll"]
+                        pattern_loss = objective["pattern_nll"]
+                        with torch.no_grad():
+                            diagnostic_metrics = {
+                                "train/atom_nll": float(atom_loss.mean()),
+                                "train/pattern_nll": float(pattern_loss.mean()),
+                                "train/pattern_perplexity": float(
+                                    pattern_loss.mean().clamp(max=20).exp()
+                                ),
+                                "train/pattern_top1": float(
+                                    (
+                                        pattern_logits.argmax(dim=-1)
+                                        == target_pattern_ids
+                                    ).float().mean()
+                                ),
+                                "train/classification_loss": float(
+                                    objective["classification"]
+                                ),
+                                "train/atom_top1": float(
+                                    (
+                                        atom_logits.argmax(dim=-1)
+                                        == target_atoms
+                                    ).float().mean()
+                                ),
+                            }
+                            for depth_index in range(target_atoms.shape[-1]):
+                                diagnostic_metrics.update({
+                                    f"train/atom_nll_depth{depth_index}": float(
+                                        atom_loss[..., depth_index].mean()
+                                    ),
+                                    f"train/atom_top1_depth{depth_index}": float(
+                                        (
+                                            atom_logits[..., depth_index, :].argmax(dim=-1)
+                                            == target_atoms[..., depth_index]
+                                        ).float().mean()
+                                    ),
+                                    f"train/pattern_nll_depth{depth_index}": float(
+                                        pattern_loss[..., depth_index].mean()
+                                    ),
+                                    f"train/pattern_top1_depth{depth_index}": float(
+                                        (
+                                            pattern_logits[..., depth_index, :].argmax(dim=-1)
+                                            == target_pattern_ids[..., depth_index]
+                                        ).float().mean()
+                                    ),
+                                })
+                    elif args.support_first_pattern_tokens:
+                        target_atoms, target_pattern_ids = compact_targets
+                        loss, objective = support_first_objective(
+                            atom_logits,
+                            pattern_logits,
+                            target_atoms,
+                            target_pattern_ids,
+                            atom_weight=args.atom_loss_weight,
+                            pattern_weight=args.pattern_loss_weight,
+                            accumulation=accumulation,
+                        )
+                        atom_loss = objective["atom_nll"]
+                        pattern_loss = objective["pattern_nll"]
+                        with torch.no_grad():
+                            diagnostic_metrics = {
+                                "train/atom_nll": float(atom_loss.mean()),
+                                "train/pattern_nll": float(pattern_loss.mean()),
+                                "train/pattern_perplexity": float(
+                                    pattern_loss.mean().clamp(max=20).exp()
+                                ),
+                                "train/pattern_top1": float(
+                                    (
+                                        pattern_logits.argmax(dim=-1)
+                                        == target_pattern_ids
+                                    ).float().mean()
+                                ),
+                                "train/classification_loss": float(
+                                    objective["classification"]
+                                ),
+                                "train/atom_top1": float(
+                                    (
+                                        atom_logits.argmax(dim=-1)
+                                        == target_atoms
+                                    ).float().mean()
+                                ),
+                            }
+                            for depth_index in range(target_atoms.shape[-1]):
+                                diagnostic_metrics.update({
+                                    f"train/atom_nll_depth{depth_index}": float(
+                                        atom_loss[..., depth_index].mean()
+                                    ),
+                                    f"train/atom_top1_depth{depth_index}": float(
+                                        (
+                                            atom_logits[..., depth_index, :].argmax(dim=-1)
+                                            == target_atoms[..., depth_index]
+                                        ).float().mean()
+                                    ),
+                                })
+                    elif args.compound_tokens or args.orthogonal_compound_tokens:
+                        target_atoms, target_coeff_probs, target_physical = compact_targets
+                        progress_epochs = epoch + (
+                            min(absolute_batch_idx + 1, complete_microbatches)
+                            / complete_microbatches
+                        )
+                        geometry_weight = scheduled_geometry_weight(
+                            args.geometry_loss_weight,
+                            progress_epochs,
+                            args.geometry_start_epoch,
+                            args.geometry_warmup_epochs,
+                        )
+                        loss, objective = compound_objective(
+                            atom_logits,
+                            coeff_logits,
+                            logits.get("physical_contribution") if isinstance(logits, dict) else None,
+                            target_atoms,
+                            target_coeff_probs,
+                            target_physical,
+                            atom_weight=args.atom_loss_weight,
+                            causal_prefix_prediction=logits.get(
+                                "causal_prefix_prediction"
+                            ) if isinstance(logits, dict) else None,
+                            target_causal_prefix=causal_prefix_reconstructions,
+                            causal_prefix_weight=args.causal_prefix_loss_weight,
+                            coeff_regression_weight=args.coeff_regression_weight,
+                            coeff_crps_weight=args.coeff_crps_weight,
+                            geometry_weight=geometry_weight,
+                            accumulation=accumulation,
+                            coefficient_bins=aux.coeff_bins,
+                            distribution_geometry=args.compound_distribution_geometry,
+                            geometry_dictionary=aux.dictionary,
+                            geometry_coeff_bins=aux.coeff_bins,
+                            geometry_coeff_scales=aux.coeff_scales,
+                            geometry_top_k=args.geometry_top_k,
+                            geometry_orthogonal=args.orthogonal_compound_tokens,
+                        )
+                        atom_loss = objective["atom_nll"]
+                        coeff_loss = objective["coeff_cross_entropy"]
+                        with torch.no_grad():
+                            coeff_entropy = -(
+                                target_coeff_probs * target_coeff_probs.clamp_min(1e-30).log()
+                            ).sum(dim=-1)
+                            pred_coeff_ids = coeff_logits.argmax(dim=-1)
+                            target_coeff_ids = target_coeff_probs.argmax(dim=-1)
+                            pair_scales = aux.coeff_scales.view(
+                                1, 1, 1, args.sparsity_level
+                            )
+                            pred_values = aux.coeff_bins[pred_coeff_ids] * pair_scales
+                            target_values = aux.coeff_bins[target_coeff_ids] * pair_scales
+                            predicted_coefficients = objective["predicted_coefficients"]
+                            target_coefficients = objective["target_coefficients"]
+                            if predicted_coefficients is None:
+                                predicted_coefficients = (
+                                    coeff_logits.float().softmax(dim=-1)
+                                    * aux.coeff_bins.float()
+                                ).sum(dim=-1)
+                                target_coefficients = (
+                                    target_coeff_probs.float()
+                                    * aux.coeff_bins.float()
+                                ).sum(dim=-1)
+                            expected_abs_error = (
+                                predicted_coefficients - target_coefficients
+                            ).abs()
+                            expected_physical_abs_error = expected_abs_error * pair_scales
+                            diagnostic_metrics = {
+                                "train/atom_nll": float(atom_loss.mean()),
+                                "train/coeff_cross_entropy": float(coeff_loss.mean()),
+                                "train/coeff_target_entropy": float(coeff_entropy.mean()),
+                                "train/coeff_kl": float((coeff_loss - coeff_entropy).mean()),
+                                "train/coeff_regression_loss": float(
+                                    objective["coefficient_regression"]
+                                ),
+                                "train/coeff_crps": float(
+                                    objective["coefficient_crps"]
+                                ),
+                                "train/coeff_expected_mae": float(expected_abs_error.mean()),
+                                "train/coeff_expected_physical_mae": float(
+                                    expected_physical_abs_error.mean()
+                                ),
+                                "train/classification_loss": float(objective["classification"]),
+                                "train/geometry_loss": float(objective["geometry"]),
+                                "train/geometry_weight": geometry_weight,
+                                "train/geometry_pair_mse": float(objective["geometry_pair_mse"]),
+                                "train/geometry_spatial_mse": float(objective["geometry_spatial_mse"]),
+                                "train/causal_prefix_loss": float(objective["causal_prefix"]),
+                                "train/causal_prefix_mse": float(objective["causal_prefix_mse"]),
+                                "train/atom_top1": float(
+                                    (atom_logits.argmax(dim=-1) == target_atoms.long()).float().mean()
+                                ),
+                                "train/coeff_bin_mae": float((pred_values - target_values).abs().mean()),
+                            }
+                            if (
+                                isinstance(logits, dict)
+                                and "closed_loop_prefix" in logits
+                            ):
+                                closed_loop_mse = F.mse_loss(
+                                    logits["closed_loop_prefix"].float(),
+                                    causal_prefix_reconstructions.float(),
+                                )
+                                prefix_energy = (
+                                    causal_prefix_reconstructions.float()
+                                    .square()
+                                    .mean()
+                                    .clamp_min(1e-6)
+                                )
+                                diagnostic_metrics.update({
+                                    "train/closed_loop_prefix_mse": float(
+                                        closed_loop_mse
+                                    ),
+                                    "train/closed_loop_prefix_loss": float(
+                                        closed_loop_mse / prefix_energy
+                                    ),
+                                })
+                            for depth_index in range(target_atoms.shape[-1]):
+                                diagnostic_metrics.update({
+                                    f"train/atom_nll_depth{depth_index}": float(
+                                        atom_loss[..., depth_index].mean()
+                                    ),
+                                    f"train/atom_top1_depth{depth_index}": float(
+                                        (
+                                            atom_logits[..., depth_index, :].argmax(dim=-1)
+                                            == target_atoms[..., depth_index].long()
+                                        ).float().mean()
+                                    ),
+                                    f"train/coeff_cross_entropy_depth{depth_index}": float(
+                                        coeff_loss[..., depth_index].mean()
+                                    ),
+                                    f"train/coeff_bin_mae_depth{depth_index}": float(
+                                        (
+                                            pred_values[..., depth_index]
+                                            - target_values[..., depth_index]
+                                        ).abs().mean()
+                                    ),
+                                    f"train/coeff_expected_mae_depth{depth_index}": float(
+                                        expected_abs_error[..., depth_index].mean()
+                                    ),
+                                    f"train/coeff_expected_physical_mae_depth{depth_index}": float(
+                                        expected_physical_abs_error[..., depth_index].mean()
+                                    ),
+                                })
+                    else:
+                        target_atoms, target_coeff_probs = compact_targets
+                        atom_log_probs = F.log_softmax(atom_logits.float(), dim=-1)
+                        coeff_log_probs = F.log_softmax(coeff_logits.float(), dim=-1)
+                        atom_loss = -atom_log_probs.gather(
+                            -1, target_atoms.long().unsqueeze(-1)
+                        ).squeeze(-1)
+                        coeff_loss = -(target_coeff_probs * coeff_log_probs).sum(dim=-1)
+                        depth = target_atoms.shape[-1]
+                        loss = (
+                            atom_loss.sum(dim=-1) + coeff_loss.sum(dim=-1)
+                        ).mean() / (2 * depth * accumulation)
+                else:
+                    log_probs = F.log_softmax(logits.float(), dim=-1)
+                    loss = -(soft_targets * log_probs).sum(dim=-1).mean() / accumulation
+            loss.backward()
+            if sync:
+                grad_norm = (
+                    model.clip_grad_norm_(1.0)
+                    if is_fsdp_model(model)
+                    else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                )
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                if not memory_reported:
+                    memory_values = cuda_memory_report(
+                        device, f"first optimizer step {global_step}"
+                    )
+                    if wb is not None:
+                        memory_payload = {"train/global_step": global_step}
+                        for memory_rank, (allocated, reserved) in enumerate(memory_values):
+                            memory_payload.update({
+                                f"system/rank{memory_rank}_peak_allocated_gib": allocated,
+                                f"system/rank{memory_rank}_peak_reserved_gib": reserved,
+                            })
+                        wb.log(memory_payload)
+                    memory_reported = True
+                if wb is not None and global_step % 10 == 0:
+                    now = time.monotonic()
+                    elapsed = max(now - last_perf_time, 1e-6)
+                    completed_steps = max(global_step - last_perf_step, 1)
+                    payload = {
+                        "train/loss": float(loss.detach()) * accumulation,
+                        "train/epoch": epoch, "train/global_step": global_step,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/grad_norm": float(grad_norm),
+                        "train/images_per_second": completed_steps * args.total_batch_size / elapsed,
+                    }
+                    if diagnostic_metrics is not None:
+                        payload.update(diagnostic_metrics)
+                    wb.log(payload)
+                    last_perf_step, last_perf_time = global_step, now
+                if args.save_step_freq > 0 and global_step % args.save_step_freq == 0:
+                    if dist.is_initialized():
+                        dist.barrier()
+                    model_state, optimizer_state = full_checkpoint_states(
+                        model, optimizer, parameter_names
+                    )
+                    rng_state_by_rank = gather_rank_rng_states(device)
+                    if rank() == 0:
+                        recovery_snapshot = {
+                            "epoch": epoch,
+                            "batch_idx": absolute_batch_idx + 1,
+                            "global_step": global_step,
+                            "fid": None,
+                            "inception_score": None,
+                            "inception_score_std": None,
+                            "state_dict": model_state,
+                            "optimizer": optimizer_state,
+                            "rng_state_by_rank": rng_state_by_rank,
+                            "checkpoint_world_size": world,
+                            "scheduler": None if scheduler is None else scheduler.state_dict(),
+                            "config": runtime_config,
+                            "best_fid": best_fid,
+                            "best_inception": best_inception,
+                        }
+                        atomic_torch_save(recovery_snapshot, last_checkpoint)
+                        print(
+                            f"Step {global_step}: saved recovery checkpoint {last_checkpoint}",
+                            flush=True,
+                        )
+                        if (
+                            args.upload_checkpoints
+                            and args.checkpoint_upload_mode == "files"
+                        ):
+                            upload_selected_checkpoint_files(
+                                wb,
+                                last_checkpoint=last_checkpoint,
+                                best_fid=best_fid,
+                                upload_dir=args.output / "wandb_checkpoints",
+                            )
+                        del recovery_snapshot
+                    del model_state, optimizer_state
+                    if dist.is_initialized():
+                        dist.barrier()
+                if args.sample_grid_every > 0 and global_step % args.sample_grid_every == 0:
+                    if dist.is_initialized():
+                        dist.barrier()
+                    with optimizer_state_offloaded_for_generation(model, optimizer, device):
+                        with model_for_custom_methods(model) as sampling_model:
+                            if rank() == 0:
+                                devices = [device.index] if device.type == "cuda" else []
+                                with torch.random.fork_rng(devices=devices):
+                                    torch.manual_seed(args.sample_grid_seed)
+                                    for setting in preview_sampling_settings(args):
+                                        target = sample_class_grid(
+                                            sampling_model, aux, class_names, args.output,
+                                            global_step, wb=wb,
+                                            num_condition_classes=num_condition_classes,
+                                            num_samples=args.sample_grid_size,
+                                            sample_batch_size=args.sample_grid_batch_size,
+                                            samples_per_class=args.sample_grid_samples_per_class,
+                                            **setting,
+                                        )
+                                        print(
+                                            f"Saved preview samples: {target}", flush=True
+                                        )
+                            if is_fsdp_model(model):
+                                dist.barrier()
+                    if dist.is_initialized():
+                        dist.barrier()
+                if (
+                    args.max_optimizer_steps > 0
+                    and global_step - launch_start_step >= args.max_optimizer_steps
+                ):
+                    stop_training = True
+                    break
+        if stop_training:
+            if rank() == 0:
+                print(
+                    f"Stopped after {global_step - launch_start_step} optimizer step(s) "
+                    "as requested; skipped epoch evaluation and checkpointing",
+                    flush=True,
+                )
+            break
+        resume_batch_idx = 0
+        if sampler is not None:
+            sampler.set_start_index(0)
+        if dist.is_initialized():
+            dist.barrier()
+        run_fid = args.fid_every > 0 and (epoch + 1) % args.fid_every == 0
+        # Every evaluated model must be recoverable, even when the FID cadence
+        # does not coincide with the periodic recovery-checkpoint cadence.
+        save_epoch = (
+            run_fid
+            or (epoch + 1) % args.save_ckpt_freq == 0
+            or epoch + 1 == args.epochs
+        )
+        fid = None
+        inception_score = None
+        inception_score_std = None
+        if run_fid:
+            with optimizer_state_offloaded_for_generation(model, optimizer, device):
+                torch.cuda.reset_peak_memory_stats(device)
+                with model_for_custom_methods(model) as generation_model:
+                    fid, inception_score, inception_score_std = evaluate_generation_metrics(
+                        generation_model, aux, val_loader, args.fid_num_samples,
+                        args.fid_batch_size,
+                        num_condition_classes=num_condition_classes,
+                        atom_temperature=args.atom_temperature,
+                        atom_top_k=args.atom_top_k,
+                        atom_top_p=args.atom_top_p,
+                        coeff_temperature=args.coeff_temperature,
+                        coeff_top_k=args.coeff_top_k,
+                        coeff_top_p=args.coeff_top_p,
+                        compute_inception_score=uses_inception_score(args.dataset),
+                        metric_backend=args.metric_backend,
+                        fid_reference_stats=args.fid_reference_stats,
+                    )
+                cuda_memory_report(device, f"epoch {epoch + 1} FID generation")
+        best_path = None
+        best_inception_path = None
+        if rank() == 0:
+            if wb is not None and fid is not None:
+                evaluation_payload = {
+                    "val/fid": fid,
+                    "train/epoch": epoch + 1,
+                    "train/global_step": global_step,
+                }
+                if args.fid_reference_stats is not None:
+                    evaluation_payload[f"val/fid_rqvae_{args.dataset}_train"] = fid
+                if inception_score is not None:
+                    evaluation_payload.update({
+                        "val/inception_score": inception_score,
+                        "val/inception_score_std": inception_score_std,
+                    })
+                wb.log(evaluation_payload)
+            qualifies = fid is not None and (
+                len(best_fid) < args.keep_best_checkpoints
+                or fid < max(x[0] for x in best_fid)
+            )
+            if qualifies:
+                best_path = checkpoint_dir / f"best_fid_{fid:.4f}_epoch_{epoch + 1:03d}.pt"
+                best_fid.append((fid, str(best_path)))
+                best_fid.sort(key=lambda item: item[0])
+                while len(best_fid) > args.keep_best_checkpoints:
+                    _, stale = best_fid.pop()
+                    stale_path = Path(stale)
+                    if stale_path.is_file():
+                        stale_path.unlink()
+            qualifies_inception = inception_score is not None and (
+                len(best_inception) < args.keep_best_checkpoints
+                or inception_score > min(x[0] for x in best_inception)
+            )
+            if qualifies_inception:
+                best_inception_path = checkpoint_dir / (
+                    f"best_is_{inception_score:.4f}_epoch_{epoch + 1:03d}.pt"
+                )
+                best_inception.append((inception_score, str(best_inception_path)))
+                best_inception.sort(key=lambda item: item[0], reverse=True)
+                while len(best_inception) > args.keep_best_checkpoints:
+                    _, stale = best_inception.pop()
+                    stale_path = Path(stale)
+                    if stale_path.is_file():
+                        stale_path.unlink()
+        if save_epoch:
+            model_state, optimizer_state = full_checkpoint_states(
+                model, optimizer, parameter_names
+            )
+            rng_state_by_rank = gather_rank_rng_states(device)
+            if rank() == 0:
+                snapshot = {
+                    "epoch": epoch + 1, "global_step": global_step, "fid": fid,
+                    "inception_score": inception_score,
+                    "inception_score_std": inception_score_std,
+                    "state_dict": model_state, "optimizer": optimizer_state,
+                    "rng_state_by_rank": rng_state_by_rank,
+                    "checkpoint_world_size": world,
+                    "scheduler": None if scheduler is None else scheduler.state_dict(),
+                    "config": runtime_config, "best_fid": best_fid,
+                    "best_inception": best_inception,
+                }
+                atomic_torch_save(snapshot, last_checkpoint)
+                if best_path is not None:
+                    if args.model_only_best_checkpoints:
+                        atomic_torch_save(model_only_best_snapshot(snapshot), best_path)
+                    else:
+                        snapshot_checkpoint(last_checkpoint, best_path)
+                if best_inception_path is not None:
+                    if args.model_only_best_checkpoints:
+                        atomic_torch_save(
+                            model_only_best_snapshot(snapshot), best_inception_path
+                        )
+                    else:
+                        snapshot_checkpoint(last_checkpoint, best_inception_path)
+                # Every scheduled full save uploads a recoverable `last` plus
+                # every locally retained top-three FID and Inception member.
+                if args.upload_checkpoints and args.checkpoint_upload_mode == "artifact":
+                    artifact_aliases = ["latest"]
+                    if best_path is not None:
+                        artifact_aliases.extend(["best-fid", f"fid-epoch-{epoch + 1}"])
+                    if best_inception_path is not None:
+                        artifact_aliases.extend(["best-is", f"is-epoch-{epoch + 1}"])
+                    selected_paths = [last_checkpoint]
+                    selected_paths.extend(
+                        path for _, saved_path in best_fid
+                        if (path := Path(saved_path)).is_file() and path != last_checkpoint
+                    )
+                    selected_paths.extend(
+                        path for _, saved_path in best_inception
+                        if (path := Path(saved_path)).is_file()
+                        and path not in selected_paths
+                    )
+                    upload_checkpoints(
+                        wb, selected_paths, artifact_name=f"{wb.id}-checkpoint",
+                        aliases=artifact_aliases,
+                        metadata={
+                            "epoch": epoch + 1,
+                            "step": global_step,
+                            "fid": fid,
+                            "inception_score": inception_score,
+                            "inception_score_std": inception_score_std,
+                            "selected_checkpoints": [path.name for path in selected_paths],
+                        },
+                    )
+                elif args.upload_checkpoints:
+                    upload_selected_checkpoint_files(
+                        wb,
+                        last_checkpoint=last_checkpoint,
+                        best_fid=best_fid,
+                        upload_dir=args.output / "wandb_checkpoints",
+                    )
+                del snapshot
+            del model_state, optimizer_state
+        if rank() == 0:
+            if not save_epoch:
+                print(f"Epoch {epoch + 1}: checkpoint skipped", flush=True)
+            elif fid is None:
+                print(f"Epoch {epoch + 1}: FID skipped; saved {last_checkpoint}", flush=True)
+            else:
+                metrics = f"FID={fid:.4f}"
+                if inception_score is not None:
+                    metrics += f"; IS={inception_score:.4f}+/-{inception_score_std:.4f}"
+                print(f"Epoch {epoch + 1}: {metrics}; saved {last_checkpoint}", flush=True)
+        if dist.is_initialized():
+            dist.barrier()
+    if wb is not None:
+        wb.finish()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def run(cfg):
+    """Run the historical compound recipe with options declared in YAML."""
+    from src.training.options import options_to_argv
+
+    main(options_to_argv(OmegaConf.to_container(cfg.options, resolve=True)))
+
+
+if __name__ == "__main__":
+    main()

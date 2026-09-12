@@ -12,3 +12,7 @@ torch-fidelity
 numpy
 matplotlib
 scipy
+lmdb
+einops
+easydict
+tokenizers

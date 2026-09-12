@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from test_compound_pair_autoregressive import tiny_aux, tiny_config
+from tests.test_compound_pair_autoregressive import tiny_aux, tiny_config
 from src.church_looped_pair import LoopedPairRQTransformer
 
 

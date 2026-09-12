@@ -1,7 +1,7 @@
 import torch
 from omegaconf import OmegaConf
 
-import scripts.train_official_rqtransformer_laser_stage2 as stage2
+import src.training.rqtransformer as stage2
 from src.models.rqtransformer.configs import RQTransformerConfig
 
 

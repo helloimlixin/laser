@@ -1,7 +1,7 @@
 """Church support-first prior with one calibrated joint coefficient decision."""
 import torch
 
-from scripts.train_official_rqtransformer_laser_stage2 import SupportFirstLaserRQTransformer, support_first_objective
+from src.training.rqtransformer import SupportFirstLaserRQTransformer, support_first_objective
 from src.church_ffhq_recipe import recipe_config
 from src.coefficient_pattern_codec import assign_coefficient_patterns, selected_support_grams
 

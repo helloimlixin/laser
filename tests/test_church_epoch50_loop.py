@@ -2,8 +2,8 @@ import copy
 import pytest
 import torch
 
-from test_compound_pair_autoregressive import tiny_aux, tiny_config
-from scripts.train_official_rqtransformer_laser_stage2 import CompoundLaserRQTransformer
+from tests.test_compound_pair_autoregressive import tiny_aux, tiny_config
+from src.training.rqtransformer import CompoundLaserRQTransformer
 from src.church_epoch50_loop import GatedDepthLoop, continuation_lr
 
 

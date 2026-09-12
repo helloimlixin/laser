@@ -32,7 +32,7 @@ def test_rvq_matches_authors_forward_losses_gradients_and_serialized_decoder():
     for (_,a),(_,b) in zip(adapter.quantizer.named_parameters(),original.named_parameters()):
         torch.testing.assert_close(a.grad,b.grad,rtol=1e-6,atol=1e-7)
     assert all(torch.isfinite(p.grad).all() for p in adapter.parameters())
-    from scripts.benchmark_mdctcodec_trained_rvq import payload_roundtrip
+    from archive.scripts.benchmark_mdctcodec_trained_rvq import payload_roundtrip
     for i in range(2):
         payload,parsed=payload_roundtrip(ids[i:i+1].numpy())
         assert len(payload)==12*5

@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
-import scripts.train_official_rqtransformer_laser_stage2 as stage2
-from scripts.train_official_rqtransformer_laser_stage2 import (
+import src.training.rqtransformer as stage2
+from src.training.rqtransformer import (
     atomic_torch_save,
     create_cosine_lr_scheduler,
     create_warmup_linear_lr_scheduler,

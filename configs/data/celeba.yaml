@@ -1,5 +1,5 @@
 dataset: celeba
-data_dir: ${oc.env:CELEBA_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/celeba}
+data_dir: ${oc.env:CELEBA_DIR,${oc.env:DATA_DIR,../data}/celeba}
 batch_size: 8
 # 8 is a good default on a multi-core machine; use data.num_workers=0 only for debugging.
 num_workers: 8

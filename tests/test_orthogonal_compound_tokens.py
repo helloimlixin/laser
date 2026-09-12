@@ -1,7 +1,7 @@
 import torch
 from omegaconf import OmegaConf
 
-from scripts.train_official_rqtransformer_laser_stage2 import (
+from src.training.rqtransformer import (
     CompoundLaserRQTransformer,
     LaserAux,
     OrthogonalCompoundLaserRQTransformer,

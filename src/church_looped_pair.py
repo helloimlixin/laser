@@ -2,7 +2,7 @@
 import torch
 from torch import nn
 
-from scripts.train_official_rqtransformer_laser_stage2 import CompoundLaserRQTransformer
+from src.training.rqtransformer import CompoundLaserRQTransformer
 from src.church_ffhq_recipe import recipe_config
 def sample_field(logits, temperature=1., top_k=0, top_p=None):
     if temperature <= 0 or (top_p is not None and not 0 < top_p <= 1):

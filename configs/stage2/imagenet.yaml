@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - base
+  - override /data: imagenet
+  - _self_
+
+ar:
+  class_conditional: true
+  num_classes: 1000

@@ -1,5 +1,5 @@
 dataset: vctk
-data_dir: ${oc.env:VCTK_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/vctk}
+data_dir: ${oc.env:VCTK_DIR,${oc.env:DATA_DIR,../data}/vctk}
 batch_size: 8
 num_workers: 4
 image_size: 128

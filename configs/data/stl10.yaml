@@ -1,5 +1,5 @@
 dataset: stl10
-data_dir: ${oc.env:STL10_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/stl10}
+data_dir: ${oc.env:STL10_DIR,${oc.env:DATA_DIR,../data}/stl10}
 batch_size: 64
 num_workers: 4
 image_size: 96

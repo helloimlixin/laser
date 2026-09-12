@@ -1,14 +1,14 @@
-Legacy-adjacent helper utilities live here so top-level `scripts/` stays focused on the maintained launch path.
+# Shared utilities
 
-Maintained launch entrypoints:
-- `scripts/profile.sh`
-- `scripts/run.sh`
-- `scripts/sweep.sh`
+Normal training uses [`train.py`](../../train.py) and the stage/dataset YAML
+recipes documented in the [README](../../README.md). Stage 2 builds its cache
+automatically; most runs do not need to call these utilities directly.
 
-Utilities in this directory:
-- `smoke_e2e.py`
-- `cache.py`
-- `compute_rfid.py` - post-hoc paper-style rFID: full validation split by default (`--max-samples 0`); supports ImageNet/image-folder datasets.
-- `kmeans_quantize_sparse_codes.py`
-- `prune_runs.py`
-- `laser_sanity.py`
+- `build_token_cache.py`: extract sparse tokens from Lightning stage-1 checkpoints.
+- `build_official_imagenet_token_cache.py`: extract compound caches from historical
+  upstream checkpoints, including supported face and LSUN datasets.
+- `compute_rfid.py`: reconstruction FID (also exposed by root `compute_rfid.py`).
+- Other files support cache conversions, diagnostics, sampling reports, and local
+  run maintenance. Their individual `--help` describes required inputs.
+
+Experiment launchers have moved to [`archive/scripts/`](../../archive/scripts/).

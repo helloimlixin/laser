@@ -4,7 +4,7 @@ import math
 from omegaconf import OmegaConf
 import torch
 
-from scripts.train_official_rqtransformer_laser_stage2 import CompoundLaserRQTransformer
+from src.training.rqtransformer import CompoundLaserRQTransformer
 from src.models.rqtransformer.configs import RQTransformerConfig
 
 

@@ -2,7 +2,7 @@
 import hashlib
 import torch
 
-from scripts.train_official_rqtransformer_laser_stage2 import build_model
+from src.training.rqtransformer import build_model
 from src.church_epoch50_loop import GatedDepthLoop
 from src.coefficient_history_training import EpochStream
 

@@ -3,7 +3,7 @@ import torch
 
 from src.church_original_scratch import scratch_prior, initialization_audit, FullBatchEpochStream
 from src.church_ffhq_recipe import early_decay_lr
-from test_church_epoch50_loop import pair
+from tests.test_church_epoch50_loop import pair
 
 
 def test_factory_cannot_read_or_load_a_checkpoint():

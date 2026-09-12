@@ -6,7 +6,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "scripts" / "train_foundationvision_var_laser_stage2.py"
+MODULE_PATH = ROOT / "archive" / "scripts" / "train_foundationvision_var_laser_stage2.py"
 SPEC = importlib.util.spec_from_file_location("foundationvision_var_laser", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE

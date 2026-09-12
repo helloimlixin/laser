@@ -1,0 +1,36 @@
+# @package _global_
+defaults:
+  - /config
+  - override /model: image
+  - _self_
+
+stage: stage1
+output_dir: outputs/${data.dataset}/stage1
+
+train:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  max_epochs: 100
+  learning_rate: 4.0e-5
+  beta: 0.5
+  beta2: 0.9
+  warmup_steps: 500
+  min_lr_ratio: 1.0
+  deterministic: false
+  log_every_n_steps: 20
+  run_test_after_fit: false
+
+data:
+  batch_size: 8
+  eval_batch_size: 8
+  num_workers: 4
+  image_size: 256
+  pin_memory: true
+
+wandb:
+  project: laser
+  name: ${data.dataset}-stage1
+  group: ${data.dataset}
+  save_dir: ${output_dir}/wandb

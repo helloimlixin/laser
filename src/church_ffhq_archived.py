@@ -8,11 +8,11 @@ from omegaconf import OmegaConf
 from src import ffhq_v4_archived as archived
 from src.church_epoch50_loop import GatedDepthLoop
 from src.church_original_scratch import FullBatchEpochStream, initialization_audit
-from scripts.train_official_rqtransformer_laser_stage2 import LaserAux as ChurchTokenizer
+from src.training.rqtransformer import LaserAux as ChurchTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_SHA256 = '9ba1b49b4e5e339f0076bebee6fbac5629f6c391601de467019a3723c9d3e33f'
-UPSTREAM_CONFIG = ROOT / 'configs/church_ffhq_archived_upstream.yaml'
+UPSTREAM_CONFIG = ROOT / 'archive/configs/church_ffhq_archived_upstream.yaml'
 
 
 class ChurchAux(ChurchTokenizer):

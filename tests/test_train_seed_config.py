@@ -2,7 +2,7 @@ from pathlib import Path
 
 from hydra import compose, initialize_config_dir
 
-from train import _stage1_fit_checkpoint_kwargs
+from src.training.common import _stage1_fit_checkpoint_kwargs
 
 
 def _compose(*overrides: str):

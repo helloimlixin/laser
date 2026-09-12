@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.train_official_rqtransformer_laser_stage2 import LaserAux, val_image_transform
+from src.training.rqtransformer import LaserAux, val_image_transform
 
 
 class ChurchImages(Dataset):

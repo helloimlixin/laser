@@ -1,6 +1,6 @@
 import os
 
-from scripts.train_official_rqtransformer_laser_stage2 import (
+from src.training.rqtransformer import (
     upload_selected_checkpoint_files,
 )
 

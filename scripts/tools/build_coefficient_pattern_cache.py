@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "third_party" / "rq-vae-transformer"))
 
-from scripts.train_official_rqtransformer_laser_stage2 import load_stage1_checkpoint
+from src.training.rqtransformer import load_stage1_checkpoint
 from src.coefficient_pattern_codec import (
     assign_coefficient_patterns,
     fit_coefficient_patterns,

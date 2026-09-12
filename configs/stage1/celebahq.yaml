@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - base
+  - override /data: celebahq
+  - _self_
+
+model:
+  num_embeddings: 2048
+  sparsity_level: 2
+
+train:
+  max_epochs: 200

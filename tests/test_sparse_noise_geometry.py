@@ -1,6 +1,6 @@
 import torch
 
-from scripts.audit_church_noise_scale import expected_latent_error
+from archive.scripts.audit_church_noise_scale import expected_latent_error
 
 
 def test_expected_error_matches_biased_discrete_sampling_with_correlated_atoms():

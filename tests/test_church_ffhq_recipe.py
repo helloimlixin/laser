@@ -4,7 +4,7 @@ from omegaconf import OmegaConf
 import pytest
 import torch
 
-from scripts.train_official_rqtransformer_laser_stage2 import CompoundLaserRQTransformer, LaserAux
+from src.training.rqtransformer import CompoundLaserRQTransformer, LaserAux
 from src.church_ffhq_recipe import make_prior, early_decay_lr, recipe_targets
 from src.coefficient_history_training import EpochStream
 from src.models.rqtransformer.configs import RQTransformerConfig

@@ -56,7 +56,7 @@ def test_boundaries_are_normalized_without_nan_or_out_of_range_ids():
 
 def test_calibrated_trainer_preserves_training_loop_and_generation():
     root = Path(__file__).resolve().parents[1]
-    old, new = [ast.parse((root/f'scripts/{name}.py').read_text()) for name in
+    old, new = [ast.parse((root/f'archive/scripts/{name}.py').read_text()) for name in
                 ('train_church_ffhq_archived', 'train_church_ffhq_noise')]
     def functions(tree):
         return {n.name:n for n in tree.body if isinstance(n, ast.FunctionDef)}

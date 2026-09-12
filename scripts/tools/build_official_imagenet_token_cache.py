@@ -16,7 +16,7 @@ from torchvision import datasets
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.train_official_rqtransformer_laser_stage2 import (
+from src.training.rqtransformer import (
     LaserAux,
     source_image_dataset,
     val_image_transform,

@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torchaudio.functional import resample
 
-from scripts.benchmark_mdctcodec_vctk import align_mdct, load_reference, pad_encodec_segment_tail
-from scripts.benchmark_mdctcodec_trained_rvq import load_trained_reference
+from archive.scripts.benchmark_mdctcodec_vctk import align_mdct, load_reference, pad_encodec_segment_tail
+from archive.scripts.benchmark_mdctcodec_trained_rvq import load_trained_reference
 from src.mdctcodec_bitstream import pack_frames, unpack_frames
 from src.models.laser import LASER
 

@@ -11,7 +11,7 @@ from src.models.audio_codec import (
 )
 from src.models.dictionary_learner import DictionaryLearning
 from src.models.discriminator import MDCTCodecOfficialDiscriminator
-from train import _make_selected_checkpoint_artifact_callback
+from src.training.common import _make_selected_checkpoint_artifact_callback
 
 
 def test_mdct_reconstructs_boundaries_and_preserves_energy():
@@ -61,7 +61,7 @@ def test_upload_happens_after_every_five_completed_epochs():
 
 
 def test_encodec_short_tail_padding_preserves_original_samples():
-    from scripts.benchmark_mdctcodec_vctk import pad_encodec_segment_tail
+    from archive.scripts.benchmark_mdctcodec_vctk import pad_encodec_segment_tail
     for length, expected in [(47520, 47520), (47521, 48000), (47999, 48000), (48000, 48000)]:
         x = torch.randn(1, 2, length)
         padded = pad_encodec_segment_tail(x, 48000, 47520)

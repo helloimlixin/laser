@@ -2,7 +2,7 @@ import torch
 from omegaconf import OmegaConf
 
 from src.masked_coefficient_head import MaskedCoefficientHead, ids_to_bits, bits_to_ids
-from scripts.train_church_bar_coefficients import CoefficientExperimentPrior
+from archive.scripts.train_church_bar_coefficients import CoefficientExperimentPrior
 from src.models.rqtransformer.configs import RQTransformerConfig
 from types import SimpleNamespace
 

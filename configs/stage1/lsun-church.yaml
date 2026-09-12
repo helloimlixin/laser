@@ -1,0 +1,5 @@
+# @package _global_
+defaults:
+  - base
+  - override /data: lsun_church
+  - _self_

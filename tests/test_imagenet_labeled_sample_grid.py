@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from scripts.train_official_rqtransformer_laser_stage2 import (
+from src.training.rqtransformer import (
     save_class_labeled_grid,
     save_unlabeled_grid,
 )

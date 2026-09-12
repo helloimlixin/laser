@@ -42,6 +42,9 @@ IMAGE_TOKEN_CACHE_DATASETS = [
     "ffhq",
     "imagenet",
     "imagenette2",
+    "lsun_bedroom",
+    "lsun_church",
+    "lsun_cat",
     "stl10",
 ]
 
@@ -64,6 +67,7 @@ def _build_datamodule(args):
         mean=tuple(float(x) for x in args.mean),
         std=tuple(float(x) for x in args.std),
         augment=False,
+        seed=int(getattr(args, "seed", 42)),
         max_items=int(args.max_items),
     )
     return build_stage1_datamodule(data_cfg)
@@ -454,6 +458,7 @@ def main():
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42, help="Match the stage-1 dataset split seed.")
     parser.add_argument("--mean", type=float, nargs=3, default=(0.5, 0.5, 0.5))
     parser.add_argument("--std", type=float, nargs=3, default=(0.5, 0.5, 0.5))
     parser.add_argument("--coeff_vocab_size", type=int, default=16, help="Number of coefficient bins.")

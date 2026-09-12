@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - base
+  - override /data: cc3m
+  - _self_
+
+# Cache captions alongside sparse image tokens for text-conditioned generation.
+token_cache:
+  text_tokenizer: char
+  text_max_length: 160
+
+ar:
+  text_conditional: true
+  text_conditioning_mode: rq_prefix
+  text_prefix_length: 32
+
+train_ar:
+  sample_text_prompts:
+    - A small house beside a lake
+    - A cat sitting on a wooden chair

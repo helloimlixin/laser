@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from types import SimpleNamespace
 
-from scripts.train_church_bar_coefficients import CoefficientExperimentPrior
+from archive.scripts.train_church_bar_coefficients import CoefficientExperimentPrior
 from src.models.rqtransformer.configs import RQTransformerConfig
 from src.coefficient_history_training import (
     EpochStream, categorical_draw, recovery_mask, sample_coefficient_span,

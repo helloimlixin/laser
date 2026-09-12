@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import functional as TF
 
-from scripts.train_official_rqtransformer_laser_stage2 import CompoundLaserRQTransformer
+from src.training.rqtransformer import CompoundLaserRQTransformer
 from src.church_ffhq_recipe import recipe_config
 from src.coefficient_history_training import EpochStream
 

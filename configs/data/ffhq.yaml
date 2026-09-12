@@ -1,5 +1,5 @@
 dataset: ffhq
-data_dir: ${oc.env:FFHQ_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/ffhq}
+data_dir: ${oc.env:FFHQ_DIR,${oc.env:DATA_DIR,../data}/ffhq}
 batch_size: ${oc.env:FFHQ_BATCH_SIZE,96}
 eval_batch_size: ${oc.env:FFHQ_EVAL_BATCH_SIZE,256}
 num_workers: ${oc.env:FFHQ_NUM_WORKERS,32}

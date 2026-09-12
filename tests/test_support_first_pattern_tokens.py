@@ -4,7 +4,7 @@ import torch
 from omegaconf import OmegaConf
 
 from src.models.rqtransformer.configs import RQTransformerConfig
-from scripts.train_official_rqtransformer_laser_stage2 import (
+from src.training.rqtransformer import (
     CoefficientPatternCacheDataset,
     SupportFirstLaserRQTransformer,
     support_first_objective,

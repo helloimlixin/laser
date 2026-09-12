@@ -5,8 +5,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from scripts.train_official_rqtransformer_laser_stage2 import build_model
-from scripts.train_church_bar_coefficients import quantized_splits
+from src.training.rqtransformer import build_model
+from archive.scripts.train_church_bar_coefficients import quantized_splits
 
 
 class GatedDepthLoop(nn.Module):

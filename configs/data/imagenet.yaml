@@ -1,5 +1,5 @@
 dataset: imagenet
-data_dir: ${oc.env:IMAGENET_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/imagenet}
+data_dir: ${oc.env:IMAGENET_DIR,${oc.env:DATA_DIR,../data}/imagenet}
 batch_size: 8
 eval_batch_size: null
 num_workers: 8

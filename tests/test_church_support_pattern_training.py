@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 import torch
 
-from scripts.train_official_rqtransformer_laser_stage2 import SupportFirstLaserRQTransformer
+from src.training.rqtransformer import SupportFirstLaserRQTransformer
 from src.church_support_pattern_training import pattern_targets, pattern_objective, support_pattern_prior, ChurchSupportPatternRQTransformer
 from src.models.rqtransformer.configs import RQTransformerConfig
 

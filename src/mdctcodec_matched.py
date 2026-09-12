@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from src.models.laser import LASER
 from src.mdctcodec_bitstream import pack_frames, unpack_frames
-from scripts.benchmark_mdctcodec_trained_rvq import payload_roundtrip
-from scripts.benchmark_mdctcodec_vctk import align_mdct, measure
+from archive.scripts.benchmark_mdctcodec_trained_rvq import payload_roundtrip
+from archive.scripts.benchmark_mdctcodec_vctk import align_mdct, measure
 
 
 def tensor_hash(state):

@@ -4,7 +4,7 @@ import math
 import torch
 from torch import nn
 
-from scripts.train_official_rqtransformer_laser_stage2 import CompoundLaserRQTransformer
+from src.training.rqtransformer import CompoundLaserRQTransformer
 from src.church_ffhq_recipe import recipe_config
 from src.church_pattern_order import ChurchPatternOrderRQTransformer, sample_field
 from src.complete_sparse_codec import pack_exact

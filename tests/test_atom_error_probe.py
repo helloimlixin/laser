@@ -1,6 +1,6 @@
 import torch
 
-from scripts.probe_church_atom_error_propagation import (
+from archive.scripts.probe_church_atom_error_propagation import (
     exclude_site_atoms, scalar_projection_coefficient, select_coefficients, restore_component,
 )
 

@@ -1,6 +1,6 @@
 import torch
 
-from scripts.train_official_rqtransformer_laser_stage2 import LevelwiseLaserVAR
+from src.training.rqtransformer import LevelwiseLaserVAR
 
 
 class TinyAux(torch.nn.Module):

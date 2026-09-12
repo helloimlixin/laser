@@ -1,0 +1,50 @@
+# @package _global_
+defaults:
+  - _self_
+
+# Compatibility recipe for upstream .pt checkpoints and compound token caches.
+# The regular ffhq.yaml recipe consumes this repository's Lightning .ckpt files.
+stage: stage2
+backend: rqtransformer
+options:
+  checkpoint: ???
+  data: ${oc.env:FFHQ_DIR,${oc.env:DATA_DIR,../data}/ffhq}
+  token_cache: ???
+  output: outputs/ffhq/stage2-compound
+  dataset: ffhq
+  model_preset: ffhq-350m
+  distributed_backend: ddp
+  epochs: 200
+  batch_size: 8
+  total_batch_size: 128
+  num_atoms: 2048
+  sparsity_level: 2
+  coeff_vocab_size: 1024
+  coeff_max: 3
+  compound_tokens: true
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  compound_distribution_geometry: true
+  geometry_top_k: 4
+  atom_loss_weight: 1.5
+  geometry_loss_weight: 0.05
+  geometry_start_epoch: 2
+  geometry_warmup_epochs: 3
+  lr: 0.0005
+  lr_schedule: constant
+  atom_temperature: 1.0
+  atom_top_k: 250
+  atom_top_p: 1.0
+  coeff_temperature: 1.0
+  coeff_top_k: 250
+  coeff_top_p: 1.0
+  fid_num_samples: 50000
+  fid_batch_size: 8
+  fid_every: 50
+  save_ckpt_freq: 10
+  sample_grid_every: 1000
+  wandb_entity: null
+  wandb_project: laser
+  wandb_name: ffhq-compound
+  wandb_id: null
+  resume: false

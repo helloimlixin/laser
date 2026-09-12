@@ -66,7 +66,7 @@ def test_invalid_noise_parameters(sigma, relative, truncate):
 
 def test_trainer_keeps_archived_training_evaluation_and_generation():
     root = Path(__file__).resolve().parents[1]
-    old, new = [ast.parse((root/f'scripts/{name}.py').read_text()) for name in
+    old, new = [ast.parse((root/f'archive/scripts/{name}.py').read_text()) for name in
                 ('train_church_ffhq_noise', 'train_church_relative_noise')]
     def functions(tree):
         return {n.name:n for n in tree.body if isinstance(n, ast.FunctionDef)}

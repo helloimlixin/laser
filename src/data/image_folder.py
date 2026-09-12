@@ -17,6 +17,15 @@ def normalize_image_folder_dataset_name(name: str) -> str:
     return str(name).strip().lower().replace("-", "_")
 
 
+def _unconditional_target(_target) -> int:
+    return 0
+
+
+def _lsun_categories(dataset_name: str) -> tuple[str, ...]:
+    category = dataset_name.removeprefix("lsun_")
+    return ("church_outdoor", "church") if category == "church" else (category,)
+
+
 class ImageFolderDataModule(pl.LightningDataModule):
     """Generic RGB image-folder datamodule for paper-aligned image datasets.
 
@@ -45,6 +54,10 @@ class ImageFolderDataModule(pl.LightningDataModule):
         stem = self.dataset_name
         if stem.startswith("lsun_"):
             category = stem.removeprefix("lsun_")
+            # Standard LSUN downloads keep category databases beside one another.
+            if any((raw.parent / f"{name}_train_lmdb" / "data.mdb").is_file()
+                   for name in _lsun_categories(stem)):
+                candidates.append(raw.parent)
             candidates.extend(
                 [
                     Path(f"/scratch/{Path.home().name}/datasets/lsun") / category,
@@ -151,6 +164,23 @@ class ImageFolderDataModule(pl.LightningDataModule):
             return
 
         root = self._resolve_data_dir()
+        categories = _lsun_categories(self.dataset_name) if self.dataset_name.startswith("lsun_") else ()
+        for category in categories:
+            train_db = root / f"{category}_train_lmdb"
+            val_db = root / f"{category}_val_lmdb"
+            if (train_db / "data.mdb").is_file():
+                if not (val_db / "data.mdb").is_file():
+                    raise FileNotFoundError(f"LSUN validation database not found: {val_db}")
+                from torchvision.datasets import LSUNClass
+
+                self.train_dataset = LSUNClass(
+                    str(train_db), transform=self._train_transform(), target_transform=_unconditional_target
+                )
+                self.val_dataset = LSUNClass(
+                    str(val_db), transform=self._eval_transform(), target_transform=_unconditional_target
+                )
+                self.test_dataset = self.val_dataset
+                return
         train_list_file = getattr(self.config, "train_list_file", None)
         val_list_file = getattr(self.config, "val_list_file", None)
         if train_list_file or val_list_file:

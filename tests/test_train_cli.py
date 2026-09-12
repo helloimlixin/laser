@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import train
+from src.training import legacy_cli as train
 
 
 def test_direct_yaml_config_builds_stage_command(tmp_path):
@@ -155,7 +155,7 @@ def test_stage2_command_uses_train_py_stage2_selector():
 
 
 def _assert_imagenet_pipeline_uses_rqvae_style_backbone(config_name, *, sparsity_level):
-    config = Path(__file__).resolve().parents[1] / "configs" / config_name
+    config = Path(__file__).resolve().parents[1] / "archive" / "configs" / config_name
 
     commands, _, _ = train._pipeline_commands(config)
     command_by_label = {label: cmd for label, cmd in commands}

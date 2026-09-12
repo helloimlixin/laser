@@ -1,0 +1,55 @@
+# @package _global_
+defaults:
+  - /config_ar
+  - /data: ffhq
+  - _self_
+
+stage: stage2
+output_dir: outputs/${data.dataset}/stage2
+token_cache_path: ${output_dir}/token_cache/train.pt
+
+# Stage 2 extracts these tokens once, then reuses the cache on later launches.
+token_cache:
+  build: true
+  stage1_output_root: outputs/${data.dataset}/stage1
+  output: ${token_cache_path}
+  cache_mode: quantized
+  coeff_vocab_size: 1024
+  coeff_quantization: quantile
+  coeff_calibration_percentile: 99.5
+  batch_size: 32
+  num_workers: ${data.num_workers}
+
+ar:
+  type: sparse_spatial_depth
+  d_model: 768
+  n_heads: 12
+  n_layers: 12
+  n_depth_layers: 4
+  d_ff: 3072
+  learning_rate: 5.0e-4
+  warmup_steps: 1000
+  max_steps: 300000
+
+train_ar:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  batch_size: 32
+  max_epochs: 300
+  deterministic: false
+  val_check_interval: 1.0
+  sample_every_n_epochs: 10
+  sample_num_images: 8
+  run_test_after_fit: false
+  save_final_samples_after_fit: false
+
+data:
+  num_workers: 4
+
+wandb:
+  project: laser
+  name: ${data.dataset}-stage2
+  group: ${data.dataset}
+  save_dir: ${output_dir}/wandb

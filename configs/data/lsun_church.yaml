@@ -1,5 +1,5 @@
 dataset: lsun_church
-data_dir: ${oc.env:LSUN_CHURCH_DIR,${oc.env:LSUN_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/lsun}/church}
+data_dir: ${oc.env:LSUN_CHURCH_DIR,${oc.env:LSUN_DIR,${oc.env:DATA_DIR,../data}/lsun}/church}
 batch_size: 8
 num_workers: 8
 image_size: 256

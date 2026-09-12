@@ -1,5 +1,5 @@
 dataset: celebahq
-data_dir: ${oc.env:CELEBAHQ_DIR,${oc.env:CELEBA_HQ_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/celebahq}}
+data_dir: ${oc.env:CELEBAHQ_DIR,${oc.env:CELEBA_HQ_DIR,${oc.env:DATA_DIR,../data}/celebahq}}
 batch_size: ${oc.env:CELEBAHQ_BATCH_SIZE,32}
 eval_batch_size: ${oc.env:CELEBAHQ_EVAL_BATCH_SIZE,32}
 num_workers: ${oc.env:CELEBAHQ_NUM_WORKERS,8}

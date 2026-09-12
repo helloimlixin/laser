@@ -1,6 +1,6 @@
 from omegaconf import OmegaConf
 
-from train import _sample_text_prompts
+from src.training.common import _sample_text_prompts
 
 
 def test_sample_text_prompts_prefers_train_ar_prompts():

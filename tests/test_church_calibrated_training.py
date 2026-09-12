@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from scripts.train_official_rqtransformer_laser_stage2 import LaserAux
+from src.training.rqtransformer import LaserAux
 from src.church_calibrated_training import (
     physical_targets, augmented_view, AugmentedChurch, PendingEpochBatches,
     HeldoutStop, calibrated_prior, optimizer_groups,
