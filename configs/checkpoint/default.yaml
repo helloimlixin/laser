@@ -9,7 +9,12 @@ mode: "min"
 save_top_k: 3
 save_last: true
 every_n_epochs: 1
+# Reuse the source checkpoint directory on full-state resumes when explicitly
+# enabled by a run config, preserving ModelCheckpoint's top-k bookkeeping.
+resume_in_place: false
 # Upload the currently selected top-k checkpoints plus last.ckpt to W&B as one
 # explicit artifact. This replaces Lightning's opaque log_model="all" behavior.
 upload_to_wandb: true
+# "artifact" keeps versioned model lineage; "files" maintains mutable run-file slots.
+upload_mode: artifact
 upload_every_n_epochs: 1

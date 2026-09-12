@@ -1,6 +1,7 @@
 import math
 import os
 import wave
+import fnmatch
 from pathlib import Path
 from typing import List, Sequence, Tuple, Union
 
@@ -207,7 +208,12 @@ class VCTKSpectrogramDataset(Dataset):
         self.paths = [Path(p) for p in paths]
         self.train = bool(train)
         self.sample_rate = int(config.sample_rate)
-        self.audio_num_samples = int(config.audio_num_samples)
+        eval_num_samples = getattr(config, "audio_eval_num_samples", None)
+        self.audio_num_samples = int(
+            config.audio_num_samples
+            if self.train or eval_num_samples is None
+            else eval_num_samples
+        )
         self.n_fft = int(config.stft_n_fft)
         self.hop_length = int(config.stft_hop_length)
         self.win_length = int(config.stft_win_length or config.stft_n_fft)
@@ -233,7 +239,12 @@ class VCTKSpectrogramDataset(Dataset):
         if self.win_length > self.n_fft:
             raise ValueError(f"stft_win_length ({self.win_length}) must be <= stft_n_fft ({self.n_fft})")
         self.window = torch.hann_window(self.win_length, periodic=True)
-        self.texts = [_read_vctk_transcript(path) for path in self.paths]
+        load_text = bool(getattr(config, "audio_load_text", True))
+        self.texts = (
+            [_read_vctk_transcript(path) for path in self.paths]
+            if load_text
+            else [""] * len(self.paths)
+        )
         self.speaker_to_index = dict(speaker_to_index or {
             speaker: idx for idx, speaker in enumerate(sorted({path.parent.name for path in self.paths}))
         })
@@ -335,7 +346,21 @@ class VCTKWaveformDataset(Dataset):
         self.paths = [Path(p) for p in paths]
         self.train = bool(train)
         self.sample_rate = int(config.sample_rate)
-        self.audio_num_samples = int(config.audio_num_samples)
+        eval_num_samples = getattr(config, "audio_eval_num_samples", None)
+        self.audio_num_samples = int(
+            config.audio_num_samples
+            if self.train or eval_num_samples is None
+            else eval_num_samples
+        )
+        self.eval_full_utterance = bool(
+            getattr(config, "audio_eval_full_utterance", False)
+        )
+        self.eval_alignment_hop = max(
+            1, int(getattr(config, "audio_eval_alignment_hop", 1))
+        )
+        self.eval_frame_multiple = max(
+            1, int(getattr(config, "audio_eval_frame_multiple", 1))
+        )
         self.augment = bool(config.augment)
         self.dc_remove = bool(getattr(config, "audio_dc_remove", False))
         self.peak_normalize = bool(getattr(config, "audio_peak_normalize", False))
@@ -343,12 +368,27 @@ class VCTKWaveformDataset(Dataset):
         self.rms_normalize = bool(getattr(config, "audio_rms_normalize", False))
         self.target_rms = float(getattr(config, "audio_target_rms", 0.12))
         self.max_gain = float(getattr(config, "audio_max_gain", 8.0))
+        self.random_gain_db_min = float(
+            getattr(config, "audio_random_gain_db_min", 0.0)
+        )
+        self.random_gain_db_max = float(
+            getattr(config, "audio_random_gain_db_max", 0.0)
+        )
+        if self.random_gain_db_min > self.random_gain_db_max:
+            raise ValueError(
+                "audio_random_gain_db_min must be <= audio_random_gain_db_max"
+            )
         self.min_crop_rms = max(0.0, float(getattr(config, "audio_min_crop_rms", 0.0)))
         self.crop_attempts = max(1, int(getattr(config, "audio_crop_attempts", 1)))
         self.fade_samples = max(0, int(getattr(config, "audio_fade_samples", 0)))
         if self.audio_num_samples <= 0:
             raise ValueError(f"audio_num_samples must be positive, got {self.audio_num_samples}")
-        self.texts = [_read_vctk_transcript(path) for path in self.paths]
+        load_text = bool(getattr(config, "audio_load_text", True))
+        self.texts = (
+            [_read_vctk_transcript(path) for path in self.paths]
+            if load_text
+            else [""] * len(self.paths)
+        )
         self.speaker_to_index = dict(speaker_to_index or {
             speaker: idx for idx, speaker in enumerate(sorted({path.parent.name for path in self.paths}))
         })
@@ -391,6 +431,27 @@ class VCTKWaveformDataset(Dataset):
     def _crop_or_pad(self, waveform: np.ndarray) -> Tuple[torch.Tensor, dict]:
         audio = torch.from_numpy(waveform.astype(np.float32, copy=False))
         length = int(audio.numel())
+        if not self.train and self.eval_full_utterance:
+            # MDCTCodec validates complete utterances at batch size one. Align
+            # the length exactly as its Dataset(split=False): the padded MDCT
+            # frame count (T / hop + 1) must be divisible by the encoder ratio.
+            hop = self.eval_alignment_hop
+            frame_multiple = self.eval_frame_multiple
+            aligned_frames = ((length // hop + 1) // frame_multiple) * frame_multiple
+            aligned_length = (aligned_frames - 1) * hop
+            if aligned_length <= 0:
+                aligned_length = (frame_multiple - 1) * hop
+                output = torch.zeros(aligned_length, dtype=torch.float32)
+                output[: min(length, aligned_length)] = audio[:aligned_length]
+                mode = CROP_MODE_PAD
+            else:
+                output = audio[:aligned_length]
+                mode = CROP_MODE_SLICE
+            return output, {
+                "crop_mode": mode,
+                "crop_offset": 0,
+                "source_num_samples": length,
+            }
         target = self.audio_num_samples
         if length >= target:
             max_offset = length - target
@@ -414,6 +475,26 @@ class VCTKWaveformDataset(Dataset):
             "source_num_samples": length,
         }
 
+    def _apply_random_gain(self, waveform: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.train
+            or not self.augment
+            or self.random_gain_db_min == self.random_gain_db_max == 0.0
+        ):
+            return waveform
+        gain_db = torch.empty((), dtype=waveform.dtype).uniform_(
+            self.random_gain_db_min,
+            self.random_gain_db_max,
+        )
+        peak = waveform.abs().max()
+        if float(peak.item()) > 1.0e-8:
+            safe_gain_db = 20.0 * torch.log10(
+                waveform.new_tensor(0.999) / peak
+            )
+            gain_db = torch.minimum(gain_db, safe_gain_db)
+        gain = torch.pow(waveform.new_tensor(10.0), gain_db / 20.0)
+        return (waveform * gain).clamp(-0.999, 0.999)
+
     def __getitem__(self, index: int):
         path = self.paths[index]
         sample_rate, samples = _read_audio_file(path)
@@ -433,6 +514,7 @@ class VCTKWaveformDataset(Dataset):
             max_gain=self.max_gain,
             peak_limit=self.target_peak,
         )
+        waveform = self._apply_random_gain(waveform)
         meta = {
             "path": str(path),
             "speaker_id": path.parent.name,
@@ -470,20 +552,27 @@ class VCTKDataModule(pl.LightningDataModule):
 
     def _list_audio_files(self, root: Union[str, Path]) -> List[Path]:
         base = Path(root)
-        wav_paths = sorted(
+        # A single recursive walk matters on network filesystems: VCTK 0.92 has
+        # tens of thousands of utterances, and the historical WAV/FLAC passes
+        # doubled startup metadata I/O.
+        audio_paths = sorted(
             path for path in base.rglob("*")
-            if path.is_file() and path.suffix.lower() in WAV_EXTENSIONS
+            if path.suffix.lower() in (WAV_EXTENSIONS | FLAC_EXTENSIONS)
         )
-        flac_paths = sorted(
-            path for path in base.rglob("*")
-            if path.is_file() and path.suffix.lower() in FLAC_EXTENSIONS
-        )
-        audio_paths = wav_paths + flac_paths
         if audio_paths:
             return audio_paths
         raise RuntimeError(f"No WAV/FLAC audio files found under {base}")
 
     def _filter_audio_files(self, paths: Sequence[Path]) -> List[Path]:
+        file_pattern = str(
+            getattr(self.config, "audio_file_pattern", "") or ""
+        ).strip()
+        if file_pattern:
+            paths = [path for path in paths if fnmatch.fnmatch(path.name, file_pattern)]
+            if not paths:
+                raise RuntimeError(
+                    f"VCTK audio_file_pattern={file_pattern!r} matched no files"
+                )
         min_duration = max(0.0, float(getattr(self.config, "audio_min_duration_seconds", 0.0) or 0.0))
         max_duration = max(0.0, float(getattr(self.config, "audio_max_duration_seconds", 0.0) or 0.0))
         require_text = bool(getattr(self.config, "audio_require_text", False))
@@ -601,15 +690,96 @@ class VCTKDataModule(pl.LightningDataModule):
         self.num_speakers = len(self.speaker_ids)
 
         generator = torch.Generator().manual_seed(int(self.config.seed))
-        indices = torch.randperm(num_items, generator=generator)
-        num_val = max(1, int(round(0.05 * num_items)))
-        num_test = max(1, int(round(0.05 * num_items)))
-        num_val = min(num_val, num_items - 2)
-        num_test = min(num_test, num_items - num_val - 1)
-        num_train = num_items - num_val - num_test
-        train_idx = indices[:num_train].tolist()
-        val_idx = indices[num_train:num_train + num_val].tolist()
-        test_idx = indices[num_train + num_val:num_train + num_val + num_test].tolist()
+        split_protocol = str(
+            getattr(self.config, "audio_split_protocol", "") or ""
+        ).strip().lower()
+        if split_protocol in {"mdctcodec", "mdctcodec_vctk", "mdctcodec_disjoint"}:
+            # The MDCTCodec/APCodec VCTK protocol uses the 43,873 mic2 files:
+            # all 40,936 utterances from 100 speakers train the model, while
+            # 2,937 utterances from eight unseen speakers form the published
+            # evaluation set. The authors' public trainer calls this second
+            # directory "validation" and evaluates the same held-out pool, so
+            # expose it as both val and test rather than silently withholding
+            # ten percent of the 40,936 training utterances.
+            expected_test_speakers = {
+                "p360", "p361", "p362", "p363", "p364", "p374", "p376", "s5"
+            }
+            test_speakers = expected_test_speakers.intersection(self.speaker_ids)
+            if len(test_speakers) != len(expected_test_speakers):
+                missing = sorted(expected_test_speakers - test_speakers)
+                raise RuntimeError(
+                    "MDCTCodec VCTK split requires the canonical mic2 speakers; "
+                    f"missing {missing}"
+                )
+            train_val_idx = [
+                idx
+                for idx, path in enumerate(audio_paths)
+                if path.parent.name not in test_speakers
+            ]
+            test_idx = [
+                idx
+                for idx, path in enumerate(audio_paths)
+                if path.parent.name in test_speakers
+            ]
+            if len(train_val_idx) != 40_936 or len(test_idx) != 2_937:
+                raise RuntimeError(
+                    "MDCTCodec VCTK protocol expected 40,936 train/val and "
+                    f"2,937 test mic2 files, got {len(train_val_idx)} and {len(test_idx)}"
+                )
+            train_idx = train_val_idx
+            val_idx = test_idx
+            if split_protocol == "mdctcodec_disjoint":
+                # Earlier runs selected checkpoints on the first four files
+                # and monitored losses on the first 64. Reserve those files
+                # from the new test set, along with a balanced validation set.
+                legacy_validation = set(test_idx[:64])
+                by_speaker = {
+                    speaker: [i for i in test_idx if audio_paths[i].parent.name == speaker]
+                    for speaker in sorted(test_speakers)
+                }
+                val_idx = [i for indices in by_speaker.values() for i in indices[:4]]
+                reserved = legacy_validation.union(val_idx)
+                test_idx = [i for i in test_idx if i not in reserved]
+        elif bool(getattr(self.config, "audio_split_by_speaker", False)):
+            if len(self.speaker_ids) < 3:
+                raise RuntimeError(
+                    "audio_split_by_speaker requires at least three distinct speakers"
+                )
+            speaker_order = torch.randperm(len(self.speaker_ids), generator=generator).tolist()
+            shuffled_speakers = [self.speaker_ids[int(index)] for index in speaker_order]
+            num_val_speakers = max(1, int(round(0.05 * len(shuffled_speakers))))
+            num_test_speakers = max(1, int(round(0.05 * len(shuffled_speakers))))
+            num_val_speakers = min(num_val_speakers, len(shuffled_speakers) - 2)
+            num_test_speakers = min(
+                num_test_speakers,
+                len(shuffled_speakers) - num_val_speakers - 1,
+            )
+            val_speakers = set(shuffled_speakers[:num_val_speakers])
+            test_speakers = set(
+                shuffled_speakers[
+                    num_val_speakers:num_val_speakers + num_test_speakers
+                ]
+            )
+            train_speakers = set(shuffled_speakers) - val_speakers - test_speakers
+            train_idx = [
+                idx for idx, path in enumerate(audio_paths) if path.parent.name in train_speakers
+            ]
+            val_idx = [
+                idx for idx, path in enumerate(audio_paths) if path.parent.name in val_speakers
+            ]
+            test_idx = [
+                idx for idx, path in enumerate(audio_paths) if path.parent.name in test_speakers
+            ]
+        else:
+            indices = torch.randperm(num_items, generator=generator)
+            num_val = max(1, int(round(0.05 * num_items)))
+            num_test = max(1, int(round(0.05 * num_items)))
+            num_val = min(num_val, num_items - 2)
+            num_test = min(num_test, num_items - num_val - 1)
+            num_train = num_items - num_val - num_test
+            train_idx = indices[:num_train].tolist()
+            val_idx = indices[num_train:num_train + num_val].tolist()
+            test_idx = indices[num_train + num_val:num_train + num_val + num_test].tolist()
 
         def gather(idxs: Sequence[int]) -> List[Path]:
             return [audio_paths[int(i)] for i in idxs]
@@ -654,9 +824,10 @@ class VCTKDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         val_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
+        eval_batch_size = self.config.eval_batch_size or self.config.batch_size
         return self._build_loader(
             dataset=self.val_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
             num_workers=val_workers,
             seed_offset=1,
@@ -664,9 +835,10 @@ class VCTKDataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         test_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
+        eval_batch_size = self.config.eval_batch_size or self.config.batch_size
         return self._build_loader(
             dataset=self.test_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
             num_workers=test_workers,
             seed_offset=2,
@@ -680,13 +852,16 @@ class VCTKDataModule(pl.LightningDataModule):
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=False,
+            pin_memory=bool(getattr(self.config, "pin_memory", False)),
             persistent_workers=(num_workers > 0),
             generator=self._loader_generator(seed_offset),
         )
         if num_workers > 0:
             kwargs["timeout"] = 120
             kwargs["multiprocessing_context"] = "spawn"
+            prefetch_factor = getattr(self.config, "prefetch_factor", None)
+            if prefetch_factor is not None:
+                kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
         else:
             kwargs["timeout"] = 0
         return DataLoader(**kwargs)

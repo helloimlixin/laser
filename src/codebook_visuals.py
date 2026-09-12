@@ -108,6 +108,358 @@ def render_codebook_scatter(snapshots, steps, *, title: str):
     return image
 
 
+def render_dictionary_usage_scatter(
+    atoms: torch.Tensor,
+    usage: torch.Tensor,
+    contribution: torch.Tensor,
+    *,
+    atom_ids: torch.Tensor | None = None,
+    step: int = 0,
+    title: str = "Dictionary atoms",
+):
+    """Render dictionary geometry together with empirical sparse-code usage.
+
+    PCA coordinates provide a geometry for the atoms; raw atom IDs do not. The
+    left panel therefore shows the projected dictionary with validation-active
+    atoms colored by selection count and sized by absolute coefficient
+    contribution. The right panel makes load concentration explicit by plotting
+    selection count against mean absolute coefficient for each active atom.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    atoms = torch.nan_to_num(atoms.detach().cpu().to(torch.float32))
+    usage = torch.nan_to_num(usage.detach().cpu().to(torch.float32)).reshape(-1)
+    contribution = torch.nan_to_num(
+        contribution.detach().cpu().to(torch.float32)
+    ).reshape(-1)
+    if atoms.ndim != 2:
+        raise ValueError(f"Expected atoms [N,D], got {tuple(atoms.shape)}")
+    count = int(atoms.size(0))
+    if usage.numel() != count or contribution.numel() != count:
+        raise ValueError(
+            "atoms, usage, and contribution must have the same leading size; "
+            f"got {count}, {usage.numel()}, {contribution.numel()}"
+        )
+    if atom_ids is None:
+        atom_ids = torch.arange(count, dtype=torch.long)
+    else:
+        atom_ids = atom_ids.detach().cpu().to(torch.long).reshape(-1)
+    if atom_ids.numel() != count:
+        raise ValueError(
+            f"atom_ids must contain {count} entries, got {atom_ids.numel()}"
+        )
+    if count == 0:
+        return None
+
+    projected, pc1_var, pc2_var = _pca_project_snapshots([atoms])
+    points = projected[0]
+    x_lim, y_lim = _fixed_square_axis_limits(projected)
+    usage_np = usage.numpy()
+    contribution_np = contribution.numpy()
+    active = usage_np > 0
+    active_count = int(active.sum())
+    total_selections = float(usage_np.sum())
+    active_usage = np.log1p(usage_np[active]) if active_count else np.empty(0)
+    active_contribution = contribution_np[active] if active_count else np.empty(0)
+    if active_count:
+        size_scale = active_contribution / (active_contribution.max() + 1.0e-8)
+        active_sizes = 20.0 + 90.0 * np.sqrt(size_scale)
+    else:
+        active_sizes = np.empty(0)
+
+    fig, (ax_geom, ax_load) = plt.subplots(1, 2, figsize=(14, 6))
+    ax_geom.scatter(
+        points[:, 0],
+        points[:, 1],
+        c="#c7c7c7",
+        s=8,
+        alpha=0.28,
+        linewidths=0,
+        label="not selected in visual batch",
+    )
+    scatter = None
+    if active_count:
+        scatter = ax_geom.scatter(
+            points[active, 0],
+            points[active, 1],
+            c=active_usage,
+            s=active_sizes,
+            cmap="viridis",
+            alpha=0.9,
+            linewidths=0.25,
+            edgecolors="black",
+            label="selected atom",
+        )
+        top_local = np.argsort(active_contribution)[-min(8, active_count):]
+        active_indices = np.flatnonzero(active)
+        for local_idx in top_local:
+            point_idx = int(active_indices[local_idx])
+            ax_geom.annotate(
+                str(int(atom_ids[point_idx].item())),
+                (points[point_idx, 0], points[point_idx, 1]),
+                xytext=(3, 3),
+                textcoords="offset points",
+                fontsize=7,
+                color="#202020",
+            )
+    ax_geom.set_xlim(x_lim)
+    ax_geom.set_ylim(y_lim)
+    ax_geom.set_aspect("equal", adjustable="box")
+    ax_geom.set_xlabel(f"PC1 ({pc1_var:.1f}% variance)")
+    ax_geom.set_ylabel(f"PC2 ({pc2_var:.1f}% variance)")
+    ax_geom.set_title("Atom geometry and validation usage")
+    ax_geom.legend(loc="best", fontsize=8, frameon=False)
+    if scatter is not None:
+        colorbar = fig.colorbar(scatter, ax=ax_geom, fraction=0.045, pad=0.02)
+        colorbar.set_label("log(1 + selection count)")
+
+    if active_count:
+        mean_magnitude = active_contribution / np.maximum(usage_np[active], 1.0)
+        load_scatter = ax_load.scatter(
+            usage_np[active],
+            mean_magnitude,
+            c=active_usage,
+            s=active_sizes,
+            cmap="viridis",
+            alpha=0.82,
+            linewidths=0.25,
+            edgecolors="black",
+        )
+        ax_load.set_xscale("log")
+        top_local = np.argsort(active_contribution)[-min(10, active_count):]
+        active_ids = atom_ids[torch.from_numpy(np.flatnonzero(active)).long()].numpy()
+        for local_idx in top_local:
+            ax_load.annotate(
+                str(int(active_ids[local_idx])),
+                (usage_np[active][local_idx], mean_magnitude[local_idx]),
+                xytext=(3, 3),
+                textcoords="offset points",
+                fontsize=7,
+            )
+        colorbar = fig.colorbar(load_scatter, ax=ax_load, fraction=0.045, pad=0.02)
+        colorbar.set_label("log(1 + selection count)")
+    else:
+        ax_load.text(
+            0.5,
+            0.5,
+            "No validation selections available",
+            ha="center",
+            va="center",
+            transform=ax_load.transAxes,
+        )
+    ax_load.set_xlabel("Selection count (log scale)")
+    ax_load.set_ylabel("Mean |coefficient|")
+    ax_load.set_title("Active-atom load and contribution")
+    ax_load.grid(True, alpha=0.2)
+
+    fig.suptitle(
+        f"{title} | step {int(step)} | active {active_count}/{count} sampled atoms | "
+        f"{int(total_selections)} selections",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    image = _figure_to_rgb_array(fig)
+    plt.close(fig)
+    return image
+
+
+def render_dictionary_diagnostics(
+    atoms: torch.Tensor,
+    usage: torch.Tensor,
+    contribution: torch.Tensor,
+    *,
+    atom_ids: torch.Tensor | None = None,
+    step: int = 0,
+    movement_snapshots: tuple[torch.Tensor, torch.Tensor] | None = None,
+    movement_steps: tuple[int, int] | None = None,
+    title: str = "Dictionary diagnostics",
+):
+    """Render geometry and load diagnostics without a lossy 2-D embedding.
+
+    Pairwise and nearest-neighbor cosine statistics are measured in the actual
+    atom space. Usage concentration is shown as cumulative mass, and aligned
+    snapshots use angular drift rather than projected PCA displacement.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    atoms = torch.nan_to_num(atoms.detach().cpu().to(torch.float32))
+    usage = torch.nan_to_num(usage.detach().cpu().to(torch.float32)).reshape(-1)
+    contribution = torch.nan_to_num(
+        contribution.detach().cpu().to(torch.float32)
+    ).reshape(-1)
+    if atoms.ndim != 2:
+        raise ValueError(f"Expected atoms [N,D], got {tuple(atoms.shape)}")
+    count = int(atoms.size(0))
+    if count == 0:
+        return None
+    if usage.numel() != count or contribution.numel() != count:
+        raise ValueError(
+            "atoms, usage, and contribution must have the same leading size; "
+            f"got {count}, {usage.numel()}, {contribution.numel()}"
+        )
+    if atom_ids is None:
+        atom_ids = torch.arange(count, dtype=torch.long)
+    else:
+        atom_ids = atom_ids.detach().cpu().to(torch.long).reshape(-1)
+    if atom_ids.numel() != count:
+        raise ValueError(f"atom_ids must contain {count} entries, got {atom_ids.numel()}")
+
+    # Bound the quadratic similarity calculation while keeping a deterministic,
+    # evenly spaced sample. All load-concentration panels still use every atom.
+    similarity_count = min(count, 1024)
+    similarity_idx = torch.linspace(0, count - 1, steps=similarity_count).round().long()
+    similarity_atoms = torch.nn.functional.normalize(
+        atoms.index_select(0, similarity_idx), p=2, dim=1, eps=1.0e-8
+    )
+    similarity_usage = usage.index_select(0, similarity_idx)
+    cosine = (similarity_atoms @ similarity_atoms.t()).clamp(-1.0, 1.0)
+    upper = torch.triu_indices(similarity_count, similarity_count, offset=1)
+    pairwise = cosine[upper[0], upper[1]] if similarity_count > 1 else torch.zeros(1)
+    cosine.fill_diagonal_(-float("inf"))
+    nearest = cosine.max(dim=1).values if similarity_count > 1 else torch.zeros(1)
+    active = similarity_usage > 0
+
+    def _cdf(values: torch.Tensor):
+        values = values[torch.isfinite(values)].sort().values
+        if values.numel() == 0:
+            return np.empty(0), np.empty(0)
+        y = torch.arange(1, values.numel() + 1, dtype=torch.float32) / values.numel()
+        return values.numpy(), y.numpy()
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+    ax_pairwise, ax_nearest, ax_concentration = axes[0]
+    ax_top, ax_drift, ax_drift_cdf = axes[1]
+
+    ax_pairwise.hist(pairwise.numpy(), bins=60, density=True, color="#4c78a8", alpha=0.85)
+    ax_pairwise.axvline(float(pairwise.mean()), color="black", ls="--", lw=1.1)
+    ax_pairwise.set_xlabel("atom-pair cosine similarity")
+    ax_pairwise.set_ylabel("density")
+    ax_pairwise.set_title(
+        f"Pairwise similarity in {int(atoms.size(1))}D — mean {float(pairwise.mean()):.3f}"
+    )
+    ax_pairwise.grid(True, alpha=0.18)
+
+    for mask, label, color in (
+        (active, "selected in validation batch", "#e45756"),
+        (~active, "not selected", "#72b7b2"),
+    ):
+        x_values, y_values = _cdf(nearest[mask])
+        if x_values.size:
+            ax_nearest.plot(x_values, y_values, label=label, color=color, lw=1.7)
+    ax_nearest.set_xlabel("nearest-other-atom cosine similarity")
+    ax_nearest.set_ylabel("empirical CDF")
+    ax_nearest.set_title("Nearest-neighbor redundancy (actual atom space)")
+    ax_nearest.legend(fontsize=8, loc="lower right")
+    ax_nearest.grid(True, alpha=0.18)
+
+    atom_fraction = torch.arange(1, count + 1, dtype=torch.float32) / count
+    for values, label, color in (
+        (usage, "selection count", "#f58518"),
+        (contribution, "sum |coefficient|", "#54a24b"),
+    ):
+        ranked = values.sort(descending=True).values
+        total = ranked.sum()
+        cumulative = ranked.cumsum(0) / total.clamp_min(1.0e-8)
+        ax_concentration.plot(atom_fraction.numpy(), cumulative.numpy(), label=label, color=color, lw=1.8)
+    ax_concentration.plot([0, 1], [0, 1], color="#999999", ls=":", lw=1.0, label="uniform")
+    ax_concentration.set_xlim(0.0, 1.0)
+    ax_concentration.set_ylim(0.0, 1.02)
+    ax_concentration.set_xlabel("fraction of atoms, ranked high to low")
+    ax_concentration.set_ylabel("fraction of total mass captured")
+    ax_concentration.set_title("Dictionary load concentration")
+    ax_concentration.legend(fontsize=8, loc="lower right")
+    ax_concentration.grid(True, alpha=0.18)
+
+    top_count = min(16, count)
+    top_ids = contribution.argsort(descending=True)[:top_count]
+    top_usage = usage.index_select(0, top_ids)
+    top_contribution = contribution.index_select(0, top_ids)
+    selection_share = top_usage / usage.sum().clamp_min(1.0e-8)
+    contribution_share = top_contribution / contribution.sum().clamp_min(1.0e-8)
+    positions = np.arange(top_count)
+    width = 0.42
+    ax_top.bar(
+        positions - width / 2,
+        selection_share.numpy(),
+        width,
+        label="selection share",
+        color="#f58518",
+    )
+    ax_top.bar(
+        positions + width / 2,
+        contribution_share.numpy(),
+        width,
+        label="|coefficient| share",
+        color="#54a24b",
+    )
+    ax_top.set_xticks(positions)
+    ax_top.set_xticklabels(
+        [str(int(atom_ids[index])) for index in top_ids], rotation=60, ha="right", fontsize=7
+    )
+    ax_top.set_xlabel("atom ID (ranked by contribution)")
+    ax_top.set_ylabel("share of validation total")
+    ax_top.set_title("Highest-contributing atoms")
+    ax_top.legend(fontsize=8)
+    ax_top.grid(True, axis="y", alpha=0.18)
+
+    drift_degrees = torch.empty(0)
+    drift_norm = torch.empty(0)
+    if movement_snapshots is not None:
+        first, latest = movement_snapshots
+        first = torch.nan_to_num(first.detach().cpu().to(torch.float32))
+        latest = torch.nan_to_num(latest.detach().cpu().to(torch.float32))
+        if first.shape == latest.shape and first.ndim == 2 and first.numel() > 0:
+            first_unit = torch.nn.functional.normalize(first, p=2, dim=1, eps=1.0e-8)
+            latest_unit = torch.nn.functional.normalize(latest, p=2, dim=1, eps=1.0e-8)
+            aligned_cosine = (first_unit * latest_unit).sum(dim=1).clamp(-1.0, 1.0)
+            drift_degrees = torch.rad2deg(torch.acos(aligned_cosine))
+            drift_norm = (latest - first).norm(dim=1)
+
+    if drift_degrees.numel():
+        ax_drift.hist(drift_degrees.numpy(), bins=50, color="#b279a2", alpha=0.85)
+        median_angle = float(torch.quantile(drift_degrees, 0.5))
+        p90_angle = float(torch.quantile(drift_degrees, 0.9))
+        ax_drift.axvline(median_angle, color="black", ls="--", lw=1.0, label="median")
+        ax_drift.axvline(p90_angle, color="#e45756", ls=":", lw=1.2, label="p90")
+        ax_drift.set_title(f"Angular drift — median {median_angle:.2f}°, p90 {p90_angle:.2f}°")
+        ax_drift.legend(fontsize=8)
+        drift_x, drift_y = _cdf(drift_norm)
+        ax_drift_cdf.plot(drift_x, drift_y, color="#9d755d", lw=1.8)
+        step_text = ""
+        if movement_steps is not None:
+            step_text = f" (steps {int(movement_steps[0])}→{int(movement_steps[1])})"
+        ax_drift_cdf.set_title(f"Aligned atom L2-drift CDF{step_text}")
+    else:
+        ax_drift.text(0.5, 0.5, "A second snapshot is needed", ha="center", va="center", transform=ax_drift.transAxes)
+        ax_drift.set_title("Angular drift")
+        ax_drift_cdf.text(0.5, 0.5, "A second snapshot is needed", ha="center", va="center", transform=ax_drift_cdf.transAxes)
+        ax_drift_cdf.set_title("Aligned atom L2-drift CDF")
+    ax_drift.set_xlabel("angle from initial atom (degrees)")
+    ax_drift.set_ylabel("atom count")
+    ax_drift.grid(True, alpha=0.18)
+    ax_drift_cdf.set_xlabel("L2 displacement from initial atom")
+    ax_drift_cdf.set_ylabel("empirical CDF")
+    ax_drift_cdf.grid(True, alpha=0.18)
+
+    active_count = int((usage > 0).sum())
+    fig.suptitle(
+        f"{title} | step {int(step)} | active {active_count}/{count} displayed atoms | "
+        f"similarity sample {similarity_count}",
+        fontsize=12,
+    )
+    image = _figure_to_rgb_array(fig)
+    plt.close(fig)
+    return image
+
+
 def save_codebook_trajectory_gif(snapshots, steps, path, *, title: str, fps: int = 2) -> Path | None:
     """Save a PCA trajectory GIF for a sequence of codebook/dictionary snapshots."""
     if len(snapshots) < 2:

@@ -1,0 +1,20 @@
+# 48,000 / (40 * 8) frames/s * 2 atoms * (13 + 7) bits = 6,000 bit/s.
+# Continue the recovered stage 1 recipe with quantization active during training.
+defaults:
+  - vctk_mdctcodec_stage1
+  - _self_
+
+output_dir: outputs/vctk_mdctcodec_stage1_6kbps
+model:
+  sparsity_level: 2
+  coefficient_quantization_bits: 7
+  # Signed 127-level grid; p99.9 |coefficient| on 1,024 training crops only.
+  coefficient_quantization_max: 18.45128059387207
+  coefficient_quantization_start_step: 0
+  coefficient_quantization_warmup_steps: 0
+checkpoint:
+  filename: 'mdct-laser-6kbps-{epoch:03d}-{step:07d}'
+wandb:
+  name: mdctcodec-laser-6kbps-k2-q7-vctk-stage1
+  group: mdctcodec-vctk-6kbps-20260911
+  tags: [stage1, vctk, mdctcodec, laser, 6kbps, k2, q7, resumed, native48k, balanced-val32]

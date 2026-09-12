@@ -1,7 +1,10 @@
 dataset: vctk
 data_dir: ${oc.env:VCTK_DIR,${oc.env:DATA_DIR,${hydra:runtime.cwd}/../data}/vctk}
 batch_size: 8
+eval_batch_size: null
 num_workers: 4
+pin_memory: true
+prefetch_factor: 2
 image_size: 128
 seed: ${seed}
 mean: [0.0]
@@ -10,6 +13,10 @@ augment: true
 audio_representation: waveform
 sample_rate: 16000
 audio_num_samples: 32768
+audio_eval_num_samples: null
+audio_eval_full_utterance: false
+audio_eval_alignment_hop: 1
+audio_eval_frame_multiple: 1
 stft_n_fft: 1024
 stft_hop_length: 256
 stft_win_length: 1024
@@ -22,6 +29,15 @@ audio_target_peak: 0.95
 audio_rms_normalize: true
 audio_target_rms: 0.12
 audio_max_gain: 8.0
+# Optional post-normalization loudness augmentation. Keep disabled by default;
+# production Meta EnCodec runs override this to cover the backbone's expected
+# non-normalized amplitude range without clipping.
+audio_random_gain_db_min: 0.0
+audio_random_gain_db_max: 0.0
 audio_min_crop_rms: 0.03
 audio_crop_attempts: 64
 audio_fade_samples: 1024
+audio_load_text: true
+audio_split_by_speaker: false
+audio_file_pattern: null
+audio_split_protocol: ""

@@ -361,7 +361,7 @@ def _mel_db(waveform: torch.Tensor, config: Mapping[str, Any]) -> np.ndarray:
         window=window,
         center=True,
         return_complex=True,
-    ).abs()
+    )
     mel_fb = _mel_filterbank(
         sample_rate=int(config["sample_rate"]),
         n_fft=n_fft,
@@ -392,6 +392,11 @@ def _has_visqol_python_module() -> bool:
     return importlib.util.find_spec("visqol") is not None
 
 
+def is_visqol_available() -> bool:
+    """Return whether an official ViSQOL Python binding or CLI is available."""
+    return _has_visqol_python_module() or _resolve_visqol_binary() is not None
+
+
 def _has_pesq() -> bool:
     return importlib.util.find_spec("pesq") is not None
 
@@ -400,8 +405,34 @@ def _has_stoi() -> bool:
     return importlib.util.find_spec("pystoi") is not None
 
 
-def _visqol_mode(sample_rate: int) -> str:
+def _visqol_mode(sample_rate: int, *, dataset: Optional[str] = None) -> str:
+    dataset_key = str(dataset or "").strip().lower()
+    if dataset_key == "vctk":
+        return "speech"
+    if dataset_key == "maestro":
+        return "audio"
     return "speech" if int(sample_rate) <= 16000 else "audio"
+
+
+def _prepare_visqol_waveforms(
+    reference_waveform: torch.Tensor,
+    degraded_waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Resample inputs to the canonical rate required by official ViSQOL."""
+    canonical_rate = 16_000 if str(mode) == "speech" else 48_000
+
+    def _prepare(waveform: torch.Tensor) -> torch.Tensor:
+        values = np.asarray(
+            waveform.detach().cpu().to(torch.float32).reshape(-1).numpy(),
+            dtype=np.float32,
+        )
+        values = _resample_if_needed(values, int(sample_rate), canonical_rate)
+        return torch.from_numpy(np.ascontiguousarray(values))
+
+    return _prepare(reference_waveform), _prepare(degraded_waveform), canonical_rate
 
 
 def _measure_visqol_python(
@@ -465,7 +496,26 @@ def _measure_visqol_cli(
             "--results_csv",
             str(output_csv),
         ]
-        if _visqol_mode(sample_rate) == "speech":
+        mode = _visqol_mode(sample_rate)
+        model_name = _VISQOL_SPEECH_MODEL if mode == "speech" else _VISQOL_AUDIO_MODEL
+        model_candidates = []
+        explicit_model = os.environ.get(
+            "VISQOL_SPEECH_MODEL" if mode == "speech" else "VISQOL_AUDIO_MODEL"
+        )
+        if explicit_model:
+            model_candidates.append(Path(explicit_model).expanduser())
+        binary_path = Path(binary).expanduser().resolve()
+        model_candidates.extend(
+            (
+                Path(f"{binary_path}.runfiles") / "__main__" / "model" / model_name,
+                binary_path.parent / "model" / model_name,
+                Path.cwd() / "model" / model_name,
+            )
+        )
+        model_path = next((path for path in model_candidates if path.is_file()), None)
+        if model_path is not None:
+            cmd.extend(("--similarity_to_quality_model", str(model_path)))
+        if mode == "speech":
             cmd.append("--use_speech_mode")
         result = subprocess.run(
             cmd,
@@ -494,7 +544,17 @@ def _measure_visqol(
     degraded_waveform: torch.Tensor,
     *,
     sample_rate: int,
+    mode: Optional[str] = None,
 ) -> Optional[float]:
+    mode = str(mode or _visqol_mode(sample_rate)).strip().lower()
+    if mode not in {"speech", "audio"}:
+        raise ValueError(f"ViSQOL mode must be 'speech' or 'audio', got {mode!r}")
+    reference_waveform, degraded_waveform, sample_rate = _prepare_visqol_waveforms(
+        reference_waveform,
+        degraded_waveform,
+        sample_rate=sample_rate,
+        mode=mode,
+    )
     if _has_visqol_python_module():
         try:
             return _measure_visqol_python(
@@ -544,6 +604,22 @@ def _stft_magnitude_batch(
     hop_length: Optional[int] = None,
     win_length: Optional[int] = None,
 ) -> torch.Tensor:
+    return _stft_complex_batch(
+        waveform,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+    ).abs()
+
+
+def _stft_complex_batch(
+    waveform: torch.Tensor,
+    *,
+    n_fft: int,
+    hop_length: Optional[int] = None,
+    win_length: Optional[int] = None,
+) -> torch.Tensor:
+    """Return a differentiable complex STFT for a mono waveform batch."""
     if waveform.ndim == 3:
         if int(waveform.size(1)) != 1:
             raise ValueError(f"Expected mono waveform [B, 1, T], got {tuple(waveform.shape)}")
@@ -564,7 +640,7 @@ def _stft_magnitude_batch(
         # Constant padding is stable for both metrics and differentiable losses.
         pad_mode="constant",
         return_complex=True,
-    ).abs()
+    )
 
 
 def _waveform_spectral_convergence(
@@ -591,8 +667,21 @@ def compute_waveform_multires_stft_loss(
     fft_sizes: Optional[Sequence[int]] = None,
     hop_lengths: Optional[Sequence[int]] = None,
     win_lengths: Optional[Sequence[int]] = None,
+    phase_weight: float = 0.0,
+    phase_activity_floor_db: float = -40.0,
+    sample_rate: int = 24_000,
+    tonal_grid_hz: float = 0.0,
+    tonal_margin_db: float = 0.5,
 ) -> dict[str, torch.Tensor]:
-    """Differentiable multi-resolution STFT reconstruction loss for waveform batches."""
+    """Differentiable multi-resolution magnitude and phase reconstruction loss.
+
+    Magnitude-only objectives can reward spectrally plausible but source-
+    incoherent high-frequency energy.  When ``phase_weight`` is positive, this
+    also measures anti-wrapped instantaneous phase, group-delay, and temporal
+    phase-increment errors on reference-active bins.  This is the waveform-
+    decoder analogue of the explicit phase supervision used by APCodec; the
+    activity mask avoids undefined phase in silent bins.
+    """
     if not torch.is_tensor(inputs) or not torch.is_tensor(reconstructions):
         return {}
     if inputs.ndim != 3 or reconstructions.ndim != 3 or int(inputs.size(1)) != 1 or int(reconstructions.size(1)) != 1:
@@ -617,12 +706,34 @@ def compute_waveform_multires_stft_loss(
     spectral_terms = []
     logmag_terms = []
     linmag_terms = []
+    complex_spectral_terms = []
+    phase_ip_terms = []
+    phase_gd_terms = []
+    phase_iaf_terms = []
+    tonal_excess_terms = []
     result_dtype = inputs.dtype if torch.is_floating_point(inputs) else torch.float32
     recon = reconstructions.to(dtype=torch.float32)
     target = inputs.to(dtype=torch.float32)
+    phase_weight = max(0.0, float(phase_weight))
+    phase_activity_ratio = 10.0 ** (float(phase_activity_floor_db) / 20.0)
+    sample_rate = max(1, int(sample_rate))
+    tonal_grid_hz = max(0.0, float(tonal_grid_hz))
+    tonal_margin_nepers = max(0.0, float(tonal_margin_db)) * math.log(10.0) / 10.0
+    largest_fft = max(fft_sizes)
+
+    def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(dtype=value.dtype)
+        return (value * mask).sum() / mask.sum().clamp_min(1.0)
+
     for n_fft, hop, win in zip(fft_sizes, hop_lengths, win_lengths):
-        target_mag = _stft_magnitude_batch(target, n_fft=n_fft, hop_length=hop, win_length=win)
-        recon_mag = _stft_magnitude_batch(recon, n_fft=n_fft, hop_length=hop, win_length=win)
+        target_spec = _stft_complex_batch(
+            target, n_fft=n_fft, hop_length=hop, win_length=win
+        )
+        recon_spec = _stft_complex_batch(
+            recon, n_fft=n_fft, hop_length=hop, win_length=win
+        )
+        target_mag = target_spec.abs()
+        recon_mag = recon_spec.abs()
         spectral_terms.append(
             _waveform_spectral_convergence(
                 target_mag,
@@ -632,20 +743,224 @@ def compute_waveform_multires_stft_loss(
         )
         logmag_terms.append(F.l1_loss(torch.log(recon_mag.clamp_min(eps)), torch.log(target_mag.clamp_min(eps))))
         linmag_terms.append(F.l1_loss(recon_mag, target_mag))
+        if phase_weight > 0.0:
+            complex_diff = (recon_spec - target_spec).reshape(
+                int(target_spec.size(0)), -1
+            )
+            complex_target = target_spec.reshape(int(target_spec.size(0)), -1)
+            complex_spectral_terms.append(
+                (
+                    torch.linalg.vector_norm(complex_diff, dim=1)
+                    / torch.linalg.vector_norm(complex_target, dim=1).clamp_min(eps)
+                ).mean()
+            )
+
+            # The angle of recon * conj(target) is already wrapped to [-pi, pi].
+            # Its finite difference along frequency/time gives anti-wrapped
+            # group-delay and instantaneous-frequency errors without unwrapping
+            # either phase surface independently.
+            phase_error = torch.angle(recon_spec * target_spec.conj())
+            local_peak = target_mag.amax(dim=1, keepdim=True)
+            active = (local_peak > eps) & (
+                target_mag >= local_peak * phase_activity_ratio
+            )
+            phase_ip_terms.append(_masked_mean(phase_error.abs(), active))
+            if int(phase_error.size(1)) > 1:
+                group_delay_delta = (
+                    phase_error[:, 1:, :] - phase_error[:, :-1, :]
+                )
+                group_delay_error = torch.atan2(
+                    torch.sin(group_delay_delta),
+                    torch.cos(group_delay_delta),
+                )
+                phase_gd_terms.append(
+                    _masked_mean(
+                        group_delay_error.abs(),
+                        active[:, 1:, :] & active[:, :-1, :],
+                    )
+                )
+            if int(phase_error.size(2)) > 1:
+                temporal_phase_delta = (
+                    phase_error[:, :, 1:] - phase_error[:, :, :-1]
+                )
+                temporal_phase_error = torch.atan2(
+                    torch.sin(temporal_phase_delta),
+                    torch.cos(temporal_phase_delta),
+                )
+                phase_iaf_terms.append(
+                    _masked_mean(
+                        temporal_phase_error.abs(),
+                        active[:, :, 1:] & active[:, :, :-1],
+                    )
+                )
+
+        if tonal_grid_hz > 0.0 and int(n_fft) == int(largest_fft):
+            # Transposed-convolution images appear as narrow, stationary lines
+            # at multiples of an intermediate sample rate. Compare each line's
+            # prominence to the source's local spectral neighborhood so real
+            # speech harmonics are retained and only reconstruction excess is
+            # penalized.
+            frequencies = torch.linspace(
+                0.0,
+                0.5 * float(sample_rate),
+                steps=int(target_mag.size(1)),
+                device=target_mag.device,
+                dtype=target_mag.dtype,
+            )
+            nyquist = 0.5 * float(sample_rate)
+            first_harmonic = max(1, int(math.ceil(3_000.0 / tonal_grid_hz)))
+            last_harmonic = int(math.floor((nyquist - 180.0) / tonal_grid_hz))
+            if last_harmonic >= first_harmonic:
+                harmonic_centers = (
+                    torch.arange(
+                        first_harmonic,
+                        last_harmonic + 1,
+                        device=target_mag.device,
+                        dtype=target_mag.dtype,
+                    )
+                    * tonal_grid_hz
+                )
+                distance = (
+                    frequencies.unsqueeze(0) - harmonic_centers.unsqueeze(1)
+                ).abs()
+                center_weights = (distance <= 18.0).to(target_mag.dtype)
+                shoulder_weights = (
+                    (distance >= 60.0) & (distance <= 180.0)
+                ).to(target_mag.dtype)
+                center_weights = center_weights / center_weights.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1.0)
+                shoulder_weights = shoulder_weights / shoulder_weights.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1.0)
+                target_power = target_mag.square()
+                recon_power = recon_mag.square()
+                target_center = torch.einsum(
+                    "hf,bft->bht", center_weights, target_power
+                )
+                recon_center = torch.einsum(
+                    "hf,bft->bht", center_weights, recon_power
+                )
+                target_shoulder = torch.einsum(
+                    "hf,bft->bht", shoulder_weights, target_power
+                )
+                recon_shoulder = torch.einsum(
+                    "hf,bft->bht", shoulder_weights, recon_power
+                )
+                target_tonality = torch.log(
+                    (target_center + eps) / (target_shoulder + eps)
+                )
+                recon_tonality = torch.log(
+                    (recon_center + eps) / (recon_shoulder + eps)
+                )
+                tonal_excess_terms.append(
+                    (recon_tonality - target_tonality - tonal_margin_nepers)
+                    .clamp_min(0.0)
+                    .mean()
+                )
 
     spectral_loss = torch.stack(spectral_terms).mean().to(dtype=result_dtype)
     logmag_loss = torch.stack(logmag_terms).mean().to(dtype=result_dtype)
     linmag_loss = torch.stack(linmag_terms).mean().to(dtype=result_dtype)
     total = spectral_loss + logmag_loss + 0.1 * linmag_loss
-    return {
+    metrics = {
         "audio_multires_stft_loss": total,
         "audio_multires_stft_spectral_convergence": spectral_loss,
         "audio_multires_stft_logmag_l1": logmag_loss,
         "audio_multires_stft_mag_l1": linmag_loss,
     }
+    if phase_weight > 0.0:
+        complex_spectral_loss = torch.stack(complex_spectral_terms).mean()
+        phase_ip_loss = torch.stack(phase_ip_terms).mean()
+        phase_gd_loss = (
+            torch.stack(phase_gd_terms).mean()
+            if phase_gd_terms
+            else phase_ip_loss.new_zeros(())
+        )
+        phase_iaf_loss = (
+            torch.stack(phase_iaf_terms).mean()
+            if phase_iaf_terms
+            else phase_ip_loss.new_zeros(())
+        )
+        # Optimize only the scale-invariant wrapped phase terms here. Complex
+        # convergence is retained as a diagnostic, but including it in the
+        # phase objective lets an under-capacity decoder lower loss by turning
+        # down hard-to-predict high-frequency energy. Magnitude, mel, ERB, and
+        # time-domain objectives already supervise amplitude explicitly.
+        phase_loss = (
+            phase_ip_loss + phase_gd_loss + phase_iaf_loss
+        ) / 3.0
+        total = total + phase_weight * phase_loss.to(dtype=total.dtype)
+        metrics.update(
+            {
+                "audio_multires_stft_loss": total,
+                "audio_multires_stft_phase_loss": phase_loss.to(dtype=result_dtype),
+                "audio_multires_stft_complex_convergence": complex_spectral_loss.to(
+                    dtype=result_dtype
+                ),
+                "audio_multires_stft_phase_ip": phase_ip_loss.to(dtype=result_dtype),
+                "audio_multires_stft_phase_gd": phase_gd_loss.to(dtype=result_dtype),
+                "audio_multires_stft_phase_iaf": phase_iaf_loss.to(dtype=result_dtype),
+            }
+        )
+    if tonal_excess_terms:
+        tonal_loss = torch.stack(tonal_excess_terms).mean().to(dtype=result_dtype)
+        metrics.update(
+            {
+                "audio_upsampling_tone_loss": tonal_loss,
+                "audio_upsampling_tone_excess_db": (
+                    tonal_loss * (10.0 / math.log(10.0))
+                ),
+            }
+        )
+    return metrics
+
+
+def compute_waveform_preemphasis_loss(
+    inputs: torch.Tensor,
+    reconstructions: torch.Tensor,
+    *,
+    coefficient: float = 0.97,
+) -> dict[str, torch.Tensor]:
+    """Source-aligned high-frequency waveform loss.
+
+    Matching only the RMS of a first difference can restore brightness with
+    unrelated noise.  Pre-emphasis instead compares the filtered waveforms
+    sample-for-sample, directly penalizing the audible high-band residual.
+    """
+    if not torch.is_tensor(inputs) or not torch.is_tensor(reconstructions):
+        return {}
+    if (
+        inputs.ndim != 3
+        or reconstructions.ndim != 3
+        or int(inputs.size(1)) != 1
+        or int(reconstructions.size(1)) != 1
+        or int(inputs.size(-1)) < 2
+        or int(reconstructions.size(-1)) < 2
+    ):
+        return {}
+    coefficient = float(coefficient)
+    if not math.isfinite(coefficient) or not 0.0 <= coefficient <= 1.0:
+        raise ValueError("coefficient must be finite and in [0, 1]")
+    target = inputs.to(dtype=torch.float32)
+    recon = reconstructions.to(dtype=torch.float32)
+    target_pre = target[..., 1:] - coefficient * target[..., :-1]
+    recon_pre = recon[..., 1:] - coefficient * recon[..., :-1]
+    difference = recon_pre - target_pre
+    l1_loss = difference.abs().mean()
+    convergence = (
+        torch.linalg.vector_norm(difference.flatten(1), dim=1)
+        / torch.linalg.vector_norm(target_pre.flatten(1), dim=1).clamp_min(1.0e-8)
+    ).mean()
+    result_dtype = inputs.dtype if torch.is_floating_point(inputs) else torch.float32
+    return {
+        "audio_preemphasis_l1_loss": l1_loss.to(dtype=result_dtype),
+        "audio_preemphasis_convergence": convergence.to(dtype=result_dtype),
+    }
 
 
 _MEL_FB_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+_SLANEY_MEL_FB_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _cached_mel_filterbank(*, sample_rate: int, n_fft: int, n_mels: int, device, dtype) -> torch.Tensor:
@@ -655,6 +970,120 @@ def _cached_mel_filterbank(*, sample_rate: int, n_fft: int, n_mels: int, device,
         fb = _mel_filterbank(sample_rate=int(sample_rate), n_fft=int(n_fft), n_mels=int(n_mels))
         _MEL_FB_CACHE[key] = fb
     return fb.to(device=device, dtype=dtype)
+
+
+def _slaney_mel_filterbank(*, sample_rate: int, n_fft: int, n_mels: int) -> torch.Tensor:
+    """Librosa-compatible Slaney mel bank used by the authors' codec code."""
+    key = (int(sample_rate), int(n_fft), int(n_mels))
+    cached = _SLANEY_MEL_FB_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def hz_to_mel(frequencies: np.ndarray) -> np.ndarray:
+        frequencies = np.asarray(frequencies, dtype=np.float64)
+        f_sp = 200.0 / 3.0
+        mels = frequencies / f_sp
+        log_region = frequencies >= 1000.0
+        mels[log_region] = 15.0 + np.log(frequencies[log_region] / 1000.0) / (
+            np.log(6.4) / 27.0
+        )
+        return mels
+
+    def mel_to_hz(mels: np.ndarray) -> np.ndarray:
+        mels = np.asarray(mels, dtype=np.float64)
+        f_sp = 200.0 / 3.0
+        frequencies = f_sp * mels
+        log_region = mels >= 15.0
+        frequencies[log_region] = 1000.0 * np.exp(
+            (np.log(6.4) / 27.0) * (mels[log_region] - 15.0)
+        )
+        return frequencies
+
+    mel_edges = np.linspace(
+        hz_to_mel(np.array([0.0]))[0],
+        hz_to_mel(np.array([0.5 * float(sample_rate)]))[0],
+        int(n_mels) + 2,
+    )
+    hz_edges = mel_to_hz(mel_edges)
+    fft_frequencies = np.linspace(
+        0.0, 0.5 * float(sample_rate), 1 + int(n_fft) // 2
+    )
+    ramps = hz_edges[:, None] - fft_frequencies[None, :]
+    weights = np.zeros((int(n_mels), 1 + int(n_fft) // 2), dtype=np.float64)
+    for index in range(int(n_mels)):
+        lower = -ramps[index] / max(hz_edges[index + 1] - hz_edges[index], 1.0e-12)
+        upper = ramps[index + 2] / max(hz_edges[index + 2] - hz_edges[index + 1], 1.0e-12)
+        weights[index] = np.maximum(0.0, np.minimum(lower, upper))
+    weights *= (2.0 / np.maximum(hz_edges[2:] - hz_edges[:-2], 1.0e-12))[:, None]
+    cached = torch.from_numpy(weights.astype(np.float32, copy=False)).contiguous()
+    _SLANEY_MEL_FB_CACHE[key] = cached
+    return cached
+
+
+def compute_waveform_mdctcodec_mel_loss(
+    inputs: torch.Tensor,
+    reconstructions: torch.Tensor,
+    *,
+    sample_rate: int = 48_000,
+    n_fft: int = 1024,
+    hop_length: int = 40,
+    win_length: int = 320,
+    n_mels: int = 80,
+) -> dict[str, torch.Tensor]:
+    """MDCTCodec/APCodec log-mel MAE+MSE objective.
+
+    This deliberately differs from the repository's generic multi-resolution
+    mel objective: the published spectral codec uses one 1024-point STFT, a
+    320-sample Hann window, 40-sample hop, 80 Slaney mel bands, log compression,
+    and the sum of elementwise MAE and MSE.
+    """
+    if not torch.is_tensor(inputs) or not torch.is_tensor(reconstructions):
+        return {}
+    if (
+        inputs.ndim != 3
+        or reconstructions.ndim != 3
+        or int(inputs.size(1)) != 1
+        or int(reconstructions.size(1)) != 1
+    ):
+        return {}
+
+    target = inputs[:, 0].to(torch.float32)
+    recon = reconstructions[:, 0].to(torch.float32)
+    window = torch.hann_window(
+        int(win_length), periodic=True, device=target.device, dtype=target.dtype
+    )
+
+    def log_mel(waveform: torch.Tensor) -> torch.Tensor:
+        spectrum = torch.stft(
+            waveform,
+            n_fft=int(n_fft),
+            hop_length=int(hop_length),
+            win_length=int(win_length),
+            window=window,
+            center=True,
+            pad_mode="reflect",
+            return_complex=True,
+        )
+        magnitude = torch.sqrt(spectrum.real.square() + spectrum.imag.square() + 1.0e-9)
+        filterbank = _slaney_mel_filterbank(
+            sample_rate=int(sample_rate),
+            n_fft=int(n_fft),
+            n_mels=int(n_mels),
+        ).to(device=magnitude.device, dtype=magnitude.dtype)
+        mel = torch.einsum("mf,bft->bmt", filterbank, magnitude)
+        return torch.log(mel.clamp_min(1.0e-5))
+
+    target_mel = log_mel(target).detach()
+    recon_mel = log_mel(recon)
+    difference = recon_mel - target_mel
+    mae = difference.abs().mean()
+    mse = difference.square().mean()
+    result_dtype = inputs.dtype if torch.is_floating_point(inputs) else torch.float32
+    return {
+        "audio_mel_loss": (mae + mse).to(dtype=result_dtype),
+        "audio_mel_mae_loss": mae.to(dtype=result_dtype),
+        "audio_mel_mse_loss": mse.to(dtype=result_dtype),
+    }
 
 
 def compute_waveform_multiscale_mel_loss(
@@ -707,6 +1136,259 @@ def compute_waveform_multiscale_mel_loss(
     return {"audio_mel_loss": mel_loss}
 
 
+_CRITICAL_BAND_FB_CACHE: dict[tuple[int, int, int, float, float], torch.Tensor] = {}
+
+
+def _cached_erb_filterbank(
+    *,
+    sample_rate: int,
+    n_fft: int,
+    num_bands: int,
+    min_frequency: float,
+    max_frequency: float,
+    device,
+    dtype,
+) -> torch.Tensor:
+    """Return unit-area triangular bands uniformly spaced on the ERB-rate scale."""
+    nyquist = 0.5 * float(sample_rate)
+    min_frequency = max(0.0, float(min_frequency))
+    max_frequency = min(max(float(max_frequency), min_frequency + 1.0), nyquist)
+    key = (
+        int(sample_rate),
+        int(n_fft),
+        int(num_bands),
+        round(min_frequency, 4),
+        round(max_frequency, 4),
+    )
+    filterbank = _CRITICAL_BAND_FB_CACHE.get(key)
+    if filterbank is None:
+        # Glasberg-Moore ERB-rate mapping. Uniform spacing here approximates
+        # auditory critical-band integration much more closely than linear FFT
+        # bins, especially below 2 kHz.
+        def hz_to_erb(frequency: torch.Tensor) -> torch.Tensor:
+            return 21.4 * torch.log10(1.0 + 4.37e-3 * frequency)
+
+        def erb_to_hz(rate: torch.Tensor) -> torch.Tensor:
+            return (torch.pow(10.0, rate / 21.4) - 1.0) / 4.37e-3
+
+        low_rate = hz_to_erb(torch.tensor(min_frequency, dtype=torch.float32))
+        high_rate = hz_to_erb(torch.tensor(max_frequency, dtype=torch.float32))
+        edges = erb_to_hz(
+            torch.linspace(low_rate, high_rate, steps=int(num_bands) + 2)
+        )
+        frequencies = torch.linspace(0.0, nyquist, steps=int(n_fft) // 2 + 1)
+        left = edges[:-2, None]
+        center = edges[1:-1, None]
+        right = edges[2:, None]
+        rising = (frequencies[None, :] - left) / (center - left).clamp_min(1.0e-8)
+        falling = (right - frequencies[None, :]) / (right - center).clamp_min(1.0e-8)
+        filterbank = torch.minimum(rising, falling).clamp(0.0, 1.0)
+        filterbank = filterbank / filterbank.sum(dim=1, keepdim=True).clamp_min(1.0e-8)
+        _CRITICAL_BAND_FB_CACHE[key] = filterbank
+    return filterbank.to(device=device, dtype=dtype)
+
+
+def compute_waveform_critical_band_energy_loss(
+    inputs: torch.Tensor,
+    reconstructions: torch.Tensor,
+    *,
+    sample_rate: int = 24_000,
+    fft_sizes: Optional[Sequence[int]] = (512, 2048),
+    num_bands: int = 32,
+    min_frequency: float = 30.0,
+    max_frequency: Optional[float] = None,
+    deficit_weight: float = 0.5,
+    activity_floor_db: float = -50.0,
+) -> dict[str, torch.Tensor]:
+    """Match short-time energy in perceptual critical bands.
+
+    The symmetric log-energy error preserves the spectral envelope, while an
+    additional one-sided term penalizes missing audible energy more strongly
+    than excess energy. The latter directly targets dull consonants and weak
+    attacks without applying a broadband gain. Bands below the reference's
+    local activity floor are excluded from the asymmetric term.
+    """
+    if not torch.is_tensor(inputs) or not torch.is_tensor(reconstructions):
+        return {}
+    if (
+        inputs.ndim != 3
+        or reconstructions.ndim != 3
+        or int(inputs.size(1)) != 1
+        or int(reconstructions.size(1)) != 1
+    ):
+        return {}
+    sample_rate = max(1, int(sample_rate))
+    num_bands = max(1, int(num_bands))
+    fft_sizes = _canonical_stft_sizes(fft_sizes, (512, 2048))
+    max_frequency = (
+        0.5 * float(sample_rate)
+        if max_frequency is None
+        else min(float(max_frequency), 0.5 * float(sample_rate))
+    )
+    eps = 1.0e-8
+    target = inputs.to(dtype=torch.float32)
+    recon = reconstructions.to(dtype=torch.float32)
+    result_dtype = inputs.dtype if torch.is_floating_point(inputs) else torch.float32
+    symmetric_terms = []
+    deficit_terms = []
+    log_ratio_terms = []
+    activity_power_ratio = 10.0 ** (float(activity_floor_db) / 10.0)
+
+    for n_fft in fft_sizes:
+        hop = max(1, int(n_fft) // 4)
+        target_magnitude = _stft_magnitude_batch(
+            target, n_fft=n_fft, hop_length=hop, win_length=n_fft
+        )
+        recon_magnitude = _stft_magnitude_batch(
+            recon, n_fft=n_fft, hop_length=hop, win_length=n_fft
+        )
+        filterbank = _cached_erb_filterbank(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            num_bands=num_bands,
+            min_frequency=min_frequency,
+            max_frequency=max_frequency,
+            device=target_magnitude.device,
+            dtype=target_magnitude.dtype,
+        )
+        target_energy = torch.einsum(
+            "kf,bft->bkt", filterbank, target_magnitude.square()
+        ).clamp_min(eps)
+        recon_energy = torch.einsum(
+            "kf,bft->bkt", filterbank, recon_magnitude.square()
+        ).clamp_min(eps)
+        target_log = torch.log(target_energy)
+        recon_log = torch.log(recon_energy)
+        log_error = recon_log - target_log
+        symmetric_terms.append(log_error.abs().mean())
+
+        local_peak = target_energy.amax(dim=1, keepdim=True)
+        active = (target_energy >= local_peak * activity_power_ratio).to(target_energy.dtype)
+        active_count = active.sum().clamp_min(1.0)
+        deficit_terms.append(((-log_error).clamp_min(0.0) * active).sum() / active_count)
+        log_ratio_terms.append((log_error * active).sum() / active_count)
+
+    symmetric_loss = torch.stack(symmetric_terms).mean()
+    deficit_loss = torch.stack(deficit_terms).mean()
+    total = symmetric_loss + float(deficit_weight) * deficit_loss
+    energy_ratio = torch.exp(torch.stack(log_ratio_terms).mean())
+    return {
+        "audio_critical_band_loss": total.to(dtype=result_dtype),
+        "audio_critical_band_log_energy_l1": symmetric_loss.to(dtype=result_dtype),
+        "audio_critical_band_deficit": deficit_loss.to(dtype=result_dtype),
+        "audio_critical_band_energy_ratio": energy_ratio.to(dtype=result_dtype),
+    }
+
+
+def compute_waveform_energy_matching_loss(
+    inputs: torch.Tensor,
+    reconstructions: torch.Tensor,
+    *,
+    sample_rate: int = 24_000,
+    frame_durations_ms: Sequence[float] = (10.0, 40.0, 160.0),
+    frame_weight: float = 0.5,
+    global_weight: float = 0.25,
+    transient_weight: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Match waveform loudness envelopes and high-frequency/transient energy.
+
+    Sample and spectral reconstruction losses can have nearly optimal values
+    while a trainable decoder remains perceptually flat: the global RMS is
+    preserved by low-frequency/voiced energy, but consonants and attacks are
+    attenuated.  This objective therefore combines three scale-independent
+    log-RMS terms:
+
+    * global waveform energy;
+    * active-speech frame energy at multiple time scales; and
+    * first-difference energy, a cheap phase-insensitive proxy for high-frequency
+      and transient content.
+
+    Silence is excluded from the frame term using a per-example threshold 35 dB
+    below the reference RMS. The loss is differentiable with respect to
+    ``reconstructions`` and returns direct energy ratios for monitoring.
+    """
+    if not torch.is_tensor(inputs) or not torch.is_tensor(reconstructions):
+        return {}
+    if (
+        inputs.ndim != 3
+        or reconstructions.ndim != 3
+        or int(inputs.size(1)) != 1
+        or int(reconstructions.size(1)) != 1
+    ):
+        return {}
+
+    sample_rate = max(1, int(sample_rate))
+    eps = 1.0e-8
+    result_dtype = inputs.dtype if torch.is_floating_point(inputs) else torch.float32
+    target = inputs.to(dtype=torch.float32)
+    recon = reconstructions.to(dtype=torch.float32)
+
+    target_rms = target.square().mean(dim=-1).clamp_min(eps).sqrt()
+    recon_rms = recon.square().mean(dim=-1).clamp_min(eps).sqrt()
+    global_log_ratio = torch.log(recon_rms / target_rms.clamp_min(eps))
+    global_loss = global_log_ratio.abs().mean()
+    global_ratio = (recon_rms / target_rms.clamp_min(eps)).mean()
+
+    frame_losses: list[torch.Tensor] = []
+    frame_log_ratios: list[torch.Tensor] = []
+    for duration_ms in frame_durations_ms:
+        frame_size = max(1, int(round(float(duration_ms) * sample_rate / 1_000.0)))
+        frame_size = min(frame_size, int(target.size(-1)))
+        hop_size = max(1, frame_size // 2)
+        target_frame_rms = F.avg_pool1d(
+            target.square(), frame_size, stride=hop_size
+        ).clamp_min(eps).sqrt()
+        recon_frame_rms = F.avg_pool1d(
+            recon.square(), frame_size, stride=hop_size
+        ).clamp_min(eps).sqrt()
+        # Keep real speech/background structure in scope but prevent padded or
+        # truly silent frames from dominating a logarithmic objective.
+        activity_floor = target_rms.unsqueeze(-1) * (10.0 ** (-35.0 / 20.0))
+        active = (target_frame_rms >= activity_floor).to(target_frame_rms.dtype)
+        active_count = active.sum().clamp_min(1.0)
+        log_ratio = torch.log(recon_frame_rms / target_frame_rms.clamp_min(eps))
+        frame_losses.append((log_ratio.abs() * active).sum() / active_count)
+        frame_log_ratios.append((log_ratio * active).sum() / active_count)
+
+    if frame_losses:
+        frame_loss = torch.stack(frame_losses).mean()
+        active_frame_ratio = torch.exp(torch.stack(frame_log_ratios).mean())
+    else:
+        frame_loss = global_loss.new_zeros(())
+        active_frame_ratio = global_ratio
+
+    if int(target.size(-1)) > 1:
+        target_delta = target[..., 1:] - target[..., :-1]
+        recon_delta = recon[..., 1:] - recon[..., :-1]
+        target_delta_rms = target_delta.square().mean(dim=-1).clamp_min(eps).sqrt()
+        recon_delta_rms = recon_delta.square().mean(dim=-1).clamp_min(eps).sqrt()
+        transient_log_ratio = torch.log(
+            recon_delta_rms / target_delta_rms.clamp_min(eps)
+        )
+        transient_loss = transient_log_ratio.abs().mean()
+        transient_ratio = (
+            recon_delta_rms / target_delta_rms.clamp_min(eps)
+        ).mean()
+    else:
+        transient_loss = global_loss.new_zeros(())
+        transient_ratio = global_ratio
+
+    total = (
+        float(frame_weight) * frame_loss
+        + float(global_weight) * global_loss
+        + float(transient_weight) * transient_loss
+    ).to(dtype=result_dtype)
+    return {
+        "audio_energy_loss": total,
+        "audio_frame_log_rms_l1": frame_loss.to(dtype=result_dtype),
+        "audio_global_log_rms_l1": global_loss.to(dtype=result_dtype),
+        "audio_transient_log_rms_l1": transient_loss.to(dtype=result_dtype),
+        "audio_rms_ratio": global_ratio.to(dtype=result_dtype),
+        "audio_active_frame_rms_ratio": active_frame_ratio.to(dtype=result_dtype),
+        "audio_transient_rms_ratio": transient_ratio.to(dtype=result_dtype),
+    }
+
+
 def _compute_waveform_reconstruction_metrics(
     inputs: torch.Tensor,
     reconstructions: torch.Tensor,
@@ -715,6 +1397,8 @@ def _compute_waveform_reconstruction_metrics(
     device: torch.device,
     dtype: torch.dtype,
     compute_visqol: bool = False,
+    compute_spectral_metrics: bool = True,
+    compute_paper_visqol: bool = False,
 ) -> dict:
     target = inputs.detach().to(torch.float32)
     recon = reconstructions.detach().to(torch.float32)
@@ -723,8 +1407,13 @@ def _compute_waveform_reconstruction_metrics(
     limit = min(int(target.size(0)), int(recon.size(0)))
     if limit <= 0:
         return {}
-    target = target[:limit].cpu()
-    recon = recon[:limit].cpu()
+    # Core train/validation metrics are tensor operations and should stay on the
+    # accelerator. Moving every 48 kHz clip to CPU here made an 8-rank job run
+    # hundreds of threaded CPU STFTs per step, dominating the actual codec
+    # update. Reference tool metrics below copy only their small evaluation
+    # inputs when those optional packages require NumPy/CPU arrays.
+    target = target[:limit].to(device=device)
+    recon = recon[:limit].to(device=device)
     diff = recon - target
     eps = 1.0e-8
     waveform_mse = diff.pow(2).mean()
@@ -732,45 +1421,99 @@ def _compute_waveform_reconstruction_metrics(
     signal = target.pow(2).mean(dim=(1, 2))
     noise = diff.pow(2).mean(dim=(1, 2)).clamp_min(eps)
     snr = (10.0 * torch.log10(signal.clamp_min(eps) / noise)).mean()
-    base_fft = int(config["stft_n_fft"])
-    stft_metrics = compute_waveform_multires_stft_loss(
-        target,
-        recon,
-        fft_sizes=(max(16, base_fft // 2), base_fft, base_fft * 2),
+    target_centered = target - target.mean(dim=-1, keepdim=True)
+    recon_centered = recon - recon.mean(dim=-1, keepdim=True)
+    projection_scale = (
+        (recon_centered * target_centered).sum(dim=-1, keepdim=True)
+        / target_centered.square().sum(dim=-1, keepdim=True).clamp_min(eps)
     )
-    logmag_l1 = stft_metrics.get("audio_multires_stft_logmag_l1", torch.tensor(0.0))
-    spectral_convergence = stft_metrics.get(
-        "audio_multires_stft_spectral_convergence",
-        torch.tensor(0.0),
-    )
-    lsd = logmag_l1.to(torch.float32)
+    projected = projection_scale * target_centered
+    residual = recon_centered - projected
+    si_sdr = (
+        10.0
+        * torch.log10(
+            projected.square().sum(dim=-1).clamp_min(eps)
+            / residual.square().sum(dim=-1).clamp_min(eps)
+        )
+    ).mean()
     metrics = {
-        "audio_lsd": lsd.to(device=device, dtype=dtype),
-        "audio_log_spectral_distance": lsd.to(device=device, dtype=dtype),
         "audio_waveform_mse": waveform_mse.to(device=device, dtype=dtype),
         "audio_waveform_l1": waveform_l1.to(device=device, dtype=dtype),
         "audio_snr_db": snr.to(device=device, dtype=dtype),
-        "audio_logmag_l1": logmag_l1.to(device=device, dtype=dtype),
-        "audio_spectral_convergence": spectral_convergence.to(device=device, dtype=dtype),
+        "audio_si_sdr_db": si_sdr.to(device=device, dtype=dtype),
     }
-    should_compute_visqol = bool(compute_visqol) and (
-        _has_visqol_python_module() or _resolve_visqol_binary() is not None
-    )
+    # Training already evaluates multi-resolution STFT and seven-scale mel
+    # objectives. Repeating another three STFT pairs merely for telemetry on
+    # every batch is expensive, particularly because Lightning only publishes
+    # step metrics every ``log_every_n_steps``. Callers can therefore sample
+    # these diagnostics at the logger cadence while validation keeps computing
+    # the complete metric set.
+    if compute_spectral_metrics:
+        base_fft = int(config["stft_n_fft"])
+        stft_metrics = compute_waveform_multires_stft_loss(
+            target,
+            recon,
+            fft_sizes=(max(16, base_fft // 2), base_fft, base_fft * 2),
+        )
+        logmag_l1 = stft_metrics.get(
+            "audio_multires_stft_logmag_l1",
+            torch.zeros((), device=device, dtype=torch.float32),
+        )
+        spectral_convergence = stft_metrics.get(
+            "audio_multires_stft_spectral_convergence",
+            torch.zeros((), device=device, dtype=torch.float32),
+        )
+        lsd = logmag_l1.to(torch.float32)
+        metrics.update(
+            {
+                "audio_lsd": lsd.to(device=device, dtype=dtype),
+                "audio_log_spectral_distance": lsd.to(device=device, dtype=dtype),
+                "audio_logmag_l1": logmag_l1.to(device=device, dtype=dtype),
+                "audio_spectral_convergence": spectral_convergence.to(
+                    device=device,
+                    dtype=dtype,
+                ),
+            }
+        )
+    should_compute_visqol = bool(compute_visqol) and is_visqol_available()
     if should_compute_visqol:
-        visqol_scores = []
-        for idx in range(limit):
+        # VCTK crops are two seconds, whereas ViSQOL recommends approximately
+        # 8--10 seconds per comparison. Concatenating the equal-length batch
+        # yields one stable 8-second paired sample and avoids four subprocesses.
+        try:
+            score = _measure_visqol(
+                target[:limit, 0].clamp(-1.0, 1.0).reshape(-1),
+                recon[:limit, 0].clamp(-1.0, 1.0).reshape(-1),
+                sample_rate=int(config["sample_rate"]),
+                mode=_visqol_mode(
+                    int(config["sample_rate"]),
+                    dataset=str(config.get("dataset", "") or ""),
+                ),
+            )
+        except Exception:
+            score = None
+        if score is not None:
+            metrics["audio_visqol"] = torch.tensor(
+                float(score), dtype=torch.float32, device=device
+            ).to(dtype=dtype)
+        # Most 24 kHz codec papers report ViSQOL's general-audio model, whose
+        # canonical input rate is 48 kHz. VCTK checkpoint selection deliberately
+        # remains on speech mode; this separately named value exists solely as
+        # a paper-facing comparison column and never changes historical ranking.
+        if bool(compute_paper_visqol):
             try:
-                score = _measure_visqol(
-                    target[idx, 0].clamp(-1.0, 1.0),
-                    recon[idx, 0].clamp(-1.0, 1.0),
+                paper_score = _measure_visqol(
+                    target[:limit, 0].clamp(-1.0, 1.0).reshape(-1),
+                    recon[:limit, 0].clamp(-1.0, 1.0).reshape(-1),
                     sample_rate=int(config["sample_rate"]),
+                    mode="audio",
                 )
             except Exception:
-                score = None
-            if score is not None:
-                visqol_scores.append(torch.tensor(float(score), dtype=torch.float32))
-        if visqol_scores:
-            metrics["audio_visqol"] = torch.stack(visqol_scores).mean().to(device=device, dtype=dtype)
+                paper_score = None
+            if paper_score is not None:
+                metrics["audio_visqol_audio48k"] = torch.tensor(
+                    float(paper_score), dtype=torch.float32, device=device
+                ).to(dtype=dtype)
 
     # PESQ + STOI: pip-installable reference-based perceptual metrics, used as the
     # practical alternative to ViSQOL (which has no wheel and needs a bazel C++
@@ -785,8 +1528,8 @@ def _compute_waveform_reconstruction_metrics(
             pesq_scores = []
             for idx in range(limit):
                 try:
-                    ref = target[idx, 0].clamp(-1.0, 1.0).numpy()
-                    deg = recon[idx, 0].clamp(-1.0, 1.0).numpy()
+                    ref = target[idx, 0].clamp(-1.0, 1.0).cpu().numpy()
+                    deg = recon[idx, 0].clamp(-1.0, 1.0).cpu().numpy()
                     pesq_scores.append(float(_pesq_fn(sr, ref, deg, mode)))
                 except Exception:
                     continue
@@ -803,8 +1546,8 @@ def _compute_waveform_reconstruction_metrics(
             stoi_scores = []
             for idx in range(limit):
                 try:
-                    ref = target[idx, 0].clamp(-1.0, 1.0).numpy()
-                    deg = recon[idx, 0].clamp(-1.0, 1.0).numpy()
+                    ref = target[idx, 0].clamp(-1.0, 1.0).cpu().numpy()
+                    deg = recon[idx, 0].clamp(-1.0, 1.0).cpu().numpy()
                     stoi_scores.append(float(_stoi_fn(ref, deg, sr, extended=False)))
                 except Exception:
                     continue
@@ -824,6 +1567,8 @@ def compute_audio_reconstruction_metrics(
     audio_meta: Mapping[str, Any],
     audio_source: Any,
     compute_visqol: bool = False,
+    compute_spectral_metrics: bool = True,
+    compute_paper_visqol: bool = False,
 ) -> dict:
     """Compute audio-domain reconstruction metrics for normalized log-spectrogram batches."""
     if not has_audio_metadata(audio_meta):
@@ -842,6 +1587,8 @@ def compute_audio_reconstruction_metrics(
             device=inputs.device,
             dtype=dtype,
             compute_visqol=compute_visqol,
+            compute_spectral_metrics=compute_spectral_metrics,
+            compute_paper_visqol=compute_paper_visqol,
         )
 
     limit = min(int(inputs.size(0)), int(reconstructions.size(0)), len(audio_meta["path"]))
@@ -859,9 +1606,7 @@ def compute_audio_reconstruction_metrics(
         n_mels=int(config["mel_bins"]),
     ).to(torch.float32)
     log_offset = float(config["stft_log_offset"])
-    should_compute_visqol = bool(compute_visqol) and (
-        _has_visqol_python_module() or _resolve_visqol_binary() is not None
-    )
+    should_compute_visqol = bool(compute_visqol) and is_visqol_available()
 
     logmag_mses = []
     log_spectral_distances = []
@@ -869,6 +1614,8 @@ def compute_audio_reconstruction_metrics(
     spectral_convergences = []
     logmel_l1s = []
     visqol_scores = []
+    visqol_references = []
+    visqol_degraded = []
     with torch.no_grad():
         for idx in range(limit):
             item = _meta_item(meta, idx)
@@ -900,15 +1647,26 @@ def compute_audio_reconstruction_metrics(
                         length=int(original_waveform.numel()),
                         num_iters=int(config["griffin_lim_iters"]),
                     )
-                    visqol_score = _measure_visqol(
-                        original_waveform,
-                        recon_waveform,
-                        sample_rate=int(config["sample_rate"]),
-                    )
+                    visqol_references.append(original_waveform.reshape(-1))
+                    visqol_degraded.append(recon_waveform.reshape(-1))
                 except Exception:
-                    visqol_score = None
-                if visqol_score is not None:
-                    visqol_scores.append(torch.tensor(float(visqol_score), dtype=torch.float32))
+                    pass
+
+    if visqol_references and len(visqol_references) == len(visqol_degraded):
+        try:
+            visqol_score = _measure_visqol(
+                torch.cat(visqol_references),
+                torch.cat(visqol_degraded),
+                sample_rate=int(config["sample_rate"]),
+                mode=_visqol_mode(
+                    int(config["sample_rate"]),
+                    dataset=str(config.get("dataset", "") or ""),
+                ),
+            )
+        except Exception:
+            visqol_score = None
+        if visqol_score is not None:
+            visqol_scores.append(torch.tensor(float(visqol_score), dtype=torch.float32))
 
     if not logmag_mses:
         return {}

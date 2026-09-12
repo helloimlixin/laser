@@ -1,29 +1,60 @@
 """Visualization concern for :class:`~src.models.laser.LASER`.
 
 Extracted from ``laser.py`` as a mixin: these methods produce reconstruction
-grids, codebook scatter/animation, and latent/error heatmaps for W&B logging.
+grids, dictionary diagnostics, and latent/error heatmaps for W&B logging.
 They operate on the LASER instance's state via ``self`` and carry no state of
 their own.
 """
 
-import os
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
 
-from src.audio_logging import build_audio_log_payload
+from src.audio_logging import _cached_erb_filterbank, build_audio_log_payload
 from src.codebook_visuals import (
-    render_codebook_scatter,
-    save_codebook_trajectory_gif,
+    _figure_to_rgb_array,
+    render_dictionary_diagnostics,
     select_codebook_vectors,
 )
-from src.wandb_media import log_wandb_images, log_wandb_payload, log_wandb_video
+from src.wandb_media import log_wandb_images, log_wandb_payload
 
 
 class VisualsMixin:
     """Image/codebook/heatmap visualization methods for LASER."""
+
+    _LEGACY_WANDB_VISUAL_KEYS = (
+        "val/latent_activation_map",
+        "val/sparse_support_tracks",
+        "val/sparse_coefficient_tracks",
+        "val/sparse_codec_dashboard",
+        "val/dictionary_atom_scatter",
+        "val/dictionary_movement_scatter",
+        "val/dictionary_scatter",
+        "val/dictionary_atom_trajectories",
+        "val/visual_support_jaccard_mean",
+        "val/visual_support_retained_fraction_mean",
+        "val/visual_support_retained_mass_mean",
+        "val/visual_support_entered_atoms_per_frame",
+        "val/visual_support_run_length_frames_p50",
+        "val/visual_support_run_length_frames_p90",
+    )
+
+    def _remove_legacy_wandb_visual_summaries(self):
+        """Prevent removed media from reappearing when W&B resumes a run."""
+        if not self._is_log_rank_zero():
+            return
+        experiment = getattr(getattr(self, "logger", None), "experiment", None)
+        summary = getattr(experiment, "summary", None)
+        if summary is None:
+            return
+        for key in self._LEGACY_WANDB_VISUAL_KEYS:
+            try:
+                del summary[key]
+            except (AttributeError, KeyError, TypeError):
+                continue
 
     def _visual_split(self, key, split=None):
         if split not in (None, ""):
@@ -110,10 +141,10 @@ class VisualsMixin:
                 self._save_local_visual_image(key, item, step=step, index=idx)
 
     def _snapshot_dictionary(self):
-        """Store a copy of the current dictionary atoms for trajectory animation.
+        """Keep aligned initial/latest atom samples for movement statistics.
 
-        Called once per validation epoch (not every N training steps) to keep
-        the snapshot list short and the final GIF fast to render.
+        Only two snapshots are retained, so validation count cannot grow the
+        visualization memory footprint.
         """
         if not self.enable_val_latent_visuals or not self._is_log_rank_zero():
             return
@@ -123,11 +154,56 @@ class VisualsMixin:
         step = int(getattr(self, "global_step", 0) or 0)
         if self._dict_snapshot_steps and self._dict_snapshot_steps[-1] == step:
             return
-        self._dict_snapshots.append(atoms)
-        self._dict_snapshot_steps.append(step)
+        if not self._dict_snapshots:
+            self._dict_snapshots.append(atoms)
+            self._dict_snapshot_steps.append(step)
+        elif len(self._dict_snapshots) == 1:
+            self._dict_snapshots.append(atoms)
+            self._dict_snapshot_steps.append(step)
+        else:
+            self._dict_snapshots[-1] = atoms
+            self._dict_snapshot_steps[-1] = step
 
-    def _log_dict_scatter(self):
-        """Log a static PCA scatter of current dictionary atoms (cheap, once per val epoch)."""
+    def _dictionary_visual_subset(self):
+        """Select atoms while retaining every validation-active atom when possible."""
+        atoms = self.bottleneck.dictionary.detach().t().cpu().to(torch.float32)
+        count = int(atoms.size(0))
+        limit = min(int(self.codebook_visual_max_vectors), count)
+        usage = getattr(self, "_val_visual_atom_usage", None)
+        contribution = getattr(self, "_val_visual_atom_contribution", None)
+        if not torch.is_tensor(usage) or int(usage.numel()) != count:
+            usage = torch.zeros(count, dtype=torch.float32)
+        else:
+            usage = usage.detach().cpu().to(torch.float32).reshape(-1)
+        if not torch.is_tensor(contribution) or int(contribution.numel()) != count:
+            contribution = torch.zeros(count, dtype=torch.float32)
+        else:
+            contribution = contribution.detach().cpu().to(torch.float32).reshape(-1)
+
+        active = torch.nonzero(usage > 0, as_tuple=False).flatten()
+        if int(active.numel()) >= limit:
+            active_score = contribution.index_select(0, active)
+            order = torch.argsort(active_score, descending=True, stable=True)
+            atom_ids = active.index_select(0, order[:limit])
+        else:
+            chosen = torch.zeros(count, dtype=torch.bool)
+            chosen[active] = True
+            remaining = limit - int(active.numel())
+            grid = torch.linspace(0, count - 1, steps=max(limit * 2, 1)).round().to(torch.long)
+            filler = grid[~chosen.index_select(0, grid)]
+            if int(filler.numel()) < remaining:
+                filler = torch.nonzero(~chosen, as_tuple=False).flatten()
+            atom_ids = torch.cat([active, filler[:remaining]], dim=0)
+        atom_ids = torch.unique(atom_ids, sorted=True)
+        return (
+            atoms.index_select(0, atom_ids),
+            usage.index_select(0, atom_ids),
+            contribution.index_select(0, atom_ids),
+            atom_ids,
+        )
+
+    def _log_dict_diagnostics(self):
+        """Log actual-space similarity, load, and aligned movement summaries."""
         if not self.enable_val_latent_visuals or not self._is_log_rank_zero():
             return
         if not self._dict_snapshots:
@@ -135,74 +211,36 @@ class VisualsMixin:
         logger = getattr(self, "logger", None)
         if logger is None:
             return
-        image = render_codebook_scatter(
-            self._dict_snapshots,
-            self._dict_snapshot_steps,
-            title="Dictionary Atoms (PCA)",
+        atoms, usage, contribution, atom_ids = self._dictionary_visual_subset()
+        step = self._wandb_epoch_end_step()
+        movement_snapshots = None
+        movement_steps = None
+        if len(self._dict_snapshots) > 1:
+            movement_snapshots = (self._dict_snapshots[0], self._dict_snapshots[-1])
+            movement_steps = (self._dict_snapshot_steps[0], self._dict_snapshot_steps[-1])
+        image = render_dictionary_diagnostics(
+            atoms,
+            usage,
+            contribution,
+            atom_ids=atom_ids,
+            step=step,
+            movement_snapshots=movement_snapshots,
+            movement_steps=movement_steps,
+            title="LASER dictionary",
         )
         if image is None:
             return
-
-        step = self._wandb_epoch_end_step()
-        self._save_local_visual_image("val/dictionary_scatter", image, step=step)
+        self._save_local_visual_image("val/dictionary_diagnostics", image, step=step)
         log_wandb_images(
             logger,
-            "val/dictionary_scatter",
+            "val/dictionary_diagnostics",
             [image],
             step=step,
-            captions=[f"dictionary scatter step={step}"],
+            captions=[
+                "Actual-space cosine similarity, nearest-neighbor redundancy, "
+                "load concentration, and aligned angular drift"
+            ],
         )
-
-    def _generate_dict_animation(self):
-        """Build the full trajectory GIF from all accumulated snapshots.
-
-        Called once at the end of training (on_fit_end), not every val epoch.
-        """
-        if not self.enable_val_latent_visuals or not self._is_log_rank_zero():
-            return
-        if len(self._dict_snapshots) < 2:
-            return
-
-        logger = getattr(self, "logger", None)
-        if logger is None:
-            return
-        step = self._wandb_epoch_end_step()
-        gif_path = self._visual_path(
-            "val/dictionary_atom_trajectories",
-            step=step,
-            suffix=".gif",
-        )
-        delete_after = False
-        if gif_path is None:
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
-                gif_path = Path(tmp.name)
-            delete_after = True
-        try:
-            saved = save_codebook_trajectory_gif(
-                self._dict_snapshots,
-                self._dict_snapshot_steps,
-                gif_path,
-                title="Dictionary Atom Trajectories (PCA)",
-                fps=2,
-            )
-            if saved is None:
-                return
-            log_wandb_video(
-                logger,
-                "val/dictionary_atom_trajectories",
-                [str(saved)],
-                step=step,
-                captions=[f"dictionary trajectories step={step}"],
-                formats=["gif"],
-            )
-        finally:
-            if delete_after:
-                try:
-                    os.unlink(gif_path)
-                except OSError:
-                    pass
 
     def log_images(self, x, recon, prefix='val', max_images=8, audio_meta=None, step=None):
         """Log reconstruction images to wandb."""
@@ -366,8 +404,356 @@ class VisualsMixin:
             heat_np.append(hmap.detach().cpu().numpy())
         return heat_np
 
+    def _waveform_sparse_visual_payload(
+        self,
+        z_latent,
+        sparse_codes,
+        *,
+        encoder_latent=None,
+        waveform=None,
+        reconstruction=None,
+        sample_rate=None,
+        duration_seconds=None,
+        split="val",
+    ):
+        """Render perceptually grounded audio reconstruction diagnostics.
+
+        Sparse support tracks, coefficient tracks, and latent activation maps
+        are intentionally absent: their coordinate systems are not perceptual
+        and made adjacent validation examples difficult to compare. Sparse-code
+        statistics are still accumulated for the separate dictionary summary,
+        while this dashboard shows only audible-domain evidence.
+        """
+        if z_latent.ndim != 4 or int(z_latent.size(2)) != 1:
+            raise ValueError(
+                "Expected waveform bottleneck latent [B,C,1,T], got "
+                f"{tuple(z_latent.shape)}"
+            )
+        if encoder_latent is None:
+            encoder_latent = z_latent
+        if encoder_latent.shape != z_latent.shape:
+            raise ValueError(
+                "encoder_latent must match the sparse latent shape; got "
+                f"{tuple(encoder_latent.shape)} vs {tuple(z_latent.shape)}"
+            )
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        if waveform is None or reconstruction is None:
+            raise ValueError("waveform and reconstruction are required for audio diagnostics")
+        if waveform.ndim != 3 or reconstruction.ndim != 3:
+            raise ValueError(
+                "Expected waveform and reconstruction [B,1,T], got "
+                f"{tuple(waveform.shape)} and {tuple(reconstruction.shape)}"
+            )
+        sample_rate = max(
+            1,
+            int(sample_rate or getattr(self, "audio_sample_rate", 0) or 24_000),
+        )
+        limit = min(
+            4,
+            int(z_latent.size(0)),
+            int(waveform.size(0)),
+            int(reconstruction.size(0)),
+        )
+        frames = int(z_latent.size(-1))
+        num_embeddings = max(int(getattr(sparse_codes, "num_embeddings", 1)), 1)
+        global_usage = torch.zeros(num_embeddings, dtype=torch.float32)
+        global_contribution = torch.zeros(num_embeddings, dtype=torch.float32)
+        dashboard_items = []
+        captions = []
+        all_abs_coefficients = []
+
+        for idx in range(limit):
+            support = (
+                sparse_codes.support[idx, 0]
+                .detach()
+                .to(torch.long)
+                .cpu()
+                .transpose(0, 1)
+            )
+            coefficients = (
+                sparse_codes.values[idx, 0]
+                .detach()
+                .to(torch.float32)
+                .cpu()
+                .transpose(0, 1)
+            )
+
+            flat_support = support.reshape(-1).clamp(0, num_embeddings - 1)
+            flat_abs = coefficients.abs().reshape(-1)
+            usage = torch.bincount(flat_support, minlength=num_embeddings).to(torch.float32)
+            contribution = torch.zeros(num_embeddings, dtype=torch.float32)
+            contribution.index_add_(0, flat_support, flat_abs)
+            global_usage.add_(usage)
+            global_contribution.add_(contribution)
+            all_abs_coefficients.append(coefficients.abs().reshape(-1))
+
+            target = waveform[idx, 0].detach().to(torch.float32).cpu()
+            estimate = reconstruction[idx, 0].detach().to(torch.float32).cpu()
+            sample_count = min(int(target.numel()), int(estimate.numel()))
+            target = target[:sample_count]
+            estimate = estimate[:sample_count]
+            audio_duration = sample_count / float(sample_rate)
+            audio_time = np.arange(sample_count, dtype=np.float32) / float(sample_rate)
+            audio_residual = estimate - target
+
+            max_fft = min(1024, max(16, sample_count))
+            n_fft = 1 << int(np.floor(np.log2(max_fft)))
+            hop = max(1, n_fft // 4)
+            window = torch.hann_window(n_fft, dtype=torch.float32)
+            target_mag = torch.stft(
+                target,
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                center=True,
+                pad_mode="constant",
+                return_complex=True,
+            ).abs()
+            estimate_mag = torch.stft(
+                estimate,
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                center=True,
+                pad_mode="constant",
+                return_complex=True,
+            ).abs()
+            reference = target_mag.max().clamp_min(1.0e-7)
+            target_db = (20.0 * torch.log10(target_mag.clamp_min(reference * 1.0e-4) / reference)).clamp(-80.0, 0.0)
+            estimate_db = (20.0 * torch.log10(estimate_mag.clamp_min(reference * 1.0e-4) / reference)).clamp(-80.0, 12.0)
+            spectral_delta_db = (estimate_db - target_db).clamp(-24.0, 24.0)
+
+            num_bands = min(32, max(8, n_fft // 8))
+            erb_filterbank = _cached_erb_filterbank(
+                sample_rate=sample_rate,
+                n_fft=n_fft,
+                num_bands=num_bands,
+                min_frequency=30.0,
+                max_frequency=0.5 * sample_rate,
+                device=target_mag.device,
+                dtype=target_mag.dtype,
+            )
+            target_band_energy = (erb_filterbank @ target_mag.square()).clamp_min(1.0e-8)
+            estimate_band_energy = (erb_filterbank @ estimate_mag.square()).clamp_min(1.0e-8)
+            band_delta_db_raw = (
+                10.0 * torch.log10(estimate_band_energy / target_band_energy)
+            )
+            band_delta_db = band_delta_db_raw.clamp(-18.0, 18.0)
+            band_centers_hz = (
+                erb_filterbank * torch.linspace(0.0, 0.5 * sample_rate, n_fft // 2 + 1)
+            ).sum(dim=1) / erb_filterbank.sum(dim=1).clamp_min(1.0e-8)
+
+            eps = 1.0e-8
+            snr_db = 10.0 * torch.log10(
+                target.square().mean().clamp_min(eps)
+                / audio_residual.square().mean().clamp_min(eps)
+            )
+            critical_ratio = estimate_band_energy.sum() / target_band_energy.sum().clamp_min(eps)
+            critical_log_mae_db = band_delta_db_raw.abs().mean()
+
+            fig = plt.figure(figsize=(15, 13), constrained_layout=True)
+            grid = fig.add_gridspec(4, 2, height_ratios=(0.8, 1.0, 1.0, 0.9))
+            ax_waveform = fig.add_subplot(grid[0, :])
+            ax_target_spec = fig.add_subplot(grid[1, 0])
+            ax_estimate_spec = fig.add_subplot(grid[1, 1])
+            ax_spectral_error = fig.add_subplot(grid[2, 0])
+            ax_band_error = fig.add_subplot(grid[2, 1])
+            ax_envelope = fig.add_subplot(grid[3, 0])
+            ax_band_profile = fig.add_subplot(grid[3, 1])
+
+            ax_waveform.plot(audio_time, target.numpy(), label="reference", lw=1.0, alpha=0.85)
+            ax_waveform.plot(audio_time, estimate.numpy(), label="reconstruction", lw=0.9, alpha=0.78)
+            ax_waveform.plot(audio_time, audio_residual.numpy(), label="error", lw=0.75, alpha=0.65)
+            ax_waveform.set_xlim(0.0, max(audio_duration, 1.0e-6))
+            ax_waveform.set_ylabel("amplitude")
+            ax_waveform.set_xlabel("time (s)")
+            ax_waveform.set_title(f"Waveform alignment — reconstruction SNR {float(snr_db):.2f} dB")
+            ax_waveform.grid(True, alpha=0.2)
+            ax_waveform.legend(ncol=3, loc="upper right", fontsize=8)
+
+            target_image = ax_target_spec.imshow(
+                target_db.numpy(),
+                aspect="auto",
+                origin="lower",
+                interpolation="bilinear",
+                cmap="magma",
+                vmin=-80.0,
+                vmax=0.0,
+                extent=(0.0, audio_duration, 0.0, 0.5 * sample_rate / 1000.0),
+            )
+            ax_target_spec.set_ylabel("frequency (kHz)")
+            ax_target_spec.set_xlabel("time (s)")
+            ax_target_spec.set_title("Reference log spectrum")
+            target_colorbar = fig.colorbar(
+                target_image, ax=ax_target_spec, fraction=0.045, pad=0.02
+            )
+            target_colorbar.set_label("dB relative to reference peak")
+
+            estimate_image = ax_estimate_spec.imshow(
+                estimate_db.numpy(),
+                aspect="auto",
+                origin="lower",
+                interpolation="bilinear",
+                cmap="magma",
+                vmin=-80.0,
+                vmax=0.0,
+                extent=(0.0, audio_duration, 0.0, 0.5 * sample_rate / 1000.0),
+            )
+            ax_estimate_spec.set_ylabel("frequency (kHz)")
+            ax_estimate_spec.set_xlabel("time (s)")
+            ax_estimate_spec.set_title("Reconstruction log spectrum (same scale)")
+            estimate_colorbar = fig.colorbar(
+                estimate_image, ax=ax_estimate_spec, fraction=0.045, pad=0.02
+            )
+            estimate_colorbar.set_label("dB relative to reference peak")
+
+            spectral_error_image = ax_spectral_error.imshow(
+                spectral_delta_db.numpy(),
+                aspect="auto",
+                origin="lower",
+                interpolation="bilinear",
+                cmap="RdBu_r",
+                vmin=-24.0,
+                vmax=24.0,
+                extent=(0.0, audio_duration, 0.0, 0.5 * sample_rate / 1000.0),
+            )
+            ax_spectral_error.set_ylabel("frequency (kHz)")
+            ax_spectral_error.set_xlabel("time (s)")
+            ax_spectral_error.set_title("Signed spectral error (blue=missing, red=excess)")
+            spectral_error_colorbar = fig.colorbar(
+                spectral_error_image,
+                ax=ax_spectral_error,
+                fraction=0.045,
+                pad=0.02,
+            )
+            spectral_error_colorbar.set_label("reconstruction − reference (dB)")
+
+            band_error_image = ax_band_error.imshow(
+                band_delta_db.numpy(),
+                aspect="auto",
+                origin="lower",
+                interpolation="bilinear",
+                cmap="RdBu_r",
+                vmin=-18.0,
+                vmax=18.0,
+                extent=(0.0, audio_duration, 0.0, float(num_bands)),
+            )
+            band_tick_ids = np.linspace(0, num_bands - 1, num=min(6, num_bands)).round().astype(int)
+            ax_band_error.set_yticks(band_tick_ids + 0.5)
+            ax_band_error.set_yticklabels(
+                [f"{float(band_centers_hz[i]) / 1000.0:.2g}" for i in band_tick_ids]
+            )
+            ax_band_error.set_ylabel("ERB-band center (kHz)")
+            ax_band_error.set_xlabel("time (s)")
+            ax_band_error.set_title(
+                f"Critical-band energy error — mean |Δ| {float(critical_log_mae_db):.2f} dB"
+            )
+            band_error_colorbar = fig.colorbar(
+                band_error_image, ax=ax_band_error, fraction=0.045, pad=0.02
+            )
+            band_error_colorbar.set_label("reconstruction − reference (dB)")
+
+            envelope_window = min(sample_count, max(1, int(round(0.025 * sample_rate))))
+            envelope_hop = min(envelope_window, max(1, int(round(0.010 * sample_rate))))
+
+            def rms_envelope(signal):
+                return F.avg_pool1d(
+                    signal.square().view(1, 1, -1),
+                    kernel_size=envelope_window,
+                    stride=envelope_hop,
+                ).sqrt().flatten()
+
+            target_envelope = rms_envelope(target)
+            estimate_envelope = rms_envelope(estimate)
+            residual_envelope = rms_envelope(audio_residual)
+            envelope_time = (
+                torch.arange(target_envelope.numel()) * envelope_hop
+                + 0.5 * envelope_window
+            ) / float(sample_rate)
+            ax_envelope.plot(
+                envelope_time.numpy(), target_envelope.numpy(), label="reference", lw=1.5
+            )
+            ax_envelope.plot(
+                envelope_time.numpy(), estimate_envelope.numpy(), label="reconstruction", lw=1.35
+            )
+            ax_envelope.plot(
+                envelope_time.numpy(), residual_envelope.numpy(), label="error", lw=1.1
+            )
+            ax_envelope.set_xlim(0.0, max(audio_duration, 1.0e-6))
+            ax_envelope.set_xlabel("time (s)")
+            ax_envelope.set_ylabel("25 ms RMS")
+            ax_envelope.set_title("Short-time energy envelope")
+            ax_envelope.legend(fontsize=8)
+            ax_envelope.grid(True, alpha=0.2)
+
+            target_band_mean = target_band_energy.mean(dim=1)
+            estimate_band_mean = estimate_band_energy.mean(dim=1)
+            band_reference = target_band_mean.max().clamp_min(eps)
+            target_band_db = 10.0 * torch.log10(
+                target_band_mean.clamp_min(band_reference * 1.0e-8) / band_reference
+            )
+            estimate_band_db = 10.0 * torch.log10(
+                estimate_band_mean.clamp_min(band_reference * 1.0e-8) / band_reference
+            )
+            ax_band_profile.semilogx(
+                band_centers_hz.numpy(), target_band_db.numpy(), label="reference", lw=1.6
+            )
+            ax_band_profile.semilogx(
+                band_centers_hz.numpy(), estimate_band_db.numpy(), label="reconstruction", lw=1.45
+            )
+            ax_band_profile.axhline(-50.0, color="0.5", ls=":", lw=1.0, label="loss activity floor")
+            ax_band_profile.set_ylim(-80.0, 5.0)
+            ax_band_profile.set_xlabel("ERB-band center frequency (Hz)")
+            ax_band_profile.set_ylabel("mean energy (dB rel. reference peak)")
+            ax_band_profile.set_title(
+                f"Critical-band profile — total energy ratio {float(critical_ratio):.3f}"
+            )
+            ax_band_profile.legend(fontsize=8)
+            ax_band_profile.grid(True, which="both", alpha=0.2)
+
+            fig.suptitle(
+                f"Audio reconstruction diagnostic — item {idx} | {sample_rate / 1000.0:.0f} kHz | "
+                f"{audio_duration:.2f} s",
+                fontsize=13,
+            )
+            dashboard_items.append(_figure_to_rgb_array(fig))
+            plt.close(fig)
+            captions.append(
+                f"item={idx}; snr_db={float(snr_db):.4f}; "
+                f"critical_band_energy_ratio={float(critical_ratio):.4f}; "
+                f"critical_band_mean_abs_delta_db={float(critical_log_mae_db):.4f}"
+            )
+
+        self._val_visual_atom_usage = global_usage
+        self._val_visual_atom_contribution = global_contribution
+        payload = {}
+        if dashboard_items:
+            payload[f"{split}/audio_reconstruction_diagnostics"] = {
+                "kind": "image",
+                "items": dashboard_items,
+                "caption": captions,
+            }
+            payload[f"{split}/visual_active_atom_count"] = float(
+                (global_usage > 0).sum().item()
+            )
+            payload[f"{split}/visual_latent_frames"] = float(frames)
+        if all_abs_coefficients:
+            flattened = torch.cat(all_abs_coefficients)
+            payload[f"{split}/visual_coefficient_abs_p95"] = float(
+                torch.quantile(flattened, 0.95).item()
+            )
+        return payload
+
     def _log_val_latent_visuals(self):
-        """Log latent RGB projections, sparse heatmaps, and reconstruction diagnostics."""
+        """Log reconstruction diagnostics and image-model latent summaries."""
+        self._remove_legacy_wandb_visual_summaries()
         if not self._supports_val_latent_heatmaps():
             return
         if not getattr(self._trainer_ref(), "is_global_zero", False):
@@ -382,11 +768,33 @@ class VisualsMixin:
         self.eval()
         try:
             with torch.no_grad():
-                z = self.encoder(x)
-                z = self.pre_bottleneck(z)
-                with self._bottleneck_autocast_context(z):
-                    z_dl, _, sparse_codes = self.bottleneck(z.float())
-                recon = self.decoder(self.post_bottleneck(z_dl))
+                if self.is_waveform_audio:
+                    z_e = self.encoder(x)
+                    z_e = self.pre_bottleneck(z_e)
+                    z_e = self._to_bottleneck_input(z_e)
+                    with self._bottleneck_autocast_context(z_e):
+                        z_dl, _, sparse_codes = self.bottleneck(z_e.float())
+                else:
+                    z_e = None
+                    z_dl, _, sparse_codes = self.encode(x)
+                recon = self.decode(z_dl)
+                if self.is_waveform_audio:
+                    sample_rate = max(int(getattr(self, "audio_sample_rate", 0) or 0), 1)
+                    log_payload = self._waveform_sparse_visual_payload(
+                        z_dl,
+                        sparse_codes,
+                        encoder_latent=z_e,
+                        waveform=x,
+                        reconstruction=recon,
+                        sample_rate=sample_rate,
+                        duration_seconds=float(x.size(-1)) / float(sample_rate),
+                        split="val",
+                    )
+                    if log_payload:
+                        step = self._wandb_epoch_end_step()
+                        self._save_local_visual_payload(log_payload, step=step)
+                        log_wandb_payload(self.logger, log_payload, step=step)
+                    return
                 image_hw = (x.shape[2], x.shape[3])
                 latent_rgb = self._latent_rgb_projection(z_dl)
                 sparse_heat = self._sparse_heatmaps(sparse_codes, image_hw)

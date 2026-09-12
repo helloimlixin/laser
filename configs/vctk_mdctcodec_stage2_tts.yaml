@@ -1,0 +1,38 @@
+# First bounded multi-speaker TTS pilot using the frozen, validation-selected codec.
+cache: outputs/mdctcodec_tts/cache/tokens.pt
+output: outputs/mdctcodec_tts/stage2
+seed: 20260912
+device: cuda:0
+evaluation_device: cuda:1
+model:
+  width: 512
+  heads: 8
+  text_layers: 3
+  audio_layers: 8
+  dropout: 0.1
+train:
+  epochs: 20
+  max_steps: 20000
+  max_hours: 8
+  frame_budget: 8192
+  max_batch: 16
+  accumulate: 4
+  learning_rate: 0.0003
+  warmup_steps: 500
+  min_lr_ratio: 0.1
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  guided_attention_weight: 0.2
+  guided_attention_steps: 8000
+  num_workers: 4
+  save_every_steps: 250
+  upload_every_epochs: 5
+  preview_every_epochs: 5
+  preview_count: 4
+  preview_max_frames: 1500
+  validation_items: 256
+wandb:
+  entity: helloimlixin-rutgers
+  project: laser
+  name: mdctcodec-laser-6kbps-stage2-tts-vctk-phoneme
+  group: mdctcodec-vctk-tts-20260912

@@ -46,6 +46,15 @@ def test_dictionary_learning_forward_and_token_roundtrip():
         dl._last_bottleneck_objective,
         dl._last_dictionary_loss + dl._last_bottleneck_loss,
     )
+    reconstruction_grad = torch.autograd.grad(
+        z_q.square().mean(),
+        z,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    assert reconstruction_grad is not None
+    assert torch.isfinite(reconstruction_grad).all()
+    assert torch.count_nonzero(reconstruction_grad) > 0
     (z_q.mean() + dl._last_bottleneck_objective_for_backward).backward()
     assert z.grad is not None
     assert dl.dictionary.grad is not None

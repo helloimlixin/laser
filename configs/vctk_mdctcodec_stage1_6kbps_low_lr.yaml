@@ -1,0 +1,29 @@
+# Controlled continuation from the best 6 kbps checkpoint at epoch 254.
+defaults:
+  - vctk_mdctcodec_stage1_6kbps
+  - _self_
+
+output_dir: outputs/vctk_mdctcodec_stage1_6kbps_low_lr
+ckpt_path: ${output_dir}/initial.ckpt
+model:
+  learning_rate: 0.00005
+  encoder_learning_rate: 0.00005
+  decoder_learning_rate: 0.00005
+  adapter_learning_rate: 0.00005
+  discriminator_learning_rate: 0.00005
+  disc_learning_rate: 0.00005
+train:
+  max_epochs: 300
+  learning_rate: 0.00005
+  lr_schedule: cosine
+  warmup_steps: 0
+  min_lr_ratio: 0.1
+  # The checkpoint's generator-update counter is 217060; global_step=434120
+  # counts both optimizers and must not be used as the cosine origin.
+  lr_schedule_start_step: 217060
+  lr_schedule_total_steps: 38385 # 45 remaining epochs * 853 generator updates.
+checkpoint:
+  filename: 'mdct-laser-6kbps-low-lr-{epoch:03d}-{step:07d}'
+wandb:
+  name: mdctcodec-laser-6kbps-low-lr-cosine
+  tags: [stage1, vctk, mdctcodec, laser, 6kbps, k2, q7, low-lr, cosine, resumed, native48k, balanced-val32]

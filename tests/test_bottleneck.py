@@ -129,6 +129,37 @@ def test_dictionary_learning_data_initializes_from_first_batch():
     )
 
 
+def test_dictionary_learning_delays_and_pools_data_initialization():
+    torch.manual_seed(0)
+    dl = DictionaryLearning(
+        num_embeddings=8,
+        embedding_dim=2,
+        sparsity_level=1,
+        data_init_from_first_batch=True,
+        data_init_start_step=2,
+        data_init_accumulation_steps=2,
+        dictionary_update_mode="alternating_residual",
+    )
+    before = dl.dictionary.detach().clone()
+
+    dl(torch.randn(1, 2, 1, 4))
+    assert dl.alternating_dictionary_update_after_step_() == 0
+    dl(torch.randn(1, 2, 1, 4))
+    assert dl.alternating_dictionary_update_after_step_() == 0
+    assert not bool(dl._data_initialized.item())
+    assert torch.equal(dl.dictionary.detach(), before)
+
+    dl(torch.randn(1, 2, 1, 4))
+    assert dl.alternating_dictionary_update_after_step_() == 0
+    assert not bool(dl._data_initialized.item())
+    assert len(dl._data_init_accumulator) == 1
+
+    dl(torch.randn(1, 2, 1, 4))
+    assert bool(dl._data_initialized.item())
+    assert len(dl._data_init_accumulator) == 0
+    assert not torch.allclose(dl.dictionary.detach(), before)
+
+
 def test_dictionary_learning_resume_does_not_reinitialize_loaded_dictionary():
     torch.manual_seed(0)
     trained = DictionaryLearning(
@@ -281,9 +312,113 @@ def test_alternating_residual_update_freezes_dictionary_and_improves_fixed_codes
     assert float(dl._last_dictionary_update_relative_improvement.item()) > 0.0
 
 
+def test_alternating_residual_update_accumulates_complete_windows():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=1,
+        dictionary_update_mode="alternating_residual",
+        dictionary_update_relaxation=1.0,
+        dictionary_update_max_atoms_per_step=2,
+        dictionary_update_min_usage=2,
+        dictionary_update_accumulation_steps=2,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(torch.eye(2))
+    z = torch.tensor([[[[1.0, 0.4]], [[0.5, 1.0]]]])
+
+    before = dl.dictionary.detach().clone()
+    dl(z)
+    assert dl.alternating_dictionary_update_after_step_() == 0
+    assert torch.equal(dl.dictionary, before)
+    assert int(dl._last_dictionary_update_accumulated_step_count.item()) == 1
+
+    dl(z)
+    assert dl.alternating_dictionary_update_after_step_() == 2
+    assert not torch.equal(dl.dictionary, before)
+    assert int(dl._dictionary_update_step.item()) == 2
+    assert int(dl._last_dictionary_update_step.item()) == 2
+    assert int(dl._last_dictionary_update_accumulated_step_count.item()) == 0
+
+    last_updated = int(dl._last_dictionary_updated_atom_count.item())
+    last_improvement = float(dl._last_dictionary_update_relative_improvement.item())
+    dl(z)
+    assert dl.alternating_dictionary_update_after_step_() == 0
+    assert int(dl._last_dictionary_updated_atom_count.item()) == last_updated
+    assert float(dl._last_dictionary_update_relative_improvement.item()) == pytest.approx(
+        last_improvement
+    )
+
+
+def test_alternating_update_uses_fixed_gather_then_broadcast_protocol(monkeypatch):
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=2,
+        sparsity_level=1,
+        dictionary_update_mode="alternating_residual",
+        dictionary_update_max_atoms_per_step=1,
+        dictionary_update_min_usage=1,
+    )
+    dl._last_dictionary_update_batch = {
+        "signals": torch.tensor([[0.1], [1.0]]),
+        "support": torch.tensor([[1]]),
+        "values": torch.tensor([[1.0]]),
+    }
+    collective_calls = []
+
+    def fake_all_reduce(tensor, op=None):
+        del op
+        collective_calls.append(("reduce", tuple(tensor.shape)))
+
+    def fake_all_gather(outputs, tensor, group=None):
+        del group
+        collective_calls.append(("gather", tuple(tensor.shape)))
+        if tensor.shape == (1,):
+            outputs[0].fill_(1)
+            outputs[1].fill_(1)
+        elif tensor.dtype == torch.long:
+            outputs[0].fill_(0)
+            outputs[1].copy_(tensor)
+        elif tensor.shape == (2, 1):
+            outputs[0].copy_(torch.tensor([[1.0], [0.0]]))
+            outputs[1].copy_(tensor)
+        else:
+            outputs[0].fill_(1.0)
+            outputs[1].copy_(tensor)
+
+    def fake_broadcast(tensor, src, group=None):
+        del src, group
+        collective_calls.append(("broadcast", tuple(tensor.shape)))
+
+    monkeypatch.setattr(dl, "_distributed_is_initialized", lambda: True)
+    monkeypatch.setattr(dl, "_distributed_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    updated = dl.alternating_dictionary_update_after_step_()
+
+    assert updated == 1
+    assert collective_calls == [
+        ("reduce", ()),
+        ("gather", (1,)),
+        ("gather", (2, 1)),
+        ("gather", (1, 1)),
+        ("gather", (1, 1)),
+        ("broadcast", (2, 4)),
+        ("broadcast", (3,)),
+    ]
+
+
 def test_dictionary_learning_rejects_unknown_update_mode():
     with pytest.raises(ValueError, match="dictionary_update_mode"):
         DictionaryLearning(dictionary_update_mode="adam-but-not-really")
+
+
+def test_dictionary_learning_rejects_unknown_collective_backend():
+    with pytest.raises(ValueError, match="dictionary_collective_backend"):
+        DictionaryLearning(dictionary_collective_backend="mixed-and-unsafe")
 
 
 def test_batch_omp_support_matches_abs_correlations_on_orthogonal_dictionary():
@@ -333,6 +468,48 @@ def test_batch_omp_uses_unclipped_least_squares_coefficients():
     assert torch.allclose(values, torch.tensor([[3.0, -2.0]]), atol=1e-4)
 
 
+def test_coherence_gated_omp_avoids_collinear_support_without_clamping_values():
+    unrestricted = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=3,
+        sparsity_level=2,
+        omp_ridge=0.1,
+    )
+    conditioned = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=3,
+        sparsity_level=2,
+        omp_ridge=0.1,
+        omp_max_support_coherence=0.25,
+    )
+    dictionary = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.05, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    dictionary = torch.nn.functional.normalize(dictionary, dim=0)
+    signal = torch.tensor([[20.0], [1.0], [0.0]], dtype=torch.float32)
+
+    plain_support, _ = unrestricted.batch_omp_with_support(signal, dictionary)
+    support, values = conditioned.batch_omp_with_support(signal, dictionary)
+
+    assert set(plain_support[0].tolist()) == {0, 1}
+    assert set(support[0].tolist()) == {1, 2}
+    selected = dictionary[:, support[0]]
+    assert float((selected[:, 0] @ selected[:, 1]).abs()) <= 0.25
+    assert float(values.abs().max()) > 10.0
+    assert float(conditioned._last_support_coherence_max) <= 0.25
+    assert float(conditioned._last_support_coherence_fallback_fraction) == 0.0
+
+
+def test_dictionary_learning_validates_support_coherence_bound():
+    with pytest.raises(ValueError, match="omp_max_support_coherence"):
+        DictionaryLearning(omp_max_support_coherence=0.0)
+
+
 def test_progressive_dictionary_loss_matches_rqvae_depth_average():
     dl = DictionaryLearning(
         num_embeddings=2,
@@ -359,6 +536,63 @@ def test_progressive_dictionary_loss_matches_rqvae_depth_average():
     dl._last_bottleneck_objective_for_backward.backward()
     assert z.grad is not None
     assert dl.dictionary.grad is not None
+
+
+def test_nonprogressive_dictionary_loss_uses_final_batch_omp_k_only():
+    dl = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=3,
+        sparsity_level=2,
+        commitment_cost=1.0,
+        progressive_loss=False,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [0.0, 0.0],
+                ]
+            )
+        )
+
+    # Final Batch OMP reconstructs [2, 1, 1] as [2, 1, 0]. The training
+    # objective must therefore be its final K=2 MSE, 1 / 3, with no K=1 term.
+    z = torch.tensor([[[[2.0]], [[1.0]], [[1.0]]]], requires_grad=True)
+    _, commitment_loss, sparse_codes = dl(z)
+
+    assert sparse_codes.support.shape[-1] == 2
+    assert dl._last_final_dictionary_loss.item() == pytest.approx(1.0 / 3.0)
+    assert dl._last_dictionary_loss.item() == pytest.approx(1.0 / 3.0)
+    assert dl._last_commitment_loss.item() == pytest.approx(1.0 / 3.0)
+    assert commitment_loss.item() == pytest.approx(1.0 / 3.0)
+
+
+def test_variance_normalized_commitment_is_scale_invariant():
+    base = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=1,
+        commitment_cost=1.0,
+        commitment_normalize_by_variance=True,
+    )
+    scaled = DictionaryLearning(
+        num_embeddings=2,
+        embedding_dim=2,
+        sparsity_level=1,
+        commitment_cost=1.0,
+        commitment_normalize_by_variance=True,
+    )
+    with torch.no_grad():
+        base.dictionary.copy_(torch.eye(2))
+        scaled.dictionary.copy_(torch.eye(2))
+
+    signal = torch.tensor([[[[2.0]], [[1.0]]]])
+    _, base_loss, _ = base(signal)
+    _, scaled_loss, _ = scaled(7.0 * signal)
+
+    assert base_loss.item() == pytest.approx(scaled_loss.item(), rel=1e-5)
 
 
 def test_batch_omp_fixed_sparsity_does_not_reselect_atoms_on_zero_ties():
@@ -399,6 +633,123 @@ def test_dictionary_learning_forward_uses_unclipped_patch_coefficients():
     assert torch.isfinite(loss)
     assert torch.allclose(z_out, z, atol=1e-4)
     assert float(sparse_codes.values.abs().max()) > 1.0
+
+
+def test_dictionary_learning_quantizes_and_bounds_codec_coefficients():
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=4,
+        sparsity_level=4,
+        coefficient_quantization_bits=4,
+        coefficient_quantization_max=2.0,
+    )
+    with torch.no_grad():
+        dl.dictionary.copy_(torch.eye(4))
+    z = torch.tensor([[[[3.0]], [[-1.1]], [[0.31]], [[-0.02]]]])
+
+    _z_out, loss, sparse_codes = dl(z)
+
+    qmax = 2 ** (4 - 1) - 1
+    step = 2.0 / qmax
+    scaled = sparse_codes.values / step
+    assert torch.isfinite(loss)
+    assert float(sparse_codes.values.abs().max()) <= 2.0
+    assert torch.allclose(scaled, scaled.round(), atol=1e-5)
+    assert float(dl._last_coefficient_saturation_fraction) > 0.0
+
+
+def test_dictionary_learning_requires_bound_for_coefficient_quantizer():
+    with pytest.raises(ValueError, match="coefficient_quantization_max"):
+        DictionaryLearning(coefficient_quantization_bits=8)
+
+
+def test_disabled_stage_one_quantizer_preserves_unbounded_coefficients_exactly():
+    dl = DictionaryLearning(
+        coefficient_quantization_bits=0,
+        coefficient_quantization_max=None,
+    )
+    values = torch.tensor([[-1000.0, -0.125, 0.0, 2400.0]])
+
+    output = dl._quantize_coefficients(values)
+
+    assert torch.equal(output, values)
+    assert float(dl._last_coefficient_quantization_fraction) == 0.0
+    assert float(dl._last_coefficient_saturation_fraction) == 0.0
+    assert float(dl._last_coefficient_abs_p99) > 2000.0
+    assert float(dl._last_coefficient_abs_max) == 2400.0
+
+
+def test_dictionary_learning_coefficient_quantization_curriculum():
+    dl = DictionaryLearning(
+        num_embeddings=4,
+        embedding_dim=4,
+        sparsity_level=2,
+        coefficient_quantization_bits=4,
+        coefficient_quantization_max=2.0,
+        coefficient_quantization_start_step=2,
+        coefficient_quantization_warmup_steps=2,
+    )
+    values = torch.tensor([[0.2, 1.7]], dtype=torch.float32)
+    quantized = torch.round(values / (2.0 / 7.0)) * (2.0 / 7.0)
+
+    assert torch.equal(dl._quantize_coefficients(values), values)
+    assert float(dl._last_coefficient_quantization_fraction) == 0.0
+
+    dl._dictionary_update_step.fill_(3)
+    halfway = dl._quantize_coefficients(values)
+    assert torch.allclose(halfway, torch.lerp(values, quantized, 0.5))
+    assert float(dl._last_coefficient_quantization_fraction) == pytest.approx(0.5)
+
+    dl._dictionary_update_step.fill_(4)
+    assert torch.allclose(dl._quantize_coefficients(values), quantized)
+    assert float(dl._last_coefficient_quantization_fraction) == 1.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"coefficient_quantization_start_step": -1}, "start_step"),
+        ({"coefficient_quantization_warmup_steps": -1}, "warmup_steps"),
+    ],
+)
+def test_dictionary_learning_rejects_negative_quantization_schedule(kwargs, expected):
+    with pytest.raises(ValueError, match=expected):
+        DictionaryLearning(**kwargs)
+
+
+def test_dictionary_learning_ridge_stabilizes_collinear_omp_coefficients():
+    dictionary = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0e-4, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    dictionary = torch.nn.functional.normalize(dictionary, dim=0)
+    signal = torch.tensor([[1.0], [0.5], [0.0]], dtype=torch.float32)
+    unregularized = DictionaryLearning(
+        num_embeddings=3,
+        embedding_dim=3,
+        sparsity_level=2,
+        omp_ridge=0.0,
+    )
+    regularized = DictionaryLearning(
+        num_embeddings=3,
+        embedding_dim=3,
+        sparsity_level=2,
+        omp_ridge=1.0e-2,
+    )
+
+    _support_plain, values_plain = unregularized.batch_omp_with_support(
+        signal, dictionary
+    )
+    _support_ridge, values_ridge = regularized.batch_omp_with_support(
+        signal, dictionary
+    )
+
+    assert torch.isfinite(values_ridge).all()
+    assert values_ridge.abs().max() < values_plain.abs().max()
 
 
 def test_patch_dictionary_learning_rejects_overlapping_stride():

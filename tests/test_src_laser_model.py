@@ -383,6 +383,31 @@ def test_laser_lr_schedule_supports_warmup_without_decay():
     assert optimizer.param_groups[0]["lr"] == 1e-3
 
 
+def test_laser_cosine_continuation_overrides_restored_optimizer_lr():
+    model = _build_model(learning_rate=5e-5, warmup_steps=0, min_lr_ratio=0.1,
+                         lr_schedule_start_step=217060, lr_schedule_total_steps=38385)
+    optimizer = model.configure_optimizers()
+    restored = optimizer.state_dict()
+    for group in restored['param_groups']:
+        group['lr'] = 1.56e-4
+    optimizer.load_state_dict(restored)
+    assert model._lr_total_steps == 38385
+    for step, expected in [(217060, 5e-5), (255445, 5e-6), (300000, 5e-6)]:
+        model._apply_scheduled_lrs(optimizer, step=step, base_lrs=model._lr_base_lrs)
+        assert all(abs(g['lr'] - expected) < 1e-12 for g in optimizer.param_groups)
+    assert abs(model._lr_multiplier_for_step(217060 + 19192) - 0.55) < 2e-5
+
+
+def test_laser_cosine_continuation_warmup_uses_relative_step():
+    model = _build_model(learning_rate=5e-5, warmup_steps=10, min_lr_ratio=0.1,
+                         lr_schedule_start_step=200000, lr_schedule_total_steps=100)
+    model.configure_optimizers()
+    assert model._lr_multiplier_for_step(200000) == 0.1
+    assert model._lr_multiplier_for_step(200005) == 0.5
+    assert model._lr_multiplier_for_step(200010) == 1.0
+    assert model._lr_multiplier_for_step(200100) == 0.1
+
+
 def test_laser_lr_schedule_does_not_force_lightning_step_estimate_property():
     model = _build_model(learning_rate=1e-3, warmup_steps=10, min_lr_ratio=0.01)
 
@@ -534,7 +559,7 @@ def test_laser_encode_to_tokens_quantizes_sparse_codes():
     assert tokens.tolist() == [[[[1, 8, 4, 11]]]]
 
 
-def test_laser_init_no_longer_exposes_removed_sparse_coding_knobs():
+def test_laser_init_exposes_only_maintained_sparse_coding_knobs():
     params = inspect.signature(laser_module.LASER.__init__).parameters
 
     assert "perceptual_batch_size" not in params
@@ -561,10 +586,15 @@ def test_laser_init_no_longer_exposes_removed_sparse_coding_knobs():
     assert "pattern_ema_decay" not in params
     assert "pattern_temperature" not in params
     assert "orthogonality_weight" not in params
-    assert "dictionary_update_mode" not in params
-    # Collapsed to a single plain gradient-trained dictionary (June 2026): the
-    # online-K-SVD, dictionary-through-decoder, usage-EMA and dead-atom-revival
-    # knobs were all removed.
+    # The bounded alternating-residual update is maintained because it is the
+    # stable K=4 recipe used by the reference LASER experiment. The older
+    # online-K-SVD and dictionary-through-decoder variants remain removed.
+    assert "dictionary_update_mode" in params
+    assert "dictionary_update_relaxation" in params
+    assert "dictionary_update_max_atoms_per_step" in params
+    assert "dictionary_update_min_usage" in params
+    assert "dictionary_update_accumulation_steps" in params
+    assert "dictionary_update_max_backtracks" in params
     assert "dictionary_through_decoder" not in params
     assert "dead_atom_revival_steps" not in params
     assert "dictionary_usage_ema_decay" not in params

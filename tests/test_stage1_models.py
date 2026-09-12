@@ -7,6 +7,8 @@ from src.codebook_visuals import (
     _fixed_square_axis_limits,
     _pca_project_snapshots,
     render_codebook_scatter,
+    render_dictionary_diagnostics,
+    render_dictionary_usage_scatter,
     save_codebook_trajectory_gif,
 )
 from src.models.laser import LASER
@@ -154,6 +156,55 @@ def test_codebook_progression_visual_helpers(tmp_path):
     assert gif_path is not None
     assert gif_path.exists()
     assert gif_path.stat().st_size > 0
+
+
+def test_dictionary_usage_scatter_encodes_active_atom_load():
+    torch.manual_seed(0)
+    atoms = torch.randn(32, 8)
+    usage = torch.zeros(32)
+    usage[[3, 7, 19]] = torch.tensor([4.0, 12.0, 2.0])
+    contribution = torch.zeros(32)
+    contribution[[3, 7, 19]] = torch.tensor([8.0, 36.0, 5.0])
+
+    scatter = render_dictionary_usage_scatter(
+        atoms,
+        usage,
+        contribution,
+        atom_ids=torch.arange(32),
+        step=50,
+        title="test dictionary",
+    )
+
+    assert scatter is not None
+    assert scatter.ndim == 3
+    assert scatter.shape[-1] == 3
+    assert scatter.dtype == np.uint8
+
+
+def test_dictionary_diagnostics_use_actual_space_statistics():
+    torch.manual_seed(1)
+    atoms = torch.randn(64, 16)
+    usage = torch.zeros(64)
+    usage[:12] = torch.arange(1, 13, dtype=torch.float32)
+    contribution = usage * torch.linspace(0.5, 2.0, 64)
+    first = atoms.clone()
+    latest = atoms + 0.03 * torch.randn_like(atoms)
+
+    image = render_dictionary_diagnostics(
+        latest,
+        usage,
+        contribution,
+        atom_ids=torch.arange(64),
+        step=100,
+        movement_snapshots=(first, latest),
+        movement_steps=(0, 100),
+        title="test dictionary",
+    )
+
+    assert image is not None
+    assert image.ndim == 3
+    assert image.shape[-1] == 3
+    assert image.dtype == np.uint8
 
 
 def test_codebook_animation_uses_fixed_square_axis_limits():

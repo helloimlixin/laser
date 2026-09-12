@@ -15,10 +15,12 @@ is set in the model config.
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import weight_norm
 
 
 def weights_init(module: nn.Module) -> None:
@@ -414,7 +416,7 @@ class AudioMultiScalePeriodDiscriminator(nn.Module):
                     num_layers=num_layers,
                     spectral=spectral,
                 )
-                for _ in range(max(1, int(num_scales)))
+                for _ in range(max(0, int(num_scales)))
             ]
         )
         # Optional DAC/Encodec-style complex-STFT critics (frequency-domain view).
@@ -460,6 +462,325 @@ class AudioMultiScalePeriodDiscriminator(nn.Module):
         return logits
 
 
+class AudioEncodecMultiScaleSTFTDiscriminator(nn.Module):
+    """Adapter around Meta EnCodec's published MS-STFT discriminator.
+
+    The upstream module always returns logits and feature maps together.
+    LASER makes feature collection optional, so this adapter preserves the
+    exact upstream STFT/convolution stack behind the local critic interface.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int = 1,
+        num_filters: int = 32,
+        max_filters: int = 1024,
+        fft_sizes=(2048, 1024, 512, 256, 128),
+    ) -> None:
+        super().__init__()
+        if int(in_channels) != 1:
+            raise ValueError("Meta EnCodec's MS-STFT discriminator expects mono audio")
+        try:
+            from encodec.msstftd import MultiScaleSTFTDiscriminator
+        except ImportError as exc:  # pragma: no cover - project pins encodec
+            raise RuntimeError(
+                "audio_adversarial_type='encodec_msstft' requires encodec==0.1.1"
+            ) from exc
+
+        n_ffts = tuple(int(value) for value in fft_sizes if int(value) > 0)
+        if not n_ffts:
+            raise ValueError("Meta EnCodec's MS-STFT discriminator needs at least one FFT scale")
+        self.model = MultiScaleSTFTDiscriminator(
+            filters=int(num_filters),
+            in_channels=int(in_channels),
+            out_channels=1,
+            n_ffts=list(n_ffts),
+            hop_lengths=[max(1, value // 4) for value in n_ffts],
+            win_lengths=list(n_ffts),
+            max_filters=int(max_filters),
+            normalized=True,
+            norm="weight_norm",
+        )
+
+    def forward(self, x: torch.Tensor, return_features: bool = False):
+        # The upstream Spectrogram transform requires fp32 under mixed precision.
+        logits, features = self.model(x.float())
+        if return_features:
+            return logits, features
+        return logits
+
+
+def _mdct_analysis_kernel(num_coefficients: int) -> torch.Tensor:
+    """Sine-windowed MDCT analysis kernel used by the MDCT critic.
+
+    Keeping the transform inside the discriminator makes every sub-critic see
+    the signed, critically sampled representation used by MDCTCodec rather
+    than a redundant complex STFT magnitude.  The kernel matches the fixed
+    MDCT front end in :mod:`src.models.audio_codec`.
+    """
+    num_coefficients = int(num_coefficients)
+    if num_coefficients <= 0:
+        raise ValueError("num_coefficients must be positive")
+    block_size = 2 * num_coefficients
+    sample = torch.arange(block_size, dtype=torch.float64).unsqueeze(1)
+    frequency = torch.arange(num_coefficients, dtype=torch.float64).unsqueeze(0)
+    basis = torch.cos(
+        math.pi
+        / num_coefficients
+        * (sample + 0.5 + num_coefficients / 2.0)
+        * (frequency + 0.5)
+    )
+    window = torch.sin(
+        math.pi
+        / block_size
+        * (torch.arange(block_size, dtype=torch.float64) + 0.5)
+    ).unsqueeze(1)
+    return (basis * window).t().unsqueeze(1).to(torch.float32).contiguous()
+
+
+class AudioMDCTSubDiscriminator(nn.Module):
+    """One signed-MDCT branch of the multi-resolution audio critic.
+
+    The convolution kernel schedule follows the MR-MDCTD description in the
+    MDCTCodec paper. Strided 2-D convolutions reduce both the frame and
+    frequency axes, keeping the shortest-window branch inexpensive for the
+    one-second VCTK crops used during training.
+    """
+
+    def __init__(self, *, num_coefficients: int, channels: int = 64) -> None:
+        super().__init__()
+        self.num_coefficients = int(num_coefficients)
+        self.hop_length = self.num_coefficients
+        self.register_buffer(
+            "analysis_kernel",
+            _mdct_analysis_kernel(self.num_coefficients),
+            persistent=False,
+        )
+        channels = max(1, int(channels))
+        kernel_sizes = ((7, 5), (5, 3), (5, 3), (3, 3), (3, 3))
+        layers: list[nn.Module] = []
+        in_channels = 1
+        for index, kernel_size in enumerate(kernel_sizes):
+            # Preserve more resolution in the first layer and then reduce both
+            # axes. Same-style padding avoids favouring particular MDCT bins.
+            stride = (1, 1) if index == 0 else (2, 2)
+            padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
+                    channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                )
+            )
+            in_channels = channels
+        self.layers = nn.ModuleList(layers)
+        self.output = nn.Conv2d(channels, 1, kernel_size=3, padding=1)
+        self.apply(weights_init)
+
+    def _analysis(self, waveform: torch.Tensor) -> torch.Tensor:
+        if waveform.ndim != 3 or int(waveform.size(1)) != 1:
+            raise ValueError(
+                "MDCT discriminator expects mono waveform [B, 1, T], got "
+                f"{tuple(waveform.shape)}"
+            )
+        # Boundary padding matches the codec MDCT and permits arbitrary crop
+        # lengths; the final partial hop is intentionally omitted.
+        padded = F.pad(waveform.float(), (self.hop_length, self.hop_length))
+        coefficients = F.conv1d(
+            padded,
+            self.analysis_kernel,
+            stride=self.hop_length,
+        )
+        # Conv2d layout: [batch, channel, time frames, signed MDCT bins].
+        return coefficients.transpose(1, 2).unsqueeze(1)
+
+    def forward(self, waveform: torch.Tensor, return_features: bool = False):
+        hidden = self._analysis(waveform)
+        features: list[torch.Tensor] = []
+        for layer in self.layers:
+            hidden = F.leaky_relu(layer(hidden), negative_slope=0.2)
+            if return_features:
+                features.append(hidden)
+        logits = self.output(hidden)
+        if return_features:
+            return logits, features
+        return logits
+
+
+class AudioMultiResolutionMDCTDiscriminator(nn.Module):
+    """MDCTCodec-style critic over multiple signed-MDCT resolutions."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int = 1,
+        num_filters: int = 64,
+        mdct_num_coefficients=(100, 25, 10),
+    ) -> None:
+        super().__init__()
+        if int(in_channels) != 1:
+            raise ValueError("multi-resolution MDCT discriminator expects mono audio")
+        resolutions = tuple(
+            int(value) for value in mdct_num_coefficients if int(value) > 0
+        )
+        if not resolutions:
+            raise ValueError("MDCT discriminator needs at least one resolution")
+        self.discriminators = nn.ModuleList(
+            [
+                AudioMDCTSubDiscriminator(
+                    num_coefficients=value,
+                    channels=int(num_filters),
+                )
+                for value in resolutions
+            ]
+        )
+
+    def forward(self, waveform: torch.Tensor, return_features: bool = False):
+        logits: list[torch.Tensor] = []
+        features: list[list[torch.Tensor]] = []
+        for discriminator in self.discriminators:
+            if return_features:
+                branch_logits, branch_features = discriminator(
+                    waveform,
+                    return_features=True,
+                )
+                logits.append(branch_logits)
+                features.append(branch_features)
+            else:
+                logits.append(discriminator(waveform))
+        if return_features:
+            return logits, features
+        return logits
+
+
+class MDCTCodecOfficialSubDiscriminator(nn.Module):
+    """One branch of the released MR-MDCTD critic.
+
+    This is intentionally separate from the earlier LASER approximation so
+    existing checkpoints retain their topology.  Transform normalization,
+    convolution strides, weight normalization, activation slope, and feature
+    map collection all match the authors' implementation.
+    """
+
+    def __init__(self, *, num_coefficients: int, channels: int = 64) -> None:
+        super().__init__()
+        self.num_coefficients = int(num_coefficients)
+        self.hop_length = self.num_coefficients
+        analysis = (
+            math.sqrt(2.0 / float(self.num_coefficients))
+            * _mdct_analysis_kernel(self.num_coefficients)
+        )
+        self.register_buffer("analysis_kernel", analysis, persistent=False)
+        channels = int(channels)
+        self.convs = nn.ModuleList(
+            [
+                weight_norm(
+                    nn.Conv2d(
+                        1, channels, kernel_size=(7, 5), stride=(2, 2), padding=(3, 2)
+                    )
+                ),
+                weight_norm(
+                    nn.Conv2d(
+                        channels, channels, kernel_size=(5, 3), stride=(2, 1), padding=(2, 1)
+                    )
+                ),
+                weight_norm(
+                    nn.Conv2d(
+                        channels, channels, kernel_size=(5, 3), stride=(2, 2), padding=(2, 1)
+                    )
+                ),
+                weight_norm(
+                    nn.Conv2d(
+                        channels, channels, kernel_size=(3, 3), stride=(2, 1), padding=1
+                    )
+                ),
+                weight_norm(
+                    nn.Conv2d(
+                        channels, channels, kernel_size=(3, 3), stride=(2, 2), padding=1
+                    )
+                ),
+            ]
+        )
+        self.conv_post = weight_norm(
+            nn.Conv2d(channels, 1, kernel_size=(3, 3), padding=(1, 1))
+        )
+
+    def _analysis(self, waveform: torch.Tensor) -> torch.Tensor:
+        if waveform.ndim != 3 or int(waveform.size(1)) != 1:
+            raise ValueError(
+                "MR-MDCTD expects mono waveform [B, 1, T], got "
+                f"{tuple(waveform.shape)}"
+            )
+        padded = F.pad(waveform.float(), (self.hop_length, self.hop_length))
+        coefficients = F.conv1d(
+            padded,
+            self.analysis_kernel,
+            stride=self.hop_length,
+        )
+        # Official Conv2d layout is [batch, channel, MDCT bin, frame].
+        return coefficients.unsqueeze(1)
+
+    def forward(self, waveform: torch.Tensor, return_features: bool = False):
+        hidden = self._analysis(waveform)
+        features: list[torch.Tensor] = []
+        for layer in self.convs:
+            hidden = F.leaky_relu(layer(hidden), negative_slope=0.1)
+            if return_features:
+                features.append(hidden)
+        logits = self.conv_post(hidden)
+        if return_features:
+            # MDCTCodec includes the final logit map in feature matching.
+            features.append(logits)
+            return logits.flatten(1), features
+        return logits.flatten(1)
+
+
+class MDCTCodecOfficialDiscriminator(nn.Module):
+    """The three-branch MDCTCodec discriminator with an exact public shell."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int = 1,
+        num_filters: int = 64,
+        mdct_num_coefficients=(50, 200, 20),
+    ) -> None:
+        super().__init__()
+        if int(in_channels) != 1:
+            raise ValueError("MDCTCodec discriminator expects mono audio")
+        resolutions = tuple(int(value) for value in mdct_num_coefficients)
+        if not resolutions or any(value <= 0 for value in resolutions):
+            raise ValueError("MDCTCodec discriminator resolutions must be positive")
+        self.discriminators = nn.ModuleList(
+            [
+                MDCTCodecOfficialSubDiscriminator(
+                    num_coefficients=value,
+                    channels=int(num_filters),
+                )
+                for value in resolutions
+            ]
+        )
+
+    def forward(self, waveform: torch.Tensor, return_features: bool = False):
+        logits: list[torch.Tensor] = []
+        features: list[list[torch.Tensor]] = []
+        for discriminator in self.discriminators:
+            if return_features:
+                branch_logits, branch_features = discriminator(
+                    waveform, return_features=True
+                )
+                logits.append(branch_logits)
+                features.append(branch_features)
+            else:
+                logits.append(discriminator(waveform))
+        if return_features:
+            return logits, features
+        return logits
+
+
 def _as_logit_list(logits) -> list[torch.Tensor]:
     if isinstance(logits, torch.Tensor):
         return [logits]
@@ -496,6 +817,50 @@ def multi_vanilla_d_loss(logits_real, logits_fake) -> torch.Tensor:
 def multi_hinge_g_loss(logits_fake) -> torch.Tensor:
     losses = [hinge_g_loss(fake) for fake in _as_logit_list(logits_fake)]
     return torch.stack(losses).mean()
+
+
+def multi_encodec_hinge_d_loss(logits_real, logits_fake) -> torch.Tensor:
+    """Meta EnCodec discriminator hinge loss, averaged across STFT scales."""
+    real_list = _as_logit_list(logits_real)
+    fake_list = _as_logit_list(logits_fake)
+    if len(real_list) != len(fake_list):
+        raise ValueError(
+            "real/fake discriminator output count mismatch: "
+            f"{len(real_list)} vs {len(fake_list)}"
+        )
+    losses = [
+        torch.relu(1.0 - real).mean() + torch.relu(1.0 + fake).mean()
+        for real, fake in zip(real_list, fake_list)
+    ]
+    return torch.stack(losses).mean()
+
+
+def multi_encodec_hinge_g_loss(logits_fake) -> torch.Tensor:
+    """Published EnCodec clipped generator objective ``relu(1 - D(fake))``."""
+    losses = [torch.relu(1.0 - fake).mean() for fake in _as_logit_list(logits_fake)]
+    return torch.stack(losses).mean()
+
+
+def multi_mdctcodec_hinge_d_loss(logits_real, logits_fake) -> torch.Tensor:
+    """Published MR-MDCTD hinge objective, summed across three resolutions."""
+    real_list = _as_logit_list(logits_real)
+    fake_list = _as_logit_list(logits_fake)
+    if len(real_list) != len(fake_list):
+        raise ValueError(
+            "real/fake discriminator output count mismatch: "
+            f"{len(real_list)} vs {len(fake_list)}"
+        )
+    losses = [
+        torch.relu(1.0 - real).mean() + torch.relu(1.0 + fake).mean()
+        for real, fake in zip(real_list, fake_list)
+    ]
+    return torch.stack(losses).sum()
+
+
+def multi_mdctcodec_hinge_g_loss(logits_fake) -> torch.Tensor:
+    """Published clipped generator hinge objective, summed over MR-MDCTD."""
+    losses = [torch.relu(1.0 - fake).mean() for fake in _as_logit_list(logits_fake)]
+    return torch.stack(losses).sum()
 
 
 def lsgan_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
@@ -543,6 +908,39 @@ def feature_matching_loss(feats_real, feats_fake) -> torch.Tensor:
     return torch.stack(terms).mean()
 
 
+def mdctcodec_feature_matching_loss(feats_real, feats_fake) -> torch.Tensor:
+    """Reference spectral-codec feature matching: sum mean-L1 over all maps."""
+    terms: list[torch.Tensor] = []
+    for real_maps, fake_maps in zip(feats_real, feats_fake):
+        for real_feat, fake_feat in zip(real_maps, fake_maps):
+            terms.append(F.l1_loss(fake_feat, real_feat.detach()))
+    if terms:
+        return torch.stack(terms).sum()
+    return (
+        torch.zeros((), device=feats_fake[0][0].device)
+        if feats_fake and feats_fake[0]
+        else torch.zeros(())
+    )
+
+
+def relative_feature_matching_loss(feats_real, feats_fake) -> torch.Tensor:
+    """Meta EnCodec feature matching normalized by real-feature magnitude."""
+    terms: list[torch.Tensor] = []
+    for real_maps, fake_maps in zip(feats_real, feats_fake):
+        for real_feat, fake_feat in zip(real_maps, fake_maps):
+            real_target = real_feat.detach()
+            numerator = (fake_feat - real_target).abs().mean()
+            denominator = real_target.abs().mean().clamp_min(1.0e-6)
+            terms.append(numerator / denominator)
+    if not terms:
+        return (
+            torch.zeros((), device=feats_fake[0][0].device)
+            if feats_fake and feats_fake[0]
+            else torch.zeros(())
+        )
+    return torch.stack(terms).mean()
+
+
 def adopt_weight(weight: float, global_step: int, threshold: int = 0, value: float = 0.0) -> float:
     """Gate ``weight`` to ``value`` until ``global_step`` reaches ``threshold``.
 
@@ -557,6 +955,11 @@ def adopt_weight(weight: float, global_step: int, threshold: int = 0, value: flo
 __all__ = [
     "NLayerDiscriminator",
     "AudioMultiScalePeriodDiscriminator",
+    "AudioEncodecMultiScaleSTFTDiscriminator",
+    "AudioMDCTSubDiscriminator",
+    "AudioMultiResolutionMDCTDiscriminator",
+    "MDCTCodecOfficialSubDiscriminator",
+    "MDCTCodecOfficialDiscriminator",
     "weights_init",
     "hinge_d_loss",
     "vanilla_d_loss",
@@ -564,5 +967,12 @@ __all__ = [
     "multi_hinge_d_loss",
     "multi_vanilla_d_loss",
     "multi_hinge_g_loss",
+    "multi_encodec_hinge_d_loss",
+    "multi_encodec_hinge_g_loss",
+    "multi_mdctcodec_hinge_d_loss",
+    "multi_mdctcodec_hinge_g_loss",
+    "feature_matching_loss",
+    "mdctcodec_feature_matching_loss",
+    "relative_feature_matching_loss",
     "adopt_weight",
 ]

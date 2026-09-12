@@ -22,6 +22,10 @@ class DataConfig:
     augment: bool = True
     sample_rate: int = 16000
     audio_num_samples: int = 32768
+    audio_eval_num_samples: Optional[int] = None
+    audio_eval_full_utterance: bool = False
+    audio_eval_alignment_hop: int = 1
+    audio_eval_frame_multiple: int = 1
     audio_representation: str = "spectrogram"
     stft_n_fft: int = 1024
     stft_hop_length: int = 256
@@ -35,12 +39,18 @@ class DataConfig:
     audio_rms_normalize: bool = False
     audio_target_rms: float = 0.12
     audio_max_gain: float = 8.0
+    audio_random_gain_db_min: float = 0.0
+    audio_random_gain_db_max: float = 0.0
     audio_min_crop_rms: float = 0.0
     audio_crop_attempts: int = 1
     audio_fade_samples: int = 0
     audio_min_duration_seconds: float = 0.0
     audio_max_duration_seconds: float = 0.0
     audio_require_text: bool = False
+    audio_load_text: bool = True
+    audio_split_by_speaker: bool = False
+    audio_file_pattern: Optional[str] = None
+    audio_split_protocol: str = ""
     stl10_include_unlabeled: bool = True
     max_items: int = 0
     

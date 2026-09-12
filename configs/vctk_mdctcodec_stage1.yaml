@@ -1,0 +1,66 @@
+# Stage 1 continuation of helloimlixin-rutgers/laser/s2er91dm.
+defaults:
+  - config
+  - override model: laser_audio_mdctcodec_official_laser_k4
+  - override data: vctk_waveform
+  - _self_
+
+seed: 1234
+output_dir: outputs/vctk_mdctcodec_stage1
+ckpt_path: outputs/mdctcodec_recovery/s2er91dm/checkpoints/last.ckpt
+data:
+  data_dir: ${oc.env:VCTK_DIR,/workspace/Projects/data/vctk}
+  batch_size: 48
+  eval_batch_size: 1
+  num_workers: 8
+  prefetch_factor: 4
+  sample_rate: 48000
+  audio_num_samples: 7960
+  audio_eval_full_utterance: true
+  audio_eval_alignment_hop: 40
+  audio_eval_frame_multiple: 8
+  audio_dc_remove: false
+  audio_peak_normalize: false
+  audio_rms_normalize: false
+  audio_min_crop_rms: 0.0
+  audio_crop_attempts: 1
+  audio_fade_samples: 0
+  audio_load_text: false
+  audio_file_pattern: '*_mic2.flac'
+  audio_split_protocol: mdctcodec_disjoint
+train:
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  deterministic: false
+  max_epochs: 300
+  max_steps: -1
+  learning_rate: 0.0002
+  beta: 0.8
+  beta2: 0.99
+  optimizer_type: adamw
+  lr_schedule: exponential_epoch
+  lr_decay_per_epoch: 0.999
+  warmup_steps: 0
+  min_lr_ratio: 1.0
+  gradient_clip_val: 0.0
+  log_every_n_steps: 20
+  limit_val_batches: 1.0
+  run_test_after_fit: false
+checkpoint:
+  monitor: val/audio_visqol_audio48k
+  mode: max
+  filename: 'mdct-laser-{epoch:03d}-{step:07d}'
+  save_top_k: 3
+  save_last: true
+  every_n_epochs: 1
+  resume_in_place: false
+  upload_to_wandb: true
+  upload_mode: artifact
+  upload_every_n_epochs: 5
+wandb:
+  project: laser
+  name: mdctcodec-laser-ridge0050-vctk-stage1-resume
+  group: mdctcodec-vctk-stage1-20260911
+  tags: [stage1, vctk, mdctcodec, laser, ridge0050, resumed, native48k, balanced-val32]
+  save_dir: ${output_dir}/wandb

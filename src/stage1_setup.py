@@ -225,22 +225,163 @@ def build_stage1_datamodule(config: DataConfig):
 
 
 def _audio_model_kwargs(model_cfg: Any) -> dict:
+    raw_mel_bins = _cfg_get(model_cfg, "audio_mel_n_mels", 80)
+    mel_bins = (
+        tuple(int(value) for value in raw_mel_bins)
+        if not isinstance(raw_mel_bins, (str, int, float))
+        and hasattr(raw_mel_bins, "__iter__")
+        else int(raw_mel_bins)
+    )
     return {
         "audio_energy_loss_weight": float(_cfg_get(model_cfg, "audio_energy_loss_weight", 0.0)),
         "audio_backbone": _cfg_get(model_cfg, "audio_backbone", "spectrogram"),
         "audio_downsample_rates": tuple(_cfg_get(model_cfg, "audio_downsample_rates", (4, 4, 4))),
         "audio_dilation_cycle": tuple(_cfg_get(model_cfg, "audio_dilation_cycle", (1, 3, 9))),
+        "audio_mdct_num_coefficients": int(
+            _cfg_get(model_cfg, "audio_mdct_num_coefficients", 320)
+        ),
+        "audio_mdct_learnable_gain": bool(
+            _cfg_get(model_cfg, "audio_mdct_learnable_gain", True)
+        ),
+        "audio_mdct_num_log_bands": int(
+            _cfg_get(model_cfg, "audio_mdct_num_log_bands", 0)
+        ),
+        "audio_mdct_log_band_scale": float(
+            _cfg_get(model_cfg, "audio_mdct_log_band_scale", 0.25)
+        ),
+        "audio_mdct_include_pitch": bool(
+            _cfg_get(model_cfg, "audio_mdct_include_pitch", False)
+        ),
+        "audio_mdct_pitch_min_hz": float(
+            _cfg_get(model_cfg, "audio_mdct_pitch_min_hz", 60.0)
+        ),
+        "audio_mdct_pitch_max_hz": float(
+            _cfg_get(model_cfg, "audio_mdct_pitch_max_hz", 500.0)
+        ),
+        "audio_mdct_pitch_scale": float(
+            _cfg_get(model_cfg, "audio_mdct_pitch_scale", 1.0)
+        ),
+        "audio_mdct_vae_hidden_channels": int(
+            _cfg_get(model_cfg, "audio_mdct_vae_hidden_channels", 256)
+        ),
+        "audio_mdct_vae_residual_hidden_channels": int(
+            _cfg_get(model_cfg, "audio_mdct_vae_residual_hidden_channels", 128)
+        ),
+        "audio_mdct_vae_num_residual_layers": int(
+            _cfg_get(model_cfg, "audio_mdct_vae_num_residual_layers", 6)
+        ),
+        "audio_mdct_vae_dilation_cycle": tuple(
+            _cfg_get(model_cfg, "audio_mdct_vae_dilation_cycle", (1, 3, 9))
+        ),
+        "audio_mdct_vae_temporal_downsample_factor": int(
+            _cfg_get(model_cfg, "audio_mdct_vae_temporal_downsample_factor", 1)
+        ),
+        "audio_mdct_vae_use_convnext_v2": bool(
+            _cfg_get(model_cfg, "audio_mdct_vae_use_convnext_v2", False)
+        ),
+        "audio_mdct_vae_convnext_intermediate_channels": int(
+            _cfg_get(
+                model_cfg,
+                "audio_mdct_vae_convnext_intermediate_channels",
+                512,
+            )
+        ),
+        "meta_encodec_pretrained": bool(_cfg_get(model_cfg, "meta_encodec_pretrained", True)),
+        "meta_encodec_trainable": bool(_cfg_get(model_cfg, "meta_encodec_trainable", True)),
+        "meta_encodec_teacher_loss_weight": float(
+            _cfg_get(model_cfg, "meta_encodec_teacher_loss_weight", 0.0)
+        ),
+        "meta_encodec_teacher_delta_weight": float(
+            _cfg_get(model_cfg, "meta_encodec_teacher_delta_weight", 0.0)
+        ),
+        "meta_encodec_teacher_bandwidth": float(
+            _cfg_get(model_cfg, "meta_encodec_teacher_bandwidth", 6.0)
+        ),
+        "meta_encodec_rvq_dictionary_init": bool(
+            _cfg_get(model_cfg, "meta_encodec_rvq_dictionary_init", False)
+        ),
         "audio_multires_stft_loss_weight": float(_cfg_get(model_cfg, "audio_multires_stft_loss_weight", 0.0)),
         "audio_multires_stft_fft_sizes": tuple(_cfg_get(model_cfg, "audio_multires_stft_fft_sizes", (512, 1024, 2048))),
+        "audio_multires_stft_phase_weight": float(
+            _cfg_get(model_cfg, "audio_multires_stft_phase_weight", 0.0)
+        ),
+        "audio_upsampling_tone_loss_weight": float(
+            _cfg_get(model_cfg, "audio_upsampling_tone_loss_weight", 0.0)
+        ),
+        "audio_upsampling_tone_grid_hz": float(
+            _cfg_get(model_cfg, "audio_upsampling_tone_grid_hz", 0.0)
+        ),
+        "audio_upsampling_tone_margin_db": float(
+            _cfg_get(model_cfg, "audio_upsampling_tone_margin_db", 0.5)
+        ),
+        "audio_preemphasis_loss_weight": float(
+            _cfg_get(model_cfg, "audio_preemphasis_loss_weight", 0.0)
+        ),
+        "audio_preemphasis_coefficient": float(
+            _cfg_get(model_cfg, "audio_preemphasis_coefficient", 0.97)
+        ),
         "audio_waveform_l1_weight": float(_cfg_get(model_cfg, "audio_waveform_l1_weight", 0.0)),
         "audio_feature_matching_weight": float(_cfg_get(model_cfg, "audio_feature_matching_weight", 0.0)),
+        "audio_mdct_loss_weight": float(_cfg_get(model_cfg, "audio_mdct_loss_weight", 0.0)),
+        "audio_mdct_loss_normalization": str(
+            _cfg_get(model_cfg, "audio_mdct_loss_normalization", "parseval")
+        ),
         "audio_mel_loss_weight": float(_cfg_get(model_cfg, "audio_mel_loss_weight", 0.0)),
+        "audio_mel_loss_type": str(
+            _cfg_get(model_cfg, "audio_mel_loss_type", "multiscale_l1")
+        ),
         "audio_mel_fft_sizes": tuple(_cfg_get(model_cfg, "audio_mel_fft_sizes", (512, 1024, 2048))),
-        "audio_mel_n_mels": int(_cfg_get(model_cfg, "audio_mel_n_mels", 80)),
+        "audio_mel_n_mels": mel_bins,
+        "audio_mel_hop_length": int(
+            _cfg_get(model_cfg, "audio_mel_hop_length", 0)
+        ),
+        "audio_mel_win_length": int(
+            _cfg_get(model_cfg, "audio_mel_win_length", 0)
+        ),
+        "audio_critical_band_loss_weight": float(
+            _cfg_get(model_cfg, "audio_critical_band_loss_weight", 0.0)
+        ),
+        "audio_critical_band_fft_sizes": tuple(
+            _cfg_get(model_cfg, "audio_critical_band_fft_sizes", (512, 2048))
+        ),
+        "audio_critical_band_num_bands": int(
+            _cfg_get(model_cfg, "audio_critical_band_num_bands", 32)
+        ),
+        "audio_critical_band_deficit_weight": float(
+            _cfg_get(model_cfg, "audio_critical_band_deficit_weight", 0.5)
+        ),
+        "use_audio_loss_balancer": bool(_cfg_get(model_cfg, "use_audio_loss_balancer", False)),
+        "audio_loss_balancer_weights": _cfg_get(model_cfg, "audio_loss_balancer_weights", None),
+        "audio_loss_balancer_ema_decay": float(_cfg_get(model_cfg, "audio_loss_balancer_ema_decay", 0.999)),
+        "audio_loss_balancer_total_norm": float(_cfg_get(model_cfg, "audio_loss_balancer_total_norm", 1.0)),
+        "audio_loss_balancer_update_interval": int(
+            _cfg_get(model_cfg, "audio_loss_balancer_update_interval", 1)
+        ),
+        "audio_eval_encodec_bandwidths": tuple(_cfg_get(model_cfg, "audio_eval_encodec_bandwidths", ())),
+        "audio_visqol_max_batches": int(_cfg_get(model_cfg, "audio_visqol_max_batches", 0)),
+        "audio_visqol_paper_audio_mode": bool(
+            _cfg_get(model_cfg, "audio_visqol_paper_audio_mode", False)
+        ),
+        "audio_disc_update_probability": float(
+            _cfg_get(model_cfg, "audio_disc_update_probability", 1.0)
+        ),
+        "audio_discriminator_first": bool(
+            _cfg_get(model_cfg, "audio_discriminator_first", False)
+        ),
+        "audio_disc_mdct_num_coefficients": tuple(
+            _cfg_get(model_cfg, "audio_disc_mdct_num_coefficients", (100, 25, 10))
+        ),
     }
 
 
-def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, image_size) -> dict:
+def laser_model_kwargs(
+    model_cfg: Any,
+    train_cfg: Any,
+    *,
+    in_channels: int,
+    image_size,
+    audio_sample_rate: int | None = None,
+) -> dict:
     # Keep this boundary explicit: it is easier to audit config-to-constructor
     # wiring here than through a second abstraction layer over the model classes.
     return {
@@ -289,26 +430,76 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "compute_fid": _cfg_get(model_cfg, "compute_fid"),
         "fid_feature": _cfg_get(model_cfg, "fid_feature", 2048),
         "bottleneck_loss_weight": _cfg_get(model_cfg, "bottleneck_loss_weight", 0.5),
+        "bottleneck_mix_start_step": int(
+            _cfg_get(model_cfg, "bottleneck_mix_start_step", 0)
+        ),
+        "bottleneck_mix_warmup_steps": int(
+            _cfg_get(model_cfg, "bottleneck_mix_warmup_steps", 0)
+        ),
         "dictionary_loss_weight": _cfg_get(model_cfg, "dictionary_loss_weight", None),
         "sparsity_level": _cfg_get(model_cfg, "sparsity_level"),
         "dict_learning_rate": _cfg_get(model_cfg, "dict_learning_rate", None),
+        "encoder_learning_rate": _cfg_get(model_cfg, "encoder_learning_rate", None),
+        "decoder_learning_rate": _cfg_get(model_cfg, "decoder_learning_rate", None),
+        "adapter_learning_rate": _cfg_get(model_cfg, "adapter_learning_rate", None),
         "patch_based": _cfg_get(model_cfg, "patch_based", True),
         "patch_size": _cfg_get(model_cfg, "patch_size", 4),
         "patch_stride": _cfg_get(model_cfg, "patch_stride", 2),
         "patch_reconstruction": _cfg_get(model_cfg, "patch_reconstruction", "tile"),
         "coef_max": _cfg_get(model_cfg, "coef_max", None),
         "data_init_from_first_batch": bool(_cfg_get(model_cfg, "data_init_from_first_batch", False)),
+        "data_init_start_step": int(_cfg_get(model_cfg, "data_init_start_step", 0)),
+        "data_init_accumulation_steps": int(
+            _cfg_get(model_cfg, "data_init_accumulation_steps", 1)
+        ),
         "dead_atom_revival": bool(_cfg_get(model_cfg, "dead_atom_revival", False)),
         "dead_atom_revival_interval": int(_cfg_get(model_cfg, "dead_atom_revival_interval", 500)),
         "dead_atom_revival_max_fraction": float(_cfg_get(model_cfg, "dead_atom_revival_max_fraction", 0.05)),
         "dead_atom_revival_noise": float(_cfg_get(model_cfg, "dead_atom_revival_noise", 0.05)),
         "dead_atom_revival_patience": int(_cfg_get(model_cfg, "dead_atom_revival_patience", 5)),
+        "progressive_loss": bool(_cfg_get(model_cfg, "progressive_loss", False)),
+        "omp_compute_precision": str(_cfg_get(model_cfg, "omp_compute_precision", "float32")),
+        "omp_ridge": float(_cfg_get(model_cfg, "omp_ridge", 0.0)),
+        "omp_max_support_coherence": float(
+            _cfg_get(model_cfg, "omp_max_support_coherence", 1.0)
+        ),
+        "dictionary_update_mode": str(_cfg_get(model_cfg, "dictionary_update_mode", "gradient")),
+        "dictionary_update_relaxation": float(_cfg_get(model_cfg, "dictionary_update_relaxation", 0.25)),
+        "dictionary_update_max_atoms_per_step": int(_cfg_get(model_cfg, "dictionary_update_max_atoms_per_step", 512)),
+        "dictionary_update_min_usage": int(_cfg_get(model_cfg, "dictionary_update_min_usage", 2)),
+        "dictionary_update_accumulation_steps": int(
+            _cfg_get(model_cfg, "dictionary_update_accumulation_steps", 1)
+        ),
+        "dictionary_update_max_backtracks": int(_cfg_get(model_cfg, "dictionary_update_max_backtracks", 6)),
+        "dictionary_collective_backend": str(
+            _cfg_get(model_cfg, "dictionary_collective_backend", "gloo")
+        ),
+        "coefficient_quantization_bits": int(_cfg_get(model_cfg, "coefficient_quantization_bits", 0)),
+        "coefficient_quantization_max": _cfg_get(model_cfg, "coefficient_quantization_max", None),
+        "coefficient_quantization_start_step": int(
+            _cfg_get(model_cfg, "coefficient_quantization_start_step", 0)
+        ),
+        "coefficient_quantization_warmup_steps": int(
+            _cfg_get(model_cfg, "coefficient_quantization_warmup_steps", 0)
+        ),
+        "commitment_normalize_by_variance": bool(
+            _cfg_get(model_cfg, "commitment_normalize_by_variance", False)
+        ),
+        "latent_rms_target": _cfg_get(model_cfg, "latent_rms_target", None),
+        "latent_rms_loss_weight": float(_cfg_get(model_cfg, "latent_rms_loss_weight", 0.0)),
+        "latent_rms_loss_start_step": int(
+            _cfg_get(model_cfg, "latent_rms_loss_start_step", 0)
+        ),
+        "latent_rms_loss_warmup_steps": int(
+            _cfg_get(model_cfg, "latent_rms_loss_warmup_steps", 0)
+        ),
         "bottleneck_type": str(_cfg_get(model_cfg, "bottleneck_type", "dictionary")),
         "rq_code_depth": int(_cfg_get(model_cfg, "rq_code_depth", 4)),
         "rq_shared_codebook": bool(_cfg_get(model_cfg, "rq_shared_codebook", True)),
         "rq_decay": float(_cfg_get(model_cfg, "rq_decay", 0.99)),
         "rq_restart_unused_codes": bool(_cfg_get(model_cfg, "rq_restart_unused_codes", True)),
         "sparsity_reg_weight": _cfg_get(model_cfg, "sparsity_reg_weight", 0.01),
+        "audio_sample_rate": audio_sample_rate,
         "audio_multires_loss_weight": float(_cfg_get(model_cfg, "audio_multires_loss_weight", 0.0)),
         "audio_multires_scales": tuple(_cfg_get(model_cfg, "audio_multires_scales", (1, 2, 4, 8))),
         **_audio_model_kwargs(model_cfg),
@@ -319,6 +510,13 @@ def laser_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int, imag
         "bypass_bottleneck": bool(_cfg_get(model_cfg, "bypass_bottleneck", False)),
         "warmup_steps": int(_cfg_get(train_cfg, "warmup_steps", 0)),
         "min_lr_ratio": float(_cfg_get(train_cfg, "min_lr_ratio", 0.01)),
+        "optimizer_type": str(_cfg_get(train_cfg, "optimizer_type", "adam")),
+        "lr_schedule": str(_cfg_get(train_cfg, "lr_schedule", "cosine")),
+        "lr_decay_per_epoch": float(
+            _cfg_get(train_cfg, "lr_decay_per_epoch", 0.999)
+        ),
+        "lr_schedule_start_step": int(_cfg_get(train_cfg, "lr_schedule_start_step", 0)),
+        "lr_schedule_total_steps": _cfg_get(train_cfg, "lr_schedule_total_steps", None),
         # PatchGAN adversarial loss (default off -> single-optimizer path).
         "adversarial_weight": float(_cfg_get(model_cfg, "adversarial_weight", 0.0)),
         "disc_start_step": int(_cfg_get(model_cfg, "disc_start_step", 0)),
@@ -362,6 +560,18 @@ def vqvae_model_kwargs(model_cfg: Any, train_cfg: Any, *, in_channels: int) -> d
         "audio_multires_stft_loss_weight": float(_cfg_get(model_cfg, "audio_multires_stft_loss_weight", 0.0)),
         "audio_multires_stft_fft_sizes": tuple(_cfg_get(model_cfg, "audio_multires_stft_fft_sizes", (512, 1024, 2048))),
         "audio_waveform_l1_weight": float(_cfg_get(model_cfg, "audio_waveform_l1_weight", 0.0)),
+        "audio_critical_band_loss_weight": float(
+            _cfg_get(model_cfg, "audio_critical_band_loss_weight", 0.0)
+        ),
+        "audio_critical_band_fft_sizes": tuple(
+            _cfg_get(model_cfg, "audio_critical_band_fft_sizes", (512, 2048))
+        ),
+        "audio_critical_band_num_bands": int(
+            _cfg_get(model_cfg, "audio_critical_band_num_bands", 32)
+        ),
+        "audio_critical_band_deficit_weight": float(
+            _cfg_get(model_cfg, "audio_critical_band_deficit_weight", 0.5)
+        ),
         "codebook_init": bool(_cfg_get(model_cfg, "codebook_init", False)),
         "dead_code_threshold": float(_cfg_get(model_cfg, "dead_code_threshold", 0.0)),
         "enable_codebook_visuals": bool(_cfg_get(model_cfg, "enable_codebook_visuals", False)),
@@ -383,6 +593,7 @@ def build_stage1_model(model_cfg: Any, train_cfg: Any, data_cfg: Any):
                 train_cfg,
                 in_channels=in_channels,
                 image_size=_cfg_get(data_cfg, "image_size"),
+                audio_sample_rate=_cfg_get(data_cfg, "sample_rate", None),
             )
         )
     if model_type == "vqvae":

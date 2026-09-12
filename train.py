@@ -54,6 +54,14 @@ _DISPATCH_STAGE_ENV = "LASER_TRAIN_DISPATCH_STAGE"
 _DISPATCH_ARGV_ENV = "LASER_TRAIN_DISPATCH_ARGV"
 
 
+def _stage1_fit_checkpoint_kwargs(ckpt_path):
+    """Build Lightning fit kwargs for a fresh fit or trusted full-state resume."""
+    kwargs = {"ckpt_path": ckpt_path}
+    if ckpt_path:
+        kwargs["weights_only"] = False
+    return kwargs
+
+
 def _dataset_key(name: object) -> str:
     return str(name or "").strip().lower().replace("-", "_")
 
@@ -189,7 +197,12 @@ def _positive_int(raw: str) -> int:
 
 
 def _configure_training_tempdir(output_dir: object) -> Path:
-    """Keep Lightning/fsspec atomic checkpoint temp files off small system /tmp."""
+    """Choose a short writable temp path for checkpoints and worker IPC.
+
+    Python multiprocessing appends its own socket directory and listener name
+    below ``TMPDIR``.  Long NFS project paths can therefore exceed Linux's
+    108-byte AF_UNIX limit before the first dataloader batch is delivered.
+    """
     configured_tmp = str(os.environ.get("TMPDIR") or "").strip()
     if configured_tmp:
         tmpdir = Path(configured_tmp).expanduser().resolve()
@@ -197,7 +210,8 @@ def _configure_training_tempdir(output_dir: object) -> Path:
         digest = hashlib.sha1(str(Path(str(output_dir)).expanduser().resolve()).encode("utf-8")).hexdigest()[:12]
         tmpdir = Path("/workspace/tmp/laser") / digest
     else:
-        tmpdir = Path(str(output_dir)).expanduser().resolve() / ".tmp"
+        digest = hashlib.sha1(str(Path(str(output_dir)).expanduser().resolve()).encode("utf-8")).hexdigest()[:12]
+        tmpdir = Path("/tmp/laser") / digest
     os.environ["TMPDIR"] = str(tmpdir)
     os.environ["TEMP"] = str(tmpdir)
     os.environ["TMP"] = str(tmpdir)
@@ -794,6 +808,30 @@ def _selected_checkpoint_paths(checkpoint_callback) -> list[Path]:
     return selected
 
 
+def _refresh_last_checkpoint(trainer, checkpoint_callback) -> None:
+    """Persist the trainer's current state before publishing selected checkpoints.
+
+    Lightning's ``every_n_epochs`` checkpoint schedule does not refresh
+    ``last.ckpt`` for a mid-epoch validation. Our runs validate several times
+    per epoch, so an upload made there could otherwise label a stale checkpoint
+    as ``last``. ``Trainer.save_checkpoint`` is deliberately called on every
+    rank, as required by distributed checkpoint strategies; only rank zero
+    writes for standard DDP.
+    """
+    if not bool(getattr(checkpoint_callback, "save_last", False)):
+        return
+    save_checkpoint = getattr(trainer, "save_checkpoint", None)
+    if not callable(save_checkpoint):
+        return
+    directory_raw = str(getattr(checkpoint_callback, "dirpath", "") or "").strip()
+    if not directory_raw:
+        return
+    directory = Path(directory_raw).expanduser()
+    last_path = directory / "last.ckpt"
+    save_checkpoint(str(last_path))
+    checkpoint_callback.last_model_path = str(last_path)
+
+
 def _make_selected_checkpoint_artifact_callback(callback_base):
     class SelectedCheckpointArtifactCallback(callback_base):
         """Upload top-k model checkpoints plus last.ckpt as one W&B artifact."""
@@ -811,15 +849,17 @@ def _make_selected_checkpoint_artifact_callback(callback_base):
             self.every_n_epochs = max(1, int(every_n_epochs or 1))
             self._last_signature = None
 
-        def _file_digest(self, path: Path) -> str:
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
-
         def _signature(self, paths: list[Path]) -> tuple:
-            return tuple((path.name, path.stat().st_size, self._file_digest(path)) for path in paths)
+            # W&B computes its own content digest in ``artifact.add_file``.
+            # Re-hashing up to four ~350 MB checkpoints here doubled synchronous
+            # NFS reads at every validation. Nanosecond mtime + inode + size is
+            # sufficient for detecting Lightning's atomic checkpoint rewrites;
+            # W&B remains the content-addressed source of truth for the upload.
+            signature = []
+            for path in paths:
+                stat = path.stat()
+                signature.append((path.name, stat.st_size, stat.st_mtime_ns, stat.st_ino))
+            return tuple(signature)
 
         def _upload(self, trainer, *, reason: str) -> None:
             if not bool(getattr(trainer, "is_global_zero", True)):
@@ -828,6 +868,13 @@ def _make_selected_checkpoint_artifact_callback(callback_base):
             experiment = getattr(logger, "experiment", None)
             if experiment is None or not hasattr(experiment, "log_artifact"):
                 return
+            if bool(getattr(self.checkpoint_callback, "save_last", False)):
+                last_path = str(getattr(self.checkpoint_callback, "last_model_path", "") or "")
+                if not last_path or not Path(last_path).is_file():
+                    # A fork resumed at an upload boundary can still point at
+                    # the parent run's best checkpoint before its first local
+                    # validation. Never publish that incomplete set as latest.
+                    return
             paths = _selected_checkpoint_paths(self.checkpoint_callback)
             if not paths:
                 return
@@ -863,12 +910,23 @@ def _make_selected_checkpoint_artifact_callback(callback_base):
         def on_validation_end(self, trainer, pl_module) -> None:
             if bool(getattr(trainer, "sanity_checking", False)):
                 return
+            # ModelCheckpoint callbacks are deliberately run after ordinary
+            # callbacks by Lightning, regardless of list order. Refresh the
+            # rolling checkpoint here, but defer publishing until the next
+            # epoch starts so ``best_k_models`` includes this validation.
+            _refresh_last_checkpoint(trainer, self.checkpoint_callback)
+
+        def on_train_epoch_start(self, trainer, pl_module) -> None:
             epoch = int(getattr(trainer, "current_epoch", 0))
-            if (epoch + 1) % self.every_n_epochs != 0:
+            if epoch <= 0:
                 return
-            self._upload(trainer, reason="validation_end")
+            completed_epoch = epoch - 1
+            if (completed_epoch + 1) % self.every_n_epochs != 0:
+                return
+            self._upload(trainer, reason="post_checkpoint_validation")
 
         def on_train_end(self, trainer, pl_module) -> None:
+            _refresh_last_checkpoint(trainer, self.checkpoint_callback)
             self._upload(trainer, reason="train_end")
 
     return SelectedCheckpointArtifactCallback
@@ -978,6 +1036,7 @@ def _make_selected_checkpoint_file_callback(callback_base):
             del pl_module
             if bool(getattr(trainer, "sanity_checking", False)):
                 return
+            _refresh_last_checkpoint(trainer, self.checkpoint_callback)
             epoch = int(getattr(trainer, "current_epoch", 0))
             if (epoch + 1) % self.every_n_epochs != 0:
                 return
@@ -985,6 +1044,7 @@ def _make_selected_checkpoint_file_callback(callback_base):
 
         def on_train_end(self, trainer, pl_module) -> None:
             del pl_module
+            _refresh_last_checkpoint(trainer, self.checkpoint_callback)
             self._upload(trainer)
 
     return SelectedCheckpointFileCallback
@@ -993,6 +1053,7 @@ def _make_selected_checkpoint_file_callback(callback_base):
 def _stage1_wandb_tags(cfg) -> list[str]:
     model_cfg = cfg.model
     backbone = str(getattr(model_cfg, "backbone", "") or "unknown").strip().lower()
+    audio_backbone = str(getattr(model_cfg, "audio_backbone", "") or "").strip().lower()
     channel_multipliers = getattr(model_cfg, "channel_multipliers", None)
     if backbone == "ddpm" and channel_multipliers:
         num_downsamples = max(0, len(channel_multipliers) - 1)
@@ -1006,6 +1067,8 @@ def _stage1_wandb_tags(cfg) -> list[str]:
         f"sparsity={int(getattr(model_cfg, 'sparsity_level', 0) or 0)}",
         f"patch_based={str(patch_based).lower()}",
     ]
+    if audio_backbone:
+        tags.append(f"audio_backbone={audio_backbone}")
     if patch_based:
         tags.append(f"patch_size={int(getattr(model_cfg, 'patch_size', 0) or 0)}")
     return tags
@@ -1492,6 +1555,14 @@ def _load_stage_entrypoints():
         print(f"Residual Hidden Dimensions: {cfg.model.num_residual_hiddens}")
         if cfg.model.type == "laser":
             print(f"Backbone: {getattr(cfg.model, 'backbone', 'simple')}")
+            if str(getattr(cfg.data, "audio_representation", "")).strip().lower() == "waveform":
+                print(f"Audio Backbone: {getattr(cfg.model, 'audio_backbone', 'waveform')}")
+                if str(getattr(cfg.model, "audio_backbone", "")).strip().lower() == "meta_encodec":
+                    print(
+                        "Meta EnCodec Initialization: "
+                        f"pretrained={bool(getattr(cfg.model, 'meta_encodec_pretrained', True))}, "
+                        f"trainable={bool(getattr(cfg.model, 'meta_encodec_trainable', True))}"
+                    )
             print(f"Dictionary Size: {cfg.model.num_embeddings}")
             print(f"Sparsity: {cfg.model.sparsity_level}")
             print(f"Bypass Bottleneck: {bool(getattr(cfg.model, 'bypass_bottleneck', False))}")
@@ -1552,10 +1623,24 @@ def _load_stage_entrypoints():
         print(f"Run Name: {cfg.wandb.name}")
         print(f"Save Directory: {cfg.wandb.save_dir}")
     
-        # Resolve checkpoint directory (base from config + run timestamp + model type)
+        # Resolve checkpoint directory. Maintenance resumes can opt into the
+        # checkpoint's existing directory so Lightning restores its full top-k
+        # monitor state instead of silently starting a new ranking after every
+        # process restart.
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         base_ckpt_dir = getattr(cfg.checkpoint, "dirpath", os.path.join(cfg.output_dir, "checkpoints"))
-        run_ckpt_dir = os.path.join(base_ckpt_dir, f'run_{timestamp}', cfg.model.type)
+        checkpoint_resume_in_place = bool(
+            getattr(cfg.checkpoint, "resume_in_place", False)
+        )
+        if ckpt_path and checkpoint_resume_in_place:
+            resume_checkpoint = Path(str(ckpt_path)).expanduser().resolve()
+            if not resume_checkpoint.is_file():
+                raise FileNotFoundError(
+                    f"Cannot resume checkpoints in place; checkpoint not found: {resume_checkpoint}"
+                )
+            run_ckpt_dir = str(resume_checkpoint.parent)
+        else:
+            run_ckpt_dir = os.path.join(base_ckpt_dir, f'run_{timestamp}', cfg.model.type)
         os.makedirs(run_ckpt_dir, exist_ok=True)
         temp_dir = _configure_training_tempdir(cfg.output_dir)
 
@@ -1566,6 +1651,15 @@ def _load_stage_entrypoints():
         else:
             monitor_key = "val/loss"
         monitor_mode = getattr(cfg.checkpoint, "mode", "min")
+        if monitor_key in {"val/audio_visqol", "val/audio_visqol_audio48k"}:
+            from src.audio_logging import is_visqol_available
+
+            if not is_visqol_available():
+                raise RuntimeError(
+                    f"checkpoint.monitor={monitor_key} requires the official "
+                    "ViSQOL Python package or a `visqol` CLI on PATH (alternatively "
+                    "set VISQOL_BINARY). Refusing to run without the monitored metric."
+                )
         filename_template = getattr(cfg.checkpoint, "filename", f"{cfg.model.type}-{{epoch:03d}}")
         checkpoint_save_top_k = int(getattr(cfg.checkpoint, "save_top_k", CHECKPOINT_SAVE_TOP_K))
         checkpoint_save_last = bool(getattr(cfg.checkpoint, "save_last", CHECKPOINT_SAVE_LAST))
@@ -1604,6 +1698,7 @@ def _load_stage_entrypoints():
         print(f"Monitor:             {monitor_key} (mode={monitor_mode})")
         print(f"Save Top K:          {cfg.checkpoint.save_top_k}")
         print(f"Save Last:           {cfg.checkpoint.save_last}")
+        print(f"Resume In Place:     {checkpoint_resume_in_place}")
         print(f"Every N Epochs:      {checkpoint_every_n_epochs}")
         print(f"W&B Selected Checkpoint Upload: {checkpoint_upload_to_wandb}")
         print(f"W&B Checkpoint Upload Mode:     {checkpoint_upload_mode}")
@@ -1717,16 +1812,52 @@ def _load_stage_entrypoints():
             log_model=False,
             **wandb_kwargs,
         )
-        wandb_logger.log_hyperparams(
-            {
-                "training_stage": "stage1",
-                "stage_role": "autoencoder_training",
-                "training_mode": STAGE1_MODE,
-                "model_type": cfg.model.type,
-                "dataset": cfg.data.dataset,
-                "input_channels": resolved_in_channels,
-            }
-        )
+        run_metadata = {
+            "training_stage": "stage1",
+            "stage_role": "autoencoder_training",
+            "training_mode": STAGE1_MODE,
+            "model_type": cfg.model.type,
+            "audio_backbone": str(getattr(cfg.model, "audio_backbone", "") or ""),
+            "dataset": cfg.data.dataset,
+            "input_channels": resolved_in_channels,
+        }
+        if bool(getattr(cfg.model, "audio_visqol_paper_audio_mode", False)):
+            eval_batch_size = int(
+                getattr(cfg.data, "eval_batch_size", None)
+                or getattr(cfg.data, "batch_size", 1)
+                or 1
+            )
+            sample_rate = int(getattr(cfg.data, "sample_rate", 24_000) or 24_000)
+            samples_per_clip = int(
+                getattr(cfg.data, "audio_num_samples", sample_rate) or sample_rate
+            )
+            run_metadata.update(
+                {
+                    "visqol_version": "3.3.3",
+                    "visqol_checkpoint_mode": (
+                        "audio" if monitor_key == "val/audio_visqol_audio48k" else "speech"
+                    ),
+                    "visqol_checkpoint_sample_rate": (
+                        48_000 if monitor_key == "val/audio_visqol_audio48k" else 16_000
+                    ),
+                    "visqol_paper_metric": "val/audio_visqol_audio48k",
+                    "visqol_paper_mode": "audio",
+                    "visqol_paper_sample_rate": 48_000,
+                    "visqol_comparison_seconds": (
+                        eval_batch_size * samples_per_clip / float(sample_rate)
+                    ),
+                    "visqol_split": (
+                        str(getattr(cfg.data, "audio_split_protocol", "")) or
+                        ("speaker-disjoint" if bool(
+                            getattr(cfg.data, "audio_split_by_speaker", False)
+                        ) else "item-random")
+                    ),
+                }
+            )
+        # Preserve the entire reproducible recipe, including data and checkpoint
+        # settings, alongside Lightning's flat model hyperparameters.
+        wandb_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
+        wandb_logger.log_hyperparams(run_metadata)
 
         # Initialize callbacks
         checkpoint_callback = ModelCheckpoint(
@@ -1781,13 +1912,24 @@ def _load_stage_entrypoints():
         if strategy_cfg is None:
             strategy_cfg = "auto"
         strat_lower = str(strategy_cfg).lower()
-        if num_devices <= 1 and strat_lower in ("ddp", "ddp_spawn", "ddp_notebook"):
+        if num_devices <= 1 and strat_lower.startswith("ddp"):
             strategy_cfg = "auto"
             strat_lower = "auto"
-        if "find_unused" in strat_lower:
-            strategy_cfg = "ddp"
-            strat_lower = "ddp"
-            print("Using standard DDP; unused-parameter detection is disabled.")
+        # The rank-zero alternating dictionary update changes a DDP buffer
+        # between iterations.  Enable PyTorch's collective-order wrapper for
+        # this mode: it performs a CPU-side sequence check before NCCL work and
+        # prevents faster ranks from issuing a later buffer broadcast while a
+        # peer is still reducing the preceding dynamic adversarial graph.
+        dictionary_collective_backend = str(
+            getattr(cfg.model, "dictionary_collective_backend", "") or ""
+        ).strip().lower()
+        if (
+            num_devices > 1
+            and strat_lower.startswith("ddp")
+            and dictionary_collective_backend == "ddp_buffer"
+        ):
+            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+            torch.distributed.set_debug_level(torch.distributed.DebugLevel.DETAIL)
         val_check_interval = resolve_val_check_interval(
             datamodule, getattr(cfg.train, "val_check_interval", 1.0)
         )
@@ -1808,6 +1950,10 @@ def _load_stage_entrypoints():
             gradient_clip_val=trainer_gradient_clip_val,
             log_every_n_steps=cfg.train.log_every_n_steps,
             val_check_interval=val_check_interval,
+            check_val_every_n_epoch=max(
+                1,
+                int(getattr(cfg.train, "check_val_every_n_epoch", 1) or 1),
+            ),
             limit_train_batches=getattr(cfg.train, "limit_train_batches", 1.0),
             limit_val_batches=getattr(cfg.train, "limit_val_batches", 1.0),
             limit_test_batches=getattr(cfg.train, "limit_test_batches", 1.0),
@@ -1820,7 +1966,13 @@ def _load_stage_entrypoints():
 
         # Train and test model (use PyTorch defaults for matmul precision to avoid API mixing)
         print("\nStarting autoencoder training...")
-        trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
+        # PyTorch 2.6 defaults torch.load to weights_only=True. A Lightning
+        # training checkpoint also contains trusted local optimizer, loop, RNG,
+        # callback, and OmegaConf state, so an actual resume must explicitly
+        # request the full checkpoint payload. Fresh fits retain Lightning's
+        # default behavior.
+        fit_kwargs = _stage1_fit_checkpoint_kwargs(ckpt_path)
+        trainer.fit(model, datamodule=datamodule, **fit_kwargs)
         print("\nAutoencoder training complete.")
 
         final_ckpt_path = os.path.join(run_ckpt_dir, "final.ckpt")
@@ -2107,6 +2259,24 @@ def _load_stage_entrypoints():
         coeff_max = _cfg_value(cache_cfg, "coeff_max", None)
         if coeff_max is not None:
             cmd.extend(["--coeff_max", str(coeff_max)])
+        if dataset in {"vctk", "maestro"}:
+            for option, key, default in (
+                ("--sample_rate", "sample_rate", 24_000),
+                ("--audio_num_samples", "audio_num_samples", 48_000),
+                ("--audio_representation", "audio_representation", "waveform"),
+                ("--audio_dc_remove", "audio_dc_remove", True),
+                ("--audio_peak_normalize", "audio_peak_normalize", False),
+                ("--audio_target_peak", "audio_target_peak", 0.95),
+                ("--audio_rms_normalize", "audio_rms_normalize", True),
+                ("--audio_target_rms", "audio_target_rms", 0.12),
+                ("--audio_max_gain", "audio_max_gain", 8.0),
+                ("--audio_min_crop_rms", "audio_min_crop_rms", 0.03),
+                ("--audio_crop_attempts", "audio_crop_attempts", 64),
+                ("--audio_fade_samples", "audio_fade_samples", 0),
+                ("--audio_load_text", "audio_load_text", False),
+                ("--audio_split_by_speaker", "audio_split_by_speaker", True),
+            ):
+                cmd.extend([option, str(_cfg_value(cfg.data, key, default))])
 
         print("Building token cache before stage 2:")
         print("  Stage-1 checkpoint:", stage1_checkpoint_path)

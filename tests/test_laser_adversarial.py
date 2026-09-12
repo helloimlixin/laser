@@ -6,10 +6,17 @@ weight) is exercised exactly as in training, on tiny CPU tensors.
 """
 
 import lightning as pl
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.models.laser import LASER
+from src.models.discriminator import (
+    AudioMultiResolutionMDCTDiscriminator,
+    multi_encodec_hinge_d_loss,
+    multi_encodec_hinge_g_loss,
+    relative_feature_matching_loss,
+)
 
 
 def _tiny_model(**overrides):
@@ -154,3 +161,48 @@ def test_logit_mean_accepts_multiscale_audio_outputs():
     reduced = LASER._logits_mean(logits)
     assert reduced.shape == ()
     assert reduced.item() == torch.tensor(2.0).item()
+
+
+def test_encodec_adversarial_losses_match_clipped_reference_objective():
+    real = [torch.tensor([2.0, 0.5]), torch.tensor([1.5])]
+    fake = [torch.tensor([-2.0, 0.25]), torch.tensor([1.5])]
+
+    discriminator_loss = multi_encodec_hinge_d_loss(real, fake)
+    generator_loss = multi_encodec_hinge_g_loss(fake)
+
+    # Scale 1: mean([0, .5]) + mean([0, 1.25]) = .875.
+    # Scale 2: 0 + 2.5 = 2.5. The reference averages the scale losses.
+    assert discriminator_loss.item() == pytest.approx((0.875 + 2.5) / 2.0)
+    # The EnCodec generator objective is clipped relu(1-D(fake)), not -D(fake).
+    assert generator_loss.item() == pytest.approx((1.875 + 0.0) / 2.0)
+
+
+def test_encodec_relative_feature_matching_normalizes_each_feature_map():
+    real = [[torch.full((2, 3), 2.0), torch.full((1,), 0.5)]]
+    fake = [[torch.full((2, 3), 3.0, requires_grad=True), torch.full((1,), 1.0, requires_grad=True)]]
+
+    loss = relative_feature_matching_loss(real, fake)
+    loss.backward()
+
+    assert loss.item() == pytest.approx((0.5 + 1.0) / 2.0)
+    assert all(feature.grad is not None for feature in fake[0])
+
+
+def test_multiresolution_mdct_discriminator_backpropagates_signed_spectra():
+    torch.manual_seed(7)
+    discriminator = AudioMultiResolutionMDCTDiscriminator(
+        num_filters=8,
+        mdct_num_coefficients=(16, 8, 4),
+    )
+    waveform = torch.randn(2, 1, 256, requires_grad=True)
+
+    logits, features = discriminator(waveform, return_features=True)
+    loss = torch.stack([value.mean() for value in logits]).mean()
+    loss.backward()
+
+    assert len(logits) == 3
+    assert len(features) == 3
+    assert all(branch for branch in features)
+    assert waveform.grad is not None
+    assert torch.isfinite(waveform.grad).all()
+    assert any(parameter.grad is not None for parameter in discriminator.parameters())

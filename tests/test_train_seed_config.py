@@ -2,6 +2,8 @@ from pathlib import Path
 
 from hydra import compose, initialize_config_dir
 
+from train import _stage1_fit_checkpoint_kwargs
+
 
 def _compose(*overrides: str):
     config_dir = str(Path(__file__).resolve().parents[1] / "configs")
@@ -24,3 +26,11 @@ def test_training_is_deterministic_by_default():
 def test_stage1_init_ckpt_path_is_structured_config_key():
     cfg = _compose("data=cifar10", "init_ckpt_path=/tmp/stage1/final.ckpt")
     assert cfg.init_ckpt_path == "/tmp/stage1/final.ckpt"
+
+
+def test_stage1_full_resume_explicitly_disables_weights_only_loading():
+    assert _stage1_fit_checkpoint_kwargs(None) == {"ckpt_path": None}
+    assert _stage1_fit_checkpoint_kwargs("/tmp/stage1/last.ckpt") == {
+        "ckpt_path": "/tmp/stage1/last.ckpt",
+        "weights_only": False,
+    }

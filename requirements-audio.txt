@@ -1,0 +1,13 @@
+-r requirements.txt
+torchaudio
+numpy>=1.26,<2
+soundfile
+librosa>=0.10
+einops
+encodec==0.1.1
+matplotlib
+pystoi
+pesq
+phonemizer==3.3.0
+# TTS phonemization also requires the system package espeak-ng.
+# setup_mdctcodec_audio.sh installs DAC and resolves its obsolete protobuf pin.
