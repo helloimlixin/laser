@@ -189,7 +189,7 @@ def train(args):
     source=protocol['initializations'][args.arm]
     assert sha(source['path'])==source['sha256']
     initial=torch.load(source['path'],map_location='cpu',weights_only=False)
-    model=MatchedModel(**initial['hyper_parameters'])
+    model=MatchedModel(**{**initial['hyper_parameters'], **protocol.get('continuation_hparams', {})})
     model.load_state_dict(initial['state_dict'],strict=True)
     model.output_path=str(output)
     model.metric_workers=args.metric_workers
@@ -200,11 +200,11 @@ def train(args):
     budget=args.updates or protocol['generator_updates']
     data=MatchedData(manifest,workers=args.workers,batch_size=protocol['batch_size'],
                      validation_limit=args.validation_limit)
-    previous=json.loads((output/'run.json').read_text()) if args.resume else {}
+    previous=json.loads((output/'run.json').read_text()) if args.resume and (output/'run.json').exists() else {}
     logger=WandbLogger(entity='helloimlixin-rutgers',project='laser',
-        name=f'{protocol["name"]}-{args.arm}-'+('preflight' if args.smoke else '200k'),
+        name=f'{protocol["name"]}-{args.arm}-'+('preflight' if args.smoke else f'{budget//1000}k'),
         group=protocol.get('group','mdctcodec-matched-scratch-6kbps-20260912'),save_dir=str(output),
-        id=previous.get('id'),resume='must' if args.resume else None,mode=args.mode,
+        id=previous.get('id'),resume='must' if previous else None,mode=args.mode,
         log_model=False,config={**protocol,'arm':args.arm,'actual_budget':budget,'smoke':args.smoke},
         tags=['mdctcodec','6kbps','matched','scratch',args.arm,'preflight' if args.smoke else 'stage1'])
     run=logger.experiment
@@ -213,18 +213,27 @@ def train(args):
         restored_updates=int(restored['state_dict']['_manual_train_step'])
         order_path=output/'data_order.jsonl'
         if order_path.exists():
-            lines=order_path.read_text().splitlines()
+            lines=[line for line in order_path.read_text().splitlines() if line.strip()]
             retained=[line for line in lines if json.loads(line)['generator_updates']<=restored_updates]
             if len(lines)!=len(retained):
                 order_path.with_suffix('.before_resume.jsonl').write_text('\n'.join(lines)+'\n')
                 order_path.write_text('\n'.join(retained)+'\n')
         if (output/'completion.json').exists():
             (output/'completion.json').rename(output/'completion_before_resume.json')
-        run.config.update({'actual_budget':budget},allow_val_change=True)
+        run.config.update({'actual_budget':budget, 'last_resume_generator_updates':restored_updates,
+                           'last_resume_checkpoint':str(args.resume), 'last_resume_sha256':sha(args.resume)},allow_val_change=True)
+        if previous and args.mode == 'online' and protocol.get('continuation'):
+            recovery_source = wandb.Artifact(f'mdctcodec-continuation-recovery-{run.id}', type='experiment',
+                metadata={'restored_generator_updates':restored_updates,'checkpoint_sha256':sha(args.resume)})
+            recovery_source.add_file(str(args.resume), name='resume.ckpt')
+            for path in [Path(__file__), Path('scripts/tools/continue_mdctcodec_matched.py'),
+                         Path('scripts/tools/run_mdctcodec_long.py'), Path('src/training/mdctcodec_continuation.py')]:
+                recovery_source.add_file(str(path), name='source/' + path.name)
+            run.log_artifact(recovery_source, aliases=['latest', f'from-step-{restored_updates}']).wait()
     run.summary['status']='running'
     (output/'run.json').write_text(json.dumps({'id':run.id,'url':run.url,'arm':args.arm,
         'generator_update_budget':budget,'manifest_sha256':protocol['manifest_sha256']},indent=2))
-    if args.mode=='online' and not args.resume:
+    if args.mode=='online' and not previous:
         artifact=wandb.Artifact(f'mdctcodec-matched-protocol-{run.id}',type='experiment',metadata={'arm':args.arm})
         for path in [root/'protocol.json',root/'manifest.json',root/'calibration.json',Path(source['path']),
                      Path(__file__),Path('src/mdctcodec_matched.py'),Path('src/models/mdctcodec_rvq.py'),
@@ -232,6 +241,14 @@ def train(args):
             artifact.add_file(str(path),name=path.name)
         for name in ['source.tar.gz','source_files.json','environment.txt','preflight_verified.json','restore_verified.json']:
             if (root/name).is_file():artifact.add_file(str(root/name),name=name)
+        if protocol.get('continuation'):
+            for path in ['scripts/tools/continue_mdctcodec_matched.py', 'src/training/mdctcodec_continuation.py',
+                         'src/audio_research_media.py', 'src/training/common.py']:
+                artifact.add_file(path, name=path)
+            artifact.add_file(str(root/'prepared.json'), name='prepared.json')
+            artifact.add_file(str(args.resume), name='resume_200k.ckpt')
+            parent = protocol['continuation']['lineage'][args.arm]['parent_run']['id']
+            run.use_artifact(f'helloimlixin-rutgers/laser/model-{parent}-selected-checkpoints:complete')
         run.log_artifact(artifact).wait()
     checkpoint=ModelCheckpoint(dirpath=str(output/'checkpoints'),monitor='val/audio_visqol_audio48k',
         mode='max',save_top_k=3,save_last=True,every_n_epochs=1,save_on_train_epoch_end=False,
@@ -240,8 +257,11 @@ def train(args):
     callbacks=[checkpoint,upload,PairedAudit(output,budget)]
     if args.arm=='laser' and protocol.get('range_policy'):
         callbacks.append(TrainingCoefficientRange(output,**protocol['range_policy']))
+    if protocol.get('continuation') and not args.smoke:
+        from src.training.mdctcodec_continuation import AudioContinuationMedia, GracefulBudget
+        callbacks.extend([AudioContinuationMedia(output, manifest, args.arm), GracefulBudget(output)])
     trainer=pl.Trainer(accelerator='gpu',devices=1,precision='bf16-mixed',
-        max_steps=budget*2,max_epochs=math.ceil(budget/protocol['batches_per_epoch']),
+        max_steps=budget*2,max_epochs=math.ceil(budget/protocol['batches_per_epoch'])+2,
         callbacks=callbacks,logger=logger,
         enable_progress_bar=False,enable_model_summary=False,num_sanity_val_steps=0,
         log_every_n_steps=20,deterministic='warn',benchmark=False,
@@ -251,8 +271,20 @@ def train(args):
     trainer.fit(model,datamodule=data,ckpt_path=str(args.resume) if args.resume else None)
     actual=int(model._manual_train_step)
     if actual!=budget:
+        if getattr(model, 'continuation_stopped', False):
+            trainer.save_checkpoint(str(output/'checkpoints/last.ckpt'))
+            record = {'status':'paused_budget','generator_updates':actual,'target':budget,'url':run.url}
+            (output/'completion.json').write_text(json.dumps(record,indent=2))
+            run.summary.update(record)
+            logger.finalize('success'); wandb.finish()
+            return
         raise RuntimeError(f'Incomplete update budget: {actual}/{budget}')
     trainer.save_checkpoint(str(output/'checkpoints/final.ckpt'))
+    if args.smoke and checkpoint.best_model_score is None:
+        # A two-update resume ends mid-epoch; explicitly exercise full-audio validation.
+        metrics = trainer.validate(model, datamodule=data, verbose=False)[0]
+        checkpoint.best_model_score = torch.tensor(metrics['val/audio_visqol_audio48k'])
+        checkpoint.best_model_path = str(output/'checkpoints/final.ckpt')
     if not checkpoint.best_model_path:
         raise RuntimeError('Training completed without a validation-selected checkpoint')
     completion={'status':'complete','generator_updates':actual,'lightning_global_step':trainer.global_step,

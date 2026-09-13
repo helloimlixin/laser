@@ -63,7 +63,7 @@ def main():
     output=root/'comparison';output.mkdir(exist_ok=True)
     torch.set_num_threads(4);torch.backends.cuda.matmul.allow_tf32=False
     run=wandb.init(entity='helloimlixin-rutgers',project='laser',mode='online',
-        name=protocol['name']+'-200k-final',job_type='benchmark',
+        name=protocol['name']+f'-{protocol["generator_updates"]//1000}k-final',job_type='benchmark',
         group=protocol.get('group','mdctcodec-matched-scratch-6kbps-20260912'),dir=str(output),
         config={'protocol':protocol,'selected_models':completed,'manifest_sha256':manifest_hash})
     summaries,records={},{}
@@ -113,7 +113,7 @@ def main():
                           'Released weights have their own training history. No comprehensive SOTA claim.'}
     (output/'results.json').write_text(json.dumps(result,indent=2))
     lines=['# Matched MDCTCodec RVQ–LASER experiment at 6 kbps','',
-           'Both fresh arms completed 200,000 generator updates with identical common initialization and audited batches/crops. '
+           f'Both paired arms completed {protocol["generator_updates"]:,} generator updates with identical common initialization and audited batches/crops. '
            'Checkpoints were selected only by validation ViSQOL. Test recordings were frozen before training.','',
            '| Model | Payload kbps | ViSQOL audio48 | ViSQOL speech16 | PESQ-WB | STOI16 |',
            '|---|---:|---:|---:|---:|---:|']

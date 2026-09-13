@@ -1,8 +1,10 @@
-"""Phoneme-conditioned, frame-autoregressive LASER codec language model.
+"""Phoneme-conditioned, frame-autoregressive LASER/RVQ codec language model.
 
 The temporal transformer predicts one 150 Hz frame at a time. A small recurrent
-depth decoder predicts atom1, coefficient1, atom2, coefficient2 within a frame.
-The first atom head also predicts EOS; EOS is not part of the codec payload.
+depth decoder is retained for old LASER checkpoints. New paired priors use a
+causal depth transformer over four integer fields: alternating atom/coefficient
+tokens for LASER, four residual codebook IDs for RVQ. Head zero also predicts
+EOS, which is not part of either codec payload.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
@@ -22,6 +24,8 @@ class TTSConfig:
     text_layers: int = 3
     audio_layers: int = 8
     dropout: float = .1
+    codec: str = 'laser'
+    depth_layers: int = 0  # Zero preserves the original GRU checkpoints.
 
 
 def position_encoding(length, width, device, offset=0):
@@ -82,6 +86,22 @@ class DecoderBlock(nn.Module):
         return x + self.drop(self.ff(self.norms[2](x))), weights
 
 
+class DepthBlock(nn.Module):
+    """Causal attention over the fields of one frame; never over future fields."""
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1, self.norm2 = nn.LayerNorm(cfg.width), nn.LayerNorm(cfg.width)
+        self.attention = Attention(cfg.width, cfg.heads, cfg.dropout)
+        self.ff = nn.Sequential(nn.Linear(cfg.width, 4 * cfg.width), nn.GELU(),
+                                nn.Dropout(cfg.dropout), nn.Linear(4 * cfg.width, cfg.width))
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x, cache=None):
+        y, _ = self.attention(self.norm1(x), causal=True, cache=cache)
+        x = x + self.drop(y)
+        return x + self.drop(self.ff(self.norm2(x)))
+
+
 class LaserTTS(nn.Module):
     EOS = 8192
     vocab_sizes = (8193, 127, 8192, 127)
@@ -90,7 +110,11 @@ class LaserTTS(nn.Module):
         super().__init__()
         if cfg.width % cfg.heads or cfg.width % 2:
             raise ValueError('Width must be even and divisible by attention heads')
+        if cfg.codec not in ('laser', 'rvq') or cfg.depth_layers < 0:
+            raise ValueError('Expected laser/rvq codec and nonnegative depth_layers')
         self.cfg = cfg
+        self.EOS = 8192 if cfg.codec == 'laser' else 1024
+        self.vocab_sizes = (8193, 127, 8192, 127) if cfg.codec == 'laser' else (1025, 1024, 1024, 1024)
         self.phones = nn.Embedding(cfg.phone_vocab, cfg.width, padding_idx=0)
         self.speakers = nn.Embedding(cfg.speakers, cfg.width)
         layer = nn.TransformerEncoderLayer(cfg.width, cfg.heads, 4 * cfg.width, cfg.dropout,
@@ -101,7 +125,11 @@ class LaserTTS(nn.Module):
         self.frame_norm = nn.LayerNorm(cfg.width)
         self.blocks = nn.ModuleList([DecoderBlock(cfg) for _ in range(cfg.audio_layers)])
         self.out_norm = nn.LayerNorm(cfg.width)
-        self.depth_cell = nn.GRUCell(cfg.width, cfg.width)
+        if cfg.depth_layers:
+            self.depth_blocks = nn.ModuleList([DepthBlock(cfg) for _ in range(cfg.depth_layers)])
+            self.depth_position = nn.Parameter(torch.randn(1, 4, cfg.width) * .02)
+        else:
+            self.depth_cell = nn.GRUCell(cfg.width, cfg.width)
         self.depth_norm = nn.LayerNorm(cfg.width)
         self.heads = nn.ModuleList([nn.Linear(cfg.width, size) for size in self.vocab_sizes])
         nn.init.normal_(self.bos, std=.02)
@@ -133,15 +161,31 @@ class LaserTTS(nn.Module):
         # fields only condition later fields within that same target frame.
         state = contexts.flatten(0, 1)
         teacher = teacher_codes.flatten(0, 1)
+        if self.cfg.depth_layers:
+            prefix = torch.stack([self.fields[d](teacher[:, d]) for d in range(3)], dim=1).cumsum(1)
+            x = torch.cat((state[:, None], prefix), dim=1) + self.depth_position
+            for block in self.depth_blocks:
+                x = block(x)
+            states = self.depth_norm(x)
         result = []
         for d, head in enumerate(self.heads):
-            logits = head(self.depth_norm(state))
-            if d == 2:
+            logits = head(states[:, d] if self.cfg.depth_layers else self.depth_norm(state))
+            if d == 2 and self.cfg.codec == 'laser':
                 logits = logits.scatter(1, teacher[:, 0:1].clamp_max(8191), -1e4)
             result.append(logits.view(*contexts.shape[:2], -1))
-            if d < 3:
+            if d < 3 and not self.cfg.depth_layers:
                 state = self.depth_cell(self.fields[d](teacher[:, d]), state)
         return result
+
+    def depth_next_logits(self, context, fields, caches):
+        """One cached depth-transformer step, equivalent to teacher forcing."""
+        d = len(fields)
+        x = context[:, None] if not fields else sum(
+            self.fields[i](value) for i, value in enumerate(fields))[:, None]
+        x = x + self.depth_position[:, d:d+1]
+        for block, cache in zip(self.depth_blocks, caches):
+            x = block(x, cache=cache)
+        return self.heads[d](self.depth_norm(x[:, 0]))
 
     def forward(self, batch, guide_weight=0.0, return_logits=False):
         codes, lengths = batch['codes'], batch['lengths']
@@ -169,9 +213,11 @@ class LaserTTS(nn.Module):
             penalty = 1 - torch.exp(-(t[:, :, None] - s[:, None, :]).square() / (2 * .2**2))
             guided = ((attention * penalty).sum(-1) * valid).sum() / valid.sum().clamp_min(1)
         result = {'loss': torch.stack(losses).mean() + guide_weight * guided,
-                  'nll': torch.stack(nlls).mean(), 'atom_nll': (nlls[0] + nlls[2]) / 2,
-                  'coefficient_nll': (nlls[1] + nlls[3]) / 2,
+                  'nll': torch.stack(nlls).mean(),
                   'token_accuracy': torch.stack(accuracy).mean(), 'guided_attention': guided}
+        result.update({f'field_{d}_nll': value for d, value in enumerate(nlls)})
+        if self.cfg.codec == 'laser':
+            result.update(atom_nll=(nlls[0] + nlls[2]) / 2, coefficient_nll=(nlls[1] + nlls[3]) / 2)
         if return_logits:
             result['logits'] = logits
         return result
@@ -192,11 +238,14 @@ class LaserTTS(nn.Module):
                 y, _ = block(y, memory, mask, cache=state, static_kv=static)
             state = self.out_norm(y[:, 0])
             fields = []
+            depth_caches = [{} for _ in range(self.cfg.depth_layers)]
+            depth_fields = []
             for d, head in enumerate(self.heads):
-                scores = head(self.depth_norm(state)).float()
+                scores = (self.depth_next_logits(state, depth_fields, depth_caches)
+                          if self.cfg.depth_layers else head(self.depth_norm(state))).float()
                 if d == 0 and position < min_frames:
                     scores[:, self.EOS] = -1e4
-                if d == 2:
+                if d == 2 and self.cfg.codec == 'laser':
                     scores[:, fields[0]] = -1e4
                 if temperature <= 0:
                     value = int(scores.argmax(-1))
@@ -209,7 +258,8 @@ class LaserTTS(nn.Module):
                 if d == 0 and value == self.EOS:
                     stopped = True; break
                 fields.append(value)
-                if d < 3:
+                depth_fields.append(torch.tensor([value], device=phones.device))
+                if d < 3 and not self.cfg.depth_layers:
                     state = self.depth_cell(self.fields[d](torch.tensor([value], device=phones.device)), state)
             if stopped:
                 break

@@ -46,7 +46,7 @@ class TTSDataset(Dataset):
         r = self.records[index]
         phones = [self.phone_to_id.get(p, 1) for p in r['phonemes'].split()] + [2]
         return {'codes': r['codes'].long(), 'phones': torch.tensor(phones),
-                'speaker': self.speaker_to_id[r['speaker']], 'record': r}
+                'speaker': self.speaker_to_id[r['speaker']], 'record': r, 'index': index}
 
 
 def collate_tts(items):
@@ -57,10 +57,13 @@ def collate_tts(items):
     for i, item in enumerate(items):
         codes[i, :len(item['codes'])] = item['codes']
         phones[i, :len(item['phones'])] = item['phones']
-    return {'codes': codes, 'phones': phones,
+    result = {'codes': codes, 'phones': phones,
             'lengths': torch.tensor([len(x['codes']) for x in items]),
             'text_lengths': torch.tensor([len(x['phones']) for x in items]),
             'speakers': torch.tensor([x['speaker'] for x in items])}
+    if all('index' in item for item in items):
+        result['indices'] = torch.tensor([item['index'] for item in items])
+    return result
 
 
 class FrameBatchSampler(Sampler):

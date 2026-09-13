@@ -49,6 +49,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Torchvision's LSUN LMDB key indexes.
+_cache_*
 cover/
 
 # Translations

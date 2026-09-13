@@ -23,6 +23,7 @@ from archive.scripts.train_church_ffhq_recipe import write_json
 from src.church_ffhq_archived import full_training_cache, FullBatchEpochStream, ARCHIVE_SHA256, UPSTREAM_CONFIG
 from src.church_joint_geometry import make_prior, objective, early_decay_lr
 from src.church_joint_distributed import JointObjective, backward_batch, generation_range
+from src.church_fid_lr import FidLearningRate, synchronize_observation
 from src.church_relative_noise import RelativeChurchAux
 from src.ffhq_v4_archived import atomic_torch_save, scheduled_geometry_weight
 from src.rqvae_metrics import DistributedOriginalRQVAEMetrics
@@ -118,6 +119,7 @@ def main():
     parser.add_argument('--stop-after-step',type=int,default=0)
     parser.add_argument('--verification-skip-evaluation',action='store_true')
     parser.add_argument('--wandb-id')
+    parser.add_argument('--fid-lr-policy',type=Path)
     args=parser.parse_args()
     rank=int(os.environ.get('RANK',0));world=int(os.environ.get('WORLD_SIZE',1))
     local_rank=int(os.environ.get('LOCAL_RANK',0));torch.cuda.set_device(local_rank)
@@ -133,6 +135,13 @@ def main():
     source=args.source_checkpoint or args.output/'last.pt'
     saved=torch.load(source,map_location='cpu',weights_only=False,mmap=True)
     config=saved['config']
+    fid_lr_state=saved.get('fid_lr_state')
+    policy_path=args.fid_lr_policy
+    if policy_path is None and fid_lr_state is not None:
+        policy_path=Path(saved['execution']['fid_lr_policy'])
+    policy=json.loads(policy_path.read_text()) if policy_path else None
+    fid_lr=(FidLearningRate.from_state(fid_lr_state or policy['initial_state'],policy['config'])
+            if policy else None)
     if config['batch_size'] % (world*args.microbatch): parser.error('Unequal rank microbatches')
     assert config['parameters']==404738048 and config['batch_size']==256
     assert config['initialization']['kind']=='random' and config['stage2_checkpoint_loaded'] is None
@@ -170,7 +179,9 @@ def main():
     execution={'world_size':world,'microbatch_per_gpu':args.microbatch,'effective_batch':config['batch_size'],
         'generation_batch_per_gpu':args.generation_batch,'resumed_step':step,'source_checkpoint':str(source),
         'optimizer_restored':True,'stream_restored':True,'precision':'unchanged FP32/TF32 training',
-        'source_hashes':{p:sha256_file(ROOT/p) for p in ['src/church_joint_distributed.py',
+        'fid_lr_policy':str(policy_path.resolve()) if policy_path else None,
+        'fid_lr_policy_sha256':sha256_file(policy_path) if policy_path else None,
+        'source_hashes':{p:sha256_file(ROOT/p) for p in ['src/church_joint_distributed.py','src/church_fid_lr.py',
             'scripts/tools/train_church_joint_distributed.py','src/church_ffhq_archived.py','src/training/rqtransformer.py']}}
     if rank==0: write_json(args.output/'execution.json',execution)
     wb=None
@@ -201,7 +212,8 @@ def main():
             atomic_torch_save({'state_dict':model.state_dict(),'optimizer':optimizer.state_dict(),
                 'stream':stream.state_dict(),'config':config,'step':step,'best_fid':best_fid,'best_step':best_step,
                 'bad_checks':bad_checks,'pending_eval':pending_eval,'initialized':initialized,
-                'elapsed_seconds':elapsed+time.monotonic()-started,'execution':execution},args.output/'last.pt')
+                'elapsed_seconds':elapsed+time.monotonic()-started,'execution':execution,
+                'fid_lr_state':fid_lr.state_dict() if fid_lr else None},args.output/'last.pt')
             log({'phase':'checkpoint_saved'})
         if world>1:dist.barrier()
 
@@ -210,6 +222,20 @@ def main():
         if rank==0:atomic_torch_save({'state_dict':model.state_dict(),'config':config,'step':step,
             'screen_fid':best_fid},args.output/name)
         if world>1:dist.barrier()
+
+    def observe_fid(result,evaluation_step):
+        if fid_lr is None:return
+        base_lr=early_decay_lr(step,config['maximum_steps'],config['steps_per_epoch'],peak=config['lr'])
+        event=synchronize_observation(fid_lr,evaluation_step,result,base_lr)
+        for group in optimizer.param_groups:
+            group['lr']=fid_lr.learning_rate(base_lr)*group['lr_multiplier']
+        if rank==0:
+            write_json(args.output/'lr-monitor.json',{'pid':os.getpid(),'updated_unix':time.time(),
+                'optimizer_step':step,'state':fid_lr.state_dict(),'latest_event':event,
+                'next_lr':fid_lr.learning_rate(base_lr)})
+        if event is not None:
+            log({'phase':'fid_lr_monitor',**{f'lr_monitor/{k}':v for k,v in event.items()}})
+            if wb:wb.summary['fid_lr_monitor']=fid_lr.state_dict()
 
     def validate():
         nonlocal best_fid,best_step,bad_checks,pending_eval,initialized
@@ -230,6 +256,7 @@ def main():
                 save_model('best-screen.pt')
             elif best_step != step:bad_checks+=1
             log({'phase':'screen_complete','screen/fid':result['fid'],'screen/samples':result['samples']})
+            observe_fid(result,step)
             if wb:wb.log({'samples':wandb.Image(str(directory/'screen/samples.png')),'optimizer_step':step})
         epoch=step//config['steps_per_epoch']
         if config['confirmation_samples'] and (epoch==10 or epoch%50==0):
@@ -251,12 +278,25 @@ def main():
 
     log({'phase':'ready','resumed':True,'parameters':config['parameters'],'execution':execution})
     try:
+        if fid_lr is not None:
+            # Reconcile evaluations completed since the monitor was armed.
+            # Checkpoint state is authoritative; duplicate cached scores cannot
+            # cause another reduction after a restart.
+            for path in sorted(args.output.glob('evaluations/step-*/screen/metrics.json')):
+                evaluation_step=int(path.parent.parent.name.split('-')[-1])
+                if fid_lr.last_step < evaluation_step <= step and evaluation_step != pending_eval:
+                    observe_fid(json.loads(path.read_text()),evaluation_step)
+            if rank==0 and not (args.output/'lr-monitor.json').exists():
+                write_json(args.output/'lr-monitor.json',{'pid':os.getpid(),'updated_unix':time.time(),
+                    'optimizer_step':step,'state':fid_lr.state_dict(),'latest_event':None,
+                    'next_lr':fid_lr.learning_rate(early_decay_lr(step,config['maximum_steps'],config['steps_per_epoch'],peak=config['lr']))})
         if args.verification_skip_evaluation:pending_eval=None
         elif pending_eval is not None:validate()
         if pause():return
         while stream.epoch+stream.position/stream.size<config['epochs']:
             indices,_,epoch_end=stream.next(config['batch_size']);step+=1
-            lr=early_decay_lr(step-1,config['maximum_steps'],config['steps_per_epoch'],peak=config['lr'])
+            base_lr=early_decay_lr(step-1,config['maximum_steps'],config['steps_per_epoch'],peak=config['lr'])
+            lr=fid_lr.learning_rate(base_lr) if fid_lr else base_lr
             weight=scheduled_geometry_weight(.05,step/config['steps_per_epoch'],2.,3.)
             for group in optimizer.param_groups:group['lr']=lr*group['lr_multiplier']
             optimizer.zero_grad(set_to_none=True);model.train()
@@ -267,6 +307,7 @@ def main():
             optimizer.step();torch.cuda.synchronize()
             if step%4==0 or args.verification_skip_evaluation:
                 log({'phase':'train',**{f'train/{k}':v for k,v in totals.items()},'train/lr':lr,
+                    'train/base_lr':base_lr,'train/lr_multiplier':fid_lr.multiplier if fid_lr else 1.,
                     'train/geometry_weight':weight,'train/gradient_norm':float(norm),
                     'train/step_seconds':time.monotonic()-iteration,
                     'gpu/peak_allocated_gib':torch.cuda.max_memory_allocated()/2**30})

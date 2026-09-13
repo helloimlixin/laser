@@ -9,6 +9,7 @@ import torchaudio
 from src.mdctcodec_bitstream import pack_frames, unpack_frames
 from src.models.laser import LASER
 from src.tts_data import phonemize_texts, text_key
+from archive.scripts.benchmark_mdctcodec_trained_rvq import payload_roundtrip
 
 
 def encode_prompt(text, metadata, device):
@@ -26,20 +27,33 @@ class CodecDecoder:
         self.device = torch.device(device)
         self.model = LASER.load_from_checkpoint(str(checkpoint), map_location='cpu').to(device).eval()
         self.model.requires_grad_(False)
-        self.bound = self.model.bottleneck.coefficient_quantization_max
-        assert self.model.bottleneck.num_embeddings == 8192 and self.model.bottleneck.sparsity_level == 2
-        assert self.model.bottleneck.coefficient_quantization_bits == 7
+        self.codec = 'rvq' if self.model.bottleneck_type == 'mdctcodec_rvq' else 'laser'
+        if self.codec == 'rvq':
+            assert self.model.bottleneck.num_embeddings == 1024 and self.model.bottleneck.code_depth == 4
+            self.bound = None
+        else:
+            self.bound = self.model.bottleneck.coefficient_quantization_max
+            assert self.model.bottleneck.num_embeddings == 8192 and self.model.bottleneck.sparsity_level == 2
+            assert self.model.bottleneck.coefficient_quantization_bits == 7
 
     @torch.inference_mode()
     def decode(self, codes):
         if len(codes) == 0:
             return np.zeros(1, dtype=np.float32), b''
         fields = codes.cpu().long().numpy()
-        payload = pack_frames(fields[:, 0::2], fields[:, 1::2] - 63)
-        atoms, integers = unpack_frames(payload)
-        support = torch.from_numpy(atoms).to(self.device)[None, None]
-        values = torch.from_numpy(integers).to(self.device)[None, None].float() * (self.bound / 63)
-        waveform = self.model.decode_from_atoms_and_coeffs(support, values)[0, 0].float().cpu().numpy()
+        if fields.ndim != 2 or fields.shape[1] != 4:
+            raise ValueError('Expected four integer fields per frame')
+        if self.codec == 'rvq':
+            payload, parsed = payload_roundtrip(fields.T[None])
+            latent = self.model.bottleneck.quantizer.from_codes(torch.from_numpy(parsed).to(self.device))[0]
+            decoded = self.model.decoder(latent)
+        else:
+            payload = pack_frames(fields[:, 0::2], fields[:, 1::2] - 63)
+            atoms, integers = unpack_frames(payload)
+            support = torch.from_numpy(atoms).to(self.device)[None, None]
+            values = torch.from_numpy(integers).to(self.device)[None, None].float() * (self.bound / 63)
+            decoded = self.model.decode_from_atoms_and_coeffs(support, values)
+        waveform = decoded[0, 0].float().cpu().numpy()
         if not np.isfinite(waveform).all():
             raise RuntimeError('Decoder produced nonfinite audio')
         return waveform.clip(-1, 1), payload

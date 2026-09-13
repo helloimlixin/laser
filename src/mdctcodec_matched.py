@@ -217,7 +217,7 @@ class PairedAudit(pl.Callback):
                'batches':self.batches, 'data_order_sha256':self.digest.hexdigest()}
         path=self.output/'data_order.jsonl'
         if path.exists():
-            previous=[json.loads(line) for line in path.read_text().splitlines()]
+            previous=[json.loads(line) for line in path.read_text().splitlines() if line.strip()]
             same=[r for r in previous if r['epoch']==row['epoch']]
             if same:
                 if same[-1]!=row:raise RuntimeError('Resume changed the audited epoch stream')
