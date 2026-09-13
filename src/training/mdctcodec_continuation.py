@@ -29,9 +29,11 @@ class GracefulBudget(pl.Callback):
 
 
 class AudioContinuationMedia(pl.Callback):
-    def __init__(self, output, manifest, arm):
+    def __init__(self, output, manifest, arm, *, reconstruct_fn=reconstruct_serialized,
+                 rate_label='6 kbps'):
         self.output, self.arm = Path(output), arm
         self.paths = select_validation_examples(manifest)
+        self.reconstruct_fn, self.rate_label = reconstruct_fn, rate_label
 
     @torch.inference_mode()
     def on_validation_end(self, trainer, model):
@@ -48,7 +50,7 @@ class AudioContinuationMedia(pl.Callback):
                 assert sr == 48000
                 x = torch.from_numpy(reference)[None, None].to(model.device)
                 with torch.autocast('cuda', enabled=False):
-                    decoded, payload = reconstruct_serialized(model, x)
+                    decoded, payload = self.reconstruct_fn(model, x)
                 audio = decoded[0, 0].float().cpu().numpy()
                 stem = Path(path).stem
                 wav = target / f'{stem}_{self.arm}.wav'
@@ -57,7 +59,7 @@ class AudioContinuationMedia(pl.Callback):
                 reference_path = target / f'{stem}_reference.wav'
                 sf.write(reference_path, reference, sr, subtype='FLOAT')
                 figures, _ = render_audio_comparison({'reference': reference, self.arm: audio},
-                    target / stem, f'{stem} | {self.arm.upper()} | {step:,} updates | 6 kbps')
+                    target / stem, f'{stem} | {self.arm.upper()} | {step:,} updates | {self.rate_label}')
                 media[f'audio/{index}/reference'] = wandb.Audio(str(reference_path))
                 media[f'audio/{index}/reconstruction'] = wandb.Audio(str(wav))
                 for kind, image in figures.items():

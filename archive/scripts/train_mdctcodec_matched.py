@@ -177,7 +177,7 @@ def prepare(root):
           'coefficient_max':bound,'shared_hashes':shared_hashes},indent=2))
 
 
-def train(args):
+def train(args, *, model_class=MatchedModel, extra_callbacks_factory=None):
     root=args.root
     protocol=json.loads((root/'protocol.json').read_text())
     manifest=json.loads((root/'manifest.json').read_text())
@@ -189,7 +189,7 @@ def train(args):
     source=protocol['initializations'][args.arm]
     assert sha(source['path'])==source['sha256']
     initial=torch.load(source['path'],map_location='cpu',weights_only=False)
-    model=MatchedModel(**{**initial['hyper_parameters'], **protocol.get('continuation_hparams', {})})
+    model=model_class(**{**initial['hyper_parameters'], **protocol.get('continuation_hparams', {})})
     model.load_state_dict(initial['state_dict'],strict=True)
     model.output_path=str(output)
     model.metric_workers=args.metric_workers
@@ -206,7 +206,8 @@ def train(args):
         group=protocol.get('group','mdctcodec-matched-scratch-6kbps-20260912'),save_dir=str(output),
         id=previous.get('id'),resume='must' if previous else None,mode=args.mode,
         log_model=False,config={**protocol,'arm':args.arm,'actual_budget':budget,'smoke':args.smoke},
-        tags=['mdctcodec','6kbps','matched','scratch',args.arm,'preflight' if args.smoke else 'stage1'])
+        tags=['mdctcodec','6kbps-target' if protocol.get('rate_is_target_only') else '6kbps',
+              'matched','scratch',args.arm,'preflight' if args.smoke else 'stage1'])
     run=logger.experiment
     if args.resume:
         restored=torch.load(args.resume,map_location='cpu',weights_only=False)
@@ -241,6 +242,8 @@ def train(args):
             artifact.add_file(str(path),name=path.name)
         for name in ['source.tar.gz','source_files.json','environment.txt','preflight_verified.json','restore_verified.json']:
             if (root/name).is_file():artifact.add_file(str(root/name),name=name)
+        for path in protocol.get('runtime_source_files', []):
+            artifact.add_file(path, name=path)
         if protocol.get('continuation'):
             for path in ['scripts/tools/continue_mdctcodec_matched.py', 'src/training/mdctcodec_continuation.py',
                          'src/audio_research_media.py', 'src/training/common.py']:
@@ -255,6 +258,8 @@ def train(args):
         filename=f'{args.arm}-{{epoch:03d}}-{{step:07d}}')
     upload=_make_selected_checkpoint_artifact_callback(pl.Callback)(checkpoint,every_n_epochs=5)
     callbacks=[checkpoint,upload,PairedAudit(output,budget)]
+    if extra_callbacks_factory:
+        callbacks.extend(extra_callbacks_factory(output, manifest, args.arm))
     if args.arm=='laser' and protocol.get('range_policy'):
         callbacks.append(TrainingCoefficientRange(output,**protocol['range_policy']))
     if protocol.get('continuation') and not args.smoke:

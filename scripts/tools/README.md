@@ -18,6 +18,17 @@ automatically; most runs do not need to call these utilities directly.
   100-speaker TTS comparison with F5-TTS and Chatterbox Turbo, including ASR,
   speaker similarity, predicted quality, timing and listening samples; see the
   [TTS benchmark protocol](../../docs/mdctcodec-tts-benchmark-2026-09-12.md).
+- `evaluate_audio_coefficient_levels.py`: calibrate and evaluate compact joint
+  atom/coefficient vocabularies, with actual payload rates and optional 6 kbps
+  residual corrections; see the [audio quantizer screen](../../docs/mdctcodec-compact-audio-vocabulary-2026-09-13.md).
+- `train_mdctcodec_hard6k.py` and `run_mdctcodec_hard6k_pair.py`: prepare and train
+  the current K4/4096-atom LASER and four-book RVQ pair under an enforced 6000
+  bit/s packet limit, including coefficients and headers; see the
+  [hard-rate protocol](../../docs/mdctcodec-hard6k-2026-09-13.md).
+- `train_mdctcodec_k4.py`: historical K4 with 4096 learned atoms, matching the total vectors
+  in RVQ's four 1024-entry codebooks,
+  with training-only coefficient calibration and measured entropy payload rates;
+  see the [K4 protocol](../../docs/mdctcodec-k4-a4096-2026-09-13.md).
 - Other files support cache conversions, diagnostics, sampling reports, and local
   run maintenance. Their individual `--help` describes required inputs.
 
