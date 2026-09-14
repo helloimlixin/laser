@@ -4,6 +4,9 @@ This folder holds short notes for the maintained code path.
 
 ## Core Notes
 
+- [Sparse Coding with Batch OMP and Alternating Online Dictionary Updates](batch-omp-online-dictionary-learning.md):
+  manuscript section on batched pursuit, progressive Cholesky solves, and
+  normalized dictionary updates with backtracking.
 - [Tokenization of Real-Valued Sparse Codes](sparse-codes-for-autoregressive-generation.md):
   manuscript section on joint atom/coefficient tokens, residual assignment,
   coefficient fitting, and autoregressive training.

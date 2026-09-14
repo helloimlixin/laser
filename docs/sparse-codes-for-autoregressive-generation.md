@@ -31,7 +31,7 @@ We obtain a token sequence by greedy residual quantization. With $r_0=h$, the
 $k$-th step selects
 
 $$
-t_k=\operatorname*{arg\,min}_{v\in\mathcal V}
+t_k=\arg\min_{v\in\mathcal V}
 \|r_{k-1}-e(v)\|_2^2,
 \qquad
 r_k=r_{k-1}-e(t_k),
