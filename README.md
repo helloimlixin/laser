@@ -135,7 +135,16 @@ python train.py --config configs/stage2/ffhq-compound.yaml \
   options.token_cache=/path/to/compound-cache.pt
 ```
 
-For that backend, multiple GPUs use `torchrun --standalone --nproc_per_node=4
+The matched ImageNet VAR experiment trains both VQ and LASER OMP from random
+initialization, using two GPUs per arm. Use
+[`imagenet-var-vq-scratch.yaml`](configs/experiments/imagenet-var-vq-scratch.yaml)
+and [`imagenet-var-scratch.yaml`](configs/experiments/imagenet-var-scratch.yaml).
+The [scratch comparison notes](docs/imagenet-var-scratch.md) describe the shared
+initialization, factor-16 layout, training budgets, W&B runs, and evaluation.
+The user authorized this matched ImageNet-only recipe after reviewing the
+differences from published VAR. See the [source audit](docs/var-stage1-protocol-audit.md).
+
+For the compound RQ backend, multiple GPUs use `torchrun --standalone --nproc_per_node=4
 train.py --config ...`; supply an existing compound cache and retain its calibrated
 coefficient metadata. Historical results and their original recipes are in
 [`docs/results.md`](docs/results.md). The standard recipes are starting points for

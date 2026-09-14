@@ -72,15 +72,15 @@ def image_manifest(root):
 
 class CachedClassLatents(Dataset):
     """One view per image each epoch, alternating the cached augmented views."""
-    def __init__(self, cache, split='train', epoch=0):
+    def __init__(self, cache, split='train', epoch=0, include_hard_codes=True):
         cache = Path(cache)
         self.spec = json.loads((cache/'complete.json').read_text())
         self.views = self.spec['train_views'] if split == 'train' else 1
         self.latents = [np.load(cache/f'{split}-view{v}-latents.npy', mmap_mode='r')
                         for v in range(self.views)]
         self.labels = np.load(cache/f'{split}-labels.npy', mmap_mode='r')
-        self.hard = [np.load(cache/f'{split}-view{v}-codes.npy', mmap_mode='r')
-                     for v in range(self.views)]
+        self.hard = ([np.load(cache/f'{split}-view{v}-codes.npy', mmap_mode='r')
+                      for v in range(self.views)] if include_hard_codes else [])
         self.epoch = epoch
         for array in self.latents:
             assert array.dtype == np.float32 and array.shape == (len(self.labels),8,8,256)
@@ -93,8 +93,9 @@ class CachedClassLatents(Dataset):
 
     def __getitem__(self, index):
         view = (self.epoch + index) % self.views
-        return (torch.from_numpy(self.latents[view][index].copy()),
-                int(self.labels[index]), torch.from_numpy(self.hard[view][index].astype(np.int64)))
+        hard = (torch.from_numpy(self.hard[view][index].astype(np.int64))
+                if self.hard else torch.empty(0, dtype=torch.long))
+        return (torch.from_numpy(self.latents[view][index].copy()), int(self.labels[index]), hard)
 
 
 def sdpa_forward(self, x, caching=False, past_kv=None):
@@ -122,7 +123,8 @@ def enable_sdpa(model):
     return count
 
 
-def conditional_update(ddp, tokenizer, optimizer, scaler, batches, temperature, max_gn=1.):
+def conditional_update(ddp, tokenizer, optimizer, scaler, batches, temperature, max_gn=1.,
+                       *, inputs_are_images=False, encoder_batch_size=16):
     total = sum(len(batch[0]) for batch in batches)
     device = next(ddp.parameters()).device
     optimizer.zero_grad(set_to_none=True)
@@ -130,6 +132,9 @@ def conditional_update(ddp, tokenizer, optimizer, scaler, batches, temperature, 
     for index,(z,labels,_) in enumerate(batches):
         with (ddp.no_sync() if index+1 < len(batches) else nullcontext()):
             with torch.no_grad():
+                if inputs_are_images:
+                    z = torch.cat([tokenizer.encode(images.to(device, non_blocking=True))
+                                   for images in z.split(encoder_batch_size)])
                 targets,codes = tokenizer.quantizer.get_soft_codes(
                     z.to(device,non_blocking=True),temp=temperature,stochastic=True)
             logits = ddp(codes,model_aux=tokenizer,cond=labels.to(device,non_blocking=True),amp=True)

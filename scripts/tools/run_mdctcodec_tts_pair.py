@@ -36,6 +36,41 @@ def gpus_idle():
     return not output.strip()
 
 
+def preceding_hard6k_done(root):
+    """The stage1 supervisor owns GPUs through its post-training comparison."""
+    if not (root/'status.json').exists():return False
+    state=json.loads((root/'status.json').read_text())
+    if state.get('pid') and alive(state['pid']):return False
+    if state['status']!='complete' or state.get('comparison',{}).get('status')!='complete':return False
+    if not (root/'comparison_complete.json').exists():return False
+    target=json.loads((root/'protocol.json').read_text())['generator_updates']
+    for arm in ('laser','rvq'):
+        path=root/arm/'completion.json'
+        if not path.exists():return False
+        done=json.loads(path.read_text())
+        if done.get('status')!='complete' or done.get('generator_updates')!=target:return False
+    return not any(j.get('pid') and alive(j['pid']) for j in state['jobs'])
+
+
+def hard6k_jobs(root,stage1,python):
+    jobs=[{'name':'prepare','gpu':None,'deps':[],
+        'command':[python,'-u','scripts/tools/prepare_mdctcodec_hard6k_tts.py','--root',str(root),'--stage1',str(stage1)]}]
+    for arm,gpu in [('laser',0),('rvq',1)]:
+        cache=root/f'{arm}_cache'
+        jobs.extend([
+            {'name':f'inventory_{arm}','gpu':None,'deps':['prepare'],'command':[python,'-u',
+                'scripts/tools/cache_mdctcodec_tts.py','--prepare','--output',str(cache),
+                '--inventory-from',str(REPO/'outputs/mdctcodec_tts_rangefix/cache/inventory.json'),
+                '--checkpoint',str(root/'frozen_codecs'/f'{arm}.ckpt')]},
+            {'name':f'cache_{arm}','gpu':gpu,'deps':[f'inventory_{arm}'],'command':[python,'-u',
+                'scripts/tools/cache_mdctcodec_tts.py','--output',str(cache),'--device','cuda:0']},
+            {'name':f'merge_{arm}','gpu':None,'deps':[f'cache_{arm}'],'command':[python,'-u',
+                'scripts/tools/cache_mdctcodec_tts.py','--merge','--output',str(cache)]}])
+    jobs.append({'name':'finalize','gpu':None,'deps':['merge_laser','merge_rvq'],
+        'command':[python,'-u','scripts/tools/prepare_mdctcodec_hard6k_tts.py','--finalize','--root',str(root)]})
+    return jobs
+
+
 def verify_preflights(root):
     results=[json.loads((root/f'preflight_{a}/completion.json').read_text()) for a in ('laser','rvq')]
     assert all(r['status']=='smoke_complete' and r['step']==2 for r in results)
@@ -49,11 +84,22 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root',type=Path,default=Path('outputs/mdctcodec_tts_paired'))
     p.add_argument('--resume',action='store_true')
-    args=p.parse_args(); os.chdir(REPO); root=args.root.resolve()
+    p.add_argument('--hard6k-stage1',type=Path,help='Wait for this completed hard6k pair, then freeze best ViSQOL codecs and retokenize both arms')
+    args=p.parse_args(); os.chdir(REPO); root=args.root.resolve();root.mkdir(parents=True,exist_ok=True)
+    stage1=args.hard6k_stage1.resolve() if args.hard6k_stage1 else None
     lock=(root/'supervisor.lock').open('a'); fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     previous=json.loads((root/'status.json').read_text()) if (root/'status.json').exists() else None
     if previous and not args.resume: raise RuntimeError('Existing queue; use --resume after inspecting its status')
-    plan=json.loads((root/'plan.json').read_text())
+    if stage1 and not (root/'plan.json').exists():
+        plan={'name':'mdctcodec-hard6k-k4-paired-rqtransformer-20260914','compute_budget_gpu_hours':48,
+            'train':{'epochs':160},'stage1_root':str(stage1),
+            'selection':'Wait for both stage1 completions and comparison; freeze each respective highest validation-ViSQOL checkpoint, never latest; build fresh K4 caches.',
+            'hard_rate_cap_bps':6000,'stage1_selection_pending':True}
+        if (root/'gpu_preflight.json').exists():
+            plan['preflight_gpu_seconds']=json.loads((root/'gpu_preflight.json').read_text()).get('conservative_charged_gpu_seconds',0)
+        from scripts.tools.prepare_mdctcodec_tts_pair import write
+        write(root/'queued_plan.json',plan)
+    else:plan=json.loads((root/'plan.json').read_text())
     python=sys.executable
     jobs=[{'name':f'cache_rvq_{i}','gpu':i,'deps':[],
         'command':[python,'-u','scripts/tools/cache_mdctcodec_tts.py','--output',str(root/'rvq_cache_gpu'),
@@ -61,6 +107,7 @@ def main():
     jobs += [
         {'name':'merge','gpu':None,'deps':['cache_rvq_0','cache_rvq_1'],'command':[python,'-u','scripts/tools/cache_mdctcodec_tts.py','--merge','--output',str(root/'rvq_cache_gpu')]},
         {'name':'finalize','gpu':None,'deps':['merge'],'command':[python,'-u','scripts/tools/prepare_mdctcodec_tts_pair.py','--finalize','--root',str(root)]}]
+    if stage1:jobs=hard6k_jobs(root,stage1,python)
     for arm,gpu in [('laser',0),('rvq',1)]:
         jobs.append({'name':f'preflight_{arm}','gpu':gpu,'deps':['finalize'],
             'command':[python,'-u','scripts/tools/train_mdctcodec_tts.py','--config',str(root/f'{arm}.yaml'),
@@ -84,21 +131,24 @@ def main():
             elif job['name'].startswith('preflight_') and (root/job['name']/'run.json').exists():
                 raise RuntimeError('Failed preflight output exists; inspect and choose a fresh preflight directory before retrying')
     import wandb
-    run=wandb.init(entity='helloimlixin-rutgers',project='laser',name='mdctcodec-6kbps-paired-rqtransformer-campaign',
+    run=wandb.init(entity='helloimlixin-rutgers',project='laser',name='mdctcodec-hard6k-k4-tts-campaign' if stage1 else 'mdctcodec-6kbps-paired-rqtransformer-campaign',
         group=plan['name'],job_type='paired-tts-supervisor',dir=str(root),config=plan,
         id=previous.get('wandb_id') if previous else None,resume='must' if previous else None)
-    artifact=wandb.Artifact('mdctcodec-paired-rqtransformer-protocol',type='experiment-protocol')
-    for path in [root/'plan.json',root/'benchmark/manifest.json',root/'laser_initial.pt',root/'rvq_initial.pt',
+    artifact_name='mdctcodec-hard6k-k4-tts-protocol' if stage1 else 'mdctcodec-paired-rqtransformer-protocol'
+    artifact=wandb.Artifact(artifact_name,type='experiment-protocol')
+    for path in [root/'plan.json',root/'queued_plan.json',root/'benchmark/manifest.json',root/'laser_initial.pt',root/'rvq_initial.pt',
                  root/'gpu_preflight.json',root/'plan_before_gpu_cache_amendment.json',
-                 REPO/'docs/mdctcodec-paired-rqtransformer-2026-09-13.md',
+                 REPO/('docs/mdctcodec-hard6k-tts-2026-09-14.md' if stage1 else 'docs/mdctcodec-paired-rqtransformer-2026-09-13.md'),
                  Path(__file__),REPO/'scripts/tools/prepare_mdctcodec_tts_pair.py',
                  REPO/'scripts/tools/evaluate_mdctcodec_tts_pair.py',REPO/'src/models/laser_tts.py',
-                 REPO/'src/training/mdctcodec_tts.py',REPO/'src/tts_pairing.py']:
+                 REPO/'src/training/mdctcodec_tts.py',REPO/'src/tts_pairing.py',
+                 REPO/'scripts/tools/prepare_mdctcodec_hard6k_tts.py',REPO/'scripts/tools/cache_mdctcodec_tts.py',
+                 REPO/'src/tts_runtime.py',REPO/'src/tts_data.py',REPO/'src/audio_hard6k_bitstream.py']:
         if not path.exists(): continue
         artifact.add_file(str(path),name=path.name)
     run.log_artifact(artifact,aliases=['latest','frozen-plan']).wait()
     processes={}; stopped=False; failure=None; last=time.monotonic(); last_log=last
-    previous_path=REPO/'outputs/mdctcodec_long_campaign/status.json'
+    previous_path=stage1/'status.json' if stage1 else REPO/'outputs/mdctcodec_long_campaign/status.json'
     resources_released=bool(previous and previous.get('resources_released'))
     def stop(*_):
         nonlocal stopped
@@ -114,10 +164,14 @@ def main():
                            finished_utc=datetime.now(timezone.utc).isoformat())
                 log.close(); del processes[name]
                 if rc==0:
+                    if name=='prepare' and stage1:
+                        plan=json.loads((root/'plan.json').read_text())
+                        run.config.update({**plan,'stage1_selection_pending':False},allow_val_change=True)
+                        run.summary['selected_stage1']={a:{k:v for k,v in item.items() if k.startswith('stage1_') or k=='codec_sha256'} for a,item in plan['arms'].items()}
                     if name=='finalize':
-                        verified=wandb.Artifact('mdctcodec-paired-rqtransformer-protocol',type='experiment-protocol',
+                        verified=wandb.Artifact(artifact_name,type='experiment-protocol',
                             metadata={'protocol_sha256':file_sha(root/'protocol.json'),'cache_alignment_verified':True})
-                        for path in [root/'protocol.json',root/'laser.yaml',root/'rvq.yaml',root/'benchmark/manifest.json']:
+                        for path in [root/'protocol.json',root/'laser.yaml',root/'rvq.yaml',root/'benchmark/manifest.json',root/'laser_initial.pt',root/'rvq_initial.pt']:
                             verified.add_file(str(path),name=path.name)
                         run.log_artifact(verified,aliases=['latest','verified-caches']).wait()
                     if name.startswith('train_'):
@@ -126,8 +180,14 @@ def main():
                             job['status']='incomplete'; stopped=True; failure=f'{name} stopped before the common epoch target'
                     if job['status']=='complete': completed.add(name)
                 else: stopped=True; failure=f'{name} exited {rc}; see {root/(name+".log")}'
-            cache_ready=all((root/'rvq_cache_gpu'/f'worker_{i}_complete.json').exists() for i in range(2))
-            if not resources_released and preceding_campaign_done(previous_path) and gpus_idle(): resources_released=True
+            cache_ready=(all((root/f'{a}_cache/worker_0_complete.json').exists() for a in ('laser','rvq')) if stage1
+                else all((root/'rvq_cache_gpu'/f'worker_{i}_complete.json').exists() for i in range(2)))
+            predecessor_done=preceding_hard6k_done(stage1) if stage1 else preceding_campaign_done(previous_path)
+            if not resources_released and predecessor_done and gpus_idle(): resources_released=True
+            if stage1 and not resources_released and previous_path.exists():
+                predecessor=json.loads(previous_path.read_text())
+                if predecessor.get('pid') and not alive(predecessor['pid']) and not predecessor_done:
+                    stopped=True;failure='Stage1 supervisor exited without both completed codecs and a successful comparison; stage2 remains unstarted'
             if used>=plan['compute_budget_gpu_hours']*3600: stopped=True
             if stopped:
                 for process,job,_ in processes.values():
@@ -138,6 +198,7 @@ def main():
             else:
                 for job in jobs:
                     if job['status']!='queued' or not set(job['deps'])<=completed: continue
+                    if stage1 and not resources_released:continue
                     if job['name']=='merge' and not cache_ready: continue
                     if job['gpu'] is not None and not resources_released: continue
                     if any(other['gpu']==job['gpu'] for _,other,_ in processes.values()): continue
@@ -156,6 +217,7 @@ def main():
                 'pid':os.getpid(),'wandb_id':run.id,'url':run.url,'active_gpu_hours':used/3600,
                 'budget_gpu_hours':plan['compute_budget_gpu_hours'],'cache_workers_complete':cache_ready,
                 'resources_released':resources_released,'waiting_for':None if resources_released else str(previous_path),
+                'stage1_selection_pending':stage1 is not None and 'prepare' not in completed,
                 'updated_utc':datetime.now(timezone.utc).isoformat(),'jobs':jobs,'failure':failure}
             temp=root/'status.tmp'; temp.write_text(json.dumps(status,indent=2)); temp.replace(root/'status.json')
             if now-last_log>=60 or done:

@@ -35,6 +35,8 @@ class GenerationValidation:
             'sampling': {'seed_offset': 30000, 'max_frames': config.get('max_frames', 2250)},
             'asr': 'pinned Whisper-large-v3, English, beam5, fp16, temperature0, no VAD/context',
             'items': [{k: v for k, v in r.items() if k != 'codes'} for r in self.data.records]}
+        if config.get('max_seconds') is not None:
+            manifest['sampling']['max_seconds']=config['max_seconds']
         path = self.output / 'generation_validation_manifest.json'
         if path.exists():
             assert json.loads(path.read_text()) == manifest
@@ -55,7 +57,9 @@ class GenerationValidation:
                 with torch.autocast('cuda', dtype=torch.bfloat16):
                     tokens, info = model.generate(item['phones'][None].to(device),
                         torch.tensor([item['speaker']], device=device),
-                        max_frames=self.config.get('max_frames', 2250))
+                        max_frames=self.config.get('max_frames', 2250),
+                        max_seconds=self.config.get('max_seconds'),
+                        min_seconds=.2 if getattr(model.cfg,'hard_rate_cap_bps',0) else None)
                 audio, payload = decoder.decode(tokens)
                 path = target / f'{index:03d}_{Path(record["path"]).stem}.wav'
                 sf.write(path, audio, 48000, subtype='FLOAT')
@@ -63,7 +67,7 @@ class GenerationValidation:
                 rows.append({'text': record['text'], 'speaker': record['speaker'],
                     'reference_path': record['path'], 'audio_path': str(path.resolve()),
                     'audio_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
-                    'payload_bytes': len(payload), 'seconds': len(audio)/48000, **info})
+                    **info, 'payload_bytes': len(payload), 'seconds': len(audio)/48000})
                 print('GENERATION_VALIDATION', epoch, index+1, len(self.data.records), flush=True)
         request = target / 'generated.json'
         request.write_text(json.dumps({'manifest_sha256': self.manifest_sha, 'epoch': epoch,

@@ -182,6 +182,9 @@ __pycache__/
 *.pyc
 .env
 .venv/
+.venv-var-eval/
+# Pinned external VAR source; installation command is in docs/imagenet-laser-var.md.
+third_party/FoundationVision_VAR/
 lightning_logs/
 
 # Project-specific ignores

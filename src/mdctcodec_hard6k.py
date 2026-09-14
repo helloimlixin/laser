@@ -139,9 +139,14 @@ class HardRateStatistics(K4TrainingStatistics):
         if elapsed>=self.ceiling:
             model.continuation_stopped=True;trainer.should_stop=True
         if int(model._manual_train_step)%20==0:
-            model.logger.log_metrics({'train/packet_kbps':size*8*48000/samples/1000,
+            metrics={'train/packet_kbps':size*8*48000/samples/1000,
                 'train/rate_violations':0,'train/coded_frames':frames,'train/sparsity_or_depth':4,
-                'train/total_dictionary_vectors':4096,'train/assigned_gpu_hours':elapsed/3600},step=trainer.global_step)
+                'train/crop_seconds':samples/48000,'train/coded_frames_per_second':frames*48000/samples,
+                'train/total_dictionary_vectors':4096,'train/assigned_gpu_hours':elapsed/3600}
+            if model.arm=='laser':
+                metrics.update({'train/nonzero_coefficients_per_frame':float((codes.values!=0).float().sum(-1).mean()),
+                                'train/coefficient_level_max':float(model.bottleneck.coefficient_levels[-1])})
+            model.logger.log_metrics(metrics,step=trainer.global_step)
 
 
 @torch.inference_mode()

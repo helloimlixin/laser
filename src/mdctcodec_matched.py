@@ -74,12 +74,12 @@ class PairedSampler(Sampler):
 
 
 class MatchedData(pl.LightningDataModule):
-    def __init__(self, manifest, workers=8, batch_size=48, validation_limit=0):
+    def __init__(self, manifest, workers=8, batch_size=48, validation_limit=0, crop_samples=7960):
         super().__init__()
         self.manifest, self.workers, self.batch_size = manifest, workers, batch_size
         self.config = {'dataset':'vctk','sample_rate':48000,'audio_representation':'waveform',
                        'mean':(0.0,),'std':(1.0,)}
-        self.train_dataset = PairedAudioDataset(manifest['train'], manifest['seed'])
+        self.train_dataset = PairedAudioDataset(manifest['train'], manifest['seed'], crop_samples=crop_samples)
         paths = manifest['validation'][:validation_limit] if validation_limit else manifest['validation']
         self.val_dataset = PairedAudioDataset(paths, crop_samples=0)
 

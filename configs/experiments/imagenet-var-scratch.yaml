@@ -1,0 +1,37 @@
+# @package _global_
+defaults:
+  - imagenet-laser-var
+  - _self_
+
+# User-authorized matched ImageNet-only experiment, resumed after protocol review.
+# This is NOT the published VAR stage-1 training recipe. See
+# docs/var-stage1-protocol-audit.md. Every trainable weight starts randomly.
+output_dir: outputs/imagenet-var-scratch-20260914/${model.bottleneck}
+model:
+  initialization: scratch
+  pretrained_vae: null
+  bottleneck: laser
+  coefficient_range_decay: 0.99
+tokenizer:
+  epochs: 100
+  batch_size: 32
+  accumulation: 2
+  lr: 0.0001
+  dictionary_lr: 0.0001
+  warmup_steps: 500
+  adversarial_weight: 0.5
+  adaptive_adversarial: true
+  adversarial_start: 10000
+  calibration_images: 0
+  max_matched_rfid: null
+  max_rfid_drift: null
+prior:
+  batch_size: 96
+  accumulation: 4
+data:
+  workers: 4
+logging:
+  every_steps: 20
+wandb:
+  group: imagenet-var-scratch-matched-20260914
+  id: imagenet-var-${model.bottleneck}-scratch-f16-d16-20260914

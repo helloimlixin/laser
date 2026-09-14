@@ -8,7 +8,7 @@ import torch
 
 UPSTREAM = Path(__file__).resolve().parents[1]/'outputs/church-rq-baseline-scratch-20260912/upstream-source'
 sys.path.insert(0,str(UPSTREAM))
-from src.imagenet_scaled_stage2 import CachedClassLatents, enable_sdpa, load_imagenet_config
+from src.imagenet_scaled_stage2 import CachedClassLatents, ManifestImages, enable_sdpa, load_imagenet_config
 from src.scaled_atom_training import TrainingScaledAtomRQ
 
 
@@ -73,3 +73,37 @@ def test_cache_keeps_large_integer_ids_labels_and_epoch_views(tmp_path):
     assert first[0][0].mean()==0 and second[0][0].mean()==1
     assert first[1][1]==999 and first[0][2].max()==131072
     assert first[0][2].dtype==torch.int64
+
+
+def test_stochastic_training_reuses_latents_without_obsolete_hard_tokens(tmp_path):
+    # A changed codebook can reuse encoder outputs. Training regenerates its
+    # targets, so it must not require or read the previous vocabulary's IDs.
+    (tmp_path/'complete.json').write_text(json.dumps({'train_views':2}))
+    np.save(tmp_path/'train-labels.npy',np.array([9,926],dtype=np.int16))
+    for view in range(2):
+        np.save(tmp_path/f'train-view{view}-latents.npy',np.full((2,8,8,256),view,dtype=np.float32))
+    first=CachedClassLatents(tmp_path,epoch=0,include_hard_codes=False)
+    second=CachedClassLatents(tmp_path,epoch=1,include_hard_codes=False)
+    assert first[0][0].mean()==0 and second[0][0].mean()==1
+    assert first[1][0].mean()==1 and second[1][0].mean()==0
+    assert first[0][1]==9 and first[1][1]==926
+    assert first[0][2].numel()==0 and first[0][2].dtype==torch.long
+
+
+def test_online_imagenet_crops_change_each_epoch_and_resume_reproducibly(tmp_path):
+    from PIL import Image
+    from rqvae.img_datasets.transforms import create_transforms
+    pixels=np.random.default_rng(3).integers(0,256,(256,400,3),dtype=np.uint8)
+    Image.fromarray(pixels).save(tmp_path/'image.png')
+    manifest={'samples':[['image.png',926]]}
+    transform=create_transforms(load_imagenet_config(UPSTREAM).dataset,split='train')
+    rng=torch.get_rng_state().clone()
+    views=[ManifestImages(tmp_path,manifest,transform,view=epoch,seed=421)[0]
+           for epoch in range(6)]
+    assert all(label==926 and index==0 for _,label,index in views)
+    assert all(image.shape==(3,256,256) for image,_,_ in views)
+    assert not torch.equal(views[0][0],views[2][0])
+    assert not torch.equal(views[1][0],views[3][0])
+    repeated=ManifestImages(tmp_path,manifest,transform,view=5,seed=421)[0][0]
+    torch.testing.assert_close(views[5][0],repeated,rtol=0,atol=0)
+    assert torch.equal(torch.get_rng_state(),rng)

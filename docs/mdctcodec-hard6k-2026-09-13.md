@@ -1,5 +1,38 @@
 # Enforced 6 kbps LASER/RVQ comparison
 
+Both arms completed **200000 generator and discriminator updates** on September
+13, using 18.743 assigned GPU-hours in total. All 200000 audited batches and crop
+offsets matched. The latest and best three ViSQOL checkpoints are committed
+online for [LASER](https://wandb.ai/helloimlixin-rutgers/laser/runs/374vbgmr) and
+[RVQ](https://wandb.ai/helloimlixin-rutgers/laser/runs/oa4foeqp), artifact version
+46 for each run. Best validation ViSQOL was 4.17292 and 4.12990 respectively.
+
+The [completed 200-clip test comparison](https://wandb.ai/helloimlixin-rutgers/laser/runs/pztuqmc6)
+uses those validation-selected checkpoints, with no test fitting or selection:
+
+| Metric | LASER K4 / 4096 atoms | RVQ 4 × 1024 |
+|---|---:|---:|
+| ViSQOL audio, 48 kHz | 4.15771 | 4.11090 |
+| ViSQOL speech, 16 kHz | 3.87377 | 3.72242 |
+| PESQ-WB, 16 kHz | 2.39285 | 2.12166 |
+| STOI, 16 kHz | 0.91685 | 0.89795 |
+| Mean complete-packet kbps | 5.99117 | 5.99381 |
+| Maximum complete-packet kbps | 6.00000 | 6.00000 |
+| Packets over 6 kbps | 0 | 0 |
+
+The paired ViSQOL audio difference is +0.04681, with a 95% speaker-bootstrap
+interval of [+0.02833, +0.06822] (8 speakers, 5000 resamples). The intervals for
+all four metrics favor LASER in this experiment. This is one training seed and
+a test set previously used in earlier experiments; the intervals do not measure
+training-seed variation. Coded temporal resolution and quantizer learning differ,
+as detailed below. These results do not establish comprehensive SOTA.
+
+Reproduce the frozen comparison with
+`python archive/scripts/report_mdctcodec_matched.py --root outputs/mdctcodec_k4_a4096_hard6k_20260913`.
+It detects the hard-rate protocol and uses the packet decoder for both arms.
+Existing completed results are preserved. The older K2 stage-2 queue remains
+held; the new codec requires compatible caches and a newly trained prior.
+
 The user requires a hard limit, K4, and 4096 total learned dictionary vectors.
 Both new arms satisfy an exact packet inequality for every supported clip:
 

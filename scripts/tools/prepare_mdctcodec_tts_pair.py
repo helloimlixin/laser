@@ -145,7 +145,7 @@ def finalize(root):
     plan = json.loads((root/'plan.json').read_text())
     for arm, item in plan['arms'].items():
         cache = torch.load(item['cache'], map_location='cpu', weights_only=True)
-        assert record_signature(cache) == plan['record_signature'], f'{arm}: mismatched records/lengths'
+        assert record_signature(cache,include_frames=plan.get('record_signature_basis')!='utterance_metadata') == plan['record_signature'], f'{arm}: mismatched records/lengths'
         assert cache['codec_sha256'] == item['codec_sha256']
         item['cache_sha256'] = file_sha(item['cache'])
         del cache

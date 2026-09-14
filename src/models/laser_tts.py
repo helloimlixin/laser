@@ -1,9 +1,9 @@
 """Phoneme-conditioned, frame-autoregressive LASER/RVQ codec language model.
 
-The temporal transformer predicts one 150 Hz frame at a time. A small recurrent
+The temporal transformer predicts one coded frame at a time. A small recurrent
 depth decoder is retained for old LASER checkpoints. New paired priors use a
-causal depth transformer over four integer fields: alternating atom/coefficient
-tokens for LASER, four residual codebook IDs for RVQ. Head zero also predicts
+causal depth transformer over alternating atom/coefficient fields for LASER
+(four for K2, eight for K4), or four residual codebook IDs for RVQ. Head zero also predicts
 EOS, which is not part of either codec payload.
 """
 from __future__ import annotations
@@ -26,6 +26,11 @@ class TTSConfig:
     dropout: float = .1
     codec: str = 'laser'
     depth_layers: int = 0  # Zero preserves the original GRU checkpoints.
+    laser_atoms: int = 8192
+    laser_sparsity: int = 2
+    coefficient_levels: int = 127
+    depth_positions: int = 4
+    hard_rate_cap_bps: int = 0
 
 
 def position_encoding(length, width, device, offset=0):
@@ -113,8 +118,13 @@ class LaserTTS(nn.Module):
         if cfg.codec not in ('laser', 'rvq') or cfg.depth_layers < 0:
             raise ValueError('Expected laser/rvq codec and nonnegative depth_layers')
         self.cfg = cfg
-        self.EOS = 8192 if cfg.codec == 'laser' else 1024
-        self.vocab_sizes = (8193, 127, 8192, 127) if cfg.codec == 'laser' else (1025, 1024, 1024, 1024)
+        self.EOS = cfg.laser_atoms if cfg.codec == 'laser' else 1024
+        vocab=[cfg.laser_atoms,cfg.coefficient_levels]*cfg.laser_sparsity if cfg.codec=='laser' else [1024]*4
+        vocab[0]+=1;self.vocab_sizes=tuple(vocab);self.field_count=len(vocab)
+        if cfg.depth_positions<self.field_count:raise ValueError('Insufficient depth positions')
+        if cfg.hard_rate_cap_bps not in (0,6000):raise ValueError('Unsupported hard rate')
+        if cfg.hard_rate_cap_bps and cfg.codec=='laser' and (cfg.laser_atoms,cfg.laser_sparsity,cfg.coefficient_levels)!=(4096,4,9):
+            raise ValueError('Hard6k LASER requires K4, 4096 atoms and nine coefficient symbols')
         self.phones = nn.Embedding(cfg.phone_vocab, cfg.width, padding_idx=0)
         self.speakers = nn.Embedding(cfg.speakers, cfg.width)
         layer = nn.TransformerEncoderLayer(cfg.width, cfg.heads, 4 * cfg.width, cfg.dropout,
@@ -127,7 +137,7 @@ class LaserTTS(nn.Module):
         self.out_norm = nn.LayerNorm(cfg.width)
         if cfg.depth_layers:
             self.depth_blocks = nn.ModuleList([DepthBlock(cfg) for _ in range(cfg.depth_layers)])
-            self.depth_position = nn.Parameter(torch.randn(1, 4, cfg.width) * .02)
+            self.depth_position = nn.Parameter(torch.randn(1, cfg.depth_positions, cfg.width) * .02)
         else:
             self.depth_cell = nn.GRUCell(cfg.width, cfg.width)
         self.depth_norm = nn.LayerNorm(cfg.width)
@@ -145,7 +155,7 @@ class LaserTTS(nn.Module):
         return self.text_encoder(x, src_key_padding_mask=~mask), mask
 
     def frame_embedding(self, codes):
-        return self.frame_norm(sum(self.fields[d](codes[..., d]) for d in range(4)) / 2)
+        return self.frame_norm(sum(self.fields[d](codes[..., d]) for d in range(self.field_count)) / math.sqrt(self.field_count))
 
     def temporal(self, codes, memory, text_mask, speakers, alignment=False):
         x = torch.cat((self.bos.expand(len(codes), -1, -1), self.frame_embedding(codes)), dim=1)
@@ -162,18 +172,18 @@ class LaserTTS(nn.Module):
         state = contexts.flatten(0, 1)
         teacher = teacher_codes.flatten(0, 1)
         if self.cfg.depth_layers:
-            prefix = torch.stack([self.fields[d](teacher[:, d]) for d in range(3)], dim=1).cumsum(1)
-            x = torch.cat((state[:, None], prefix), dim=1) + self.depth_position
+            prefix = torch.stack([self.fields[d](teacher[:, d]) for d in range(self.field_count-1)], dim=1).cumsum(1)
+            x = torch.cat((state[:, None], prefix), dim=1) + self.depth_position[:,:self.field_count]
             for block in self.depth_blocks:
                 x = block(x)
             states = self.depth_norm(x)
         result = []
         for d, head in enumerate(self.heads):
             logits = head(states[:, d] if self.cfg.depth_layers else self.depth_norm(state))
-            if d == 2 and self.cfg.codec == 'laser':
-                logits = logits.scatter(1, teacher[:, 0:1].clamp_max(8191), -1e4)
+            if d>0 and d%2==0 and self.cfg.codec == 'laser':
+                logits = logits.scatter(1, teacher[:, :d:2].clamp_max(self.cfg.laser_atoms-1), -1e4)
             result.append(logits.view(*contexts.shape[:2], -1))
-            if d < 3 and not self.cfg.depth_layers:
+            if d < self.field_count-1 and not self.cfg.depth_layers:
                 state = self.depth_cell(self.fields[d](teacher[:, d]), state)
         return result
 
@@ -217,15 +227,20 @@ class LaserTTS(nn.Module):
                   'token_accuracy': torch.stack(accuracy).mean(), 'guided_attention': guided}
         result.update({f'field_{d}_nll': value for d, value in enumerate(nlls)})
         if self.cfg.codec == 'laser':
-            result.update(atom_nll=(nlls[0] + nlls[2]) / 2, coefficient_nll=(nlls[1] + nlls[3]) / 2)
+            result.update(atom_nll=torch.stack(nlls[0::2]).mean(), coefficient_nll=torch.stack(nlls[1::2]).mean())
         if return_logits:
             result['logits'] = logits
         return result
 
     @torch.inference_mode()
-    def generate(self, phones, speaker, max_frames=1500, min_frames=30, temperature=.8, top_k=50):
+    def generate(self, phones, speaker, max_frames=1500, min_frames=30, temperature=.8, top_k=50,
+                 max_seconds=None,min_seconds=None):
         if phones.shape[0] != 1:
             raise ValueError('Generation currently supports one utterance at a time')
+        if self.cfg.hard_rate_cap_bps:
+            from src.audio_hard6k_bitstream import frame_budget,samples_for_frames
+            if max_seconds is not None:max_frames=frame_budget(round(max_seconds*48000),self.cfg.codec)
+            if min_seconds is not None:min_frames=frame_budget(round(min_seconds*48000),self.cfg.codec)
         memory, mask = self.text_memory(phones, speaker)
         cache = [{} for _ in self.blocks]
         cross_kv = [block.cross_attention.kv(memory) for block in self.blocks]
@@ -245,8 +260,8 @@ class LaserTTS(nn.Module):
                           if self.cfg.depth_layers else head(self.depth_norm(state))).float()
                 if d == 0 and position < min_frames:
                     scores[:, self.EOS] = -1e4
-                if d == 2 and self.cfg.codec == 'laser':
-                    scores[:, fields[0]] = -1e4
+                if d>0 and d%2==0 and self.cfg.codec == 'laser':
+                    scores[:, fields[0:d:2]] = -1e4
                 if temperature <= 0:
                     value = int(scores.argmax(-1))
                 else:
@@ -259,12 +274,13 @@ class LaserTTS(nn.Module):
                     stopped = True; break
                 fields.append(value)
                 depth_fields.append(torch.tensor([value], device=phones.device))
-                if d < 3 and not self.cfg.depth_layers:
+                if d < self.field_count-1 and not self.cfg.depth_layers:
                     state = self.depth_cell(self.fields[d](torch.tensor([value], device=phones.device)), state)
             if stopped:
                 break
             frame = torch.tensor(fields, device=phones.device)[None, None]
             frames.append(frame[0, 0])
             x = self.frame_embedding(frame)
-        tokens = torch.stack(frames) if frames else torch.empty(0, 4, dtype=torch.long, device=phones.device)
-        return tokens, {'eos_reached': stopped, 'frames': len(frames), 'seconds': len(frames) / 150}
+        tokens = torch.stack(frames) if frames else torch.empty(0, self.field_count, dtype=torch.long, device=phones.device)
+        seconds=(samples_for_frames(len(frames),self.cfg.codec)/48000 if frames else 0.) if self.cfg.hard_rate_cap_bps else len(frames)/150
+        return tokens, {'eos_reached': stopped, 'frames': len(frames), 'seconds': seconds}

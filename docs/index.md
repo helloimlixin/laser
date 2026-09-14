@@ -4,6 +4,9 @@ This folder holds short notes for the maintained code path.
 
 ## Core Notes
 
+- [Tokenization of Real-Valued Sparse Codes](sparse-codes-for-autoregressive-generation.md):
+  manuscript section on joint atom/coefficient tokens, residual assignment,
+  coefficient fitting, and autoregressive training.
 - [Mathematical Note](/scratch/xl598/Projects/laser/docs/math_note.md): strict
   analysis of the current stage-1 bottleneck, stage-2 prior, and paper
   readiness.

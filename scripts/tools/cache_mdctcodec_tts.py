@@ -35,8 +35,11 @@ def prepare(args):
     saved=torch.load(checkpoint,map_location='cpu',weights_only=False)
     hp=saved['hyper_parameters']
     rvq=hp['bottleneck_type']=='mdctcodec_rvq'
+    hard=hp.get('hard_rate_cap_bps')==6000
     if rvq:
         assert hp['num_embeddings']==1024 and hp['rq_code_depth']==4
+    elif hard:
+        assert hp['bottleneck_type']=='dictionary' and hp['num_embeddings']==4096 and hp['sparsity_level']==4
     else:
         assert hp['bottleneck_type']=='dictionary' and hp['num_embeddings']==8192 and hp['sparsity_level']==2
         assert hp['coefficient_quantization_bits']==7
@@ -57,6 +60,14 @@ def prepare(args):
                  {**old['codec'],'coefficient_max':float(hp['coefficient_quantization_max'])}),
         'codec_generator_updates':int(saved['state_dict']['_manual_train_step']),
         'cache_policy':'Fresh FP32 encoding from full utterances; fixed checkpoint bound; text/phonemes reused after transcript checks'}
+    if hard:
+        inventory.update(batch_length_basis='native_150hz',codec={
+            'type':'rvq' if rvq else 'laser','hard_rate_cap_bps':6000,
+            'frame_rate':6000/(40 if rvq else 57),'bits_per_frame':40 if rvq else 57,
+            'vocab_sizes':[1024]*4 if rvq else [4096,9]*4,'codebooks':4 if rvq else 1,
+            'sparsity':4,'coefficient_max':None,
+            'representation':'RVQ depth order' if rvq else 'Four atom/bin pairs in OMP selection order',
+            'packet_format':'MDCT hard6k: 16-byte header including CRC; per-utterance original sample count'})
     args.output.mkdir(parents=True,exist_ok=True)
     path=args.output/'inventory.json'
     if path.exists():assert read(path)==inventory
@@ -70,11 +81,15 @@ def worker(args):
     checkpoint=Path(inventory['codec_checkpoint']);assert sha(checkpoint)==inventory['codec_sha256']
     assert 0<=args.worker_index<args.worker_count
     torch.set_num_threads(4);torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=True
-    model=LASER.load_from_checkpoint(checkpoint,map_location='cpu',strict=True).to(args.device).eval()
+    hard=inventory['codec'].get('hard_rate_cap_bps')==6000
+    if hard:
+        from src.tts_runtime import CodecDecoder
+        runtime=CodecDecoder(checkpoint,args.device);model=runtime.model
+    else:model=LASER.load_from_checkpoint(checkpoint,map_location='cpu',strict=True).to(args.device).eval()
     model.requires_grad_(False)
     rvq=model.bottleneck_type=='mdctcodec_rvq'
     bound=inventory['codec']['coefficient_max']
-    if not rvq:assert model.bottleneck.coefficient_quantization_max==bound
+    if not rvq and not hard:assert model.bottleneck.coefficient_quantization_max==bound
     records=inventory['records'];started=time.monotonic();done=0;verified_roundtrip=False
     with torch.inference_mode():
         for shard_index,start in enumerate(range(0,len(records),500)):
@@ -89,6 +104,32 @@ def worker(args):
             batch=[]
             for record in expected:
                 x,sr=sf.read(record['path'],dtype='float32');assert sr==48000 and len(x)==record['samples']
+                if hard:
+                    from src.audio_hard6k_bitstream import frame_budget,pack_tts_codes
+                    waveform=torch.from_numpy(x).to(args.device)[None,None]
+                    _,_,sparse=model.encode(waveform)
+                    arm='rvq' if rvq else 'laser'
+                    if rvq:codes=sparse.support[0,0].cpu().short()
+                    else:
+                        codes=torch.empty((sparse.support.shape[2],8),dtype=torch.int16)
+                        codes[:,0::2]=sparse.support[0,0].cpu().short()
+                        codes[:,1::2]=model.bottleneck.coefficient_bins(sparse.values)[0,0].cpu().short()
+                    validate_codes(codes,inventory['codec'],len(x))
+                    payload=pack_tts_codes(codes.numpy(),arm,len(x))
+                    assert 8*len(payload)*48000<=6000*len(x)
+                    if not verified_roundtrip:
+                        direct_payload=model.encode_packet(waveform)
+                        assert payload==direct_payload,'TTS fields must reproduce the exact codec packet'
+                        parsed,decoded_payload=runtime.decode(codes,samples=len(x))
+                        assert decoded_payload==payload and len(parsed)==len(x)
+                        assert torch.isfinite(torch.from_numpy(parsed)).all()
+                        sf.write(args.output/f'roundtrip_worker{args.worker_index}.wav',parsed,48000,subtype='FLOAT')
+                        write(args.output/f'roundtrip_worker{args.worker_index}.json',{'source':record['path'],
+                            'frames':len(codes),'fields':codes.shape[1],'payload_bytes':len(payload),
+                            'wire_kbps':8*len(payload)*48/len(x),'serialized_decode_matches':True,
+                            'codec_sha256':inventory['codec_sha256']})
+                        verified_roundtrip=True
+                    batch.append({**record,'codes':codes});continue
                 padded,length=align_mdct(torch.from_numpy(x).to(args.device)[None,None])
                 latent,_,sparse=model.encode(padded)
                 if rvq:
@@ -125,6 +166,20 @@ def worker(args):
     write(args.output/f'worker_{args.worker_index}_complete.json',{'records':done,'codec_sha256':inventory['codec_sha256']})
 
 
+def validate_codes(codes,codec,samples=None):
+    hard=codec.get('hard_rate_cap_bps')==6000;rvq=codec.get('type')=='rvq'
+    assert codes.dtype==torch.int16 and codes.ndim==2 and codes.shape[1]==(8 if hard and not rvq else 4)
+    if rvq:assert ((codes>=0)&(codes<1024)).all()
+    else:
+        assert ((codes[:,0::2]>=0)&(codes[:,0::2]<(4096 if hard else 8192))).all()
+        assert ((codes[:,1::2]>=0)&(codes[:,1::2]<(9 if hard else 127))).all()
+        atoms=codes[:,0::2].sort(-1).values
+        assert (atoms[:,1:]!=atoms[:,:-1]).all()
+    if hard:
+        from src.audio_hard6k_bitstream import frame_budget
+        assert len(codes)==frame_budget(samples,'rvq' if rvq else 'laser')
+
+
 def merge(args):
     inventory=read(args.output/'inventory.json');records=[]
     for start in range(0,len(inventory['records']),500):
@@ -133,14 +188,7 @@ def merge(args):
         expected=inventory['records'][start:start+500]
         assert [{k:v for k,v in r.items() if k!='codes'} for r in saved['records']]==expected
         for record in saved['records']:
-            codes=record['codes']
-            assert codes.dtype==torch.int16 and codes.ndim==2 and codes.shape[1]==4
-            if inventory['codec'].get('type')=='rvq':
-                assert ((codes>=0)&(codes<1024)).all()
-            else:
-                assert ((codes[:,0::2]>=0)&(codes[:,0::2]<8192)).all()
-                assert ((codes[:,1::2]>=0)&(codes[:,1::2]<127)).all()
-                assert (codes[:,0]!=codes[:,2]).all()
+            validate_codes(record['codes'],inventory['codec'],record['samples'])
         records.extend(saved['records'])
     temporary=args.output/'tokens.tmp';torch.save({**inventory,'records':records},temporary)
     temporary.replace(args.output/'tokens.pt')

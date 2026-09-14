@@ -1,0 +1,67 @@
+# @package _global_
+defaults:
+  - _self_
+stage: stage1
+backend: var_laser
+pipeline: true
+output_dir: outputs/imagenet-laser-var-f16-20260914
+seed: 0
+resume: true
+smoke_steps: 0
+data:
+  root: /workspace/Projects/data/imagenet2012
+  manifests: outputs/imagenet-scaled-rq-stage2-20260913
+  workers: 8
+  image_size: 256
+model:
+  pretrained_vae: ${output_dir}/assets/vae_ch160v4096z32.pth
+  channels: 32
+  atoms: 4096
+  sparsity: 2
+  coefficient_bins: 257
+  vae_width: 160
+  depth: 16
+  patch_nums: [1, 2, 3, 4, 5, 6, 8, 10, 13, 16]
+tokenizer:
+  epochs: 5
+  batch_size: 32
+  accumulation: 1
+  lr: 0.00002
+  dictionary_lr: 0.0001
+  adversarial_weight: 0.1
+  adversarial_start: 1000
+  calibration_images: 512
+  max_matched_rfid: 2.0
+  max_rfid_drift: 1.0
+prior:
+  epochs: 200
+  batch_size: 96
+  accumulation: 2
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 4
+  final_lr_ratio: 0.1
+  cfg: 1.5
+  top_k: 900
+  top_p: 0.96
+evaluation:
+  batch_size: 16
+  reconstruction_images: 2048
+  full_reconstruction_images: 50000
+  validation_images: 1024
+  preview_samples: 4096
+  every_epochs: 5
+  full_every_epochs: 20
+  full_samples: 50000
+  fid_reference: third_party/rq-vae-transformer/assets/fid_stats/imagenet_256_train.npz
+  adm_python: .venv-var-eval/bin/python
+  adm_evaluator: outputs/imagenet-laser-var-f16-20260914/assets/adm_evaluator.py
+  adm_reference: outputs/imagenet-laser-var-f16-20260914/assets/VIRTUAL_imagenet256_labeled.npz
+logging:
+  every_steps: 10
+  checkpoint_every_steps: 100
+wandb:
+  entity: helloimlixin-rutgers
+  project: laser
+  id: imagenet-laser-var-f16-k2-d16-20260914
+  mode: online

@@ -48,3 +48,17 @@ def test_joint_sampler_matches_released_samples_and_rng_exactly(top_k):
 
 def test_invalid_sampler_temperature_is_rejected():
     with pytest.raises(ValueError):validate_sampler(dict(mode='joint',temperature=0.,top_k=None,top_p=.92))
+
+
+def test_atom_specific_sampler_uses_coefficient_count_instead_of_atom_count():
+    # Three atoms with two levels each: a mistaken len(levels)==3 either fails
+    # the factorization or groups categorical IDs under the wrong atoms.
+    class Model:
+        block_size=(1,1,1)
+        def init_cache(self): pass
+        def cached_forward(self,*args,**kwargs):
+            return torch.tensor([[-100.,-100.,-100.,-100.,-100.,-100.,100.]])
+    aux=SimpleNamespace(quantizer=SimpleNamespace(levels=torch.tensor([[-1.,1.],[-2.,2.],[-3.,3.]])))
+    settings=dict(mode='factorized',atom_temperature=1.,atom_top_p=1.,coefficient_temperature=1.)
+    codes=sample_codes(Model(),aux,torch.tensor([9]),settings,amp=False)
+    assert codes.item()==6

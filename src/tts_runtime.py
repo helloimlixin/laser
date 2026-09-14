@@ -25,10 +25,20 @@ def encode_prompt(text, metadata, device):
 class CodecDecoder:
     def __init__(self, checkpoint, device='cuda:1'):
         self.device = torch.device(device)
-        self.model = LASER.load_from_checkpoint(str(checkpoint), map_location='cpu').to(device).eval()
+        saved=torch.load(checkpoint,map_location='cpu',weights_only=False)
+        hp=saved['hyper_parameters'];self.hard6k=hp.get('hard_rate_cap_bps')==6000
+        if self.hard6k:
+            from src.mdctcodec_hard6k import HardRateLASER,HardRateRVQ
+            cls=HardRateRVQ if hp['bottleneck_type']=='mdctcodec_rvq' else HardRateLASER
+            self.model=cls(**hp);self.model.load_state_dict(saved['state_dict'],strict=True)
+        else:
+            self.model=LASER.load_from_checkpoint(str(checkpoint),map_location='cpu')
+        self.model=self.model.to(device).eval()
         self.model.requires_grad_(False)
         self.codec = 'rvq' if self.model.bottleneck_type == 'mdctcodec_rvq' else 'laser'
-        if self.codec == 'rvq':
+        if self.hard6k:
+            self.bound=None
+        elif self.codec == 'rvq':
             assert self.model.bottleneck.num_embeddings == 1024 and self.model.bottleneck.code_depth == 4
             self.bound = None
         else:
@@ -37,10 +47,15 @@ class CodecDecoder:
             assert self.model.bottleneck.coefficient_quantization_bits == 7
 
     @torch.inference_mode()
-    def decode(self, codes):
+    def decode(self, codes,samples=None):
         if len(codes) == 0:
             return np.zeros(1, dtype=np.float32), b''
         fields = codes.cpu().long().numpy()
+        if self.hard6k:
+            from src.audio_hard6k_bitstream import pack_tts_codes
+            payload=pack_tts_codes(fields,self.codec,samples)
+            with torch.autocast(self.device.type,enabled=False):decoded=self.model.decode_packet(payload)
+            return decoded[0,0].cpu().numpy(),payload
         if fields.ndim != 2 or fields.shape[1] != 4:
             raise ValueError('Expected four integer fields per frame')
         if self.codec == 'rvq':

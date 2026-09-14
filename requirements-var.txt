@@ -1,0 +1,9 @@
+# Tested with the workspace's PyTorch 2.4.1+cu124 / torchvision 0.19.1.
+# Install these into a GPU environment; keep ADM evaluation in a separate venv.
+hydra-core==1.3.2
+huggingface-hub==0.25.2
+wandb==0.30.0
+numpy
+scipy
+Pillow
+tqdm

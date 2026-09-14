@@ -64,6 +64,7 @@ def main():
     if args.smoke_steps and train_cfg.get('generation_validation'):
         train_cfg['generation_validation']['items'] = 2
         train_cfg['generation_validation']['max_frames'] = 30
+        train_cfg['generation_validation'].pop('max_seconds',None)
     output = args.output or Path(cfg['output']); output.mkdir(parents=True, exist_ok=True)
     if (output/'run.json').exists() and not args.resume:
         raise RuntimeError('Existing TTS run: resume explicitly or choose a new output directory')
@@ -98,8 +99,8 @@ def main():
     (output / 'validation_manifest.json').write_text(json.dumps(validation_manifest, indent=2, ensure_ascii=False))
     cfg['cache_metadata'] = metadata
     (output / 'resolved_config.json').write_text(json.dumps(cfg, indent=2))
-    sampler = FrameBatchSampler(train_data.lengths, train_cfg['frame_budget'], train_cfg['max_batch'], seed=seed)
-    val_sampler = FrameBatchSampler(val_data.lengths, train_cfg['frame_budget'], train_cfg['max_batch'], shuffle=False)
+    sampler = FrameBatchSampler(train_data.batch_lengths, train_cfg['frame_budget'], train_cfg['max_batch'], seed=seed)
+    val_sampler = FrameBatchSampler(val_data.batch_lengths, train_cfg['frame_budget'], train_cfg['max_batch'], shuffle=False)
     loader_options = dict(collate_fn=collate_tts, num_workers=train_cfg['num_workers'], pin_memory=True,
                           persistent_workers=train_cfg['num_workers'] > 0,
                           generator=torch.Generator().manual_seed(seed))
@@ -118,7 +119,7 @@ def main():
     budget_sampler = sampler
     if args.smoke_steps:
         # A small smoke dataset must not shorten the restored LR schedule.
-        budget_sampler = FrameBatchSampler(TTSDataset(cache, 'train').lengths,
+        budget_sampler = FrameBatchSampler(TTSDataset(cache, 'train').batch_lengths,
             train_cfg['frame_budget'], train_cfg['max_batch'], seed=seed)
     total_steps = min(train_cfg['max_steps'], math.ceil(len(budget_sampler) / train_cfg['accumulate']) * train_cfg['epochs'])
     if cfg.get('paired'):
@@ -277,7 +278,9 @@ def main():
                 phones=item['phones'][None].to(device)
                 speaker=torch.tensor([item['speaker']],device=device)
                 with torch.autocast('cuda', dtype=torch.bfloat16):
-                    tokens, info = model.generate(phones,speaker,max_frames=train_cfg['preview_max_frames'])
+                    tokens, info = model.generate(phones,speaker,max_frames=train_cfg['preview_max_frames'],
+                        max_seconds=None if args.smoke_steps else train_cfg.get('preview_max_seconds'),
+                        min_seconds=.2 if model_cfg.hard_rate_cap_bps and not args.smoke_steps else None)
                     memory,text_mask=model.text_memory(phones,speaker)
                     _,attention=model.temporal(tokens[None],memory,text_mask,speaker,alignment=True)
                 audio, payload = decoder.decode(tokens)
@@ -291,7 +294,9 @@ def main():
                 ref_hypothesis = recognizer.transcribe(reference)
                 ref_err, ref_words = word_error(r['text'], ref_hypothesis)
                 row = {'text': r['text'], 'speaker': r['speaker'], 'asr_text': hypothesis,
-                       'wer': err / max(1, num_words), 'reference_asr_wer': ref_err / max(1, ref_words), **info}
+                       'wer': err / max(1, num_words), 'reference_asr_wer': ref_err / max(1, ref_words), **info,
+                       'seconds':len(audio)/48000,'payload_bytes':len(payload),
+                       'wire_kbps':len(payload)*8*48/len(audio)}
                 results.append(row)
                 figures=render_tts_preview(reference,audio,preview_dir/Path(r['path']).stem,
                     title=f'{r["speaker"]} | Epoch {epoch} | {r["text"]}',
@@ -353,7 +358,7 @@ def main():
             if epoch == start_epoch and batch_index < skip_batches: continue
             if cfg.get('paired'):
                 data_chain = batch_chain(data_chain, batch)
-                seen_frames += int(batch['lengths'].sum()); seen_batches += 1
+                seen_frames += int(batch.get('audit_lengths',batch['lengths']).sum()); seen_batches += 1
             batch = to_device(batch, device)
             group_start = (batch_index // train_cfg['accumulate']) * train_cfg['accumulate']
             group_size = min(train_cfg['accumulate'], epoch_batches - group_start)

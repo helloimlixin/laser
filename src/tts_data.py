@@ -38,6 +38,12 @@ class TTSDataset(Dataset):
         self.phone_to_id = cache['phone_to_id']
         self.speaker_to_id = cache['speaker_to_id']
         self.lengths = [len(r['codes']) + 1 for r in self.records]
+        self.batch_length_basis=cache.get('batch_length_basis','codec_frames')
+
+    @property
+    def batch_lengths(self):
+        if self.batch_length_basis=='native_150hz':return [(r['samples']+40+319)//320+1 for r in self.records]
+        return self.lengths
 
     def __len__(self):
         return len(self.records)
@@ -46,13 +52,16 @@ class TTSDataset(Dataset):
         r = self.records[index]
         phones = [self.phone_to_id.get(p, 1) for p in r['phonemes'].split()] + [2]
         return {'codes': r['codes'].long(), 'phones': torch.tensor(phones),
+                'audit_length':(r['samples']+40+319)//320+1 if self.batch_length_basis=='native_150hz' else len(r['codes']),
                 'speaker': self.speaker_to_id[r['speaker']], 'record': r, 'index': index}
 
 
 def collate_tts(items):
     frames = max(len(x['codes']) for x in items)
     text = max(len(x['phones']) for x in items)
-    codes = torch.zeros(len(items), frames, 4, dtype=torch.long)
+    fields=items[0]['codes'].shape[1]
+    if any(x['codes'].shape[1]!=fields for x in items):raise ValueError('Mixed codec field layouts in one batch')
+    codes = torch.zeros(len(items), frames, fields, dtype=torch.long)
     phones = torch.zeros(len(items), text, dtype=torch.long)
     for i, item in enumerate(items):
         codes[i, :len(item['codes'])] = item['codes']
@@ -63,6 +72,8 @@ def collate_tts(items):
             'speakers': torch.tensor([x['speaker'] for x in items])}
     if all('index' in item for item in items):
         result['indices'] = torch.tensor([item['index'] for item in items])
+    if all('audit_length' in item for item in items):
+        result['audit_lengths']=torch.tensor([item['audit_length'] for item in items])
     return result
 
 

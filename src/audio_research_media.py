@@ -251,7 +251,7 @@ def render_tts_preview(reference, generated, output, title, attention=None, phon
         if attention.ndim!=2 or not np.isfinite(attention).all():raise ValueError('Expected finite time-by-phoneme attention')
         fig,ax=plt.subplots(figsize=(12,5),layout='constrained')
         im=ax.imshow(attention,origin='lower',aspect='auto',cmap=attention_cmap,vmin=0,vmax=1,interpolation='nearest',
-            extent=[-.5,attention.shape[1]-.5,0,attention.shape[0]/150])
+            extent=[-.5,attention.shape[1]-.5,0,max(len(generated)/SAMPLE_RATE,1/SAMPLE_RATE)])
         if phone_labels is not None:
             assert len(phone_labels)==attention.shape[1]
             ax.set_xticks(range(len(phone_labels)),phone_labels,rotation=90,fontsize=8)

@@ -179,10 +179,13 @@ def generate(args):
             phones, _ = encode_prompt(target['text'], metadata, device)
             speaker = torch.tensor([metadata['speaker_to_id'][row['speaker']]], device=device)
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                tokens, info = model.generate(phones, speaker, max_frames=2250, temperature=.8, top_k=50)
+                tokens, info = model.generate(phones, speaker, max_frames=2250, temperature=.8, top_k=50,
+                    max_seconds=manifest.get('generation',{}).get('max_seconds'),
+                    min_seconds=.2 if model.cfg.hard_rate_cap_bps else None)
             audio, payload = decoder.decode(tokens); sr = 48000
         elif is_codec:
-            audio, payload = decoder.decode(records[target['path']]['codes']); sr = 48000
+            record=records[target['path']]
+            audio, payload = decoder.decode(record['codes'],samples=record['samples'] if decoder.hard6k else None); sr = 48000
         elif args.arm == 'reference': audio, sr = sf.read(target['path'], dtype='float32')
         elif args.arm == 'f5':
             audio, sr, _ = model.infer(ref_file=row['enrollment']['path'], ref_text=row['enrollment']['text'],

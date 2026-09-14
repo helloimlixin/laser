@@ -45,7 +45,8 @@ def test_hard_cap_for_short_tail_boundaries_and_adversarial_tokens(arm):
 
 
 @pytest.mark.parametrize('arm',['laser','rvq'])
-def test_rate_controller_is_in_training_gradient_and_packet_decoder(arm):
+@pytest.mark.parametrize('samples',[7960,31960])
+def test_rate_controller_is_in_training_gradient_and_packet_decoder(arm,samples):
     from src.mdctcodec_hard6k import HardRateLASER,HardRateRVQ
     initial=Path('outputs/mdctcodec_matched_6kbps_rangefix')/f'{arm}_initial.pt'
     kwargs=torch.load(initial,map_location='cpu',weights_only=False)['hyper_parameters']
@@ -54,9 +55,9 @@ def test_rate_controller_is_in_training_gradient_and_packet_decoder(arm):
     kwargs['sparsity_level']=4
     if arm=='laser':kwargs.update(num_embeddings=4096,coefficient_quantization_bits=4,coefficient_quantization_max=1.)
     model=(HardRateLASER if arm=='laser' else HardRateRVQ)(**kwargs)
-    x=torch.randn(1,1,7960)*.02
+    x=torch.randn(1,1,samples)*.02
     y,loss,codes=model(x)
-    assert y.shape==x.shape and codes.support.shape[-2:]==(frame_budget(7960,arm),4)
+    assert y.shape==x.shape and codes.support.shape[-2:]==(frame_budget(samples,arm),4)
     objective=(y-x).square().mean()+loss
     if arm=='rvq':objective=objective+model.bottleneck._last_dictionary_loss_for_backward
     objective.backward()

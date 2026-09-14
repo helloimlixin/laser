@@ -6,6 +6,7 @@ import torch
 
 
 SAMPLER_SETTINGS = {
+    'published_imagenet_480m': dict(mode='joint',temperature=1.,top_k=256,top_p=.95),
     'original': dict(mode='joint',temperature=1.,top_k=16384,top_p=.92),
     'full_p92': dict(mode='joint',temperature=1.,top_k=None,top_p=.92),
     'full_t09_p92': dict(mode='joint',temperature=.9,top_k=None,top_p=.92),
@@ -64,7 +65,7 @@ def sample_codes(model,tokenizer,labels,settings,*,amp=True):
     try:
         for h,w,d in product(*(range(n) for n in shape)):
             logits=model.cached_forward(codes[:,:h+1],tokenizer,cond=labels,amp=amp,sample_loc=(h,w,d))
-            codes[:,h,w,d]=draw_token(logits,settings,len(tokenizer.quantizer.levels))
+            codes[:,h,w,d]=draw_token(logits,settings,tokenizer.quantizer.levels.shape[-1])
     finally:
         model.init_cache()
     return codes

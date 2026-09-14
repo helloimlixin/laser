@@ -25,6 +25,9 @@ automatically; most runs do not need to call these utilities directly.
   the current K4/4096-atom LASER and four-book RVQ pair under an enforced 6000
   bit/s packet limit, including coefficients and headers; see the
   [hard-rate protocol](../../docs/mdctcodec-hard6k-2026-09-13.md).
+- `continue_mdctcodec_hard6k.py`: preserve both 200k codec optimizer states and
+  continue to 600k with longer audio crops and a gradual learning-rate decay;
+  see the [continuation protocol](../../docs/mdctcodec-hard6k-long-2026-09-13.md).
 - `train_mdctcodec_k4.py`: historical K4 with 4096 learned atoms, matching the total vectors
   in RVQ's four 1024-entry codebooks,
   with training-only coefficient calibration and measured entropy payload rates;

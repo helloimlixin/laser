@@ -34,6 +34,23 @@ def frame_budget(samples, arm):
     return ((max_packet_bytes(samples)-HEADER_BYTES)*8)//FRAME_BITS[arm]
 
 
+def samples_for_frames(frames,arm):
+    """Deterministic generated-audio duration, including header and byte padding."""
+    if not isinstance(frames,(int,np.integer)) or frames<1:raise ValueError('At least one coded frame is required')
+    samples=max(MIN_SAMPLES,64*(HEADER_BYTES+(int(frames)*FRAME_BITS[arm]+7)//8))
+    if frame_budget(samples,arm)!=frames:raise ValueError('Frame count cannot be represented')
+    return samples
+
+
+def pack_tts_codes(codes,arm,samples=None):
+    """LASER uses four alternating atom/bin pairs; RVQ uses four book IDs."""
+    codes=np.asarray(codes)
+    fields=8 if arm=='laser' else 4
+    if codes.ndim!=2 or codes.shape[1]!=fields:raise ValueError(f'Expected {fields} integer fields')
+    samples=samples_for_frames(len(codes),arm) if samples is None else int(samples)
+    return pack_packet(arm,samples,codes[:,0::2],codes[:,1::2]) if arm=='laser' else pack_packet(arm,samples,codes)
+
+
 @lru_cache(maxsize=1)
 def combinations():
     return np.array([[math.comb(a,depth) for a in range(4097)] for depth in range(1,5)],dtype=np.uint64)

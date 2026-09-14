@@ -199,7 +199,7 @@ def train(args, *, model_class=MatchedModel, extra_callbacks_factory=None):
     pl.seed_everything(protocol['seed'],workers=True)
     budget=args.updates or protocol['generator_updates']
     data=MatchedData(manifest,workers=args.workers,batch_size=protocol['batch_size'],
-                     validation_limit=args.validation_limit)
+                     validation_limit=args.validation_limit,crop_samples=protocol.get('crop_samples',7960))
     previous=json.loads((output/'run.json').read_text()) if args.resume and (output/'run.json').exists() else {}
     logger=WandbLogger(entity='helloimlixin-rutgers',project='laser',
         name=f'{protocol["name"]}-{args.arm}-'+('preflight' if args.smoke else f'{budget//1000}k'),
@@ -262,11 +262,11 @@ def train(args, *, model_class=MatchedModel, extra_callbacks_factory=None):
         callbacks.extend(extra_callbacks_factory(output, manifest, args.arm))
     if args.arm=='laser' and protocol.get('range_policy'):
         callbacks.append(TrainingCoefficientRange(output,**protocol['range_policy']))
-    if protocol.get('continuation') and not args.smoke:
+    if protocol.get('continuation') and not args.smoke and extra_callbacks_factory is None:
         from src.training.mdctcodec_continuation import AudioContinuationMedia, GracefulBudget
         callbacks.extend([AudioContinuationMedia(output, manifest, args.arm), GracefulBudget(output)])
     trainer=pl.Trainer(accelerator='gpu',devices=1,precision='bf16-mixed',
-        max_steps=budget*2,max_epochs=math.ceil(budget/protocol['batches_per_epoch'])+2,
+        max_steps=budget*2,max_epochs=protocol.get('max_epochs',math.ceil(budget/protocol['batches_per_epoch'])+2),
         callbacks=callbacks,logger=logger,
         enable_progress_bar=False,enable_model_summary=False,num_sanity_val_steps=0,
         log_every_n_steps=20,deterministic='warn',benchmark=False,
@@ -293,7 +293,11 @@ def train(args, *, model_class=MatchedModel, extra_callbacks_factory=None):
     if not checkpoint.best_model_path:
         raise RuntimeError('Training completed without a validation-selected checkpoint')
     completion={'status':'complete','generator_updates':actual,'lightning_global_step':trainer.global_step,
-        'completed_full_epochs':actual//protocol['batches_per_epoch'],
+        'completed_full_epochs':sum(row['batches']==(
+            protocol.get('continuation',{}).get('parent_batches_per_epoch',protocol['batches_per_epoch'])
+            if row['epoch']<protocol.get('continuation',{}).get('lineage',{}).get(args.arm,{}).get('resumed_epoch',0)
+            else protocol['batches_per_epoch'])
+            for row in (json.loads(line) for line in (output/'data_order.jsonl').read_text().splitlines())),
         'best_checkpoint':checkpoint.best_model_path,'best_validation_visqol':float(checkpoint.best_model_score),
         'best_three':{p:float(v) for p,v in checkpoint.best_k_models.items()},
         'latest_checkpoint':checkpoint.last_model_path,'url':run.url,'manifest_sha256':protocol['manifest_sha256']}

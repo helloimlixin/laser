@@ -24,8 +24,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> DictCon
         cfg = compose(config_name=config_name, overrides=overrides or [])
     if cfg.get("stage") not in {"stage1", "stage2"}:
         raise ValueError("Config stage must be stage1 or stage2.")
-    if cfg.get("backend", "lightning") not in {"lightning", "rqtransformer"}:
-        raise ValueError("Config backend must be lightning or rqtransformer.")
+    if cfg.get("backend", "lightning") not in {"lightning", "rqtransformer", "var_laser"}:
+        raise ValueError("Config backend must be lightning, rqtransformer, or var_laser.")
     if cfg.get("backend") == "rqtransformer" and cfg.stage != "stage2":
         raise ValueError("The rqtransformer backend requires stage2.")
     return cfg
@@ -34,7 +34,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> DictCon
 def run(cfg: DictConfig) -> None:
     """Import only the requested stage, after configuration has been validated."""
     backend = cfg.get("backend", "lightning")
-    module = "rqtransformer" if backend == "rqtransformer" else cfg.stage
+    module = backend if backend in {"rqtransformer", "var_laser"} else cfg.stage
     import_module(f"src.training.{module}").run(cfg)
 
 

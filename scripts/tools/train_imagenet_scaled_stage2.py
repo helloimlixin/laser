@@ -29,6 +29,7 @@ from rqvae.optimizer.scheduler import create_scheduler
 from src.original_rq_training import (atomic_json,file_sha256,state_sha256,seed_all,
     fresh_transformer,FeatureMoments,fid_from_moments)
 from src.scaled_atom_training import FrozenScaledTokenizer,soft_cross_entropy
+from src.compact_rq_training import FrozenCompactTokenizer
 from src.imagenet_scaled_stage2 import (ManifestImages,CachedClassLatents,
     load_imagenet_config,enable_sdpa,conditional_update)
 from src.tokenizer_fidelity import require_tokenizer_fidelity
@@ -291,13 +292,17 @@ def main():
     p.add_argument('--cache-only',action='store_true')
     p.add_argument('--cache-smoke-items',type=int,default=0)
     p.add_argument('--levels',type=int,default=8)
+    p.add_argument('--compact',action='store_true',help='Use frozen atom-specific coefficient levels')
     p.add_argument('--fidelity-report',type=Path)
     p.add_argument('--max-rfid-drift',type=float,default=.1)
     p.add_argument('--reuse-cache',type=Path)
     p.add_argument('--sample-grid-on-start',action='store_true')
     p.add_argument('--sampler',choices=list(SAMPLER_SETTINGS),default='original')
+    p.add_argument('--online-images',action='store_true',
+        help='Draw fresh released ImageNet augmentations each epoch and encode them during training')
     args=p.parse_args()
     assert args.views>=1 and args.batch_size>0
+    assert not args.compact or args.levels in (2,4)
     assert args.cache_smoke_items>=0
     assert not args.cache_smoke_items or (args.cache_only and args.offline)
     rank,world=int(os.environ['RANK']),int(os.environ['WORLD_SIZE'])
@@ -329,20 +334,41 @@ def main():
     config.loss.temp=temperature
     config.vqvae=dict(ckpt=str(args.checkpoint.resolve()),codebook=str(args.codebook.resolve()))
     config.cache=dict(path=str(args.cache.resolve()),views=args.views,stochastic_targets_each_visit=True)
+    config.cache.training_latents_reused=not args.online_images
+    config.training_data=dict(mode='online-images' if args.online_images else 'cached-latents',
+        augmentation=('released Resize256/RandomCrop256/RandomHorizontalFlip; fresh per image and epoch'
+            if args.online_images else 'two finite cached views'),
+        reproducibility='image index and epoch determine augmentation seed',encoder_batch_size=16)
+    config.target_temperature_policy=dict(original_rq_temperature=.5,
+        sparse_tokenizer_temperature=temperature,calibration=str(args.preparation/'temperature-calibration.json'))
     config.training_precision='FP16 model autocast; FP32 tokenizer geometry and full soft CE; SDPA attention'
     config.pipeline=f'imagenet-class-conditional-frozen-scaled-atom-rq{args.levels}'
+    compact_spec=torch.load(args.codebook,map_location='cpu',weights_only=True) if args.compact else None
+    depth_specific=bool(compact_spec and compact_spec['kind']=='depth_adaptive_scaled_atom_rq')
+    config.coefficient_construction=('depth-and-atom-specific' if depth_specific else
+        'atom-specific' if args.compact else 'shared')
+    config.coefficient_tables=4 if depth_specific else 1
+    del compact_spec
+    if args.compact:
+        config.pipeline=f'imagenet-class-conditional-frozen-compact-adaptive-rq{args.levels}'
     config.tokenizer_fidelity=quality
     config.stage2_from_scratch=True
     config.stage1_frozen=True
     config.source_rfid=calibration['source_rfid']
     config.source_run='helloimlixin-rutgers/laser/imga16384k4altbn64-b128-b300-20260830000755'
     config.reference_run='helloimlixin-rutgers/laser/church-scaled-rq8-scratch-20260913'
+    if args.compact:
+        config.reference_run='helloimlixin-rutgers/laser/church-compact-rq32k-scratch-20260913'
     config.upstream_commit='341395e562ac347f5eb62db9f5f08b9f2cc42a60'
-    config.recipe='released ImageNet 480M architecture/optimizer/schedule/sampler; expanded output vocabulary; finite cached augmentations; calibrated target temperature'
+    config.recipe=('released ImageNet 480M architecture/optimizer/schedule; compact tokenizer and calibrated target temperature; '
+        + ('fresh image augmentations' if args.online_images else 'finite cached augmentations'))
     config.sample_grid=dict(classes=[dict(id=c,name=n) for c,n in REQUESTED_CLASSES],
         samples_per_class=8,seed=GRID_SEED,layout='10 labeled rows x 8 samples')
     config.generation_sampler=dict(name=args.sampler,**SAMPLER_SETTINGS[args.sampler])
     config.generation_fid_policy='original sampler retained; selected sampler logged separately'
+    if args.sampler=='published_imagenet_480m':
+        config.sampling=dict(temp=1.,top_k=256,top_p=.95)
+        config.generation_fid_policy='published 480M checkpoint sampler; generation/published_fid_*; earlier sampler histories retained'
     run=None
     if rank==0:
         OmegaConf.save(config,out/'config.yaml')
@@ -353,6 +379,8 @@ def main():
             import wandb
             run=wandb.init(entity='helloimlixin-rutgers',project='laser',id=args.run_id,name=args.run_id,
                 resume='allow' if args.resume else 'never',dir=str(out),config=OmegaConf.to_container(config,resolve=True))
+            if args.resume:
+                run.config.update(OmegaConf.to_container(config,resolve=True),allow_val_change=True)
             atomic_json(out/'wandb.json',dict(run_id=run.id,url=run.url))
             run.summary['training_status']='prebuilding_cache'
     started=time.time()
@@ -366,7 +394,9 @@ def main():
             if run:
                 run.summary['training_status']=phase
                 run.log({f'{"stage2" if phase=="training" else phase}/{k}':v for k,v in values.items() if isinstance(v,(int,float))})
-    tokenizer=FrozenScaledTokenizer(args.checkpoint,args.codebook,levels=args.levels).to(device).eval()
+    tokenizer=(FrozenCompactTokenizer(args.checkpoint,args.codebook) if args.compact else
+        FrozenScaledTokenizer(args.checkpoint,args.codebook,levels=args.levels)).to(device).eval()
+    assert tokenizer.quantizer.vocab_size==vocab_size
     frozen_hash=state_sha256(tokenizer)
     if args.preflight:
         cache=json.loads((args.cache/'complete.json').read_text())
@@ -400,7 +430,7 @@ def main():
                                 gradient_as_bucket_view=True,bucket_cap_mb=100)
     accumulation=2048//(world*args.batch_size)
     assert accumulation*world*args.batch_size==2048
-    train_images=2048*max(args.max_updates,3) if args.preflight else len(CachedClassLatents(args.cache))
+    train_images=2048*max(args.max_updates,3) if args.preflight else len(CachedClassLatents(args.cache,include_hard_codes=False))
     per_rank=math.ceil(train_images/world)
     batches_per_epoch=math.ceil(per_rank/args.batch_size)
     steps_per_epoch=math.ceil(batches_per_epoch/accumulation)
@@ -408,6 +438,7 @@ def main():
     scaler=torch.amp.GradScaler('cuda',init_scale=65536.)
     step=attempts=skipped=consecutive_skips=start_epoch=start_batch=0
     resume_rng=None
+    resumed_from_step=None
     if args.resume and (out/'last.pt').exists():
         saved=torch.load(out/'last.pt',map_location='cpu',weights_only=False,mmap=True)
         assert saved['cache']['checkpoint_sha256']==cache['checkpoint_sha256']
@@ -421,15 +452,20 @@ def main():
         step,attempts,skipped=saved['step'],saved['attempts'],saved['skipped_amp_updates']
         initial_hash=saved['initial_weights_sha256']
         resume_rng=saved['rng_states'][rank]
+        resumed_from_step=step
         del saved
     initialization=dict(parameters=parameters,stage2_from_scratch=True,pretrained_stage2_checkpoint=None,
         initial_weights_sha256=initial_hash,initial_weights_identical_across_ranks=True,
-        optimizer_initially_empty=True,tokenizer_frozen=True,tokenizer_sha256=cache['checkpoint_sha256'],
+        optimizer_initially_empty=resumed_from_step is None,resumed_from_step=resumed_from_step,
+        tokenizer_frozen=True,tokenizer_sha256=cache['checkpoint_sha256'],
         codebook_sha256=cache['codebook_sha256'],microbatch_per_gpu=args.batch_size,world_size=world,
         gradient_accumulation=accumulation,effective_batch_size=2048,steps_per_epoch=steps_per_epoch,
         architecture='ImageNet 480M: width1536 spatial12 depth4 heads24',vocabulary=vocab_size,
         coefficient_levels=args.levels,
-        class_vocabulary=1000,target_temperature=temperature,sdpa_attention_layers=count)
+        coefficient_construction=config.coefficient_construction,
+        coefficient_tables=config.coefficient_tables,
+        class_vocabulary=1000,target_temperature=temperature,sdpa_attention_layers=count,
+        training_data_mode=config.training_data.mode,generation_sampler=config.generation_sampler.name)
     if rank==0:
         atomic_json(out/'initialization.json',initialization)
         if run:
@@ -479,8 +515,14 @@ def main():
         preview(start_epoch+start_batch/(steps_per_epoch*accumulation))
     seed_all(rank)
     torch.cuda.reset_peak_memory_stats(device)
+    train_manifest=json.loads((args.preparation/'train-manifest.json').read_text()) if args.online_images else None
     for epoch_index in range(start_epoch,100):
-        dataset=CachedClassLatents(args.cache,epoch=epoch_index)
+        if args.online_images:
+            dataset=ManifestImages(args.data/'train',train_manifest,
+                create_transforms(config.dataset,split='train'),view=epoch_index,seed=421,
+                indices=calibration['fit_indices'][:32] if args.preflight else None)
+        else:
+            dataset=CachedClassLatents(args.cache,epoch=epoch_index,include_hard_codes=False)
         if args.preflight:
             dataset=RepeatedCache(dataset,train_images)
         sampler=DistributedSampler(dataset,num_replicas=world,rank=rank,shuffle=True,seed=0)
@@ -501,7 +543,8 @@ def main():
             assert batches
             consumed+=len(batches)
             update_start=time.time()
-            metrics=conditional_update(ddp,tokenizer,optimizer,scaler,batches,temperature,max_gn=1.)
+            metrics=conditional_update(ddp,tokenizer,optimizer,scaler,batches,temperature,max_gn=1.,
+                inputs_are_images=args.online_images)
             attempts+=1
             if metrics['optimizer_updated']:
                 scheduler.step();step+=1;consecutive_skips=0
@@ -541,8 +584,13 @@ def main():
                         assert not torch.allclose(logits[:,0,0,0],other[:,0,0,0])
                         del targets,logits,other
                         labels=torch.tensor([0,207,281,979],device=device)
-                        sampled=model.sample(torch.zeros(4,8,8,4,device=device,dtype=torch.long),model_aux=tokenizer,
-                            cond=labels,temperature=1.,top_k=16384,top_p=.92,amp=True)
+                        settings=SAMPLER_SETTINGS[args.sampler]
+                        if settings['mode']=='joint':
+                            sampled=model.sample(torch.zeros(4,8,8,4,device=device,dtype=torch.long),model_aux=tokenizer,
+                                cond=labels,temperature=settings['temperature'],top_k=settings['top_k'],
+                                top_p=settings['top_p'],amp=True)
+                        else:
+                            sampled=sample_codes(model,tokenizer,labels,settings)
                         decoded=tokenizer.decode_code(sampled)
                         assert sampled.min()>=0 and sampled.max()<vocab_size and torch.isfinite(decoded).all()
                         if rank==0:
@@ -551,7 +599,8 @@ def main():
                         sources=[Path(__file__).resolve(),
                             *[ROOT/'src'/name for name in ('imagenet_scaled_stage2.py','scaled_atom_training.py',
                                 'scaled_atom_rq.py','original_rq_training.py','tokenizer_fidelity.py',
-                                'imagenet_sample_grid.py','scaled_atom_sampling.py')],
+                                'imagenet_sample_grid.py','scaled_atom_sampling.py',
+                                'compact_rq_training.py','adaptive_scaled_atom_rq.py')],
                             *sorted(UPSTREAM.rglob('*.py')),
                             UPSTREAM/'configs/imagenet256/stage2/in256-rqtransformer-8x8x4-480M.yaml']
                         atomic_json(out/'verification.json',dict(preflight_passed=True,strict_checkpoint_reload=True,
@@ -581,6 +630,14 @@ def main():
                 if run:run.log({'validation/epoch':epoch,**{f'validation/{k}':v for k,v in metrics.items()}})
             preview(epoch)
             for samples in ([4096,50000] if epoch%10==0 else [4096]):
+                if args.sampler=='published_imagenet_480m':
+                    score=generation(model,tokenizer,inception,samples,epoch,out,reference,device,rank,world,status,
+                        sampler_name=args.sampler)
+                    if rank==0 and run:
+                        run.log({f'generation/published_fid_{samples}':score,'generation/epoch':epoch,
+                            'generation/sampler_name':args.sampler})
+                        run.summary[f'last_published_fid_{samples}']=score
+                    continue
                 score=generation(model,tokenizer,inception,samples,epoch,out,reference,device,rank,world,status)
                 if rank==0 and run:
                     run.log({f'generation/fid_{samples}':score,'generation/epoch':epoch})

@@ -76,6 +76,19 @@ def test_data_audit_restores_pending_epoch_end_without_duplicate_rows(tmp_path):
     assert len((tmp_path/'data_order.jsonl').read_text().splitlines())==1
 
 
+def test_longer_training_crops_keep_full_validation_and_legacy_default(tmp_path):
+    from src.mdctcodec_matched import MatchedData
+    path=tmp_path/'p225_001_mic2.flac'
+    sf.write(path,np.linspace(-.5,.5,48000,dtype=np.float32),48000)
+    manifest={'train':[str(path)],'validation':[str(path)],'seed':1234}
+    legacy=MatchedData(manifest,workers=0)
+    longer=MatchedData(manifest,workers=0,batch_size=12,crop_samples=31960)
+    assert legacy.train_dataset[(235,0)][0].shape==(1,7960)
+    assert longer.train_dataset[(235,0)][0].shape==(1,31960)
+    assert longer.val_dataset[0][0].shape==(1,48000)
+    torch.testing.assert_close(longer.train_dataset[(235,0)][0],longer.train_dataset[(235,0)][0],atol=0,rtol=0)
+
+
 def test_range_observer_follows_scale_drift_and_restores_state(tmp_path):
     from src.models.dictionary_learner import DictionaryLearning
     quantizer=DictionaryLearning(num_embeddings=8,embedding_dim=4,sparsity_level=2,

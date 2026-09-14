@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - imagenet-var-scratch
+  - _self_
+model:
+  bottleneck: vq
