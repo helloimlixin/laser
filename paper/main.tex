@@ -145,12 +145,49 @@ where $\ell_{\mathrm{rec}}$ is a modality-appropriate reconstruction loss and $\
 
 For images, $\ell_{\mathrm{rec}}$ combines pixel and perceptual reconstruction terms when enabled. For raw waveform audio, it combines waveform and spectral reconstruction terms. These choices affect the metric surface but not the latent variable factorization in Eq.~\ref{eq:sparse-code}.
 
-As in adversarial autoencoding and VQGAN-style training, the reconstruction objective can be augmented with a discriminator loss to improve perceptual sharpness. In that case, the encoder, dictionary bottleneck, and decoder define the generator, while a patch discriminator distinguishes real samples from reconstructions. This adversarial extension changes the training signal but leaves the sparse latent representation and tokenization unchanged.
+\subsection{Adversarial Training for High-Frequency Detail}
+\label{sec:adversarial-training}
+
+Aggressive encoder downsampling and a constrained latent bottleneck can discard information needed to reconstruct high-frequency detail. When several fine-scale patterns are compatible with a compressed representation, a deterministic decoder trained with squared reconstruction error is encouraged to predict their conditional mean. Averaging over these alternatives can attenuate rapid variations and produce overly smooth reconstructions. We therefore augment autoencoder training with a discriminator that supplies a learned signal for perceptual realism, following the general approach of combining autoencoding and adversarial objectives~\citep{larsen2016vaegan,esser2021vqgan}.
+
+Let $\hat{x}=G_\psi(\hat{z})$ denote a reconstruction from a compressed latent $\hat{z}$, and let $\mathcal{L}_{\mathrm{AE}}$ denote the base autoencoder objective. For a variational autoencoder~\citep{kingma2014vae}, the encoder defines an approximate posterior $q_\theta(\hat{z}\mid x)$, and the base objective is the negative evidence lower bound:
+\begin{equation}
+    \mathcal{L}_{\mathrm{AE}}^{\mathrm{VAE}}
+    = \mathbb{E}_{x\sim p_{\mathrm{data}}}
+    \left[
+        \mathbb{E}_{\hat{z}\sim q_\theta(\cdot\mid x)}
+        [-\log p_\psi(x\mid\hat{z})]
+        + D_{\mathrm{KL}}\!\left(q_\theta(\hat{z}\mid x)\,\|\,p(\hat{z})\right)
+    \right],
+    \label{eq:vae-base-objective}
+\end{equation}
+where $p(\hat{z})$ is the latent prior and $p_\psi(x\mid\hat{z})$ is the decoder likelihood, with $G_\psi(\hat{z})$ giving its predicted reconstruction. The first term promotes reconstruction fidelity, while the Kullback--Leibler divergence regularizes the posterior toward the prior. VQGAN~\citep{esser2021vqgan} applies adversarial reconstruction training to a VQ-VAE-style model with deterministic quantized latents; its base objective combines reconstruction and perceptual terms with codebook and commitment losses. In LASER, $\hat{z}=z_{\mathrm{sp}}$ and $\mathcal{L}_{\mathrm{AE}}=\mathcal{L}_{\mathrm{s1}}$ from Eq.~\ref{eq:stage1-objective}.
+
+Introduce a discriminator $C_\phi$ that assigns higher scores to real data than to reconstructions. A common VQGAN-style formulation uses a hinge loss:
+\begin{align}
+    \mathcal{L}_{\mathrm{disc}}
+    &= \frac{1}{2}\mathbb{E}_{x}
+       \bigl[\max(0,1-C_\phi(x))\bigr]
+       + \frac{1}{2}\mathbb{E}_{x,\hat{z}}
+       \bigl[\max(0,1+C_\phi(\hat{x}))\bigr],
+       \label{eq:discriminator-objective}\\
+    \mathcal{L}_{\mathrm{adv}}
+    &= -\mathbb{E}_{x,\hat{z}}\bigl[C_\phi(\hat{x})\bigr],
+       \label{eq:adversarial-reconstruction-objective}\\
+    \mathcal{L}_{\mathrm{gen}}
+    &= \mathcal{L}_{\mathrm{AE}}
+       + \lambda_{\mathrm{adv}}\mathcal{L}_{\mathrm{adv}},
+       \qquad \lambda_{\mathrm{adv}}\geq 0.
+       \label{eq:adversarial-autoencoder-objective}
+\end{align}
+Expectations are over $x\sim p_{\mathrm{data}}$ and, for stochastic encoders, $\hat{z}\sim q_\theta(\cdot\mid x)$; for deterministic bottlenecks, $\hat{z}$ is fixed by $x$. Training alternates between minimizing $\mathcal{L}_{\mathrm{disc}}$ with respect to $\phi$, treating reconstructions as fixed, and minimizing $\mathcal{L}_{\mathrm{gen}}$ with respect to the autoencoder parameters while holding $\phi$ fixed. During the autoencoder update, gradients propagate through the discriminator to the decoder and encoder, using reparameterization for a continuous VAE or a straight-through estimator for the discrete or sparse bottleneck. The discriminator is used only during training.
+
+The reconstruction term ties each output to its input, while the adversarial term encourages statistics that resemble those of real data. If missing high-frequency structure provides a cue for distinguishing reconstructions, the discriminator can learn to penalize it, encouraging the decoder to synthesize plausible detail from the retained latent information. This signal is learned from data and does not explicitly isolate a frequency band. It improves the incentive to reproduce fine-scale structure, but does not guarantee exact recovery of information discarded by compression. The weight $\lambda_{\mathrm{adv}}$ controls the contribution of this perceptual objective alongside reconstruction and latent regularization. The same mechanism applies to continuous, vector-quantized, and sparse dictionary latents, independently of the modality-specific discriminator architecture.
 
 \begin{figure}[!htbp]
     \centering
     \includegraphics[width=0.88\linewidth]{dlgan-arch.png}
-    \caption{Adversarial extension of the dictionary-learning autoencoder. A patch discriminator supplies an additional perceptual training signal while the compression bottleneck remains the sparse dictionary representation.}
+    \caption{Adversarial extension of the dictionary-learning autoencoder. A discriminator distinguishes real data from reconstructions and supplies an additional training signal for perceptually realistic detail.}
     \label{fig:dlgan-arch}
 \end{figure}
 

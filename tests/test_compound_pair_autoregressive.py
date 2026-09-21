@@ -195,6 +195,31 @@ def test_full_pair_cached_next_event_reads_generated_coefficient():
     assert torch.equal(low_hidden, future_hidden)
 
 
+def test_pair_predictions_are_causal_across_sites_and_condition_coefficient_on_current_atom():
+    torch.manual_seed(23)
+    config = tiny_config()
+    config.block_size = [2, 2, 2]
+    model = CompoundLaserRQTransformer(config, num_atoms=7, coeff_vocab_size=5,
+        pair_autoregressive=True, micro_transformer_layers=1).eval()
+    aux = tiny_aux()
+    atoms = torch.tensor([[[[2,4],[1,3]],[[0,6],[5,2]]]])
+    tokens = atoms*5 + 2
+    future = tokens.clone()
+    future[:,1,1] = torch.tensor([6*5+4, 1*5])
+    current = tokens.clone()
+    current[:,0,0,0] = 3*5+2
+    with torch.no_grad():
+        base = model(tokens,model_aux=aux,amp=False)
+        changed_future = model(future,model_aux=aux,amp=False)
+        changed_atom = model(current,model_aux=aux,amp=False)
+    for name in ['atom_logits','coeff_logits']:
+        torch.testing.assert_close(base[name][:,:1],changed_future[name][:,:1],atol=0,rtol=0)
+    # An atom predictor never reads the atom it is supposed to predict.
+    torch.testing.assert_close(base['atom_logits'][:,0,0,0],changed_atom['atom_logits'][:,0,0,0],atol=0,rtol=0)
+    # Its coefficient distribution must depend on that atom's identity.
+    assert not torch.equal(base['coeff_logits'][:,0,0,0],changed_atom['coeff_logits'][:,0,0,0])
+
+
 def test_builder_enables_full_pair_ar_without_changing_depth():
     with torch.device("meta"):
         model = build_model(

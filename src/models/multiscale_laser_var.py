@@ -186,7 +186,17 @@ class LaserVAR(VAR):
                          patch_nums=q.v_patch_nums, attn_l2_norm=True,
                          drop_path_rate=.1 * depth / 24, norm_eps=1e-6,
                          flash_if_available=False, fused_if_available=False)
+        expected_length = sum(pn * pn for pn in q.v_patch_nums)
+        if self.L != expected_length:
+            raise RuntimeError(
+                f"LASER changed the VAR spatial sequence: {self.L} != {expected_length}"
+            )
+        # Sparse depth is deliberately local to each spatial position. It must
+        # never be flattened into the transformer's sequence dimension.
+        self.spatial_token_length = self.L
         self.sparsity, self.coefficient_bins = q.sparsity, q.coefficient_bins
+        self.sparse_pairs_per_image = self.L * self.sparsity
+        self.categorical_decisions_per_image = self.sparse_pairs_per_image * 2
         self.coefficient_head = nn.Linear(self.C, q.coefficient_bins)
         self.atom_context = nn.Linear(q.Cvae, self.C, bias=False)
         self.depth_context = nn.Sequential(nn.Linear(q.Cvae, self.C), nn.SiLU(), nn.Linear(self.C, self.C))

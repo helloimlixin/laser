@@ -22,6 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, Subset
 from torchvision import transforms
+from torchvision.datasets import STL10
 from torchvision.transforms import InterpolationMode
 from torchvision.utils import save_image
 
@@ -61,6 +62,42 @@ class Images(Dataset):
             with Image.open(self.root / name) as im:
                 image = self.transform(im.convert("RGB"))
         return image, label
+
+
+class HFSquareImages(Dataset):
+    """Deterministic square view of a cached Hugging Face image split."""
+    def __init__(self, root, split, train, seed, image_size,
+                 torchvision_stl_fallback=False, resize_crop=True):
+        hf_path = Path(root) / 'hf'
+        if hf_path.is_dir():
+            from datasets import load_from_disk
+            self.dataset = load_from_disk(str(hf_path))[split]
+            self.huggingface = True
+        elif torchvision_stl_fallback:
+            self.dataset = STL10(str(root), split=split, download=False)
+            self.huggingface = False
+        else:
+            raise FileNotFoundError(f'Cached image dataset not found: {hf_path}')
+        self.seed, self.epoch = int(seed), 0
+        target = int(image_size)
+        resize = max(target, round(target * 1.125)) if resize_crop else target
+        operations = [transforms.Resize(resize, interpolation=InterpolationMode.LANCZOS)]
+        if resize_crop:
+            operations.append(transforms.RandomCrop(target) if train else transforms.CenterCrop(target))
+        if train:
+            operations.append(transforms.RandomHorizontalFlip())
+        operations.extend([transforms.ToTensor(), transforms.Normalize(.5, .5)])
+        self.transform = transforms.Compose(operations)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        image, label = (item['image'], item['label']) if self.huggingface else item
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self.seed + self.epoch * 10000019 + index)
+            return self.transform(image), int(label)
 
 
 def optimizer_groups(model):
@@ -108,17 +145,53 @@ class Experiment:
         self.device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
+        dataset_name = str(cfg.data.get('dataset', 'imagenet')).lower()
+        data_root = Path(cfg.data.root).expanduser().resolve()
+        if dataset_name == 'imagenet':
+            data_fingerprints = {
+                f'{split}_manifest_sha256': file_sha256(Path(cfg.data.manifests)/f'{split}-manifest.json')
+                for split in ('train', 'val')}
+        elif dataset_name in {'stl10', 'celebahq'}:
+            hf_path = data_root / 'hf'
+            if hf_path.is_dir():
+                files = sorted(hf_path.rglob('*.arrow'))
+                if not files:
+                    raise ValueError(f'No cached Arrow files found under {hf_path}')
+                data_fingerprints = {f'arrow_{i:02d}_sha256': file_sha256(p) for i, p in enumerate(files)}
+            else:
+                if dataset_name != 'stl10':
+                    raise FileNotFoundError(f'Cached CelebA-HQ dataset not found: {hf_path}')
+                binary = data_root / 'stl10_binary'
+                data_fingerprints = {
+                    name.replace('.', '_') + '_sha256': file_sha256(binary / name)
+                    for name in ('train_X.bin', 'train_y.bin', 'test_X.bin', 'test_y.bin')}
+        else:
+            raise ValueError(f'Unsupported VAR dataset: {dataset_name}')
         if self.rank == 0:
             contract = {key:OmegaConf.to_container(cfg[key], resolve=True)
                         for key in ('model', 'tokenizer', 'prior')}
             contract.update(seed=int(cfg.seed), world_size=self.world,
-                            data_root=str(Path(cfg.data.root).resolve()),
-                            train_manifest_sha256=file_sha256(Path(cfg.data.manifests)/'train-manifest.json'),
-                            val_manifest_sha256=file_sha256(Path(cfg.data.manifests)/'val-manifest.json'))
+                            dataset=dataset_name, data_root=str(data_root), **data_fingerprints)
             contract_path = self.out/'training-contract.json'
-            if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
-                raise ValueError('Training configuration changed; use a new output directory')
-            atomic_json(contract_path, contract)
+            if contract_path.exists():
+                saved_contract = json.loads(contract_path.read_text())
+                comparable_saved = json.loads(json.dumps(saved_contract))
+                comparable_new = json.loads(json.dumps(contract))
+                extensions = {}
+                for phase in ('tokenizer', 'prior'):
+                    old_epochs = int(comparable_saved[phase].pop('epochs'))
+                    new_epochs = int(comparable_new[phase].pop('epochs'))
+                    if new_epochs < old_epochs:
+                        raise ValueError(f'{phase} epochs cannot decrease on resume')
+                    if new_epochs != old_epochs:
+                        extensions[phase] = dict(from_epochs=old_epochs, to_epochs=new_epochs)
+                if comparable_saved != comparable_new:
+                    raise ValueError('Training configuration changed; use a new output directory')
+                if extensions:
+                    atomic_json(self.out/f'contract-extension-{int(time.time())}.json', extensions)
+                    atomic_json(contract_path, contract)
+            else:
+                atomic_json(contract_path, contract)
         self.stop = False
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stop", True))
@@ -132,14 +205,26 @@ class Experiment:
                                  config=OmegaConf.to_container(cfg, resolve=True))
             OmegaConf.save(cfg, self.out / "resolved-config.yaml", resolve=True)
         self.global_log_step = 0
-        manifests = {s: json.loads((Path(cfg.data.manifests) / f"{s}-manifest.json").read_text()) for s in ("train", "val")}
-        if manifests["train"]["classes"] != manifests["val"]["classes"]:
-            raise ValueError("Train and validation label mappings differ")
-        for split, expected in (("train", 1281167), ("val", 50000)):
-            if len(manifests[split]["samples"]) != expected or len(manifests[split]["classes"]) != 1000:
-                raise ValueError(f"Incomplete ImageNet {split} manifest")
-        self.train = Images(Path(cfg.data.root) / "train", manifests["train"], True, cfg.seed)
-        self.val = Images(Path(cfg.data.root) / "val", manifests["val"], False, cfg.seed)
+        if dataset_name == 'imagenet':
+            manifests = {s: json.loads((Path(cfg.data.manifests) / f"{s}-manifest.json").read_text()) for s in ("train", "val")}
+            if manifests["train"]["classes"] != manifests["val"]["classes"]:
+                raise ValueError("Train and validation label mappings differ")
+            for split, expected in (("train", 1281167), ("val", 50000)):
+                if len(manifests[split]["samples"]) != expected or len(manifests[split]["classes"]) != 1000:
+                    raise ValueError(f"Incomplete ImageNet {split} manifest")
+            self.num_classes = 1000
+            self.train = Images(data_root / "train", manifests["train"], True, cfg.seed)
+            self.val = Images(data_root / "val", manifests["val"], False, cfg.seed)
+        elif dataset_name == 'stl10':
+            self.num_classes = 10
+            self.train = HFSquareImages(data_root, 'train', True, cfg.seed, cfg.data.image_size, True)
+            self.val = HFSquareImages(data_root, 'test', False, cfg.seed, cfg.data.image_size, True)
+        else:
+            self.num_classes = 2
+            self.train = HFSquareImages(data_root, 'train', True, cfg.seed,
+                                        cfg.data.image_size, resize_crop=False)
+            self.val = HFSquareImages(data_root, 'validation', False, cfg.seed,
+                                      cfg.data.image_size, resize_crop=False)
         if self.initialization == 'scratch':
             self.vae = build_scratch_tokenizer(cfg.model, cfg.seed)
         else:
@@ -163,9 +248,10 @@ class Experiment:
             atomic_json(self.out / "provenance.json", dict(
                 upstream_revision=revision, source_sha256={str(p.relative_to(ROOT)): file_sha256(p) for p in files},
                 vae_sha256=file_sha256(cfg.model.pretrained_vae) if cfg.model.pretrained_vae else None,
-                manifest_sha256={s:file_sha256(Path(cfg.data.manifests)/f'{s}-manifest.json') for s in ('train','val')},
-                train_images=len(self.train), val_images=len(self.val), classes=1000,
-                downsampling=16, spatial_sites=sum(p*p for p in cfg.model.patch_nums),
+                data_fingerprints=data_fingerprints, dataset=dataset_name,
+                train_images=len(self.train), val_images=len(self.val), classes=self.num_classes,
+                image_size=int(cfg.data.image_size), downsampling=16,
+                spatial_sites=sum(p*p for p in cfg.model.patch_nums),
                 sparse_pairs=sites*cfg.model.sparsity if self.kind=='laser' else None,
                 nominal_bits_per_image=bits, **self.initialization_receipt,
                 protocol="Fresh 288px resize/256px random crop every training epoch; no horizontal flip, official sorted WNIDs"))
@@ -405,7 +491,9 @@ class Experiment:
                     return bool(self.cfg.smoke_steps)
             state.update(epoch=epoch+1, batch=0)
             save_checkpoint(path, self.vae, optimizer, state, dict(discriminator=disc.state_dict(), discriminator_optimizer=d_optimizer.state_dict(), initialization=self.initialization_receipt))
-            self.reconstruction(epoch+1, self.cfg.evaluation.reconstruction_images)
+            evaluation_every = int(cfg.get('evaluation_every_epochs', 1))
+            if (epoch + 1) % evaluation_every == 0 or epoch + 1 == cfg.epochs:
+                self.reconstruction(epoch+1, self.cfg.evaluation.reconstruction_images)
         quality = self.reconstruction(cfg.epochs, self.cfg.evaluation.full_reconstruction_images)
         if ((cfg.get('max_matched_rfid') is not None and quality['matched_rfid'] > cfg.max_matched_rfid) or
                 (cfg.get('max_rfid_drift') is not None and quality.get('rfid_drift',0) > cfg.max_rfid_drift)):
@@ -449,7 +537,7 @@ class Experiment:
         values = np.load(sample_path, mmap_mode="r+") if official else None
         for begin in range(0, len(indices), self.cfg.evaluation.batch_size):
             selected = indices[begin:begin+self.cfg.evaluation.batch_size]
-            labels = torch.tensor([i % 1000 for i in selected], device=self.device)
+            labels = torch.tensor([i % self.num_classes for i in selected], device=self.device)
             with self.amp():
                 latent = model.sample(labels, cfg=cfg.cfg, top_k=cfg.top_k, top_p=cfg.top_p,
                                       seed=73000+self.rank+begin*self.world)
@@ -472,8 +560,18 @@ class Experiment:
         if result[0] != count:
             raise RuntimeError("Generated sample count mismatch")
         if self.rank == 0:
-            ref = np.load(self.cfg.evaluation.fid_reference)
-            score = float(frechet_distance(result[1], result[2], ref["mu"], ref["sigma"]))
+            if self.cfg.evaluation.get('fid_reference'):
+                ref = np.load(self.cfg.evaluation.fid_reference)
+                ref_mu, ref_sigma = ref['mu'], ref['sigma']
+            else:
+                real = FeatureMoments(self.device)
+                real_indices = np.random.default_rng(2718).permutation(len(self.val))[:count][self.rank::self.world]
+                for real_images, _ in self.loader(self.val, self.cfg.evaluation.batch_size, real_indices):
+                    real.update(self.inception(((real_images.to(self.device).float()+1)*.5).clamp(0,1)))
+                real_count, ref_mu, ref_sigma = real.finish()
+                if real_count != count:
+                    raise RuntimeError('Real-image FID count mismatch')
+            score = float(frechet_distance(result[1], result[2], ref_mu, ref_sigma))
             self.log("generation", epoch=epoch, count=count, pytorch_fid_diagnostic=score)
             atomic_json(self.out / f"generation-epoch{epoch:03d}-{count}.json",
                         dict(epoch=epoch, count=count, pytorch_fid_diagnostic=score,
@@ -509,11 +607,12 @@ class Experiment:
         cfg = self.cfg.prior
         self.vae.eval().requires_grad_(False)
         if self.initialization == 'scratch':
-            model = build_scratch_prior(self.vae, self.kind, self.cfg.seed+1001, depth=self.cfg.model.depth)
+            model = build_scratch_prior(self.vae, self.kind, self.cfg.seed+1001,
+                                        depth=self.cfg.model.depth, num_classes=self.num_classes)
             if self.rank == 0:
                 atomic_json(self.out/'prior-initialization.json', dict(initialization='scratch', seed=int(self.cfg.seed+1001), shared_sha256=shared_prior_digest(model)))
         else:
-            model = LaserVAR(self.vae, depth=self.cfg.model.depth)
+            model = LaserVAR(self.vae, depth=self.cfg.model.depth, num_classes=self.num_classes)
         model.to(self.device)
         optimizer = torch.optim.AdamW(optimizer_groups(model), lr=cfg.lr, betas=(.9,.95), weight_decay=cfg.weight_decay, fused=True)
         path = self.out / "prior-last.pt"
@@ -531,8 +630,16 @@ class Experiment:
         if checkpoint:
             restore_rng(checkpoint)
             del checkpoint
-        self.log("prior_setup", parameters=sum(p.numel() for p in model.parameters()),
-                 global_batch=cfg.batch_size*cfg.accumulation*self.world)
+        setup = dict(parameters=sum(p.numel() for p in model.parameters()),
+                     global_batch=cfg.batch_size*cfg.accumulation*self.world,
+                     spatial_sequence_length=int(model.L),
+                     original_var_spatial_sequence_length=sum(p*p for p in self.cfg.model.patch_nums),
+                     spatial_sequence_ratio_to_original_var=1.0)
+        if self.kind == 'laser':
+            setup.update(sparse_depth=int(model.sparsity),
+                         sparse_pairs_per_image=int(model.sparse_pairs_per_image),
+                         categorical_decisions_per_image=int(model.categorical_decisions_per_image))
+        self.log("prior_setup", **setup)
         for epoch in range(state["epoch"], cfg.epochs):
             self.train.epoch = epoch
             sampler = DistributedSampler(self.train, self.world, self.rank, shuffle=True, seed=self.cfg.seed)
@@ -593,12 +700,13 @@ class Experiment:
             if epoch==0 or (epoch+1)%self.cfg.evaluation.every_epochs==0:
                 full = (epoch+1)%self.cfg.evaluation.full_every_epochs==0 or epoch+1==cfg.epochs
                 count = self.cfg.evaluation.full_samples if full else self.cfg.evaluation.preview_samples
-                self.generate(model, epoch+1, count, official=full)
+                official = full and bool(self.cfg.evaluation.get('adm_reference'))
+                self.generate(model, epoch+1, count, official=official)
 
 
 def run(cfg):
-    if cfg.data.image_size != 256 or tuple(cfg.model.patch_nums)[-1] != 16:
-        raise ValueError('This VAR experiment requires 256px images and factor-16 latents')
+    if int(cfg.data.image_size) % 16 or tuple(cfg.model.patch_nums)[-1] != int(cfg.data.image_size) // 16:
+        raise ValueError('VAR scale endpoint must equal image_size / tokenizer downsampling (16)')
     os.environ.setdefault("TORCH_HOME", "/workspace/tmp/official-rqvae-eval-cache")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     torch.set_num_threads(4)

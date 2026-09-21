@@ -79,7 +79,9 @@ g_i=G_{S_i^{(k-1)},j_i^{(k)}},
 \qquad
 L_i^{(k-1)}w_i=g_i,
 \qquad
-\delta_i=\sqrt{\max(1-w_i^\top w_i,\epsilon)}.
+q_i=1-w_i^\top w_i,
+\qquad
+\delta_i=\sqrt{q_i}.
 $$
 
 The augmented factor is
@@ -101,9 +103,23 @@ L_i^{(k)}u_i=B_{S_i^{(k)},i},
 (L_i^{(k)})^\top\gamma_i^{(k)}=u_i.
 $$
 
-The positive floor $\epsilon$ protects the square root and subsequent solves
-against numerical degeneracy. Exact least-squares identities apply when the
-selected systems are nonsingular and this safeguard is inactive.
+The Cholesky solve is used only when the Schur complement $q_i$ is sufficiently
+positive relative to the diagonal and the precision used to form the Gram
+matrix. Small or nonfinite pivots trigger a double-precision singular-value
+decomposition of the selected subdictionary. In the unregularized case, singular
+values below a relative precision threshold are discarded. With ridge
+regularization, the inverse singular values are replaced by
+$\sigma/(\sigma^2+\rho)$. A vector that requires this fallback remains on that
+path for subsequent pursuit depths.
+
+We also evaluate the reconstructed residual directly after each coefficient
+solve. If its objective increases beyond numerical tolerance or becomes
+nonfinite, the stable solve is attempted. If that candidate still fails after
+conversion to the output precision, the previous coefficients are retained and
+the newly selected slot receives a zero coefficient. For $\rho>0$, this check
+uses the regularized objective, including $\rho\|\gamma\|_2^2$. A zero coefficient
+denotes an inactive slot. Exact least-squares identities apply when the selected
+system is nonsingular and no truncation or rejection is needed.
 
 Residual correlations are updated directly from the precomputed matrices:
 
@@ -114,15 +130,20 @@ B_{:,i}-G_{:,S_i^{(k)}}\gamma_i^{(k)}
 =D^\top\!\left(h_i-D_{S_i^{(k)}}\gamma_i^{(k)}\right).
 $$
 
-This avoids recomputing a dictionary projection of the explicit residual at
-every pursuit step. Support selection, factor updates, and triangular solves
+This avoids recomputing a dictionary projection of the explicit residual on
+the Cholesky path. For vectors using the stable fallback, correlations are
+recomputed from the explicit residual in double precision. Support selection,
+factor updates, and triangular solves
 are batched across vectors. The procedure executes $K$ selections and returns
 the support and its fitted real coefficients; the number of nonzero
 coefficients can be smaller than $K$.
 
 Precomputing $G$ costs $O(mM^2)$, and computing $B$ costs $O(mMN)$.
 For the direct correlation updates above, the remaining work over all pursuit
-depths is $O(NMK^2+NK^3)$. The shared Gram matrix requires $O(M^2)$ storage,
+depths, including direct reconstruction checks, is $O(N(M+m)K^2+NK^3)$
+on the Cholesky path. A fallback at depth $k$ adds a selected-subdictionary
+decomposition and residual projection, costing $O(mk^2+mM)$ for that vector
+when $k\leq m$. The shared Gram matrix requires $O(M^2)$ storage,
 the batch correlation workspace requires $O(NM)$ storage, and the per-vector
 Cholesky factors require $O(NK^2)$ storage. The Gram matrix is recomputed when
 the dictionary changes.
@@ -138,6 +159,71 @@ atom $d_\ell$. If no unselected atom satisfies the threshold, selection falls
 back to the remaining unselected atoms. These conditioning variants preserve
 the fixed support budget, but the regularized solve does not have the exact
 residual-orthogonality property of unregularized OMP.
+
+Algorithm 1 gives the batched pursuit procedure. Setting $\rho=0$ and $\mu=1$
+recovers the unregularized, unrestricted selection rule. The parallel loop
+denotes batched operations over independent vectors, and each saved prefix is
+the reconstruction after refitting that depth's coefficients.
+
+~~~text
+Algorithm 1: Batch OMP with incremental Cholesky solves
+
+Input: H in R^(m x N); unit-column dictionary D in R^(m x M);
+       sparsity K <= M; ridge rho >= 0; coherence threshold 0 < mu <= 1;
+       relative pivot threshold tau_piv; solve tolerance tau_obj;
+       relative singular-value threshold tau_svd.
+Output: ordered supports S, coefficient matrix C, prefix reconstructions P.
+
+G <- transpose(D) D
+B <- transpose(D) H
+C <- zeros(M, N)
+For each i:
+    S[i] <- empty; L[i] <- empty; a[i] <- B[:, i]
+    gamma_old[i] <- empty; stable[i] <- false
+    objective_old[i] <- squared_norm(H[:, i])
+
+For k = 1, ..., K:
+    In parallel for i = 1, ..., N:
+        J <- {1, ..., M} excluding S[i]
+        If mu < 1 and S[i] is nonempty:
+            J_allowed <- {j in J : max(abs(G[S[i], j])) <= mu}
+            If J_allowed is nonempty: J <- J_allowed
+        j <- index in J maximizing abs(a[i][j])
+             (choose the smallest index in a tie)
+
+        diagonal <- G[j, j] + rho
+        If k = 1: L[i] <- [sqrt(diagonal)]
+        Else if not stable[i]:
+            w <- solve_lower_triangular(L[i], G[S[i], j])
+            pivot <- diagonal - dot(w, w)
+            If pivot is nonfinite or pivot <= tau_piv diagonal:
+                stable[i] <- true
+            Else:
+                L[i] <- block_matrix([[L[i], 0], [transpose(w), sqrt(pivot)]])
+
+        Append j to S[i]
+        If not stable[i]:
+            gamma <- solve_cholesky(L[i], B[S[i], i])
+            If objective(gamma) is nonfinite or exceeds objective_old[i]
+               by more than tau_obj max(objective_old[i], 1):
+                stable[i] <- true
+        If stable[i]:
+            gamma <- double_precision_SVD_solve(D[:, S[i]], H[:, i],
+                                               rho, tau_svd)
+            Cast gamma to the coefficient output precision
+        If objective(gamma) is nonfinite or exceeds objective_old[i]
+           by more than tau_obj max(objective_old[i], 1):
+            gamma <- concatenate(gamma_old[i], [0])
+        C[S[i], i] <- gamma
+        P[k][:, i] <- D[:, S[i]] gamma
+        objective_old[i] <- squared_norm(H[:, i] - P[k][:, i])
+                            + rho squared_norm(gamma)
+        gamma_old[i] <- gamma
+        If stable[i]: a[i] <- transpose(D) (H[:, i] - P[k][:, i])
+        Else: a[i] <- B[:, i] - G[:, S[i]] gamma
+
+Return S, C, P
+~~~
 
 When sparse coding is embedded in a trainable model, pursuit is evaluated
 without differentiating through support selection or the coefficient solves.
@@ -176,8 +262,12 @@ uses the final-depth codes, even when the encoder receives progressive
 commitment supervision.
 
 After a gradient update of the surrounding model, we update the dictionary
-using detached vectors and codes recorded during the preceding forward pass.
-An update may use one minibatch or a finite window of recorded minibatches.
+using detached vectors and codes recorded during all forward passes contributing
+to that gradient update. Accumulated gradients are normalized by the actual
+number of examples, including a final partial accumulation window. A dictionary
+update may use one such complete minibatch or a finite window of recorded
+minibatches. A skipped gradient step discards pending dictionary statistics and
+does not advance the dictionary schedules.
 Denote the concatenated vectors and fixed codes in this window again by $H$
 and $C$. The dictionary objective for this step is
 
@@ -230,7 +320,7 @@ existing contribution. The sufficient statistics are computed from selected
 support entries; dense coefficient-covariance matrices are unnecessary.
 
 We restrict updates to sufficiently observed atoms. Let
-$n_j=\sum_i\mathbf 1[j\in S_i^{(K)}]$ be the selection count in the update
+$n_j=\sum_i\mathbf 1[C_{j,i}\ne0]$ be the active selection count in the update
 window. Candidate atoms satisfy $n_j\geq n_{\min}$, and a maximum of
 $B_{\max}$ candidates are retained in descending count order with deterministic
 tie handling. Candidates with negligible coefficient energy or negligible
@@ -286,6 +376,54 @@ the update is equivalent to aggregating these quantities. A single accepted
 dictionary is then shared across workers. The acceptance test refers to that
 pooled update window.
 
+Algorithm 2 specifies the dictionary step. All targets and all backtracking
+trials use the same input dictionary, recorded vectors, and coefficients.
+Here, $\mathrm{normalize}_{\epsilon}(v)=v/\max(\|v\|_2,\epsilon)$ applies
+normalization with a numerical floor. Support slots with zero coefficients are
+inactive and do not contribute to usage counts.
+
+~~~text
+Algorithm 2: Alternating dictionary update with fixed codes
+
+Input: unit-column dictionary D; recorded vectors H and codes C;
+       final supports S; minimum count n_min; candidate cap B_max;
+       initial relaxation eta_0; backtracking budget B_bt;
+       numerical floor epsilon; acceptance tolerance epsilon_acc.
+Output: updated dictionary D_new.
+
+R <- H - D C
+E_0 <- squared_Frobenius_norm(R)
+For j = 1, ..., M:
+    n[j] <- number of i with C[j, i] != 0
+A <- indices with n[j] >= n_min, sorted by decreasing n[j]
+     (break ties by increasing index)
+A <- first min(B_max, length(A)) indices of A
+J <- empty
+
+For j in A:
+    v <- transpose(C[j, :])
+    s <- dot(v, v)
+    u <- R v + s D[:, j]
+    If s > epsilon and norm(u) > epsilon:
+        target[j] <- normalize_epsilon(u)
+        Add j to J
+
+If J is empty: return D
+
+For b = 0, ..., B_bt:
+    eta <- eta_0 / 2^b
+    Delta <- zeros_like(D)
+    In parallel for j in J:
+        candidate <- normalize_epsilon(
+                         (1 - eta) D[:, j] + eta target[j])
+        Delta[:, j] <- candidate - D[:, j]
+    E_trial <- squared_Frobenius_norm(R - Delta C)
+    If E_trial <= E_0 + epsilon_acc max(E_0, 1):
+        Return column_normalize_epsilon(D + Delta)
+
+Return D
+~~~
+
 Dictionary initialization and maintenance are separate from the alternating
 least-squares step. At initialization, atoms may be sampled from nonzero
 training vectors and normalized, with small perturbations when repeated
@@ -305,3 +443,54 @@ window is complete. The next sparse inference pass uses the resulting
 dictionary and refits the coefficients. The output remains a support with
 signed real coefficients; any subsequent conversion to a finite token vocabulary
 is a separate operation.
+
+Algorithm 3 summarizes this ordering for a finite update window of $W$
+recorded batches. The downstream objective is any differentiable objective of
+the surrounding model. Stop-gradient copies preserve the vectors and codes
+associated with each forward pass, and only the surrounding model parameters
+$\phi$ are passed to the gradient optimizer.
+
+~~~text
+Algorithm 3: Online training with alternating sparse inference
+
+Input: surrounding model parameters phi; unit-column dictionary D;
+       update-window length W; commitment weight beta;
+       settings for Algorithms 1 and 2.
+
+window <- empty
+For each optimization step:
+    H <- encoder_phi(current_minibatch)
+    H_record <- stop_gradient_copy(H)
+    With gradient recording disabled:
+        S, C, P <- BatchOMP(H_record, D)                 // Algorithm 1
+    C_record <- copy(C)
+    S_record <- copy(S)
+
+    H_ST <- H + stop_gradient(P[K] - H)
+    L_commit <- beta / (N m K)
+                * sum over k=1,...,K of
+                  squared_Frobenius_norm(H - stop_gradient(P[k]))
+    L <- downstream_objective(phi, H_ST) + L_commit
+    phi, updated <- optimizer_step(phi, L)              // D is fixed
+    If not updated:
+        Clear window
+        Continue
+
+    Append (H_record, C_record, S_record) to window
+    If length(window) = W:
+        H_window, C_window, S_window <- concatenate recorded batches
+        If using a distributed pooled update:
+            Pool these records over participating workers
+        D <- FixedCodeDictionaryUpdate(
+                 D, H_window, C_window, S_window)       // Algorithm 2
+        Share the accepted D with participating workers if needed
+        Clear window
+
+    Apply optional unused-atom maintenance and synchronize D if needed
+~~~
+
+Here, the current minibatch includes every microbatch contributing to one
+optimizer step. The pseudocode uses continuous coefficients and progressive commitment
+supervision. Retaining only the final prefix yields the final-depth commitment
+variant. An incomplete window is deferred until $W$ records are available;
+unused-atom maintenance remains separate from the accepted least-squares step.

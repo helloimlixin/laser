@@ -87,32 +87,36 @@ general minimize the final reconstruction error over all length-$K$ sequences.
 
 We fit the coefficient table with the dictionary fixed. Initial levels are
 estimated from continuous pursuit coefficients. We then alternate residual
-assignment and regularized scalar updates, keeping the coefficient table
-unchanged during each assignment pass. Let $\mathcal I_{j,b}$ contain the
-residuals assigned to the pair $(j,b)$ in a pass. Since the atoms are normalized,
-the optimal continuous projection coefficient for residual $r_i$ is
-$d_j^\top r_i$. Given a fixed prior level $\ell_{j,b}^{(0)}$ and
-$\lambda>0$, the update is
+assignment and a joint coefficient update, keeping the table unchanged during
+each assignment pass. Stack the nonzero levels into $\ell\in\mathbb R^{ML}$.
+For a vector $h_i$ with fixed token sequence, define a matrix
+$A_i\in\mathbb R^{m\times ML}$ whose column for pair $(j,b)$ is
+$n_{i,j,b}d_j$, where $n_{i,j,b}$ counts occurrences of that token in the
+sequence. Zero tokens contribute no column. Thus the complete reconstruction is
+$A_i\ell$, including contributions from repeated tokens. Given prior levels
+$\ell^{(0)}$ and $\lambda>0$, we solve
 
 $$
-\ell_{j,b}^{\mathrm{new}}
-=
-\frac{
-\sum_{i\in\mathcal I_{j,b}}d_j^\top r_i
-+\lambda\ell_{j,b}^{(0)}
-}{
-|\mathcal I_{j,b}|+\lambda
-}.
+\ell^* = \arg\min_\ell
+\sum_i\|h_i-A_i\ell\|_2^2+\lambda\|\ell-\ell^{(0)}\|_2^2.
 $$
 
-For fixed residuals and assignments, this update minimizes a regularized scalar
-least-squares objective. The prior stabilizes estimates for infrequently
-selected entries, including entries with no assignments. The coefficient levels
-are kept distinct and nonzero, and residual assignments are recomputed between
-passes. These updates account for the residuals encountered by the discrete
-encoder; they do not imply monotonic minimization of the complete multi-step
-reconstruction objective. The dictionary and fitted levels are subsequently
-held fixed during prior training.
+The normal equations are
+$(\sum_i A_i^\top A_i+\lambda I)\ell^*
+=\sum_i A_i^\top h_i+\lambda\ell^{(0)}$.
+We accumulate their sparse entries and use diagonally preconditioned conjugate
+gradients. This includes interactions between all tokens in the final
+reconstruction; the prior stabilizes rarely selected and unused entries.
+
+We form relaxed candidates between the current levels and $\ell^*$, rejecting
+candidates that violate the ordered, distinct, nonzero level constraints. For
+each candidate, the greedy residual assignments are recomputed and both final
+reconstruction error and the regularized objective are measured. The relaxation
+is halved until neither quantity increases. If no tested candidate is accepted,
+the current table is retained. Accepted passes therefore do not increase either
+measured objective on the fitting set, although they need not find a global
+optimum or improve unseen vectors. The dictionary and fitted levels are
+subsequently held fixed during prior training.
 
 For autoregressive training, we additionally use stochastic assignments and
 soft targets, following [Lee et al. (2022)](https://arxiv.org/abs/2203.01941).
@@ -129,14 +133,35 @@ q_\tau(v\mid r)
 }.
 $$
 
-At each residual step, we sample $t_k\sim q_\tau(\cdot\mid r_{k-1})$ and
+We allow a fixed temperature $\tau_k>0$ at each residual depth. At step $k$,
+we sample $t_k\sim q_{\tau_k}(\cdot\mid r_{k-1})$ and
 update $r_k=r_{k-1}-e(t_k)$. Thus, subsequent assignments are conditioned on the
 sampled prefix. The distribution assigns greater mass to contributions that
 better approximate the current residual and concentrates on the nearest
 codeword as $\tau\to0$ when the minimizer is unique. Unlike deterministic
 assignment, stochastic assignment need not reduce residual error at every step.
-The temperature is expressed in squared-distance units and is calibrated to the
-additional reconstruction distortion induced by sampling.
+Temperature is expressed in squared-distance units. To control stochasticity
+across depths, we specify a target entropy profile $(h_1^*,\ldots,h_K^*)$,
+which can be estimated from a reference tokenizer on a shared calibration
+population with index set $\mathcal C$. We choose each $\tau_k$ to satisfy
+
+$$
+\frac{1}{|\mathcal C|}\sum_{i\in\mathcal C}
+\left[-\sum_{v\in\mathcal V}
+q_{\tau_k}(v\mid r_{i,k-1})\log q_{\tau_k}(v\mid r_{i,k-1})\right]
+\approx h_k^*.
+$$
+
+Calibration proceeds in depth order. Earlier temperatures are fixed before
+sampling the prefixes that determine the next residual population. For a fixed
+residual population, entropy is nondecreasing in temperature, so a bounded
+search determines each temperature; unreachable target entropies are rejected.
+The temperatures are then held fixed during prior training. This matches mean
+entropy at each depth, rather than forcing all vectors to have equal entropy.
+We measure the induced reconstruction distortion separately on a disjoint
+population: matching entropy does not imply matching
+distortion or improving generation quality. A scalar temperature is the
+special case $\tau_1=\cdots=\tau_K$.
 
 Let $H=(h_1,\ldots,h_T)$ be an ordered collection of vectors, and let
 $S=(t_{u,k})\in\mathcal V^{T\times K}$ denote its token representation. An
@@ -149,18 +174,18 @@ p_\theta(S)
 p_\theta\!\left(t_{u,k}\mid S_{<u,:},S_{u,<k}\right).
 $$
 
-Writing $Q_\tau(S\mid H)$ for the sequential distribution induced by the
+Writing $Q_{\boldsymbol\tau}(S\mid H)$ for the sequential distribution induced by the
 stochastic quantizer, we train the prior with
 
 $$
 \mathcal L(\theta)
 =
--\mathbb E_{H,\,S\sim Q_\tau(\cdot\mid H)}
+-\mathbb E_{H,\,S\sim Q_{\boldsymbol\tau}(\cdot\mid H)}
 \left[
 \frac{1}{TK}
 \sum_{u=1}^{T}\sum_{k=1}^{K}
 \sum_{v\in\mathcal V}
-q_\tau(v\mid r_{u,k-1})
+q_{\tau_k}(v\mid r_{u,k-1})
 \log p_\theta\!\left(v\mid S_{<u,:},S_{u,<k}\right)
 \right].
 $$
@@ -172,6 +197,8 @@ decompositions and encodes the geometric relationship among candidate
 contributions. This objective is a categorical cross-entropy over token
 sequences. During generation, the prior predicts tokens from previously
 generated tokens without access to the target vectors or their residuals.
+The prior's sampling temperature is independent of these training-target
+temperatures.
 
 The same embedding function can supply the prior with continuous context:
 each token is represented by a learned projection of $e(t_{u,k})$, and the

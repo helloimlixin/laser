@@ -4,6 +4,12 @@ This folder holds short notes for the maintained code path.
 
 ## Core Notes
 
+- [Stochastic Target Calibration](stochastic-target-calibration-2026-09-15.md):
+  entropy calibration per residual depth, distortion checks, and the training trial.
+- [Training Correctness Fixes](training-code-fixes-2026-09-15.md):
+  repaired audit findings, regression results, and stage-2 checkpoint recovery.
+- [Sampling Comparison](church-sampling-sweep-2026-09-15.md):
+  controlled sampler tests and FID50k against the entire training set.
 - [Sparse Coding with Batch OMP and Alternating Online Dictionary Updates](batch-omp-online-dictionary-learning.md):
   manuscript section on batched pursuit, progressive Cholesky solves, and
   normalized dictionary updates with backtracking.

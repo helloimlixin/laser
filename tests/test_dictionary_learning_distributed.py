@@ -121,3 +121,52 @@ def test_distributed_alternating_update_skips_globally_for_missing_rank_cache(tm
         nprocs=2,
         join=True,
     )
+
+
+def _globally_active_atom_missing_locally_worker(rank, init_method):
+    from datetime import timedelta
+    dist.init_process_group('gloo', init_method=init_method, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=30))
+    try:
+        learner = DictionaryLearning(num_embeddings=3, embedding_dim=3, sparsity_level=1,
+            dictionary_update_mode='alternating_residual', dictionary_update_min_usage=2)
+        with torch.no_grad():
+            learner.dictionary.copy_(torch.eye(3))
+        signals = ([[1., .1, .1], [1., .1, .1]] if rank == 0
+                   else [[.1, 1., .1], [.1, .1, 1.]])
+        learner(torch.tensor(signals).T[None, :, None, :])
+        assert learner.alternating_dictionary_update_after_step_() == 1
+        dictionaries = [torch.empty_like(learner.dictionary) for _ in range(2)]
+        dist.all_gather(dictionaries, learner.dictionary.detach())
+        torch.testing.assert_close(dictionaries[0], dictionaries[1], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_update_keeps_collectives_when_active_atom_is_absent_locally(tmp_path):
+    mp.spawn(_globally_active_atom_missing_locally_worker,
+             args=(f'file://{tmp_path / "asymmetric-active-set"}',), nprocs=2, join=True)
+
+
+def _disagreeing_step_worker(rank, init_method):
+    from datetime import timedelta
+    dist.init_process_group('gloo', init_method=init_method, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=30))
+    try:
+        learner = DictionaryLearning(num_embeddings=3, embedding_dim=3, sparsity_level=1,
+            dictionary_update_mode='alternating_residual')
+        try:
+            learner.alternating_dictionary_update_after_step_(optimizer_updated=(rank == 0))
+        except RuntimeError as error:
+            assert 'Ranks disagree' in str(error)
+        else:
+            raise AssertionError('Asymmetric optimizer update was not rejected')
+        reached = torch.ones((), dtype=torch.long)
+        dist.all_reduce(reached)
+        assert int(reached) == 2
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_amp_disagreement_fails_on_every_rank_without_hanging(tmp_path):
+    mp.spawn(_disagreeing_step_worker, args=(f'file://{tmp_path / "unequal-steps"}',), nprocs=2, join=True)

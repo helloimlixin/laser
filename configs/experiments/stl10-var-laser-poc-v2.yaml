@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - stl10-var-laser-poc
+  - _self_
+
+output_dir: outputs/stl10-var-laser-poc-v2-20260916
+tokenizer:
+  epochs: 50
+  warmup_steps: 50
+  adversarial_start: 200
+  evaluation_every_epochs: 5
+  max_matched_rfid: 100.0
+prior:
+  epochs: 50
+wandb:
+  id: stl10-var-laser-poc-v2-20260916
+  group: stl10-var-laser-poc-20260916

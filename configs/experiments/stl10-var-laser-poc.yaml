@@ -1,0 +1,48 @@
+# @package _global_
+defaults:
+  - imagenet-var-scratch
+  - _self_
+
+# One complete tokenizer epoch followed by one complete VAR epoch on labeled
+# STL-10 at 64px with the resolution-consistent 30-position VAR layout.
+output_dir: outputs/stl10-var-laser-poc-20260916
+data:
+  dataset: stl10
+  root: /workspace/Projects/data/stl10
+  image_size: 64
+  workers: 4
+model:
+  bottleneck: laser
+  patch_nums: [1, 2, 3, 4]
+tokenizer:
+  epochs: 5
+  batch_size: 32
+  accumulation: 4
+  adversarial_start: 10000
+  calibration_images: 0
+  max_matched_rfid: null
+  max_rfid_drift: null
+prior:
+  epochs: 50
+  batch_size: 64
+  accumulation: 4
+  warmup_epochs: 0.1
+evaluation:
+  batch_size: 32
+  reconstruction_images: 256
+  full_reconstruction_images: 512
+  validation_images: 512
+  preview_samples: 128
+  full_samples: 512
+  every_epochs: 5
+  full_every_epochs: 25
+  fid_reference: null
+  adm_python: null
+  adm_evaluator: null
+  adm_reference: null
+logging:
+  every_steps: 5
+  checkpoint_every_steps: 20
+wandb:
+  id: stl10-var-laser-poc-20260916
+  group: stl10-var-laser-poc-20260916

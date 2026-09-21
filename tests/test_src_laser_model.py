@@ -490,7 +490,7 @@ def test_laser_ddpm_backbone_runs_end_to_end():
     assert model.infer_latent_hw((16, 16)) == (8, 8)
 
 
-def test_laser_unet_alias_selects_ddpm_backbone():
+def test_laser_unet_alias_selects_canonical_rqvae_backbone():
     model = _build_model(
         backbone="unet",
         resolution=16,
@@ -501,7 +501,7 @@ def test_laser_unet_alias_selects_ddpm_backbone():
         patch_based=False,
     )
 
-    assert model.backbone == "ddpm"
+    assert model.backbone == "rqvae"
 
 
 def test_laser_decode_from_tokens_forwards_quantized_decode_args():

@@ -1,0 +1,48 @@
+# @package _global_
+defaults:
+  - imagenet-var-scratch
+  - _self_
+
+output_dir: outputs/celebahq256-var-laser-poc-20260916
+data:
+  dataset: celebahq
+  root: /workspace/Projects/data/celebahq256
+  image_size: 256
+  workers: 4
+model:
+  bottleneck: laser
+  patch_nums: [1, 2, 3, 4, 5, 6, 8, 10, 13, 16]
+tokenizer:
+  epochs: 50
+  batch_size: 32
+  accumulation: 4
+  warmup_steps: 200
+  adversarial_start: 1000
+  evaluation_every_epochs: 5
+  calibration_images: 0
+  max_matched_rfid: 50.0
+  max_rfid_drift: null
+prior:
+  epochs: 50
+  batch_size: 64
+  accumulation: 4
+  warmup_epochs: 1
+evaluation:
+  batch_size: 16
+  reconstruction_images: 512
+  full_reconstruction_images: 2000
+  validation_images: 512
+  preview_samples: 128
+  every_epochs: 5
+  full_every_epochs: 25
+  full_samples: 2000
+  fid_reference: null
+  adm_python: null
+  adm_evaluator: null
+  adm_reference: null
+logging:
+  every_steps: 20
+  checkpoint_every_steps: 200
+wandb:
+  id: celebahq256-var-laser-poc-20260916
+  group: celebahq256-var-laser-poc-20260916

@@ -335,6 +335,7 @@ class DictionaryLearning(nn.Module):
         )
         self._revival_candidate_atoms = None
         self._last_dictionary_update_batch = None
+        self._dictionary_update_microbatches = []
         # Delayed scratch initialization can pool several latent batches before
         # sampling atoms. This is ordinary process state on purpose: a partial
         # initialization window is cheap to rebuild after a restart.
@@ -459,7 +460,7 @@ class DictionaryLearning(nn.Module):
             self.dictionary.grad.copy_(torch.nan_to_num(grad - atoms * radial))
 
     @torch.no_grad()
-    def alternating_dictionary_update_after_step_(self) -> int:
+    def alternating_dictionary_update_after_step_(self, *, optimizer_updated=True) -> int:
         """Update active atoms with accumulated fixed codes after an Adam step.
 
         Each preceding forward caches detached encoder signals and their OMP
@@ -470,6 +471,21 @@ class DictionaryLearning(nn.Module):
         toward those targets together; a global fixed-code reconstruction check
         backtracks the relaxation when cross-atom interactions increase error.
         """
+        # This counter also drives initialization and coefficient curricula in
+        # gradient mode. A skipped optimizer step must not advance any schedule
+        # or leave stale fixed codes queued for a later dictionary update.
+        if self._distributed_is_initialized() and self.dictionary_collective_backend != "ddp_buffer":
+            updates = torch.tensor(int(optimizer_updated), device=self.dictionary.device)
+            self._dictionary_all_reduce_(updates, op=torch.distributed.ReduceOp.SUM)
+            if int(updates) not in (0, torch.distributed.get_world_size()):
+                raise RuntimeError("Ranks disagree on whether the optimizer updated")
+        if not optimizer_updated:
+            self._last_dictionary_update_batch = None
+            self._dictionary_update_microbatches.clear()
+            self._dictionary_update_accumulator.clear()
+            self._last_dictionary_update_accumulated_step_count.zero_()
+            return 0
+        self._dictionary_update_step.add_(1)
         if self.dictionary_update_mode != "alternating_residual":
             return 0
 
@@ -481,7 +497,13 @@ class DictionaryLearning(nn.Module):
 
         batch = self._last_dictionary_update_batch
         self._last_dictionary_update_batch = None
-        self._dictionary_update_step.add_(1)
+        microbatches = self._dictionary_update_microbatches
+        self._dictionary_update_microbatches = []
+        if microbatches:
+            batch = {
+                key: torch.cat([item[key] for item in microbatches], dim=dim)
+                for key, dim in (("signals", 1), ("support", 0), ("values", 0))
+            }
         # When scratch training requests delayed data initialization, do not fit
         # the temporary random dictionary to the encoder's nearly constant
         # initialization-time latents. The dictionary is replaced once the
@@ -625,7 +647,7 @@ class DictionaryLearning(nn.Module):
 
         flat_support = support.reshape(-1)
         flat_values = values.reshape(-1)
-        counts = torch.bincount(flat_support, minlength=self.num_embeddings).to(
+        counts = torch.bincount(flat_support[flat_values != 0], minlength=self.num_embeddings).to(
             device=self.dictionary.device,
             dtype=torch.long,
         )
@@ -776,6 +798,15 @@ class DictionaryLearning(nn.Module):
             )
 
     def _batch_omp_cholesky_with_support(
+        self, signals, dictionary, debug=False, return_prefix_values=False,
+    ):
+        # Respect omp_compute_precision even inside an AMP encoder forward.
+        with torch.autocast(device_type=signals.device.type, enabled=False):
+            return self._batch_omp_cholesky_impl(
+                signals, dictionary, debug, return_prefix_values,
+            )
+
+    def _batch_omp_cholesky_impl(
         self,
         signals,
         dictionary,
@@ -820,13 +851,31 @@ class DictionaryLearning(nn.Module):
         # selected Gram systems conditioned. This avoids large cancelling OMP
         # coefficients without imposing any bound on the coefficients themselves.
         ridge = float(self.omp_ridge)
-        regularized_diagonal = 1.0 + ridge
-        L = torch.full(
-            (num_signals, 1, 1),
-            math.sqrt(regularized_diagonal),
-            device=signals.device,
-            dtype=solve_dtype,
-        )
+        diagonal = gram_matrix.diagonal().to(solve_dtype) + ridge
+        # Gram formation loses precision before triangular solves do. Once a
+        # row needs a stable solve, keep it on that path for later prefixes.
+        pivot_rtol = 64 * torch.finfo(matrix_dtype).eps
+        stable_rows = torch.zeros(num_signals, dtype=torch.bool, device=signals.device)
+        previous_values = signals.new_zeros(num_signals, 0, dtype=solve_dtype)
+        previous_objective = signals.t().double().square().sum(-1)
+
+        def reconstruction_objective(atoms, coefficients):
+            reconstructed = (atoms * coefficients[..., None]).sum(1)
+            error = (signals.t().double() - reconstructed.double()).square().sum(-1)
+            return error + ridge * coefficients.double().square().sum(-1)
+
+        def stable_solve(atoms, targets):
+            # CUDA lstsq only supplies a full-rank solver. SVD also handles
+            # repeated/linearly dependent columns and overcomplete supports.
+            design = atoms.transpose(1, 2).double()
+            u, singular, vh = torch.linalg.svd(design, full_matrices=False)
+            if ridge:
+                inverse = singular / (singular.square() + ridge)
+            else:
+                cutoff = singular[..., :1] * max(design.shape[-2:]) * torch.finfo(solve_dtype).eps
+                inverse = torch.where(singular > cutoff, singular.reciprocal(), 0.)
+            projected = u.transpose(1, 2) @ targets.double().unsqueeze(-1)
+            return (vh.transpose(1, 2) @ (inverse[..., None] * projected)).squeeze(-1).to(solve_dtype)
         support = torch.zeros(num_signals, 0, dtype=torch.long, device=signals.device)
         omega = torch.ones_like(corr_init, dtype=torch.bool)
         coherence_eligible = (
@@ -860,7 +909,11 @@ class DictionaryLearning(nn.Module):
                 )
             expanded_signal_idx = signal_idx.unsqueeze(0).expand(k, num_signals).t()
 
-            if k > 1:
+            candidate_diagonal = diagonal[next_atoms].view(num_signals, 1, 1)
+            if k == 1:
+                stable_rows |= candidate_diagonal.flatten() <= 0
+                L = candidate_diagonal.clamp_min(max(float(self.epsilon), 1e-10)).sqrt()
+            else:
                 prev_support = support[signal_idx, :]
                 new_atoms = next_atoms[expanded_signal_idx[..., :-1]]
                 gram_cross = gram_matrix[prev_support, new_atoms].view(
@@ -873,11 +926,9 @@ class DictionaryLearning(nn.Module):
                     1,
                     k - 1,
                 )
-                bottom_right = (
-                    regularized_diagonal - (w**2).sum(dim=2, keepdim=True)
-                ).clamp_min(
-                    max(float(self.epsilon), 1e-10)
-                ).sqrt()
+                pivot = candidate_diagonal - (w**2).sum(dim=2, keepdim=True)
+                stable_rows |= (~torch.isfinite(pivot) | (pivot <= pivot_rtol * candidate_diagonal)).flatten()
+                bottom_right = pivot.clamp_min(max(float(self.epsilon), 1e-10)).sqrt()
                 zeros = torch.zeros(
                     num_signals,
                     k - 1,
@@ -893,6 +944,10 @@ class DictionaryLearning(nn.Module):
                     dim=1,
                 )
 
+            # Invalid Cholesky factors must never reach a solve, even for rows
+            # whose result will be replaced. Their actual solve uses SVD below.
+            L = torch.where(stable_rows[:, None, None], torch.eye(k, device=L.device, dtype=L.dtype), L)
+
             support = torch.cat([support, next_atoms.unsqueeze(1)], dim=1)
             corr_active = corr_init[expanded_signal_idx, support[signal_idx, :]].view(
                 num_signals,
@@ -900,6 +955,21 @@ class DictionaryLearning(nn.Module):
                 1,
             ).to(dtype=solve_dtype)
             gamma_active = torch.cholesky_solve(corr_active, L).squeeze(-1)
+            atoms = dictionary.t()[support].to(solve_dtype)
+            objective = reconstruction_objective(atoms, gamma_active)
+            tolerance = previous_objective.clamp_min(1.) * (32 * torch.finfo(solve_dtype).eps)
+            stable_rows |= (~torch.isfinite(objective)) | (objective > previous_objective + tolerance)
+            if bool(stable_rows.any()):
+                gamma_active[stable_rows] = stable_solve(atoms[stable_rows], signals.t()[stable_rows])
+                objective = reconstruction_objective(atoms, gamma_active)
+            rejected = (~torch.isfinite(objective)) | (objective > previous_objective + tolerance)
+            # A rejected candidate is an inactive slot (zero coefficient).
+            # Keeping the prior prefix also handles precision loss on casting
+            # a stable double-precision solution back to the training dtype.
+            padded_previous = F.pad(previous_values, (0, 1))
+            gamma_active = torch.where(rejected[:, None], padded_previous, gamma_active)
+            previous_values = gamma_active.clone()
+            previous_objective = reconstruction_objective(atoms, gamma_active)
             gamma[signal_idx.unsqueeze(1), support[signal_idx]] = gamma_active
             if prefix_values is not None:
                 prefix_values.append(gamma_active.clone())
@@ -909,6 +979,11 @@ class DictionaryLearning(nn.Module):
                 gram_matrix[support[signal_idx], :]
             ).squeeze(1)
             corr = corr_init - beta
+            if bool(stable_rows.any()):
+                residual = signals.t()[stable_rows].double() - (
+                    atoms[stable_rows].double() * gamma_active[stable_rows, :, None].double()
+                ).sum(1)
+                corr[stable_rows] = (residual @ dictionary.double()).to(corr.dtype)
 
             if debug:
                 residual_proxy = corr.abs().amax(dim=1).max()
@@ -1259,13 +1334,15 @@ class DictionaryLearning(nn.Module):
         )
 
     @torch.no_grad()
-    def _record_atom_usage_(self, support: torch.Tensor, signals: torch.Tensor) -> None:
+    def _record_atom_usage_(self, support: torch.Tensor, signals: torch.Tensor, values=None) -> None:
         if not self.training or not self.dead_atom_revival:
             return
         if support.numel() == 0:
             return
 
         support_flat = support.detach().reshape(-1).to(torch.long)
+        if values is not None:
+            support_flat = support_flat[values.detach().reshape(-1) != 0]
         counts = torch.bincount(support_flat, minlength=self.num_embeddings).to(
             device=self._atom_usage_window.device,
             dtype=self._atom_usage_window.dtype,
@@ -1418,6 +1495,9 @@ class DictionaryLearning(nn.Module):
             self.num_embeddings,
         )
         if atoms is not None:
+            self._last_dictionary_update_batch = None
+            self._dictionary_update_microbatches.clear()
+            self._dictionary_update_accumulator.clear()
             self.dictionary.copy_(atoms)
             self.normalize_dictionary_()
         self._data_initialized.fill_(True)
@@ -1549,7 +1629,8 @@ class DictionaryLearning(nn.Module):
                 "support": support_flat.detach(),
                 "values": values.detach().reshape(-1, self.sparsity_level),
             }
-        self._record_atom_usage_(support, signals)
+            self._dictionary_update_microbatches.append(self._last_dictionary_update_batch)
+        self._record_atom_usage_(support, signals, values)
 
         # Token-error augmentation.  Corrupting 10% of tokens costs this
         # tokenizer +27.4 rFID where the reference RQ-VAE loses only +1.0: its

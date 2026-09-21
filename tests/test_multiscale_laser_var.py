@@ -82,6 +82,18 @@ def test_sparse_depth_is_causal_and_joint_loss_has_gradients():
         assert p.grad is not None and p.grad.isfinite().all(), name
 
 
+def test_sparse_depth_does_not_expand_spatial_transformer_sequence():
+    q = tokenizer()
+    model = prior(q)
+    expected = sum(p * p for p in q.v_patch_nums)
+    assert model.L == model.spatial_token_length == expected == 14
+    assert model.sparse_pairs_per_image == expected * q.sparsity
+    assert model.categorical_decisions_per_image == expected * q.sparsity * 2
+    # Like original VAR, teacher-forcing inputs omit the first 1x1 scale.
+    codes = q.decompose(torch.randn(2, 4, 3, 3))
+    assert codes['inputs'].shape[1] == expected - q.v_patch_nums[0] ** 2
+
+
 def test_sampling_is_repeatable_and_clears_kv_cache():
     q = tokenizer()
     model = prior(q)

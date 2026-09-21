@@ -367,7 +367,8 @@ def test_alternating_update_uses_fixed_gather_then_broadcast_protocol(monkeypatc
     collective_calls = []
 
     def fake_all_reduce(tensor, op=None):
-        del op
+        if op == torch.distributed.ReduceOp.SUM:
+            tensor.mul_(2)
         collective_calls.append(("reduce", tuple(tensor.shape)))
 
     def fake_all_gather(outputs, tensor, group=None):
@@ -401,6 +402,7 @@ def test_alternating_update_uses_fixed_gather_then_broadcast_protocol(monkeypatc
 
     assert updated == 1
     assert collective_calls == [
+        ("reduce", ()),
         ("reduce", ()),
         ("gather", (1,)),
         ("gather", (2, 1)),

@@ -58,6 +58,7 @@ from rqvae.img_datasets.lsun import LSUNClass
 from rqvae.models.rqvae.rqvae import RQVAE
 from src.data.imagenet_labels import class_names_for_dataset
 from src.orthogonal_sparse_codec import ordered_support_basis
+from src.stochastic_compound import BANK_FORMAT, sample_compound_bank
 
 
 FACE_DATASETS = frozenset({"celebahq", "ffhq"})
@@ -1067,6 +1068,16 @@ class SparseTokenCacheDataset(torch.utils.data.Dataset):
         self.meta = payload["meta"]
         self.prefix_coeffs = payload.get("prefix_coeffs")
         self.include_prefix_coeffs = bool(include_prefix_coeffs)
+        self.stochastic_bank = self.meta.get("format") == BANK_FORMAT
+        if self.stochastic_bank:
+            if self.include_prefix_coeffs:
+                raise ValueError("stochastic bank does not store separate causal prefixes")
+            if self.atoms.shape != self.coeffs.shape or self.atoms.ndim != 5:
+                raise ValueError("stochastic bank requires equal [N,H,W,V,K] tensors")
+            if self.atoms.shape[-2] != self.meta.get("variants_per_site"):
+                raise ValueError("stochastic bank variant count mismatch")
+            if self.atoms.shape[-2] < 2 or self.coeffs.dtype != torch.float32:
+                raise ValueError("stochastic bank needs multiple variants and FP32 coefficients")
         if not (len(self.atoms) == len(self.coeffs) == len(self.labels)):
             raise ValueError("token-cache tensors have inconsistent row counts")
         if self.include_prefix_coeffs:
@@ -4792,6 +4803,11 @@ def main(argv=None):
                 ),
             )
         cache_meta = dataset.meta
+        if cache_meta.get("format") == BANK_FORMAT and not (
+            args.compound_tokens and args.compound_pair_autoregressive
+            and not args.orthogonal_compound_tokens and not args.causal_prefix_state
+        ):
+            raise ValueError("stochastic compound banks require full raw-pair autoregression")
         expected_cache = {
             "dataset": args.dataset,
             "num_atoms": args.num_atoms,
@@ -4959,6 +4975,7 @@ def main(argv=None):
                    attn_resolutions=((16,) if args.dataset in FACE_DATASETS else (8,)),
                    coeff_scales=args.coeff_scales,
                    soft_target_physical=args.coeff_scales is not None,
+                   clamp_coeffs=(True if cache_meta is None else cache_meta.get("clip_coefficients", True)),
                    coeff_bin_centers=cached_bin_centers,
                    sparsity_level=args.sparsity_level,
                    coefficient_patterns=coefficient_patterns,
@@ -5000,6 +5017,9 @@ def main(argv=None):
         should_load = args.distributed_backend != "fsdp" or rank() == 0
         if should_load:
             raw_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+            if cache_meta is not None and cache_meta.get("format") == BANK_FORMAT:
+                if raw_payload["config"].get("compound_cache_identity") != cache_meta["bank_identity"]:
+                    raise ValueError("resume checkpoint uses a different stochastic compound cache")
             unwrapped_model.load_state_dict(raw_payload["state_dict"], strict=True)
             resume_optimizer_state = raw_payload["optimizer"]
             resume_payload = {
@@ -5151,6 +5171,12 @@ def main(argv=None):
         **vars(args),
         "world_size": world,
         "accumulation_steps": accumulation,
+        "stochastic_atom_supports": cache_meta is not None and cache_meta.get("format") == BANK_FORMAT,
+        "compound_cache_variants_per_site": 1 if cache_meta is None else cache_meta.get("variants_per_site", 1),
+        "compound_cache_identity": None if cache_meta is None else cache_meta.get("bank_identity"),
+        "coeff_bin_centers": cached_bin_centers,
+        "coefficient_clipping": aux.clamp_coeffs,
+        "coefficient_quantizer": None if cache_meta is None else cache_meta.get("coefficient_quantizer", "uniform"),
     }
     use_wandb = rank() == 0 and args.wandb_mode != "disabled"
     wb = None
@@ -5681,6 +5707,10 @@ def main(argv=None):
                     or args.causal_prefix_pattern_tokens
                 ):
                     coeffs = coeffs.to(device, non_blocking=True)
+                    if cache_meta.get("format") == BANK_FORMAT:
+                        # Select all four pairs together at each spatial site.
+                        # CUDA RNG is checkpointed; worker prefetch cannot alter draws.
+                        atoms, coeffs, bank_choices = sample_compound_bank(atoms, coeffs)
                 labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
                 if num_condition_classes == 1:
                     labels.zero_()
