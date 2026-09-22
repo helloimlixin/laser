@@ -1,0 +1,126 @@
+stage: stage2
+backend: compound_var
+pipeline: false
+output_dir: /workspace/Projects/laser/outputs/ffhq256-fid-consistency-20260922
+seed: 0
+resume: false
+smoke_steps: 0
+data:
+  root: /tmp/laser-ffhq256-data
+  manifests: outputs/imagenet-scaled-rq-stage2-20260913
+  workers: 4
+  image_size: 256
+  dataset: ffhq
+model:
+  pretrained_vae: null
+  channels: 32
+  atoms: 4096
+  sparsity: 2
+  coefficient_bins: 257
+  vae_width: 160
+  depth: 16
+  patch_nums:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  initialization: scratch
+  bottleneck: laser
+  coefficient_range_decay: 0.99
+  residual_scale_positions: null
+tokenizer:
+  epochs: 50
+  batch_size: 64
+  accumulation: 1
+  lr: 0.0001
+  dictionary_lr: 0.0001
+  adversarial_weight: 0.5
+  adversarial_start: 1000
+  calibration_images: 0
+  max_matched_rfid: 50.0
+  max_rfid_drift: null
+  warmup_steps: 200
+  adaptive_adversarial: true
+  evaluation_every_epochs: 1
+  init_discriminator: false
+  select_best: true
+prior:
+  epochs: 100
+  batch_size: 128
+  accumulation: 1
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 1
+  final_lr_ratio: 0.1
+  cfg: 0.0
+  top_k: 250
+  top_p: 1.0
+evaluation:
+  batch_size: 64
+  reconstruction_images: 10000
+  full_reconstruction_images: 10000
+  validation_images: 512
+  preview_samples: 64
+  every_epochs: 10
+  full_every_epochs: 10
+  full_samples: 50000
+  fid_reference: null
+  adm_python: null
+  adm_evaluator: null
+  adm_reference: null
+  fid_reference_images: 10000
+  grid_columns: 8
+  selection_protocol: matched_train_50k
+  rq_fid_reference: /workspace/Projects/laser/outputs/ffhq256-fid-consistency-20260922/references/laser-train-lanczos.npz
+  rq_fid_reference_sha256: e2eb3396c6a9b7c80d61422580524260cddc802017c195d00f3ac93c29c053ef
+  fid_reference_manifest: /workspace/Projects/laser/outputs/ffhq256-fid-consistency-20260922/references/laser-train-lanczos.json
+logging:
+  every_steps: 20
+  checkpoint_every_steps: 200
+wandb:
+  entity: helloimlixin-rutgers
+  project: laser
+  id: ffhq256-var341-matched-fid50k-20260922
+  mode: online
+  group: ffhq256-var341-scratch-20260921
+execution:
+  cudnn_benchmark: true
+  channels_last: false
+  lpips_channels_last: true
+  cache_reconstruction_reference: true
+  checkpoint_dir: /tmp/laser-var-checkpoints/ffhq256-var341-stage2-continue100-20260922/train
+  wandb_dir: /tmp/laser-var-wandb/ffhq256-var341-matched-fid50k-20260922
+  media_dir: /workspace/Projects/laser/outputs/ffhq256-fid-consistency-20260922/evaluate-epoch100
+  upload_checkpoints: true
+  upload_every_epochs: 10
+  publish_provenance: true
+  upload_dataset: true
+  dataset_artifact: ffhq256-var341-scratch-20260921-images
+  preflight_checkpoint_dir: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/prior-preflight
+  token_cache_dir: /tmp/laser-var-token-cache/ffhq256-var341-scratch-20260921
+  allow_layout_change: false
+  allow_cache_transition: false
+  allow_epoch_extension: true
+compound:
+  mode: evaluate-best
+  tokenizer_checkpoint: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/tokenizer-selected.pt
+  local_width: 256
+  dropout: 0.1
+  atom_loss_weight: 1.5
+  coefficient_top_p: 1.0
+  preflight_steps: 100
+  upload_checkpoints: true
+  scale_loss_weights:
+  - 1.0
+  - 8.0
+  - 4.0
+  - 2.0
+  - 1.0
+defaults:
+- _self_
+sampling:
+  atom_temperature: 0.6
+  coefficient_temperature: 1.0
+  coefficient_top_p: 1.0
+generation_checkpoint: /workspace/Projects/laser/outputs/ffhq256-fid-consistency-20260922/checkpoints/prior-best-fid.pt

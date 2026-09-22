@@ -1,0 +1,37 @@
+# @package _global_
+defaults:
+  - celebahq256-var-laser-poc
+  - _self_
+
+backend: compound_var
+stage: stage2
+pipeline: false
+output_dir: /workspace/Projects/laser/outputs/celebahq256-var-compound-20260921
+prior:
+  batch_size: 128
+  accumulation: 1
+  epochs: 50
+  top_k: 250
+  top_p: 1.0
+evaluation:
+  every_epochs: 5
+  validation_images: 512
+  full_samples: 2000
+compound:
+  mode: train
+  tokenizer_checkpoint: /workspace/Projects/laser/outputs/celebahq256-var-laser-poc-20260916/tokenizer-last.pt
+  local_width: 256
+  dropout: 0.1
+  atom_loss_weight: 1.5
+  coefficient_top_p: 1.0
+  preflight_steps: 100
+  upload_checkpoints: true
+execution:
+  checkpoint_dir: /tmp/laser-var-checkpoints/celebahq256-var-compound-20260921/train
+  wandb_dir: /tmp/laser-var-wandb/celebahq256-var-compound-20260921
+  allow_layout_change: true
+  token_cache_dir: /tmp/laser-var-token-cache/celebahq256-var-compound-20260921
+  allow_cache_transition: true
+wandb:
+  id: celebahq256-var-stochastic-compound-20260921
+  group: celebahq256-var-compound-20260921

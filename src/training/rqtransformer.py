@@ -2414,15 +2414,17 @@ class CompoundLaserRQTransformer(RQTransformer):
         return self.compound_pair_embeddings(model_aux, atoms, coeff_ids)
 
     def embed_depth_with_model_aux(self, packed, model_aux):
-        """Use causal support history inside one OMP site.
+        """Construct the history representation inside one OMP site.
 
-        ``encode_sparse_components`` stores coefficients after the final OMP
-        least-squares solve.  A coefficient attached to an early atom therefore
-        depends on atoms selected later in the same site.  Feeding those final
-        values to the depth head leaks future support information during teacher
-        forcing.  Atom identities are causal, while completed earlier spatial
-        sites can still use the full pair embedding through
-        ``embed_with_model_aux``.
+        Full-pair autoregression includes the final OMP coefficients of earlier
+        pairs. This is a valid chain-rule factorization even though the encoder
+        solves those coefficients jointly: generation samples each earlier
+        coefficient before predicting later atoms. The caller shifts the input
+        so the current and future pairs remain hidden.
+
+        The other modes instead use support-only history or an explicitly
+        supplied prefix reconstruction. Completed earlier spatial sites use
+        full pair embeddings in every mode.
         """
         atoms, coeff_ids = self.unpack(packed)
         if self.pair_autoregressive:
@@ -3686,11 +3688,24 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 compound_depth_specific_coeff_heads=False,
                 compound_causal_prefix_state=False,
                 compound_pair_autoregressive=False,
+                coefficient_history_layers=0,
+                coefficient_history_width=512,
                 support_first_patterns=False, causal_prefix_patterns=False,
                 coefficient_pattern_vocab_size=None,
                 prefix_pattern_vocab_sizes=None,
                 sparsity_level=2,
                 model_preset="imagenet-1400m"):
+    if coefficient_history_layers < 0:
+        raise ValueError("coefficient history layer count must be nonnegative")
+    if coefficient_history_layers and (
+        not compound or not compound_pair_autoregressive or orthogonal_compound
+        or levelwise_var or compound_causal_prefix_state or compound_geometry_head
+        or coefficient_history_width <= 0 or coefficient_history_width % 8
+    ):
+        raise ValueError(
+            "coefficient history requires plain full-pair compound mode, no "
+            "prefix/geometry head, and a positive width divisible by eight"
+        )
     if (compound or orthogonal_compound) and (
         support_first_patterns or causal_prefix_patterns
     ):
@@ -3806,7 +3821,7 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
             OrthogonalCompoundLaserRQTransformer
             if orthogonal_compound else CompoundLaserRQTransformer
         )
-        return compound_class(
+        model = compound_class(
             RQTransformerConfig.create(cfg), num_atoms=num_atoms,
             coeff_vocab_size=coeff_vocab_size,
             refiner_layers=compound_refiner_layers,
@@ -3825,6 +3840,13 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 ),
             } if orthogonal_compound else {}),
         )
+        if coefficient_history_layers:
+            from src.training.compound_history import attach_coefficient_history_decoder
+            attach_coefficient_history_decoder(
+                model, width=coefficient_history_width,
+                layers=coefficient_history_layers,
+            )
+        return model
     return LaserRQTransformer(RQTransformerConfig.create(cfg), num_atoms=num_atoms)
 
 
@@ -4258,6 +4280,14 @@ def build_parser():
             "(atom, coefficient) pairs; this gives the full discrete chain "
             "rule without a learned prefix-state surrogate"
         ),
+    )
+    p.add_argument(
+        "--coefficient-history-layers", type=int, default=0,
+        help="Add a causal coefficient history residual; zero preserves the original architecture",
+    )
+    p.add_argument(
+        "--coefficient-history-width", type=int, default=512,
+        help="Width of the optional coefficient history decoder, divisible by eight",
     )
     p.add_argument(
         "--orthogonal-compound-tokens",
@@ -4997,6 +5027,8 @@ def main(argv=None):
         compound_depth_specific_coeff_heads=args.compound_depth_specific_coeff_heads,
         compound_causal_prefix_state=args.causal_prefix_state,
         compound_pair_autoregressive=args.compound_pair_autoregressive,
+        coefficient_history_layers=args.coefficient_history_layers,
+        coefficient_history_width=args.coefficient_history_width,
         support_first_patterns=args.support_first_pattern_tokens,
         causal_prefix_patterns=args.causal_prefix_pattern_tokens,
         coefficient_pattern_vocab_size=coefficient_pattern_vocab_size,

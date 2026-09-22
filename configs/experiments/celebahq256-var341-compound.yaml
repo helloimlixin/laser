@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - celebahq256-var-compound
+  - _self_
+
+output_dir: /workspace/Projects/laser/outputs/celebahq256-var341-compound-20260921
+model:
+  patch_nums: [1, 2, 4, 8, 16]
+  residual_scale_positions: [0.0, 0.1111111111111111, 0.3333333333333333, 0.6666666666666666, 1.0]
+compound:
+  tokenizer_checkpoint: /workspace/Projects/laser/outputs/celebahq256-var341-compound-20260921/tokenizer-selected.pt
+execution:
+  checkpoint_dir: /tmp/laser-var-checkpoints/celebahq256-var341-compound-20260921/train
+  preflight_checkpoint_dir: /tmp/laser-var-checkpoints/celebahq256-var341-compound-20260921/prior-preflight
+  wandb_dir: /tmp/laser-var-wandb/celebahq256-var341-compound-20260921/train
+  token_cache_dir: /tmp/laser-var-token-cache/celebahq256-var341-compound-20260921
+  allow_layout_change: false
+  allow_cache_transition: false
+evaluation:
+  batch_size: 64
+wandb:
+  id: celebahq256-var341-stochastic-compound-20260921
+  group: celebahq256-var341-compound-20260921

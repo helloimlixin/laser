@@ -1,0 +1,102 @@
+# @package _global_
+stage: stage1
+backend: var_laser
+pipeline: false
+output_dir: /workspace/Projects/laser/outputs/ffhq256-var341-tokenized-scratch-20260922/tokenizer
+seed: 0
+resume: true
+smoke_steps: 0
+data:
+  root: /tmp/laser-ffhq256-data
+  manifests: outputs/imagenet-scaled-rq-stage2-20260913
+  workers: 4
+  image_size: 256
+  dataset: ffhq
+model:
+  pretrained_vae: null
+  channels: 32
+  atoms: 4096
+  sparsity: 2
+  coefficient_bins: 257
+  vae_width: 160
+  depth: 16
+  patch_nums:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  initialization: scratch
+  bottleneck: laser
+  coefficient_range_decay: 0.99
+  residual_scale_positions: null
+  tokenized_sparse_policy:
+    version: compound-hard-token-v1
+    atom_temperature_ratio: 0.0001
+    coefficient_temperature_ratio: 2.5e-05
+tokenizer:
+  epochs: 50
+  batch_size: 64
+  accumulation: 1
+  lr: 0.0001
+  dictionary_lr: 0.0001
+  adversarial_weight: 0.5
+  adversarial_start: 1000
+  calibration_images: 0
+  max_matched_rfid: 50.0
+  max_rfid_drift: null
+  warmup_steps: 200
+  adaptive_adversarial: true
+  evaluation_every_epochs: 1
+  init_discriminator: false
+  select_best: true
+prior:
+  epochs: 50
+  batch_size: 128
+  accumulation: 1
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 1
+  final_lr_ratio: 0.1
+  cfg: 0.0
+  top_k: 250
+  top_p: 1.0
+evaluation:
+  batch_size: 64
+  reconstruction_images: 10000
+  full_reconstruction_images: 10000
+  validation_images: 512
+  preview_samples: 64
+  every_epochs: 5
+  full_every_epochs: 25
+  full_samples: 2000
+  fid_reference: null
+  adm_python: null
+  adm_evaluator: null
+  adm_reference: null
+  fid_reference_images: 10000
+  grid_columns: 8
+logging:
+  every_steps: 10
+  checkpoint_every_steps: 200
+wandb:
+  entity: helloimlixin-rutgers
+  project: laser
+  id: ffhq256-var341-tokenized-scratch-20260922-stage1
+  mode: online
+  group: ffhq256-var341-tokenized-scratch-20260922
+execution:
+  cudnn_benchmark: true
+  channels_last: false
+  lpips_channels_last: true
+  cache_reconstruction_reference: true
+  checkpoint_dir: /tmp/laser-var-checkpoints/ffhq256-var341-tokenized-scratch-20260922/tokenizer
+  wandb_dir: /tmp/laser-var-wandb/ffhq256-var341-tokenized-scratch-20260922/tokenizer
+  media_dir: /tmp/laser-var-media/ffhq256-var341-tokenized-scratch-20260922/tokenizer
+  upload_checkpoints: true
+  upload_every_epochs: 5
+  publish_provenance: true
+  upload_dataset: false
+  dataset_artifact: ffhq256-var341-scratch-20260921-images
+defaults:
+- _self_

@@ -50,11 +50,13 @@ class MultiScaleLaser(nn.Module):
         self.coefficient_bins = int(coefficient_bins)
         self.beta, self.omp_chunk_size = beta, int(omp_chunk_size)
         self.coefficient_range_decay = None
+        self.tokenized_sparse_policy = None
         self.dictionary = DictionaryLearning(
             num_embeddings=atoms, embedding_dim=channels, sparsity_level=sparsity,
             omp_ridge=1e-5, omp_max_support_coherence=.999,
             dictionary_collective_backend="default")
         self.quant_resi = quant_resi
+        self.residual_scale_positions = None
         self.register_buffer("coefficient_max", torch.full((len(patch_nums),), float(coefficient_max)))
         self.register_buffer("companding", torch.tensor(10.))
 
@@ -78,13 +80,31 @@ class MultiScaleLaser(nn.Module):
         x = vectors.transpose(1, 2).reshape(vectors.shape[0], self.Cvae, pn, pn)
         if pn != final:
             x = F.interpolate(x, (final, final), mode="bicubic", align_corners=False)
-        return self.quant_resi[scale / (len(self.v_patch_nums) - 1)](x) if self.quant_resi is not None else x
+        position = (scale / (len(self.v_patch_nums) - 1) if self.residual_scale_positions is None
+                    else self.residual_scale_positions[scale])
+        return self.quant_resi[position](x) if self.quant_resi is not None else x
 
     def next_input(self, accumulated, scale):
         pn = self.v_patch_nums[scale]
         return F.interpolate(accumulated, (pn, pn), mode="area").flatten(2).transpose(1, 2)
 
+    @torch.no_grad()
+    def update_coefficient_range(self, values, scale, *, calibrate=False):
+        if calibrate:
+            bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1)
+            self.coefficient_max[scale].copy_(torch.maximum(self.coefficient_max[scale], bound))
+        elif self.training and self.coefficient_range_decay is not None:
+            bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1) * 1.2
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(bound, op=torch.distributed.ReduceOp.MAX)
+            decay = self.coefficient_range_decay
+            self.coefficient_max[scale].mul_(decay).add_(bound * (1-decay))
+
     def decompose(self, latent, *, calibrate=False):
+        if self.tokenized_sparse_policy is not None:
+            from .sparse_token_codec import decompose_sparse_tokens
+            return decompose_sparse_tokens(self, latent, stochastic=self.training and not calibrate,
+                update_ranges=self.training, calibrate=calibrate, include_probabilities=False)
         with torch.autocast(device_type=latent.device.type, enabled=False):
             z = latent.float()
             if z.shape[1:] != (self.Cvae, self.v_patch_nums[-1], self.v_patch_nums[-1]):
@@ -104,18 +124,7 @@ class MultiScaleLaser(nn.Module):
                              for chunk in signals.split(self.omp_chunk_size)]
                     atoms = torch.cat([p[0] for p in pairs])
                     values = torch.cat([p[1] for p in pairs])
-                    if calibrate:
-                        bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1)
-                        self.coefficient_max[scale].copy_(torch.maximum(self.coefficient_max[scale], bound))
-                    elif self.training and self.coefficient_range_decay is not None:
-                        # A scratch encoder's latent scale changes while learning.
-                        # Track training-only ranges, synchronized across ranks;
-                        # evaluation and the frozen prior never update these bins.
-                        bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1) * 1.2
-                        if torch.distributed.is_initialized():
-                            torch.distributed.all_reduce(bound, op=torch.distributed.ReduceOp.MAX)
-                        decay = self.coefficient_range_decay
-                        self.coefficient_max[scale].mul_(decay).add_(bound * (1-decay))
+                    self.update_coefficient_range(values, scale, calibrate=calibrate)
                     clipping.append((values.abs() > self.coefficient_max[scale]).float().mean())
                     coefficients = self.coefficient_ids(values, scale)
                 atoms = atoms.reshape(z.shape[0], pn * pn, self.sparsity)
@@ -133,8 +142,9 @@ class MultiScaleLaser(nn.Module):
     def forward(self, latent, ret_usages=False):
         result = self.decompose(latent)
         self.last_atom_ids = result['atoms'].detach()
+        self.last_coefficient_ids = result['coefficients'].detach()
         self.last_clip_fraction = result['clip_fraction'].detach()
-        straight_through = latent.float() + (result["latent"] - latent.float()).detach()
+        straight_through = result["latent"].detach() + (latent.float() - latent.float().detach())
         return straight_through, None, result["loss"]
 
     def from_codes(self, atoms, coefficients):

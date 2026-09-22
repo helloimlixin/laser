@@ -1,0 +1,61 @@
+# @package _global_
+defaults:
+  - celebahq256-var-laser-poc
+  - _self_
+
+backend: var_laser
+stage: stage1
+pipeline: false
+output_dir: /workspace/Projects/laser/outputs/ffhq256-var341-scratch-20260921/tokenizer
+data:
+  dataset: ffhq
+  root: /tmp/laser-ffhq256-data
+  image_size: 256
+  workers: 4
+model:
+  initialization: scratch
+  pretrained_vae: null
+  patch_nums: [1, 2, 4, 8, 16]
+  residual_scale_positions: null
+tokenizer:
+  epochs: 50
+  batch_size: 64
+  accumulation: 1
+  lr: 0.0001
+  dictionary_lr: 0.0001
+  warmup_steps: 200
+  adversarial_start: 1000
+  init_discriminator: false
+  evaluation_every_epochs: 1
+  select_best: true
+prior:
+  epochs: 50
+  batch_size: 128
+  accumulation: 1
+  cfg: 0.0
+  top_k: 250
+  top_p: 1.0
+evaluation:
+  batch_size: 64
+  reconstruction_images: 10000
+  full_reconstruction_images: 10000
+  fid_reference_images: 10000
+  preview_samples: 64
+  grid_columns: 8
+execution:
+  cudnn_benchmark: true
+  channels_last: false
+  lpips_channels_last: true
+  cache_reconstruction_reference: true
+  checkpoint_dir: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/tokenizer
+  wandb_dir: /tmp/laser-var-wandb/ffhq256-var341-scratch-20260921/tokenizer
+  media_dir: /tmp/laser-var-media/ffhq256-var341-scratch-20260921/tokenizer
+  upload_checkpoints: true
+  upload_every_epochs: 5
+  publish_provenance: true
+  upload_dataset: true
+  dataset_artifact: ffhq256-var341-scratch-20260921-images
+wandb:
+  id: ffhq256-var341-tokenizer-scratch-20260921
+  group: ffhq256-var341-scratch-20260921
+  mode: online

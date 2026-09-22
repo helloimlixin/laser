@@ -1,0 +1,34 @@
+# @package _global_
+defaults:
+  - ffhq256-var341-tokenizer
+  - _self_
+
+backend: compound_var
+stage: stage2
+output_dir: /workspace/Projects/laser/outputs/ffhq256-var341-scratch-20260921
+prior:
+  epochs: 75
+evaluation:
+  rq_fid_reference: /tmp/laser-rqvae-reference/ffhq_256_train.npz
+  rq_fid_reference_sha256: 7f8f54ad5eee50c5b1fc1583e9d65c5a46652c3d60ba031965c9f46c9f2fa12b
+  rq_baseline_checkpoint: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/history/epoch050/prior-best-fid.pt
+compound:
+  mode: train
+  tokenizer_checkpoint: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/tokenizer-selected.pt
+  local_width: 256
+  dropout: 0.1
+  atom_loss_weight: 1.5
+  coefficient_top_p: 1.0
+  preflight_steps: 100
+  upload_checkpoints: true
+execution:
+  checkpoint_dir: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/train
+  preflight_checkpoint_dir: /tmp/laser-var-checkpoints/ffhq256-var341-scratch-20260921/prior-preflight
+  wandb_dir: /tmp/laser-var-wandb/ffhq256-var341-scratch-20260921/train
+  media_dir: /tmp/laser-var-media/ffhq256-var341-scratch-20260921/train
+  token_cache_dir: /tmp/laser-var-token-cache/ffhq256-var341-scratch-20260921
+  allow_layout_change: false
+  allow_cache_transition: false
+  allow_epoch_extension: true
+wandb:
+  id: ffhq256-var341-stochastic-compound-scratch-20260921

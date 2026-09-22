@@ -27,10 +27,13 @@ from torchvision.transforms import InterpolationMode
 from torchvision.utils import save_image
 
 from src.models.multiscale_laser_var import LaserVQVAE, LaserVAR, VQVAE, UPSTREAM, UPSTREAM_REVISION
-from src.models.scratch_var import build_scratch_tokenizer, build_scratch_prior, state_digest, shared_prior_digest
+from src.models.scratch_var import build_scratch_tokenizer, build_scratch_prior, load_finetune_tokenizer, state_digest, shared_prior_digest
 from src.models.discriminator import NLayerDiscriminator
 from src.models.rqvae.lpips import LPIPS
 from src.original_rq_training import FeatureMoments, atomic_json, file_sha256
+from src.training.checkpoint_upload import CheckpointUploader
+from src.training.wandb_checkpoints import publish_checkpoint_bundle
+from src.training.distributed_failure import fatal_worker_error
 from utils.lr_control import lr_wd_annealing
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -93,6 +96,9 @@ class HFSquareImages(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, index):
+        # Fixed evaluation subsets commonly contain numpy.int64 indices;
+        # Hugging Face Dataset accepts Python integers only.
+        index = int(index)
         item = self.dataset[index]
         image, label = (item['image'], item['label']) if self.huggingface else item
         with torch.random.fork_rng(devices=[]):
@@ -119,7 +125,10 @@ def save_checkpoint(path, model, optimizer, state, extras=None):
         payload = dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
                        progress=state, rng=gathered, **(extras or {}))
         tmp = path.with_suffix(".tmp")
-        torch.save(payload, tmp)
+        # A file object gives every archive the same internal prefix. Identical
+        # last/best states then deduplicate in W&B despite different filenames.
+        with tmp.open('wb') as stream:
+            torch.save(payload, stream)
         tmp.replace(path)
     dist.barrier()
 
@@ -137,21 +146,25 @@ class Experiment:
         self.cfg = cfg
         self.initialization = cfg.model.get('initialization', 'pretrained')
         self.kind = cfg.model.get('bottleneck', 'laser')
-        if self.initialization not in ('scratch', 'pretrained'):
-            raise ValueError('Model initialization must be explicitly scratch or pretrained')
+        if self.initialization not in ('scratch', 'pretrained', 'finetune'):
+            raise ValueError('Model initialization must be explicitly scratch, pretrained, or finetune')
         if self.initialization == 'scratch' and cfg.model.pretrained_vae is not None:
             raise ValueError('Scratch training forbids pretrained_vae')
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
+        self.checkpoints = Path(cfg.get('execution', {}).get('checkpoint_dir', str(self.out)))
+        self.checkpoints.mkdir(parents=True, exist_ok=True)
+        self.initial_discriminator = None
+        self.finetune_receipt = {}
         dataset_name = str(cfg.data.get('dataset', 'imagenet')).lower()
         data_root = Path(cfg.data.root).expanduser().resolve()
         if dataset_name == 'imagenet':
             data_fingerprints = {
                 f'{split}_manifest_sha256': file_sha256(Path(cfg.data.manifests)/f'{split}-manifest.json')
                 for split in ('train', 'val')}
-        elif dataset_name in {'stl10', 'celebahq'}:
+        elif dataset_name in {'stl10', 'celebahq', 'ffhq'}:
             hf_path = data_root / 'hf'
             if hf_path.is_dir():
                 files = sorted(hf_path.rglob('*.arrow'))
@@ -160,7 +173,7 @@ class Experiment:
                 data_fingerprints = {f'arrow_{i:02d}_sha256': file_sha256(p) for i, p in enumerate(files)}
             else:
                 if dataset_name != 'stl10':
-                    raise FileNotFoundError(f'Cached CelebA-HQ dataset not found: {hf_path}')
+                    raise FileNotFoundError(f'Cached {dataset_name} dataset not found: {hf_path}')
                 binary = data_root / 'stl10_binary'
                 data_fingerprints = {
                     name.replace('.', '_') + '_sha256': file_sha256(binary / name)
@@ -196,13 +209,16 @@ class Experiment:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stop", True))
         self.run = None
+        self.uploader = None
         if self.rank == 0:
             import wandb
             self.run = wandb.init(entity=cfg.wandb.entity, project=cfg.wandb.project,
                                  id=cfg.wandb.id, name=cfg.wandb.id,
-                                 resume="allow", mode=cfg.wandb.mode, dir=str(self.out),
+                                 resume="allow", mode=cfg.wandb.mode,
+                                 dir=str(cfg.get('execution', {}).get('wandb_dir', self.out)),
                                  group=cfg.wandb.get('group'),
                                  config=OmegaConf.to_container(cfg, resolve=True))
+            self.run.config.update(OmegaConf.to_container(cfg, resolve=True), allow_val_change=True)
             OmegaConf.save(cfg, self.out / "resolved-config.yaml", resolve=True)
         self.global_log_step = 0
         if dataset_name == 'imagenet':
@@ -220,13 +236,23 @@ class Experiment:
             self.train = HFSquareImages(data_root, 'train', True, cfg.seed, cfg.data.image_size, True)
             self.val = HFSquareImages(data_root, 'test', False, cfg.seed, cfg.data.image_size, True)
         else:
-            self.num_classes = 2
+            self.num_classes = 1 if dataset_name == 'ffhq' else 2
             self.train = HFSquareImages(data_root, 'train', True, cfg.seed,
                                         cfg.data.image_size, resize_crop=False)
             self.val = HFSquareImages(data_root, 'validation', False, cfg.seed,
                                       cfg.data.image_size, resize_crop=False)
-        if self.initialization == 'scratch':
+        if self.initialization in ('scratch', 'finetune'):
             self.vae = build_scratch_tokenizer(cfg.model, cfg.seed)
+            if self.initialization == 'finetune':
+                source = Path(cfg.model.init_tokenizer_checkpoint)
+                payload = torch.load(source, map_location='cpu', weights_only=False, mmap=True)
+                indices = load_finetune_tokenizer(self.vae, payload, cfg.model.source_patch_nums)
+                if cfg.tokenizer.get('init_discriminator', False):
+                    self.initial_discriminator = payload['discriminator']
+                self.finetune_receipt = dict(source_checkpoint=str(source), source_checkpoint_sha256=file_sha256(source),
+                    source_progress=payload.get('progress'), retained_source_scale_indices=indices,
+                    optimizer='fresh', discriminator='source weights' if self.initial_discriminator else 'fresh')
+                del payload
         else:
             self.vae = LaserVQVAE(pretrained=cfg.model.pretrained_vae, sparsity=cfg.model.sparsity,
                                  coefficient_bins=cfg.model.coefficient_bins, ch=cfg.model.vae_width,
@@ -234,13 +260,16 @@ class Experiment:
                                  patch_nums=tuple(cfg.model.patch_nums))
         self.initialization_receipt = dict(
             initialization=self.initialization, bottleneck=self.kind, seed=int(cfg.seed),
-            pretrained_checkpoint=None if self.initialization == 'scratch' else str(cfg.model.pretrained_vae),
+            pretrained_checkpoint=str(cfg.model.pretrained_vae) if self.initialization == 'pretrained' else None,
+            **self.finetune_receipt,
             model_sha256=state_digest(self.vae), shared_backbone_sha256=state_digest(self.vae, shared_only=True))
+        if self.kind == 'laser' and self.vae.quantize.tokenized_sparse_policy is not None:
+            self.initialization_receipt['tokenized_sparse_policy'] = self.vae.quantize.tokenized_sparse_policy
         if self.rank == 0:
             revision = subprocess.check_output(["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True).strip()
             if revision != UPSTREAM_REVISION:
                 raise ValueError(f"Expected FoundationVision/VAR revision {UPSTREAM_REVISION}, got {revision}")
-            files = [ROOT / "src/models/multiscale_laser_var.py", ROOT/'src/models/scratch_var.py', Path(__file__), ROOT / "src/models/dictionary_learner.py"]
+            files = [ROOT / "src/models/multiscale_laser_var.py", ROOT/'src/models/scratch_var.py', Path(__file__), ROOT / "src/models/dictionary_learner.py", ROOT / "src/models/sparse_token_codec.py"]
             sites = sum(p*p for p in cfg.model.patch_nums)
             bits = sites*math.ceil(math.log2(cfg.model.atoms))
             if self.kind == 'laser':
@@ -254,9 +283,31 @@ class Experiment:
                 spatial_sites=sum(p*p for p in cfg.model.patch_nums),
                 sparse_pairs=sites*cfg.model.sparsity if self.kind=='laser' else None,
                 nominal_bits_per_image=bits, **self.initialization_receipt,
-                protocol="Fresh 288px resize/256px random crop every training epoch; no horizontal flip, official sorted WNIDs"))
-            if self.initialization == 'scratch' and not (self.out/'initial-tokenizer.pt').exists():
-                torch.save(dict(model=self.vae.state_dict(), **self.initialization_receipt), self.out/'initial-tokenizer.pt')
+                protocol=("256px square images; seeded horizontal flip during training; fixed validation images"
+                          if dataset_name in {'celebahq', 'ffhq'} else
+                          "Fresh resize/crop during training; deterministic validation views")))
+            if self.initialization == 'scratch' and not (self.checkpoints/'initial-tokenizer.pt').exists():
+                torch.save(dict(model=self.vae.state_dict(), **self.initialization_receipt), self.checkpoints/'initial-tokenizer.pt')
+            execution = cfg.get('execution', {})
+            if not cfg.smoke_steps and execution.get('publish_provenance', False):
+                artifact = wandb.Artifact(cfg.wandb.id + '-provenance', type='experiment')
+                for path in (self.out/'provenance.json', self.out/'resolved-config.yaml',
+                             self.out/'training-contract.json', data_root/'manifest.json'):
+                    artifact.add_file(str(path), name=path.name)
+                artifact.add_dir(str(ROOT/'src'), name='source/src')
+                artifact.add_dir(str(ROOT/'configs'), name='source/configs')
+                artifact.add_dir(str(ROOT/'scripts/tools'), name='source/scripts/tools')
+                self.run.log_artifact(artifact)
+            if not cfg.smoke_steps and execution.get('upload_dataset', False):
+                artifact = wandb.Artifact(execution.dataset_artifact, type='dataset',
+                    metadata=dict(dataset=dataset_name, classes=self.num_classes,
+                                  train_images=len(self.train), validation_images=len(self.val),
+                                  manifest_sha256=file_sha256(data_root/'manifest.json')))
+                for path in sorted((data_root/'hf').rglob('*')):
+                    if path.is_file():
+                        artifact.add_file(str(path), name=str(path.relative_to(data_root)), policy='immutable')
+                artifact.add_file(str(data_root/'manifest.json'), name='manifest.json', policy='immutable')
+                self.run.log_artifact(artifact)
         self.vae.to(self.device)
         self.inception = None
 
@@ -270,6 +321,30 @@ class Experiment:
 
     def amp(self):
         return torch.autocast("cuda", dtype=torch.bfloat16)
+
+    def media_path(self, name):
+        directory = Path(self.cfg.get('execution', {}).get('media_dir', str(self.out)))
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory/name
+
+    def upload_tokenizer(self, epoch, close=False):
+        execution = self.cfg.get('execution', {})
+        if self.rank != 0 or self.cfg.smoke_steps or not execution.get('upload_checkpoints', False):
+            return
+        if self.uploader is None:
+            staging = Path('/tmp/laser-checkpoint-transfers') / self.cfg.wandb.id
+            self.uploader = CheckpointUploader(staging, self._upload_tokenizer_snapshot)
+        self.uploader.submit([self.checkpoints/'tokenizer-last.pt', self.checkpoints/'tokenizer-best.pt'], epoch)
+        if close:
+            self.log('checkpoint_upload_wait', epoch=epoch)
+            self.uploader.close()
+
+    def _upload_tokenizer_snapshot(self, paths, epoch):
+        publish_checkpoint_bundle(self.run, self.cfg.wandb.id + '-checkpoints', paths, epoch,
+            metadata=dict(initialization=self.initialization),
+            extras=[self.out/'resolved-config.yaml', self.out/'provenance.json'],
+            receipt_path=self.out/'checkpoint-upload.json', best_name='tokenizer-best.pt',
+            best_alias='best-rfid')
 
     def record_first_batch(self, phase, images, labels, sampler):
         """Record inputs without consuming random state or changing sample order."""
@@ -313,9 +388,15 @@ class Experiment:
         self.vae.eval()
         if self.inception is None:
             self.inception = get_inception_model().eval().requires_grad_(False).to(self.device)
-        real, fake = FeatureMoments(self.device), FeatureMoments(self.device)
+        # Validation images and the frozen Inception network do not change.
+        # Keep globally reduced real moments per subset size within this run.
+        cache_reference = bool(self.cfg.get('execution', {}).get('cache_reconstruction_reference', False))
+        reference_cache = self.__dict__.setdefault('_reconstruction_reference_cache', {})
+        reference = reference_cache.get(int(count)) if cache_reference else None
+        real = FeatureMoments(self.device) if reference is None else None
+        fake = FeatureMoments(self.device)
         baseline = baseline_moments = None
-        if self.initialization != 'scratch' and (epoch == 0 or count == self.cfg.evaluation.full_reconstruction_images):
+        if self.initialization == 'pretrained' and (epoch == 0 or count == self.cfg.evaluation.full_reconstruction_images):
             baseline = VQVAE(vocab_size=self.cfg.model.atoms, z_channels=self.cfg.model.channels,
                              ch=self.cfg.model.vae_width, v_patch_nums=tuple(self.cfg.model.patch_nums), test_mode=True).to(self.device)
             baseline.load_state_dict(torch.load(self.cfg.model.pretrained_vae, map_location='cpu', weights_only=True))
@@ -329,7 +410,8 @@ class Experiment:
             recon = recon.float().clamp(-1, 1)
             original = ((images + 1) * .5).clamp(0, 1)
             decoded = (recon + 1) * .5
-            real.update(self.inception(original))
+            if real is not None:
+                real.update(self.inception(original))
             fake.update(self.inception(decoded))
             if baseline is not None:
                 with self.amp():
@@ -338,16 +420,18 @@ class Experiment:
             mse = (decoded - original).square().mean((1, 2, 3))
             totals += torch.stack((mse.sum(), (-10 * mse.clamp_min(1e-12).log10()).sum(), mse.new_tensor(len(images))))
             if batch == 0 and self.rank == 0:
-                path = self.out / f"reconstruction-epoch{epoch:03d}.png"
+                path = self.media_path(f"reconstruction-epoch{epoch:03d}.png")
                 save_image(torch.stack((original[:8], decoded[:8]), 1).flatten(0, 1), path, nrow=8)
                 if self.run:
                     import wandb
                     self.run.log({"tokenizer/reconstructions": wandb.Image(str(path))})
-        r, f = real.finish(), fake.finish()
+        r, f = (real.finish() if real is not None else reference), fake.finish()
         base = baseline_moments.finish() if baseline_moments else None
         dist.all_reduce(totals)
         if r[0] != count or f[0] != count:
             raise RuntimeError("Reconstruction evaluation count mismatch")
+        if cache_reference:
+            reference_cache[int(count)] = r
         quality = [None]
         if self.rank == 0:
             score = float(frechet_distance(r[1], r[2], f[1], f[2]))
@@ -366,14 +450,23 @@ class Experiment:
 
     def train_tokenizer(self):
         cfg = self.cfg.tokenizer
-        path = self.out / "tokenizer-last.pt"
+        path = self.checkpoints / "tokenizer-last.pt"
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.cfg.seed+101)
             disc = NLayerDiscriminator(norm="group")
+        if self.initial_discriminator is not None:
+            disc.load_state_dict(self.initial_discriminator, strict=True)
+            self.initial_discriminator = None
         if self.rank == 0:
             atomic_json(self.out/'discriminator-initialization.json', dict(seed=int(self.cfg.seed+101), sha256=state_digest(disc)))
         disc.to(self.device)
         perceptual = LPIPS().eval().requires_grad_(False).to(self.device)
+        channels_last = bool(self.cfg.get('execution', {}).get('channels_last', False))
+        if channels_last:
+            for module in (self.vae, disc, perceptual):
+                module.to(memory_format=torch.channels_last)
+        elif self.cfg.get('execution', {}).get('lpips_channels_last', False):
+            perceptual.to(memory_format=torch.channels_last)
         dictionary_params = list((self.vae.quantize.dictionary if self.kind=='laser' else self.vae.quantize.embedding).parameters())
         dictionary_ids = {id(p) for p in dictionary_params}
         optimizer = torch.optim.AdamW([
@@ -389,7 +482,14 @@ class Experiment:
             disc.load_state_dict(checkpoint["discriminator"])
             d_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
             state = checkpoint["progress"]
-        elif self.initialization != 'scratch':
+            if channels_last:
+                # Resume Adam moments in the same layout as their parameters.
+                for opt in (optimizer, d_optimizer):
+                    for values in opt.state.values():
+                        for key, value in values.items():
+                            if torch.is_tensor(value) and value.ndim == 4:
+                                values[key] = value.contiguous(memory_format=torch.channels_last)
+        elif self.initialization == 'pretrained':
             self.calibrate()
         model = DDP(self.vae, device_ids=[self.device.index], broadcast_buffers=False)
         d_model = DDP(disc, device_ids=[self.device.index], broadcast_buffers=False)
@@ -397,7 +497,12 @@ class Experiment:
             restore_rng(checkpoint)
             del checkpoint
         if not path.exists() and not self.cfg.smoke_steps:
-            self.reconstruction(0, self.cfg.evaluation.reconstruction_images)
+            with torch.random.fork_rng(devices=[self.device.index]):
+                self.reconstruction(0, self.cfg.evaluation.reconstruction_images)
+        best_path = self.checkpoints / 'tokenizer-best.pt'
+        best_record_path = self.out / 'tokenizer-best.json'
+        best_quality = (json.loads(best_record_path.read_text())['matched_rfid']
+                        if best_record_path.exists() else float('inf'))
         for epoch in range(state["epoch"], cfg.epochs):
             self.train.epoch = epoch
             sampler = DistributedSampler(self.train, self.world, self.rank, shuffle=True, seed=self.cfg.seed)
@@ -419,7 +524,8 @@ class Experiment:
                     break
                 if state['step'] == 0 and batch == 0:
                     self.record_first_batch('tokenizer', images, labels, sampler)
-                images = images.to(self.device, non_blocking=True)
+                images = images.to(self.device, non_blocking=True,
+                    memory_format=torch.channels_last if channels_last else torch.contiguous_format)
                 sync = (batch + 1) % cfg.accumulation == 0
                 adversarial = state["step"] >= cfg.adversarial_start
                 warmup = int(cfg.get('warmup_steps', 0))
@@ -485,20 +591,52 @@ class Experiment:
                 tick = time.monotonic()
                 metrics.zero_()
                 stop = self.stop_requested() or (self.cfg.smoke_steps and state["step"] >= self.cfg.smoke_steps)
+                upload_failed = torch.tensor(int(self.rank == 0 and self.uploader is not None and
+                                                self.uploader.error is not None), device=self.device)
+                dist.all_reduce(upload_failed, op=dist.ReduceOp.MAX)
+                if upload_failed.item():
+                    save_checkpoint(path, self.vae, optimizer, state, dict(discriminator=disc.state_dict(), discriminator_optimizer=d_optimizer.state_dict(), initialization=self.initialization_receipt))
+                    raise RuntimeError('Tokenizer upload failed; full training state saved')
                 if state["step"] == 1 or state["step"] % self.cfg.logging.checkpoint_every_steps == 0 or stop:
                     save_checkpoint(path, self.vae, optimizer, state, dict(discriminator=disc.state_dict(), discriminator_optimizer=d_optimizer.state_dict(), initialization=self.initialization_receipt))
                 if stop:
+                    self.upload_tokenizer(epoch, close=True)
+                    if self.cfg.smoke_steps and self.rank == 0:
+                        atomic_json(self.out / 'tokenizer-smoke-complete.json', dict(progress=state, ranks=self.world))
                     return bool(self.cfg.smoke_steps)
             state.update(epoch=epoch+1, batch=0)
             save_checkpoint(path, self.vae, optimizer, state, dict(discriminator=disc.state_dict(), discriminator_optimizer=d_optimizer.state_dict(), initialization=self.initialization_receipt))
             evaluation_every = int(cfg.get('evaluation_every_epochs', 1))
             if (epoch + 1) % evaluation_every == 0 or epoch + 1 == cfg.epochs:
-                self.reconstruction(epoch+1, self.cfg.evaluation.reconstruction_images)
-        quality = self.reconstruction(cfg.epochs, self.cfg.evaluation.full_reconstruction_images)
+                with torch.random.fork_rng(devices=[self.device.index]):
+                    quality = self.reconstruction(epoch+1, self.cfg.evaluation.reconstruction_images)
+                if cfg.get('select_best', False) and quality['matched_rfid'] < best_quality:
+                    best_quality = quality['matched_rfid']
+                    if self.rank == 0:
+                        import shutil
+                        temporary = best_path.with_suffix('.tmp')
+                        shutil.copyfile(path, temporary)
+                        temporary.replace(best_path)
+                        atomic_json(best_record_path, dict(epoch=epoch+1, count=self.cfg.evaluation.reconstruction_images, **quality))
+                    dist.barrier()
+            upload_every = int(self.cfg.get('execution', {}).get('upload_every_epochs', 5))
+            if epoch == 0 or (epoch + 1) % upload_every == 0:
+                self.upload_tokenizer(epoch + 1)
+        selected_epoch = cfg.epochs
+        if cfg.get('select_best', False):
+            selected = torch.load(best_path, map_location='cpu', weights_only=False, mmap=True)
+            self.vae.load_state_dict(selected['model'], strict=True)
+            selected_epoch = selected['progress']['epoch']
+            del selected
+        quality = self.reconstruction(selected_epoch, self.cfg.evaluation.full_reconstruction_images)
+        self.upload_tokenizer(cfg.epochs, close=True)
         if ((cfg.get('max_matched_rfid') is not None and quality['matched_rfid'] > cfg.max_matched_rfid) or
                 (cfg.get('max_rfid_drift') is not None and quality.get('rfid_drift',0) > cfg.max_rfid_drift)):
             self.log('tokenizer_quality_rejected', **quality)
             return False
+        if self.rank == 0:
+            atomic_json(self.out / 'tokenizer-complete.json', dict(progress=state, last_quality=quality,
+                        selected_checkpoint=str(best_path if cfg.get('select_best', False) else path)))
         return True
 
     @torch.no_grad()
@@ -521,6 +659,9 @@ class Experiment:
         self.log("validation", epoch=epoch, joint_nll=(total[0]/total[3]).item(),
                  atom_nll=(total[1]/total[3]).item(), coefficient_nll=(total[2]/total[3]).item())
 
+    def sampling_options(self):
+        return {}
+
     @torch.no_grad()
     def generate(self, model, epoch, count, official=False):
         model.eval()
@@ -540,7 +681,7 @@ class Experiment:
             labels = torch.tensor([i % self.num_classes for i in selected], device=self.device)
             with self.amp():
                 latent = model.sample(labels, cfg=cfg.cfg, top_k=cfg.top_k, top_p=cfg.top_p,
-                                      seed=73000+self.rank+begin*self.world)
+                                      seed=73000+self.rank+begin*self.world, **self.sampling_options())
                 images = latent.float() if self.kind=='vq' else (self.vae.fhat_to_img(latent).float()+1)*.5
             # Evaluate precisely the uint8 images exported for the official toolkit.
             pixels = images.mul(255).round().clamp(0,255).byte()
@@ -548,8 +689,9 @@ class Experiment:
             if values is not None:
                 values[selected] = pixels.permute(0,2,3,1).cpu().numpy()
             if begin == 0 and self.rank == 0:
-                path = self.out / f"generated-epoch{epoch:03d}.png"
-                save_image(images, path, nrow=4)
+                path = self.media_path(f"generated-epoch{epoch:03d}.png")
+                save_image(images[:self.cfg.evaluation.preview_samples], path,
+                           nrow=int(self.cfg.evaluation.get('grid_columns', 8)))
                 if self.run:
                     import wandb
                     self.run.log({"prior/samples": wandb.Image(str(path))})
@@ -559,23 +701,28 @@ class Experiment:
         result = moments.finish()
         if result[0] != count:
             raise RuntimeError("Generated sample count mismatch")
+        # FeatureMoments.finish performs distributed collectives. Every rank
+        # must compute its real-image shard, including nonzero ranks.
+        if not self.cfg.evaluation.get('fid_reference'):
+            real = FeatureMoments(self.device)
+            reference_count = min(int(self.cfg.evaluation.get('fid_reference_images', count)), len(self.val))
+            real_indices = np.random.default_rng(2718).permutation(len(self.val))[:reference_count][self.rank::self.world]
+            for real_images, _ in self.loader(self.val, self.cfg.evaluation.batch_size, real_indices):
+                real.update(self.inception(((real_images.to(self.device).float()+1)*.5).clamp(0,1)))
+            real_count, ref_mu, ref_sigma = real.finish()
+            if real_count != reference_count:
+                raise RuntimeError('Real-image FID count mismatch')
         if self.rank == 0:
             if self.cfg.evaluation.get('fid_reference'):
                 ref = np.load(self.cfg.evaluation.fid_reference)
                 ref_mu, ref_sigma = ref['mu'], ref['sigma']
-            else:
-                real = FeatureMoments(self.device)
-                real_indices = np.random.default_rng(2718).permutation(len(self.val))[:count][self.rank::self.world]
-                for real_images, _ in self.loader(self.val, self.cfg.evaluation.batch_size, real_indices):
-                    real.update(self.inception(((real_images.to(self.device).float()+1)*.5).clamp(0,1)))
-                real_count, ref_mu, ref_sigma = real.finish()
-                if real_count != count:
-                    raise RuntimeError('Real-image FID count mismatch')
             score = float(frechet_distance(result[1], result[2], ref_mu, ref_sigma))
             self.log("generation", epoch=epoch, count=count, pytorch_fid_diagnostic=score)
             atomic_json(self.out / f"generation-epoch{epoch:03d}-{count}.json",
                         dict(epoch=epoch, count=count, pytorch_fid_diagnostic=score,
                              cfg=cfg.cfg, top_k=cfg.top_k, top_p=cfg.top_p,
+                             sampling_options=self.sampling_options(),
+                             real_reference_images=(reference_count if not self.cfg.evaluation.get('fid_reference') else None),
                              note="Official ADM metrics are required for published VAR comparison"))
             if official:
                 # zip stores the .npy without loading the 9.2GB sample array into RAM.
@@ -719,6 +866,9 @@ def run(cfg):
     random.seed(cfg.seed + dist.get_rank())
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = bool(cfg.get('execution', {}).get('cudnn_benchmark', False))
+    if torch.backends.cudnn.benchmark:
+        torch.backends.cudnn.benchmark_limit = 8
     experiment = None
     try:
         experiment = Experiment(cfg)
@@ -735,11 +885,6 @@ def run(cfg):
         if experiment.run:
             experiment.run.finish()
     except BaseException as exc:
-        out=Path(cfg.output_dir)
-        out.mkdir(parents=True,exist_ok=True)
-        atomic_json(out/f"failure-rank{dist.get_rank()}.json", dict(type=type(exc).__name__,message=str(exc),time=time.time()))
-        if dist.get_rank() == 0:
-            atomic_json(out/'status.json', dict(phase='failed', type=type(exc).__name__, message=str(exc),time=time.time()))
-        raise
+        fatal_worker_error(exc, cfg.output_dir, dist.get_rank())
     finally:
         dist.destroy_process_group()
