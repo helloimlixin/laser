@@ -1,4 +1,10 @@
-The user selected the earlier **32,769-token integer model**, with coefficients
+This run was superseded by the user's fresh compound-token request. The
+single-GPU continuation stopped cleanly at epoch 54 / step 3,348; full latest
+and best-FID checkpoints are verified online in selected-checkpoints artifact
+v35. The replacement has full event history in both prediction decoders and is
+documented in [the fresh compound run](church-compound-full-history-2026-09-22.md).
+
+The user originally selected the **32,769-token integer model**, with coefficients
 in raw latent units and no coefficient clipping. Stage 2 starts from random
 weights and a fresh optimizer. The selected three-epoch Church LASER encoder,
 decoder, dictionary, and fitted coefficient levels remain frozen.
@@ -100,3 +106,82 @@ newer latest/best snapshots continue uploading asynchronously while training run
 The epoch-1 grid was independently downloaded from W&B and matched byte for byte.
 The exact full-training FID statistics and data-protocol record are also uploaded
 and hash-verified. `launch-complete.json` collects these verification receipts.
+
+## Continuation after the machine restart
+
+On September 22, the user requested continuation of this same run to epoch 300.
+The original run had stopped cleanly at epoch **37**, optimizer step **2,294**,
+with FID50k **12.2526825**. Its best FID was **11.8709209** at epoch **36**.
+Both full checkpoints were recovered from the committed W&B artifact
+`church-laser-integer32769-raw-noclip-scratch300-h200x5-20260922-selected-checkpoints:v17`.
+Each is 4,643,146,466 bytes; both downloads match the remote MD5 manifest.
+
+The replacement machine exposes one H200. The continuation executes the five
+original rank batches sequentially, retaining each rank's saved Python, NumPy,
+CPU Torch and CUDA Torch random state. Per-microbatch losses retain the original
+`5 * local_count / global_count` weighting through BF16 backpropagation. The
+accumulated FP32 parameter gradients are then divided by five before one
+gradient clipping and AdamW update. Global batch 2,048, the final batch of 1,299, all 126,227
+training images, 62 updates per epoch, and the 18,600-step cosine schedule are
+preserved. There is no optimizer or learning-rate reset. Floating-point gradient
+summation order differs from NCCL, so continuation is not claimed to reproduce
+the five-GPU trajectory bit for bit.
+
+FID still evaluates 50,000 generated images each epoch against the same verified
+reference, running the five original seed streams of 10,000 images sequentially.
+The sampling settings, generation batch size, frozen tokenizer, full-vocabulary
+soft targets, and raw coefficient representation are unchanged.
+
+The continuation driver is
+`outputs/church-integer-raw-rqrecipe300-20260922/resume_single_gpu.py`.
+Its supervisor, logs, receipts, samples, and durable checkpoints are in
+`outputs/church-integer-raw-rqrecipe300-20260922/continuation-h200x1-20260922-fixed/`.
+`serial-rank-validation.json` records full-epoch coverage, exact original rank
+batches, independent CUDA dropout streams, and exact BF16-backward/FP32-gradient
+and fused-AdamW equivalence checks for both full and final batches. Startup verifies every data hash and the restored
+model, optimizer tensors, scheduler and checkpoint metadata.
+
+The detached supervisor targets epoch 300 and retries failed workers from full
+epoch checkpoints. Each epoch queues its latest and best-FID full states into
+the same W&B `selected-checkpoints` artifact collection, with `latest`, `last`
+and `best-fid` aliases and remote size/MD5 verification. Completion is recorded
+only after epoch 300, step 18,600, and successful final checkpoint upload.
+`status.json`, `supervisor-status.json`, and `checkpoint-upload.json` distinguish
+current training progress from the latest checkpoint verified online.
+
+The initial single-GPU attempt divided the loss by five before BF16 backward.
+Although mathematically equivalent in real arithmetic, a CUDA audit measured
+0.354% relative gradient error from BF16 rounding. Its epoch-38 FID was 17.27108.
+That attempt is retained under `continuation-h200x1-20260922/` and marked
+superseded. The corrected continuation reloads epoch 37 and delays division until
+FP32 gradients are accumulated; the CUDA comparison now has zero gradient and
+optimizer-update discrepancy. This establishes the precision correction, not
+that it explains the entire observed FID change. Replaying the old epoch-37 first
+FID batch also reproduces its original grid within one pixel intensity level
+(mean absolute difference 0.0000743 on the 0–255 scale).
+The subsequent full 50,000-image replay scored **12.252683786**, versus the
+original **12.252682509**, an absolute difference of **0.000001277**. This verifies
+the single-GPU sampling and released FID evaluator against the original result;
+the audit is recorded in `baseline-fid-audit.json` and the W&B run summary.
+The corrected epoch 38 scored **16.0398914**, so it did not replace the epoch-36
+best of **11.8709209**. The precision correction improved the observed result
+relative to the superseded attempt but did not restore the previous FID; the
+original 300-epoch schedule continues with best-checkpoint retention.
+The corrected latest and best states are committed in W&B artifact
+`church-laser-integer32769-raw-noclip-scratch300-h200x5-20260922-selected-checkpoints:v19`,
+with remote size/MD5 verification. It contains epoch-38 `last.pt` (4,643,147,170
+bytes) and epoch-36 `best-fid-01.pt` (4,643,146,466 bytes). The `latest`, `last`,
+and `best-fid` aliases point to this bundle. The first attempt's `v18` is marked
+superseded and retained for diagnosis. Training advanced into epoch 39.
+
+The separate `monitor.py` watchdog checks progress and uploads every 30 seconds.
+It requests recovery after 15 minutes without progress or 45 minutes without a
+pending checkpoint upload completing, allows an epoch boundary for graceful
+shutdown, and restarts an unexpectedly lost supervisor. Interventions are bounded
+to avoid an uncontrolled restart loop. Its live record is `monitor-status.json`;
+it exits successfully only after epoch 300 and the final verified online upload.
+It also publishes a heartbeat, current epoch, online-checkpoint epoch, and worker
+health to the W&B run file `monitor-status.json` every five minutes, mirrored in
+summary fields under `monitor/`. The dedicated file persists independently of
+the training client's summary updates. The full baseline audit is also stored
+in the W&B run file `baseline-fid-audit.json`.
