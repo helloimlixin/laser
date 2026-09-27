@@ -196,3 +196,6 @@ Data/
 # Local experiment artifacts (run outputs, checkpoints, logs) — never tracked
 runs/
 notebooks/work_dirs/
+
+# Downloaded Inception weights used for FID evaluation
+pt_inception-2015-12-05-6726825d.pth
