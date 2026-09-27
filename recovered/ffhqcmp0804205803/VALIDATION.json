@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "source_sha256": "9ba1b49b4e5e339f0076bebee6fbac5629f6c391601de467019a3723c9d3e33f",
+  "provenance_hash_checks": 34,
+  "compiled_python_files": 21,
+  "trainer_import": "passed",
+  "trainer_help_exit_code": 0,
+  "resolved_local_modules": {
+    "src.models.rqtransformer.transformers": "/scratch/xl598/Projects/laser/recovered/ffhqcmp0804205803/src/models/rqtransformer/transformers.py",
+    "src.models.rqtransformer.attentions": "/scratch/xl598/Projects/laser/recovered/ffhqcmp0804205803/src/models/rqtransformer/attentions.py",
+    "src.models.rqtransformer.configs": "/scratch/xl598/Projects/laser/recovered/ffhqcmp0804205803/src/models/rqtransformer/configs.py",
+    "src.models.rqvae.rqvae": "/scratch/xl598/Projects/laser/recovered/ffhqcmp0804205803/src/models/rqvae/rqvae.py",
+    "src.models.interfaces": "/scratch/xl598/Projects/laser/recovered/ffhqcmp0804205803/src/models/interfaces.py",
+    "src.data.imagenet_labels": "/scratch/xl598/Projects/laser/recovered/ffhqcmp0804205803/src/data/imagenet_labels.py"
+  },
+  "python": "3.11.9",
+  "torch": "2.4.1+cu121",
+  "gpu_training_tested": false,
+  "final_evaluation_reproduced": false
+}

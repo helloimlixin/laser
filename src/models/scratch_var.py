@@ -69,7 +69,7 @@ def build_scratch_tokenizer(config, seed):
     if kind not in ('vq', 'laser'):
         raise ValueError('Choose vq or laser for the matched scratch experiment')
     with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(int(seed))
+        torch.random.default_generator.manual_seed(int(seed))
         options = dict(channels=int(config.channels), atoms=int(config.atoms),
                        ch=int(config.vae_width), patch_nums=tuple(config.patch_nums))
         if kind == 'vq':
@@ -148,10 +148,10 @@ def build_scratch_prior(tokenizer, kind, seed, depth=16, width=None, heads=None,
     # Explicitly isolate both constructor randomness (position parameters) and
     # weight initialization, so the shared VAR body and atom head match exactly.
     with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(int(seed))
+        torch.random.default_generator.manual_seed(int(seed))
         cls = VQVAR if kind == 'vq' else LaserVAR
         model = cls(tokenizer, depth=depth, width=width, heads=heads, num_classes=num_classes)
-        torch.manual_seed(int(seed)+1)
+        torch.random.default_generator.manual_seed(int(seed)+1)
         model.init_weights(init_adaln=.5, init_adaln_gamma=1e-3, init_head=.02, init_std=-1.)
         if kind == 'laser':
             model.coefficient_head.weight.data.mul_(.02)
@@ -160,7 +160,7 @@ def build_scratch_prior(tokenizer, kind, seed, depth=16, width=None, heads=None,
 
 def shared_prior_digest(model):
     digest = hashlib.sha256()
-    extra = ('coefficient_head.', 'atom_context.', 'depth_context.', 'depth_embedding.')
+    extra = ('coefficient_head.', 'coefficient_query.', 'atom_context.', 'depth_context.', 'depth_embedding.')
     for name, value in model.state_dict().items():
         if name.startswith(extra):
             continue

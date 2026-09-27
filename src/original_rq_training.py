@@ -267,6 +267,9 @@ def evaluate_validation(model, tokenizer, latents, device, rank):
     with torch.random.fork_rng(devices=[device.index]):
         torch.manual_seed(61000 + rank)
         for z in latents.split(32):
+            # Extra training ranks may be idle in the original two-stream evaluator.
+            if len(z) == 0:
+                continue
             z = z.to(device)
             targets, codes = tokenizer.quantizer.get_soft_codes(z, temp=.5, stochastic=True)
             logits = model(codes, model_aux=tokenizer, amp=True).float()

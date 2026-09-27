@@ -1,0 +1,104 @@
+dataset:
+  type: imagenet
+  transforms:
+    type: imagenet256x256
+
+# Match KakaoBrain's ImageNet RQ-VAE 8x8x4 recipe while changing only the
+# bottleneck to a two-step, shared A16,384 LASER dictionary.
+arch:
+  type: rq-vae
+  code_hier: 1
+  hparams:
+    bottleneck_type: laser
+    embed_dim: 256
+    n_embed: 16384
+    latent_shape: [8, 8, 256]
+    code_shape: [8, 8, 2]
+    shared_codebook: true
+    decay: 0.99
+    restart_unused_codes: true
+    use_padding_idx: false
+    masked_dropout: 0
+    patch_based: false
+    patch_size: 1
+    patch_stride: 1
+    sparsity_level: 2
+    # Average cumulative reconstructions at depths 1 and 2, matching the
+    # original RQ objective before its outer latent weight is applied.
+    commitment_cost: 1.0
+    progressive_loss: true
+    dict_learning_rate: 4.0e-5
+    data_init_from_first_batch: true
+    dead_atom_revival: true
+    dead_atom_revival_interval: 500
+    dead_atom_revival_max_fraction: 0.05
+    dead_atom_revival_noise: 0.05
+    dead_atom_revival_patience: 5
+    loss_type: mse
+    latent_loss_weight: 0.25
+  ddconfig:
+    double_z: false
+    z_channels: 256
+    resolution: 256
+    in_channels: 3
+    out_ch: 3
+    ch: 128
+    ch_mult: [1, 1, 2, 2, 4, 4]
+    num_res_blocks: 2
+    attn_resolutions: [8]
+    dropout: 0.0
+  checkpointing: true
+
+optimizer:
+  type: adam
+  init_lr: 4.0e-5
+  weight_decay: 0.0
+  betas: [0.5, 0.9]
+  warmup:
+    epoch: 0.5
+    multiplier: 1
+    buffer_epoch: 0
+    min_lr: 4.0e-5
+    mode: fix
+    start_from_zero: true
+
+experiment:
+  # The launcher overrides the local batch to 16 on 8 GPUs or 8 on 16 GPUs.
+  batch_size: 16
+  total_batch_size: 128
+  epochs: 10
+  save_ckpt_freq: 1
+  test_freq: 1
+  compute_rfid: true
+  rfid_backend: original-rqvae
+  recovery_ckpt_freq_steps: 250
+  amp: false
+
+gan:
+  disc:
+    arch:
+      in_channels: 3
+      num_layers: 2
+      use_actnorm: false
+      ndf: 64
+      spectral_norm: false
+    # Explicitly mirror the generator optimizer. Upstream obtains these same
+    # values through config inheritance.
+    optimizer:
+      type: adam
+      init_lr: 4.0e-5
+      weight_decay: 0.0
+      betas: [0.5, 0.9]
+      warmup:
+        epoch: 0.5
+        multiplier: 1
+        buffer_epoch: 0
+        min_lr: 4.0e-5
+        mode: fix
+        start_from_zero: true
+  loss:
+    disc_loss: hinge
+    gen_loss: vanilla
+    disc_weight: 0.75
+    perceptual_weight: 1.0
+    disc_start: 0

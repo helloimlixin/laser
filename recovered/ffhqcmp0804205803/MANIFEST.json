@@ -1,0 +1,227 @@
+{
+  "run": "helloimlixin-rutgers/laser/ffhqcmp0804205803",
+  "recovered_at_utc": "2026-09-27T14:15:54.774450+00:00",
+  "uploaded_source_sha256": "9ba1b49b4e5e339f0076bebee6fbac5629f6c391601de467019a3723c9d3e33f",
+  "archived_source_match": true,
+  "dependency_git_commit": "449ed552a9de7ac4cdcd155690eea02c933ca57e",
+  "dependency_provenance": "Reconstructed from pre-run repository commit; dependencies were not uploaded by this W&B run and metadata has no git commit.",
+  "final_evaluator_recovered": false,
+  "files": [
+    {
+      "path": "scripts/train_official_rqtransformer_laser_stage2.py",
+      "bytes": 86642,
+      "sha256": "9ba1b49b4e5e339f0076bebee6fbac5629f6c391601de467019a3723c9d3e33f",
+      "origin": "wandb:helloimlixin-rutgers/laser/ffhqcmp0804205803/code/scripts/train_official_rqtransformer_laser_stage2.py"
+    },
+    {
+      "path": "records/config.yaml",
+      "bytes": 5839,
+      "sha256": "37ea3dd5d6d1b390472e58edab722551e4ab143e35d1a06dfe774cc459756d55",
+      "origin": "wandb:helloimlixin-rutgers/laser/ffhqcmp0804205803/config.yaml"
+    },
+    {
+      "path": "records/requirements.txt",
+      "bytes": 3338,
+      "sha256": "838dbb14f33ab0ad4bf3b12dbeafeb1f162de0cdb3efcff15a314309cc8e7dae",
+      "origin": "wandb:helloimlixin-rutgers/laser/ffhqcmp0804205803/requirements.txt"
+    },
+    {
+      "path": "records/wandb-metadata.json",
+      "bytes": 10570,
+      "sha256": "ac8fe5c90159024eeb522c554b3640d9173ee306cf5a76ddb8aa51570831f9ef",
+      "origin": "wandb:helloimlixin-rutgers/laser/ffhqcmp0804205803/wandb-metadata.json"
+    },
+    {
+      "path": "records/wandb-summary.json",
+      "bytes": 1696,
+      "sha256": "97385b82dca8bd66af4e54e51ab878147052f13dea9008e4842d4503bb6afda0",
+      "origin": "wandb:helloimlixin-rutgers/laser/ffhqcmp0804205803/wandb-summary.json"
+    },
+    {
+      "path": "records/output.log",
+      "bytes": 28053,
+      "sha256": "eeb889b8dfb2b64bc4820e856a812cb80005409d052e87a1f39d59c43cb96393",
+      "origin": "wandb:helloimlixin-rutgers/laser/ffhqcmp0804205803/output.log"
+    },
+    {
+      "path": "records/run.json",
+      "bytes": 4406,
+      "sha256": "b5e5dc68fdd0b1f7e0ce26160dec9f596e167bd6fa0b14b88a7b2d7542c7c98d",
+      "origin": "W&B GraphQL run record"
+    },
+    {
+      "path": "records/launch-args.json",
+      "bytes": 1926,
+      "sha256": "e0d30f0049b526875da9dc84b4fcddff2566a6bc10018d92e9b5614462ec724c",
+      "origin": "W&B wandb-metadata.json args"
+    },
+    {
+      "path": "records/original-command.txt",
+      "bytes": 1613,
+      "sha256": "ab533b9cb9e74b9691d3cf3e31fde8fad9d044157f90b373dea5a2858b9346c8",
+      "origin": "Rendered recorded command; historical paths and run ID"
+    },
+    {
+      "path": "src/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/__init__.py"
+    },
+    {
+      "path": "src/data/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/data/__init__.py"
+    },
+    {
+      "path": "src/data/imagenet_labels.py",
+      "bytes": 2820,
+      "sha256": "4d94abc5c138e392622eb9f0ef013ad2ca44534bff3d4ffc4d5cece1360e6215",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/data/imagenet_labels.py"
+    },
+    {
+      "path": "src/models/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/__init__.py"
+    },
+    {
+      "path": "src/models/interfaces.py",
+      "bytes": 1194,
+      "sha256": "e58e1e4639da48a9baf7ef6d3e76e60c5f58ca88408a05cd49103d29581de35f",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/interfaces.py"
+    },
+    {
+      "path": "src/models/rqtransformer/__init__.py",
+      "bytes": 191,
+      "sha256": "58ff30375e4215a6fae06c7aa6921a98dd19eacbd8b02cc918e74ddaa901ab8d",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqtransformer/__init__.py"
+    },
+    {
+      "path": "src/models/rqtransformer/attentions.py",
+      "bytes": 6471,
+      "sha256": "bdf7ed1de82f8e414d848a0d67609de52e92bca30a198e5e5efba030da3e7974",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqtransformer/attentions.py"
+    },
+    {
+      "path": "src/models/rqtransformer/configs.py",
+      "bytes": 2148,
+      "sha256": "b86750e1a4f1a5712199345ca9158843a276ecee257ff6565f452ce9d2f15cf2",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqtransformer/configs.py"
+    },
+    {
+      "path": "src/models/rqtransformer/primitives.py",
+      "bytes": 5983,
+      "sha256": "7df3e7a69e73593893daf4f9e1a5e8198e8400ffc4b8263d8b66559e5bca660c",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqtransformer/primitives.py"
+    },
+    {
+      "path": "src/models/rqtransformer/transformers.py",
+      "bytes": 16662,
+      "sha256": "b7534588a73248baa74440e5e9ff916da7d9d03386d2c1201a5e4dc96ca5a5ce",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqtransformer/transformers.py"
+    },
+    {
+      "path": "src/models/rqvae/__init__.py",
+      "bytes": 252,
+      "sha256": "1e93dbbe740a0431f621d49cd45d45a9c09dc835fe7b27de05c9629bbb984458",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/__init__.py"
+    },
+    {
+      "path": "src/models/rqvae/discriminator.py",
+      "bytes": 5864,
+      "sha256": "191b3f177d272ff78cbbb6f142a1fcf5bdb5577c9447754247d47d0b0955ff48",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/discriminator.py"
+    },
+    {
+      "path": "src/models/rqvae/gan_loss.py",
+      "bytes": 904,
+      "sha256": "3ea61dcc42d3f8c72a75c1758a3910cc204c35eb5af1e6da1a2ef35c6323c2ab",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/gan_loss.py"
+    },
+    {
+      "path": "src/models/rqvae/layers.py",
+      "bytes": 6480,
+      "sha256": "52cc2a89568aa4a60c0cb04485a2fddadbf07be7d54b591cb9b2a72aef9c9e92",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/layers.py"
+    },
+    {
+      "path": "src/models/rqvae/lpips.py",
+      "bytes": 5700,
+      "sha256": "03a0a4032f1a8efcc87d59293ca705a26582bbd2605e760891d2fce373df6666",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/lpips.py"
+    },
+    {
+      "path": "src/models/rqvae/lpips_utils.py",
+      "bytes": 1506,
+      "sha256": "8222074f53a2cf950fae5218a5f853bf696cec78c4baceb3a32e792a32bd6460",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/lpips_utils.py"
+    },
+    {
+      "path": "src/models/rqvae/modules.py",
+      "bytes": 7855,
+      "sha256": "71333618eebe6969276545a7427906780a652a4d69d54c3975022f0b2279e79f",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/modules.py"
+    },
+    {
+      "path": "src/models/rqvae/quantizations.py",
+      "bytes": 15189,
+      "sha256": "54c4042c442da4fd627f8a58e88b4278a3b2462ee24cf29be3f67f7850e5451c",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/quantizations.py"
+    },
+    {
+      "path": "src/models/rqvae/rqvae.py",
+      "bytes": 5720,
+      "sha256": "968453f61782c2761b1f97fa6749e4f1363cb815b541684a5b47ca398ada8b1f",
+      "origin": "git:449ed552a9de7ac4cdcd155690eea02c933ca57e:src/models/rqvae/rqvae.py"
+    },
+    {
+      "path": "records/local-launch-config.json",
+      "bytes": 2173,
+      "sha256": "cff8423b3f73a250cbd232c498675daa90d93b4b39d4f864c60f5697d0ed3f16",
+      "origin": "local:/scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/stage2/launch_config.json"
+    },
+    {
+      "path": "records/stage1-audit.json",
+      "bytes": 821,
+      "sha256": "d8e67369a167eb6c58d91c65080fbc432e107db12a147b31f7db8bdf6cea6e83",
+      "origin": "local:/scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/stage1_audit.json"
+    },
+    {
+      "path": "records/token-cache-validation.json",
+      "bytes": 753,
+      "sha256": "f0924fbfdfb4d65258771808a3b62b6133980127f580d2619ca129ea79f0d9ab",
+      "origin": "local:/scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/token_cache/ffhq_train_a2048k2_compound_pairs.validation.json"
+    },
+    {
+      "path": "records/final-slurm-output.log",
+      "bytes": 30924,
+      "sha256": "9ea443af8e758c9c11e526e16f0a595eb8ed258fa00be196cec5a85be8515042",
+      "origin": "local:/scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/slurm-60259680.out"
+    },
+    {
+      "path": "reference/submit_ffhq_a2048k2_compound_stage2.sh",
+      "bytes": 10848,
+      "sha256": "4575e08ea155a7c63c6df50ab981c9bfe88584535e8200aa21c1ba633b6b2f6f",
+      "origin": "current workspace reference, not W&B-verified:scripts/submit_ffhq_a2048k2_compound_stage2.sh"
+    },
+    {
+      "path": "reference/build_official_ffhq_token_cache.py",
+      "bytes": 10381,
+      "sha256": "f17173da2f9eaf615eb63a7ef183c278918336f462e7970d91c1eec5ea923ec7",
+      "origin": "current workspace reference, not W&B-verified:scripts/tools/build_official_ffhq_token_cache.py"
+    },
+    {
+      "path": "README.md",
+      "bytes": 5106,
+      "sha256": "ffa98063127015cc9cc08137d3f1c1866b522119faec222d34f08b097ec4f84b",
+      "origin": "Recovery documentation"
+    },
+    {
+      "path": "VALIDATION.json",
+      "bytes": 1166,
+      "sha256": "a57452d9aaf7486a06e9a5bda328fd8b8704e5f275453e5bf90df40a7acad87a",
+      "origin": "Recovery verification in PyTorch container"
+    }
+  ]
+}

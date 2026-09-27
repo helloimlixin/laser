@@ -69,7 +69,7 @@ class CompoundLaserVAR(LaserVAR):
                  dropout=.1, atom_loss_weight=1.5, coefficient_top_p=1., scale_loss_weights=None):
         super().__init__(tokenizer, depth=depth, width=width, heads=heads, num_classes=num_classes)
         q = self._q[0]
-        for name in ('coefficient_head', 'atom_context', 'depth_context', 'depth_embedding'):
+        for name in ('coefficient_head', 'coefficient_query', 'atom_context', 'depth_context', 'depth_embedding'):
             delattr(self, name)
         self.atom_loss_weight = float(atom_loss_weight)
         self.coefficient_top_p = float(coefficient_top_p)

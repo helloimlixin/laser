@@ -1,0 +1,363 @@
+wandb_version: 1
+
+checkpoint:
+  desc: null
+  value: /scratch/xl598/runs/ffhq_celebahq_rqvae_strict_dict_sweep/ffhq-celebahq-rqvae-strict-dict-sweep-20260720_145706/ffhq-a2048-k2/ffhq256-rqvae-laser-8x8-a2048-k2/21072026_110546/best_rfid_slot3_model.pt
+data:
+  desc: null
+  value: /scratch/xl598/Projects/data/ffhq
+dataset:
+  desc: null
+  value: ffhq-flat
+architecture:
+  desc: null
+  value: compound-v4-micro2-rqtransformer-ffhq-350m
+token_cache:
+  desc: null
+  value: /scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/token_cache/ffhq_train_a2048k2_compound_pairs.pt
+resume_checkpoint:
+  desc: null
+  value: null
+output:
+  desc: null
+  value: /scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/stage2
+epochs:
+  desc: null
+  value: 200
+batch_size:
+  desc: null
+  value: 16
+total_batch_size:
+  desc: null
+  value: 128
+num_atoms:
+  desc: null
+  value: 2048
+coeff_vocab_size:
+  desc: null
+  value: 2048
+coeff_max:
+  desc: null
+  value: 3.0
+coeff_scale:
+  desc: null
+  value: 6.4
+coeff_scales:
+  desc: null
+  value:
+  - 36.208333333333336
+  - 8.583333333333334
+stage1_attn_resolutions:
+  desc: null
+  value:
+  - 16
+compound_tokens:
+  desc: null
+  value: true
+compound_refiner_layers:
+  desc: null
+  value: 0
+compound_micro_transformer_layers:
+  desc: null
+  value: 2
+compound_depth_specific_coeff_heads:
+  desc: null
+  value: true
+compound_distribution_geometry:
+  desc: null
+  value: true
+geometry_top_k:
+  desc: null
+  value: 4
+atom_loss_weight:
+  desc: null
+  value: 1.5
+geometry_loss_weight:
+  desc: null
+  value: 0.05
+geometry_start_epoch:
+  desc: null
+  value: 2.0
+geometry_warmup_epochs:
+  desc: null
+  value: 3.0
+atom_temperature:
+  desc: null
+  value: 1.0
+atom_top_k:
+  desc: null
+  value: 250
+atom_top_p:
+  desc: null
+  value: 1.0
+coeff_temperature:
+  desc: null
+  value: 1.0
+coeff_top_p:
+  desc: null
+  value: 0.85
+text_loss_weight:
+  desc: null
+  value: 0.0
+image_loss_weight:
+  desc: null
+  value: 1.0
+lr:
+  desc: null
+  value: 0.0005
+lr_schedule:
+  desc: null
+  value: cosine
+lr_schedule_epochs:
+  desc: null
+  value: 200
+min_lr:
+  desc: null
+  value: 0.0
+lr_warmup_epochs:
+  desc: null
+  value: 0.0
+wandb_project:
+  desc: null
+  value: laser
+wandb_name:
+  desc: null
+  value: ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803
+wandb_id:
+  desc: null
+  value: ffhqcmp0804205803
+fid_num_samples:
+  desc: null
+  value: 50000
+fid_batch_size:
+  desc: null
+  value: 32
+fid_reference_full_dataset:
+  desc: null
+  value: true
+inception_score:
+  desc: null
+  value: false
+fid_every:
+  desc: null
+  value: 5
+save_ckpt_freq:
+  desc: null
+  value: 5
+save_step_freq:
+  desc: null
+  value: 500
+checkpoint_dir:
+  desc: null
+  value: /scratch/xl598/runs/laser/ffhq-official-rqt350m-laser-a2048-k2-compound-8gpu-20260804_205803/stage2/checkpoints
+sample_grid_every:
+  desc: null
+  value: 500
+upload_checkpoints:
+  desc: null
+  value: true
+resume:
+  desc: null
+  value: true
+fid_reference_num_samples:
+  desc: null
+  value: 70000
+stochastic_codes:
+  desc: null
+  value: true
+temp:
+  desc: null
+  value: 0.5
+top_p:
+  desc: null
+  value: 0.92
+_wandb:
+  desc: null
+  value:
+    code_path: code/scripts/train_official_rqtransformer_laser_stage2.py
+    python_version: 3.11.9
+    cli_version: 0.16.6
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1786399585.0
+    t:
+      1:
+      - 1
+      - 41
+      - 55
+      2:
+      - 1
+      - 41
+      - 55
+      3:
+      - 2
+      - 5
+      - 7
+      - 13
+      - 14
+      - 16
+      - 23
+      - 62
+      4: 3.11.9
+      5: 0.16.6
+      8:
+      - 5
+      13: linux-x86_64
+    m:
+    - 1: train/global_step
+      6:
+      - 3
+    - 1: train/loss
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/atom_nll
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_cross_entropy
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_target_entropy
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_kl
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/classification_loss
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/geometry_loss
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/geometry_weight
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/geometry_pair_mse
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/geometry_spatial_mse
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/atom_top1
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_bin_mae
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/grad_norm
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/atom_nll_depth0
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/atom_nll_depth1
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/atom_top1_depth0
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/atom_top1_depth1
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_cross_entropy_depth0
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_cross_entropy_depth1
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_bin_mae_depth0
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/coeff_bin_mae_depth1
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/image_loss
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/text_loss
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/images_per_second
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/lr
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: train/epoch
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: val/fid
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: val/fid_50k_vs_full_train
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: val/fid_num_fake
+      5: 1
+      6:
+      - 1
+      - 3
+    - 1: val/fid_num_real
+      5: 1
+      6:
+      - 1
+      - 3
+sample_grid_padding:
+  desc: null
+  value: 0

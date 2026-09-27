@@ -1,0 +1,110 @@
+# @package _global_
+{
+  "defaults": [
+    "_self_"
+  ],
+  "data": {
+    "root": "/scratch/xl598/runs/laser/celebahq256-var-laser-repair-20260917/data",
+    "dataset": "celebahq",
+    "workers": 4,
+    "manifests": "/scratch/xl598/runs/laser/celebahq256-var-laser-repair-20260917/manifests",
+    "image_size": 256,
+    "identity_root": "/scratch/xl598/runs/laser/celebahq256-var-laser-repair-20260917/data",
+    "horizontal_flip": true
+  },
+  "seed": 0,
+  "model": {
+    "atoms": 4096,
+    "depth": 16,
+    "channels": 32,
+    "sparsity": 2,
+    "vae_width": 160,
+    "bottleneck": "laser",
+    "patch_nums": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      8,
+      10,
+      13,
+      16
+    ],
+    "initialization": "scratch",
+    "pretrained_vae": null,
+    "coefficient_bins": 257,
+    "coefficient_range_decay": 0.99,
+    "sparse_coefficient_head": "context_atom_bilinear_v2"
+  },
+  "prior": {
+    "lr": 0.0003,
+    "cfg": 1.5,
+    "top_k": 900,
+    "top_p": 0.96,
+    "epochs": 50,
+    "batch_size": 16,
+    "accumulation": 4,
+    "weight_decay": 0.05,
+    "warmup_epochs": 1,
+    "final_lr_ratio": 0.1
+  },
+  "stage": "stage1",
+  "wandb": {
+    "id": "celebahq256-var-laser-repair-20260917",
+    "mode": "online",
+    "group": "celebahq256-var-laser-poc-20260916",
+    "entity": "helloimlixin-rutgers",
+    "project": "laser"
+  },
+  "resume": true,
+  "backend": "var_laser",
+  "logging": {
+    "every_steps": 10,
+    "checkpoint_every_steps": 100,
+    "artifact_every_epochs": 5
+  },
+  "pipeline": true,
+  "tokenizer": {
+    "lr": 0.0001,
+    "epochs": 50,
+    "batch_size": 8,
+    "accumulation": 4,
+    "warmup_steps": 200,
+    "dictionary_lr": 0.0001,
+    "max_rfid_drift": null,
+    "max_matched_rfid": 50,
+    "adversarial_start": 1000,
+    "adversarial_weight": 0.5,
+    "calibration_images": 0,
+    "adaptive_adversarial": true,
+    "evaluation_every_epochs": 5
+  },
+  "comparison": {
+    "source_run": "celebahq256-var-laser-fix-20260917",
+    "both_stages_from_scratch": true,
+    "preserved_global_batch": {
+      "tokenizer": 128,
+      "prior": 256
+    },
+    "fid_selection_samples": 2000,
+    "reason": "Audit early generation FID plateau; consistent data geometry, fixed-count FID, context-atom interaction, sampling parity and best checkpoint retention."
+  },
+  "evaluation": {
+    "adm_python": null,
+    "batch_size": 8,
+    "every_epochs": 1,
+    "full_samples": 10000,
+    "adm_evaluator": null,
+    "adm_reference": null,
+    "fid_reference": null,
+    "preview_samples": 2000,
+    "full_every_epochs": 25,
+    "validation_images": 512,
+    "reconstruction_images": 512,
+    "full_reconstruction_images": 2000
+  },
+  "output_dir": "/scratch/xl598/runs/laser/celebahq256-var-laser-repair-20260917/train",
+  "smoke_steps": 0
+}

@@ -1,0 +1,24 @@
+{
+  "samples": 256,
+  "items": 70000,
+  "atom_exact_fraction": 1.0,
+  "coeff_mae": 0.00032619471312500536,
+  "coeff_max_error": 0.0018475055694580078,
+  "coeff_finite": true,
+  "atom_min": 0,
+  "atom_max": 2047,
+  "duplicate_atom_within_pair_fraction": 0.0,
+  "coeff_clip_fraction": 0.004971986636519432,
+  "coeff_scales": [
+    36.208333333333336,
+    8.583333333333334
+  ],
+  "compound_sequence_length": 128,
+  "separate_atom_coeff_sequence_length": 256,
+  "continuous_reconstruction_mse": 0.021649852395057678,
+  "continuous_reconstruction_psnr": 16.645450592041016,
+  "quantized_reconstruction_mse": 0.02165057323873043,
+  "quantized_reconstruction_psnr": 16.645305633544922,
+  "quantization_mse_increase": 7.208436727523804e-07,
+  "passed": true
+}

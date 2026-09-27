@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "checks": {
+    "checkpoint_exists": true,
+    "checkpoint_listed_in_policy": true,
+    "rfid_at_most_threshold": true,
+    "late_training_checkpoint": true,
+    "dictionary_shape_256x2048": true,
+    "laser_a2048_k2": true,
+    "official_ffhq_backbone": true,
+    "full_adversarial_recipe": true
+  },
+  "checkpoint": "/scratch/xl598/runs/ffhq_celebahq_rqvae_strict_dict_sweep/ffhq-celebahq-rqvae-strict-dict-sweep-20260720_145706/ffhq-a2048-k2/ffhq256-rqvae-laser-8x8-a2048-k2/21072026_110546/best_rfid_slot3_model.pt",
+  "epoch": 146,
+  "rfid": 6.227079379843531,
+  "wandb_run": "https://wandb.ai/helloimlixin-rutgers/laser/runs/ffhq-a2048-k2-rqvae-strict-20260720-145706",
+  "fallback_snapshot": "/scratch/xl598/submission_snapshots/laser_ffhq_celebahq_rqvae_strict_dict_sweep_20260720_145706"
+}

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -116,3 +117,67 @@ def test_public_recipe_and_backend_dispatch(monkeypatch):
     monkeypatch.setattr(cli, 'import_module', lambda name: SimpleNamespace(run=lambda cfg: calls.append(name)))
     cli.run(cfg)
     assert calls == ['src.training.var_laser']
+
+
+def test_atom_changes_the_effect_of_context_on_coefficient_predictions():
+    q = tokenizer()
+    model = prior(q)
+    features = torch.randn(2, 3, model.C)
+    vectors = q.normalized_dictionary().T
+    a = vectors[0].expand(2, 3, -1)
+    b = vectors[1].expand(2, 3, -1)
+    shifted = features + torch.randn_like(features)
+    # The old linear sum fails: changing the atom adds only a constant bias,
+    # independent of what the transformer says the image should contain.
+    delta_a = model.coefficient_logits(shifted, a) - model.coefficient_logits(features, a)
+    delta_b = model.coefficient_logits(shifted, b) - model.coefficient_logits(features, b)
+    assert (delta_a-delta_b).abs().max().item() > 1e-5
+
+
+@pytest.mark.parametrize('cfg', [0., 1.5])
+def test_cached_sampling_logits_match_teacher_forcing(monkeypatch, cfg):
+    import src.models.multiscale_laser_var as module
+    q = tokenizer().eval()
+    model = prior(q)
+    codes = q.decompose(torch.randn(2, 4, 3, 3))
+    labels = torch.tensor([0, 1])
+    both_labels = torch.cat((labels, torch.full_like(labels, model.num_classes)))
+    features = super(LaserVAR, model).forward(both_labels, codes['inputs'].repeat(2, 1, 1))
+    expected = model.token_logits(features, codes['atoms'].repeat(2, 1, 1),
+                                 codes['coefficients'].repeat(2, 1, 1))
+    calls = []
+
+    def force_ground_truth(logits, **kwargs):
+        call = len(calls)
+        scale, rem = divmod(call, 2*q.sparsity)
+        depth, kind = divmod(rem, 2)
+        lo, hi = model.begin_ends[scale]
+        guidance = cfg * scale / model.num_stages_minus_1
+        scores = expected[kind][:, lo:hi, depth]
+        # Masked -inf entries cannot be subtracted during CFG.
+        if kind == 0 and depth:
+            previous = codes['atoms'][:, lo:hi, :depth]
+            scores = scores.clone().scatter(-1, previous.repeat(2, 1, 1), 0.)
+        scores = (1+guidance)*scores[:2] - guidance*scores[2:]
+        if kind == 0 and depth:
+            scores.scatter_(-1, previous, -torch.inf)
+        torch.testing.assert_close(logits, scores, atol=1e-6, rtol=2e-4)
+        calls.append(call)
+        return codes['atoms' if kind == 0 else 'coefficients'][:, lo:hi, depth, None]
+
+    monkeypatch.setattr(module, 'sample_with_top_k_top_p_', force_ground_truth)
+    latent = model.sample(labels, cfg=cfg)
+    torch.testing.assert_close(latent, codes['latent'])
+    assert len(calls) == len(q.v_patch_nums)*q.sparsity*2
+    assert all(not b.attn.caching for b in model.blocks)
+
+
+def test_sampling_clears_cache_after_exception(monkeypatch):
+    import src.models.multiscale_laser_var as module
+    model = prior(tokenizer())
+    def fail(*args, **kwargs):
+        raise RuntimeError('injected sampler failure')
+    monkeypatch.setattr(module, 'sample_with_top_k_top_p_', fail)
+    with pytest.raises(RuntimeError, match='injected'):
+        model.sample(torch.tensor([0]))
+    assert all(not b.attn.caching for b in model.blocks)
