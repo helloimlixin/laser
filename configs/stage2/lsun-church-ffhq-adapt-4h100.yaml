@@ -1,0 +1,87 @@
+defaults:
+- _self_
+stage: stage2
+backend: rqtransformer
+recipe:
+  reference: helloimlixin-rutgers/laser/ffhqcmp0804205803
+  reference_fid: 8.174392700195312
+  recipe_basis: FFHQ architecture and atom weighting, Church-calibrated physical coefficient
+    targets; controlled repair finetune
+  dictionary_atom_vector_conditioning: true
+  initialization: model-only transfer from parent best epoch35, fresh optimizer and
+    schedule
+  parent_run: church-compound-rqpaper-b2048-4h100-20260923
+  adaptation: Physical soft targets at T=0.125; coefficient noise checked through
+    frozen decoder. Geometry disabled to avoid archived conditional-expectation bug.
+    Fine-tune LR 1e-4 and 50-epoch cosine; global batch128 matches FFHQ.
+options:
+  checkpoint: /mnt/laser-church/assets/tokenizer.pt
+  data: /workspace/Projects/data/lsun
+  token_cache: /mnt/laser-church/assets/compound-cache.pt
+  token_cache_in_ram: true
+  output: /workspace/Projects/laser/outputs/church-ffhq-repair-20260924/train
+  dataset: lsun_church
+  model_preset: lsun-church-350m
+  distributed_backend: ddp
+  num_atoms: 16384
+  sparsity_level: 4
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  coeff_scale: 1.0
+  coeff_target_space: physical
+  coeff_target_mode: soft
+  coeff_target_temperature: 0.125
+  clip_coefficients: false
+  compound_tokens: true
+  compound_pair_autoregressive: true
+  compound_mask_seen_atoms_training: false
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  compound_pair_attention: compiled
+  compound_distribution_geometry: false
+  compound_conditional_geometry: false
+  atom_loss_weight: 1.5
+  geometry_loss_weight: 0.0
+  geometry_start_epoch: 0
+  geometry_warmup_epochs: 0
+  epochs: 50
+  batch_size: 32
+  training_precision: bf16
+  total_batch_size: 128
+  lr: 0.0001
+  lr_schedule: cosine
+  lr_schedule_epochs: 50
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  seed: 0
+  atom_temperature: 1.0
+  atom_top_k: 250
+  atom_top_p: 1.0
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+  metric_backend: original-rqvae
+  fid_reference_stats: /mnt/laser-church/assets/lsun_256_church.npz
+  fid_num_samples: 50000
+  fid_batch_size: 128
+  fid_every: 5
+  save_ckpt_freq: 5
+  save_step_freq: 500
+  keep_best_checkpoints: 1
+  model_only_best_checkpoints: false
+  async_checkpoint_copy: true
+  sample_grid_every: 500
+  sample_grid_size: 64
+  sample_grid_batch_size: 64
+  sample_grid_on_start: false
+  upload_checkpoints: true
+  checkpoint_upload_mode: files
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: church-compound-ffhq-adapt-4h100-20260924
+  wandb_name: Church FFHQ adaptation physical coefficients repair 4xH100
+  wandb_mode: online
+  resume: false
+  resume_checkpoint: null
+  init_stage2_checkpoint: /mnt/laser-church/ffhq-repair-20260924/initial-prior.pt

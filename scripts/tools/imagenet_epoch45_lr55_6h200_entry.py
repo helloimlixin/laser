@@ -1,0 +1,431 @@
+"""Execute the frozen v8-compatible K4 prior with audited GPU optimizations."""
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+ROOT = Path(os.environ.get('LASER_RUNTIME_ROOT', Path(__file__).resolve().parents[2]))
+sys.path[:0] = [str(ROOT), str(ROOT / 'runtime')]
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from src.training import rqtransformer as training
+from src.models.rqtransformer.attentions import AttentionBlock
+
+BASE = Path(os.environ['LASER_RUN_BASE'])
+from src.training.fresh_images import EpochImageFolder
+original_source_images = training.source_image_dataset
+def source_images(dataset, root, transform, *, split='train'):
+    if dataset == 'imagenet' and split == 'train':
+        ready = json.loads((root / 'training-ready.json').read_text())
+        assert ready['training_images'] == 1281167 and ready['classes'] == 1000
+        dataset_view = EpochImageFolder(root / split, transform=transform, augmentation_seed=261001)
+        assert len(dataset_view) == 1281167 and len(dataset_view.classes) == 1000
+        return dataset_view
+    return original_source_images(dataset, root, transform, split=split)
+training.source_image_dataset = source_images
+original_sampler_init = training.ExactGlobalBatchSampler.__init__
+def sampler_init(self, dataset, *args, **kwargs):
+    self.dataset = dataset
+    return original_sampler_init(self, dataset, *args, **kwargs)
+training.ExactGlobalBatchSampler.__init__ = sampler_init
+original_sampler_epoch = training.ExactGlobalBatchSampler.set_epoch
+def set_sampler_epoch(self, epoch):
+    if hasattr(self.dataset, 'set_epoch'):
+        self.dataset.set_epoch(epoch)
+    return original_sampler_epoch(self, epoch)
+training.ExactGlobalBatchSampler.set_epoch = set_sampler_epoch
+original_aux_init = training.LaserAux.__init__
+def aux_init(self, *args, **kwargs):
+    kwargs['clamp_coeffs'] = False
+    return original_aux_init(self, *args, **kwargs)
+training.LaserAux.__init__ = aux_init
+original_dataloader = training.DataLoader
+def data_loader(*args, **kwargs):
+    if isinstance(args[0], EpochImageFolder):
+        kwargs.update(num_workers=10, prefetch_factor=3)
+    return original_dataloader(*args, **kwargs)
+training.DataLoader = data_loader
+AUDIT = BASE / os.environ.get('LASER_PHASE', 'production') / 'verification'
+AUDIT.mkdir(parents=True, exist_ok=True)
+COMPILE = os.environ.get('LASER_COMPILE_BLOCKS', '1') == '1'
+STOPPING = False
+parsed_args = None
+updates = 0
+first_time = None
+initial_optimizer_step = 0
+model_parameters = None
+profile_capture = None
+profile_completed = False
+
+
+def json_record(path, record):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(record, indent=2, default=str) + '\n')
+    temporary.replace(path)
+
+
+def stop_requested(signum, _frame):
+    global STOPPING
+    STOPPING = True
+
+
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, stop_requested)
+
+original_parser = training.build_parser
+
+
+def build_parser():
+    parser = original_parser()
+    parser.add_argument("--continuation-lr-policy", type=Path, default=None)
+    parse = parser.parse_args
+    def parse_args(*args, **kwargs):
+        global parsed_args
+        parsed_args = parse(*args, **kwargs)
+        assert parsed_args.sparsity_level == 4
+        assert parsed_args.total_batch_size == 2048
+        assert not parsed_args.compound_tokens
+        assert parsed_args.physical_pair_context
+        assert parsed_args.coeff_target_space == 'normalized'
+        assert parsed_args.coeff_target_temperature == 0.01125
+        if parsed_args.resume:
+            source = parsed_args.resume_checkpoint or parsed_args.checkpoint_dir / 'last.pt'
+            parsed_args.resume_checkpoint = checkpoint_io._checkpoint_upload_source(source)
+        return parsed_args
+    parser.parse_args = parse_args
+    return parser
+
+
+training.build_parser = build_parser
+original_wrap = training.wrap_distributed_model
+
+
+def wrap(model, backend, device, world_size):
+    global model_parameters
+    assert world_size == 6 and backend == 'ddp'
+    model_parameters = list(model.parameters())
+    for depth_block in model.head_transformer.blocks:
+        depth_block.attn.short_attention_backend = 'compiled'
+    if COMPILE:
+        for block in model.modules():
+            if isinstance(block, AttentionBlock):
+                eager = block.forward
+                compiled = torch.compile(eager, fullgraph=True, dynamic=True)
+                def forward(x, module=block, eager=eager, compiled=compiled):
+                    return compiled(x) if module.training and torch.is_grad_enabled() else eager(x)
+                block.forward = forward
+    original_forward = model.forward
+    def forward(*args, **kwargs):
+        if model.training and torch.is_grad_enabled():
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                result = original_forward(*args, **kwargs)
+            assert result['atom_logits'].dtype == torch.bfloat16
+            return result
+        return original_forward(*args, **kwargs)
+    model.forward = forward
+    return DDP(model, device_ids=[device.index], broadcast_buffers=False,
+               gradient_as_bucket_view=True, bucket_cap_mb=100)
+
+
+training.wrap_distributed_model = wrap
+
+
+def sparse_objective(atom_logits, coeff_logits, atoms, probabilities, accumulation):
+    atom_log_probs = torch.nn.functional.log_softmax(atom_logits.float(), dim=-1)
+    coeff_log_probs = torch.nn.functional.log_softmax(coeff_logits.float(), dim=-1)
+    atom_loss = -atom_log_probs.gather(-1, atoms.long().unsqueeze(-1)).squeeze(-1)
+    coeff_loss = -(probabilities * coeff_log_probs).sum(dim=-1)
+    depth = atoms.shape[-1]
+    return (atom_loss.sum(dim=-1) + coeff_loss.sum(dim=-1)).mean() / (2 * depth * accumulation)
+
+
+training.compiled_sparse_objective = torch.compile(sparse_objective, fullgraph=True, dynamic=True) if COMPILE and os.environ.get('LASER_COMPILE_OBJECTIVE', '1') == '1' else sparse_objective
+
+original_cosine_scheduler = training.create_cosine_lr_scheduler
+
+
+ACTIVE_FID_SCHEDULER = None
+
+def cosine_scheduler(optimizer, *, initial_lr, min_lr, total_steps, completed_steps=0, state_dict=None):
+    global ACTIVE_FID_SCHEDULER
+    if parsed_args.continuation_lr_policy is None:
+        return original_cosine_scheduler(optimizer, initial_lr=initial_lr, min_lr=min_lr,
+            total_steps=total_steps, completed_steps=completed_steps, state_dict=state_dict)
+    from src.training.fid_plateau_lr import FIDPlateauLR
+    document = json.loads(parsed_args.continuation_lr_policy.read_text())
+    policy = document['policy']
+    assert initial_lr == policy['hold_lr'] and min_lr == policy['min_lr'] and total_steps == policy['total_steps']
+    ACTIVE_FID_SCHEDULER = FIDPlateauLR(optimizer, policy=policy, completed_steps=completed_steps, state_dict=state_dict, revision_from=document.get('revision_from'))
+    if int(os.environ['RANK']) == 0:
+        record = dict(policy=policy, scheduler_step=completed_steps, current_lr=optimizer.param_groups[0]['lr'],
+            optimizer_restored=bool(optimizer.state), epoch45_weights_restored=True, source_epoch45_rng_available=False,
+            resumed_plateau_state=(state_dict.get('kind') == FIDPlateauLR.kind))
+        json_record(BASE / 'production/lr-adjustment.json', record)
+        print('Applied FID-driven LR hold: ' + json.dumps(record), flush=True)
+    return ACTIVE_FID_SCHEDULER
+
+original_generation_metrics = training.evaluate_generation_metrics
+
+def generation_metrics(*args, **kwargs):
+    result = original_generation_metrics(*args, **kwargs)
+    if ACTIVE_FID_SCHEDULER is not None and PHASE == 'production':
+        score = torch.tensor(float(result[0]), device=torch.device('cuda',int(os.environ['LOCAL_RANK'])), dtype=torch.float64)
+        dist.broadcast(score,src=0)
+        decision = ACTIVE_FID_SCHEDULER.observe_fid(float(score))
+        if int(os.environ['RANK']) == 0:
+            record = dict(global_step=ACTIVE_FID_SCHEDULER.last_epoch, **decision)
+            json_record(BASE / 'production/fid-lr-decision.json', record)
+            print('FID LR decision: ' + json.dumps(record), flush=True)
+            if WB is not None:
+                WB.log({'train/global_step':ACTIVE_FID_SCHEDULER.last_epoch,
+                        'lr_schedule/current_lr':decision['lr'],
+                        'lr_schedule/fid':float(score),
+                        'lr_schedule/reductions':ACTIVE_FID_SCHEDULER.reductions,
+                        'lr_schedule/bad_evaluations':ACTIVE_FID_SCHEDULER.bad_evaluations})
+    return result
+
+training.evaluate_generation_metrics = generation_metrics
+
+
+training.create_cosine_lr_scheduler = cosine_scheduler
+
+from src.training import k4_checkpoint_io as checkpoint_io
+from src.training.background_checkpoint import BackgroundCheckpointWriter
+checkpoint_writer = BackgroundCheckpointWriter()
+from src.training.checkpoint_upload import CheckpointUploader
+from verified_wandb_checkpoint_upload import VerifiedCloudUpload
+cloud_uploader = CheckpointUploader(
+    Path(os.environ['LASER_CHECKPOINT_UPLOAD_CACHE_DIR']) / 'verified-snapshots',
+    VerifiedCloudUpload('helloimlixin-rutgers/laser/imagenet-rfid421-epoch45-lr55-5h200-20261003',
+                        Path(os.environ['LASER_PERSISTENT_BASE']) / 'resume-6h200-20261003/cloud-checkpoint-receipt.json'))
+WB = None
+PHASE = os.environ.get('LASER_PHASE', 'production')
+
+# Isolated validation snapshots may be temporary; production keeps the
+# trainer's workspace-only checkpoint guard.
+if os.environ.get('LASER_LOCAL_PREFLIGHT') == '1':
+    assert PHASE in ('preflight', 'preflight_resume', 'generation')
+    def preflight_checkpoint_dir(output, configured):
+        target = Path(configured).resolve()
+        assert target.is_relative_to(BASE / 'preflight')
+        return target
+    training.persistent_checkpoint_dir = preflight_checkpoint_dir
+original_save = training.atomic_torch_save
+
+
+def save_checkpoint(payload, target):
+    if PHASE != 'production':
+        return original_save(payload, target)
+    saved_step = int(payload['global_step'])
+    saved_epoch = int(payload.get('epoch', -1))
+    retain_epoch = target.name == 'last.pt' and saved_epoch > 0 and saved_epoch % 5 == 0 and payload.get('batch_idx', 0) == 0 and bool(payload.get('optimizer', {}).get('state'))
+    best = list(payload.get('best_fid', []))
+    best_is = list(payload.get('best_inception', []))
+    def committed():
+        json_record(BASE / 'production' / 'durable-checkpoint.json',
+                    dict(step=saved_step, target=str(target), bytes=target.stat().st_size,
+                         committed_unix=time.time()))
+        if target.name == 'last.pt':
+            json_record(Path(os.environ['LASER_PERSISTENT_BASE']) / 'train/checkpoints/latest-checkpoint.json',
+                        dict(step=saved_step, payload=str(target.resolve()), bytes=target.stat().st_size,
+                             committed_unix=time.time()))
+        if retain_epoch:
+            snapshot = target.parent / 'epochs' / ('epoch_' + str(saved_epoch).zfill(3) + '.pt')
+            if not snapshot.exists():
+                local_source = checkpoint_io._checkpoint_upload_source(target)
+                pin_dir = Path(os.environ.get('LASER_CHECKPOINT_STAGING_DIR', str(BASE / 'checkpoint-staging')))
+                pin_dir.mkdir(parents=True, exist_ok=True)
+                pin = pin_dir / ('epoch-' + str(saved_epoch) + '-' + str(saved_step) + '.snapshot')
+                os.link(local_source, pin)
+                checkpoint_io._persist_serialized_checkpoint(pin, snapshot)
+                json_record(BASE / 'production/last-epoch-snapshot.json',
+                            dict(epoch=saved_epoch, step=saved_step, target=str(snapshot), bytes=snapshot.stat().st_size,
+                                 optimizer_and_rng_included=True))
+                print('Retained full epoch rollback checkpoint: ' + str(snapshot), flush=True)
+        if WB is not None and parsed_args.upload_checkpoints:
+            paths = checkpoint_io.upload_selected_checkpoint_files(WB,
+                last_checkpoint=parsed_args.checkpoint_dir / 'last.pt', best_fid=best,
+                best_inception=best_is, upload_dir=parsed_args.output / 'wandb_checkpoints')
+            cloud_uploader.submit(paths, saved_epoch)
+    return checkpoint_io.atomic_torch_save(payload, target, background=checkpoint_writer, on_commit=committed)
+
+
+training.atomic_torch_save = save_checkpoint
+training.remove_checkpoint = checkpoint_io.remove_checkpoint
+original_upload = training.upload_selected_checkpoint_files
+
+
+def upload_checkpoints(*args, **kwargs):
+    # The durable-copy callback queues the same fixed online slots from local
+    # immutable files, after shared-storage commit, without blocking training.
+    if PHASE != 'production':
+        return original_upload(*args, **kwargs)
+    return []
+
+
+training.upload_selected_checkpoint_files = upload_checkpoints
+import wandb
+original_wandb_init = wandb.init
+
+
+def init_wandb(*args, **kwargs):
+    global WB
+    c = kwargs['config']
+    assert c['world_size'] == 6 and c['total_batch_size'] == 2048
+    c.update(architecture='physical-pair-scalar-rqtransformer-imagenet-1400m',
+             sampling_recipe=f'atoms k{parsed_args.atom_top_k} p{parsed_args.atom_top_p} T{parsed_args.atom_temperature}; coefficients k{parsed_args.coeff_top_k} p{parsed_args.coeff_top_p} T{parsed_args.coeff_temperature}',
+             top_p=parsed_args.atom_top_p, coeff_top_p=parsed_args.coeff_top_p, stage1_rfid=4.210914134979248,
+             stage1_checkpoint_sha256='dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab',
+             reference_run='helloimlixin-rutgers/laser/v8dup0731113220', reference_fid=16.368215560913086,
+             fixes_reference_run='helloimlixin-rutgers/laser/church-shared-pair90-clean-20261001',
+             decoder_type='shared_interleaved_physical_pairs_scalar_ce_v1',
+             stage2_parent_weights_loaded=False, training_objective='baseline scalar atom and soft-coefficient CE',
+             unique_atom_masks=True, physical_only_spatial_context=True, first_checkpoint_step=1,
+             explicit_physical_pair_depth_context=True,
+             training_precision='bf16', compile_transformer_blocks=COMPILE,
+             depth_attention_backend='compiled exact causal depth8, FP32 accumulation',
+             performance_optimization='depth8_v2_physical_pair_context',
+             scalar_token_shape=[8, 8, 8], sparse_pair_shape=[8, 8, 4],
+             latent_noise_energy_fraction=0.006891967263072729,
+             noise_rms_bins=25.6, noise_target_entropy_nats=4.661042213439941,
+             evaluation_reference='ImageNet validation 50k, matching v8 training run',
+             stage2_initialization='resume' if parsed_args.resume else 'scratch',
+             frozen_stage1=True, asynchronous_durable_checkpoints=True)
+    c.update(stage2_parent_weights_loaded=True, first_checkpoint_step=28190,
+             stage2_initialization='epoch45-model-only-warm-start',
+             source_checkpoint_epoch=45, source_checkpoint_step=28170, source_checkpoint_fid=19.655982971191406,
+             optimizer_initialization='fresh Adam: epoch45 optimizer was not retained',
+             rng_initialization='fresh rank seeds: epoch45 RNG was not retained',
+             epoch45_optimizer_reset=True, epoch45_rng_reset=True, optimizer_warmup_steps=156,
+             training_augmentation='Resize256 RandomCrop256 RandomHorizontalFlip(p=0.5), fresh each epoch',
+             online_stage1_encoding=True, coefficient_clipping=False,
+             augmentation_rng='deterministic per-image per-epoch; independent of worker prefetch',
+             rollback_parent_run='helloimlixin-rutgers/laser/imagenet-rfid421-epoch6-augcosine-5h200-20261002',
+             full_epoch_checkpoint_retention=5)
+    if PHASE == 'production' and not (BASE / 'wandb-run-created.json').exists():
+        kwargs['resume'] = 'must'
+    if parsed_args.continuation_lr_policy is not None:
+        document = json.loads(parsed_args.continuation_lr_policy.read_text())
+        c.update(learning_rate_schedule='fid-plateau-lr-v1', continuation_lr_policy=document['policy'],
+                 continuation_lr_revision_note=document['note'],
+                 epoch45_optimizer_reset=True, epoch45_rng_reset=True,
+                 learning_rate_target=document['policy']['hold_lr'], learning_rate_decay_trigger='2 consecutive 50k FIDs without 0.5 percent improvement')
+    c.update(continuation_hardware='6 NVIDIA H200', continuation_resume_step=30000,
+             continuation_optimizer_restored=True, continuation_scheduler_restored=True,
+             continuation_data_cursor_preserved=True, continuation_new_rank_rng='checkpoint-derived',
+             continuation_trajectory_bitwise_identical=False)
+    kwargs['resume'] = 'must'
+    kwargs['allow_val_change'] = True
+    WB = original_wandb_init(*args, **kwargs)
+    if PHASE == 'production':
+        json_record(BASE / 'wandb-run-created.json', dict(id=WB.id, url=WB.url))
+        if not WB.summary.get('rollback/baseline_logged', False):
+            baseline = json.loads((Path(os.environ['LASER_PERSISTENT_BASE']) / 'epoch45-baseline-evaluation.json').read_text())
+            WB.log({'train/global_step':28170, 'train/epoch':45, 'val/fid':baseline['fid'],
+                    'val/inception_score':baseline['inception_score'],
+                    'val/inception_score_std':baseline['inception_score_std']})
+            WB.summary['rollback/baseline_logged'] = True
+    if parsed_args.resume:
+        WB.summary['continuation/target_reached'] = False
+        WB.summary['continuation/training_resumed'] = True
+    original_finish = WB.finish
+    def finish(*args, **kwargs):
+        checkpoint_writer.close()
+        cloud_uploader.close()
+        return original_finish(*args, **kwargs)
+    WB.finish = finish
+    if PHASE != 'production':
+        return WB
+    evidence = Path(os.environ['LASER_PERSISTENT_BASE']) / 'resume-6h200-20261003'
+    artifact = wandb.Artifact(parsed_args.wandb_id + '-resume-6h200', type='run-config')
+    for name in ['recipe.yaml', 'entry-production.py', 'layout_migration.py', 'cloud_upload.py',
+                 'resume-provenance.json', 'resume-tests.log', 'checkpoint-metadata.json',
+                 'resume-runtime.tar.gz']:
+        artifact.add_file(str(evidence / name), name=name)
+    WB.log_artifact(artifact, aliases=['latest'])
+    WB.summary['continuation/world_size'] = 6
+    WB.summary['continuation/resume_step'] = 30000
+    for metric in ('lr_schedule/current_lr','lr_schedule/fid','lr_schedule/reductions','lr_schedule/bad_evaluations'):
+        WB.define_metric(metric,step_metric='train/global_step')
+    return WB
+
+
+wandb.init = init_wandb
+original_sparse_targets = training.LaserAux.sparse_targets
+
+
+def profiled_sparse_targets(self, *args, **kwargs):
+    global profile_capture
+    if os.environ.get('LASER_PROFILE_TRAINING') == '1' and int(os.environ['RANK']) == 0 and updates == 5 and not profile_completed and profile_capture is None:
+        profile_capture = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False, profile_memory=False)
+        profile_capture.__enter__()
+    return original_sparse_targets(self, *args, **kwargs)
+
+
+training.LaserAux.sparse_targets = profiled_sparse_targets
+original_step = torch.optim.AdamW.step
+
+
+def step(optimizer, *args, **kwargs):
+    global updates, first_time, initial_optimizer_step, profile_capture, profile_completed
+    if updates == 0:
+        first_time = time.monotonic()
+        previous_steps = {int(state['step']) for state in optimizer.state.values()}
+        assert len(previous_steps) <= 1
+        initial_optimizer_step = next(iter(previous_steps), 0)
+        record = dict(rank=int(os.environ['RANK']), optimizer_states=len(optimizer.state),
+                      optimizer_step_before=initial_optimizer_step,
+                      fresh=(len(optimizer.state) == 0), parameter_count=sum(p.numel() for p in model_parameters),
+                      physical_microbatch_max=parsed_args.batch_size,
+                      accumulation=int(os.environ['LASER_ACCUMULATION']), global_batch=2048,
+                      precision='bf16', compiled_blocks=COMPILE, learning_rate=optimizer.param_groups[0]['lr'])
+        if not parsed_args.resume:
+            assert len(optimizer.state) == 0
+        json_record(AUDIT / ('startup-rank' + os.environ['RANK'] + '.json'), record)
+    checkpoint_writer.check()
+    cloud_uploader.check()
+    result = original_step(optimizer, *args, **kwargs)
+    updates += 1
+    if parsed_args.continuation_lr_policy is not None and PHASE == 'production':
+        if updates == 20:
+            parsed_args.save_step_freq = 1
+        elif updates == 21:
+            parsed_args.save_step_freq = 200
+    if profile_capture is not None and updates == 6:
+        torch.cuda.synchronize()
+        profile_capture.__exit__(None, None, None)
+        profile_dir = BASE / 'performance'
+        profile_dir.mkdir(exist_ok=True)
+        (profile_dir / 'full-training-profile.txt').write_text(profile_capture.key_averages().table(sort_by='self_cuda_time_total', row_limit=60))
+        profile_capture.export_chrome_trace(str(profile_dir / 'full-training-trace.json'))
+        profile_capture = None
+        profile_completed = True
+    if updates in (1, 20):
+        tensors = list(model_parameters) + [s[k] for s in optimizer.state.values() for k in ('exp_avg', 'exp_avg_sq')]
+        finite = bool(torch.stack([torch.isfinite(t).all() for t in tensors]).all())
+        assert finite
+        assert {int(s['step']) for s in optimizer.state.values()} == {initial_optimizer_step + updates}
+        json_record(AUDIT / ('step' + str(updates) + '-rank' + os.environ['RANK'] + '.json'),
+                    dict(rank=int(os.environ['RANK']), updates=updates, finite=True,
+                         optimizer_step=initial_optimizer_step + updates,
+                         optimizer_states=len(optimizer.state), peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
+                         peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,
+                         elapsed_seconds=time.monotonic()-first_time))
+    flag = torch.tensor(int(STOPPING), device=model_parameters[0].device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if flag.item():
+        parsed_args.max_optimizer_steps = updates
+    return result
+
+
+torch.optim.AdamW.step = step
+if parsed_args is None and os.environ.get('LASER_PATCH_ONLY') != '1':
+    from src.training.cli import main
+    raise SystemExit(main())

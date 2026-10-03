@@ -1,0 +1,30 @@
+# @package _global_
+defaults:
+  - base
+  - override /data: coco2014
+  - _self_
+
+# Every human caption is retained in the image-token / text-token cache.
+data:
+  coco_caption_mode: all
+
+token_cache:
+  text_tokenizer: char
+  text_max_length: 256
+
+ar:
+  text_conditional: true
+  text_conditioning_mode: rq_prefix
+  text_prefix_length: 32
+
+# Use all train2014 pairs. A random pair-level holdout would leak images with
+# different captions across splits. Benchmark generation uses val2014 separately.
+train_ar:
+  validation_split: 0.0
+  test_split: 0.0
+  limit_val_batches: 0
+  checkpoint_monitor: train/loss
+  early_stopping_patience: 0
+  sample_text_prompts:
+    - A dog running through a grassy field
+    - A red bus driving down a city street

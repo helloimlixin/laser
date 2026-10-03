@@ -1697,13 +1697,14 @@ class LASER(VisualsMixin, pl.LightningModule):
             )
 
     def on_before_optimizer_step(self, optimizer):
-        # Lightning calls this after AMP unscaling. Clipping scaled gradients
-        # in training_step would shrink the effective clipping threshold.
-        is_autoencoder = self.automatic_optimization or getattr(self, "_manual_step_is_autoencoder", False)
-        if is_autoencoder and not self.bypass_bottleneck:
-            self.bottleneck.project_dictionary_gradient_()
+        del optimizer
+        # Manual optimization (adversarial mode) drives dictionary gradient
+        # projection inline in training_step so it only touches the autoencoder
+        # optimizer; skip the automatic hook there to avoid double-projecting.
         if not self.automatic_optimization:
-            self._clip_manual_optimizer(optimizer)
+            return
+        if not self.bypass_bottleneck:
+            self.bottleneck.project_dictionary_gradient_()
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         # Renormalize after the step: Lightning runs zero_grad (and on_before_zero_grad)
@@ -1711,10 +1712,7 @@ class LASER(VisualsMixin, pl.LightningModule):
         # dictionary updates there break autograd for the current batch.
         step = int(getattr(self, "global_step", 0))
         self._apply_scheduled_lrs(optimizer, step=step)
-        updated = self._run_optimizer_step(optimizer, closure=optimizer_closure)
-        self._dictionary_after_optimizer_step(optimizer, updated)
-
-    def _dictionary_after_optimizer_step(self, optimizer, updated):
+        optimizer.step(closure=optimizer_closure)
         if not self.bypass_bottleneck:
             alternating_update = getattr(
                 self.bottleneck,
@@ -1722,12 +1720,11 @@ class LASER(VisualsMixin, pl.LightningModule):
                 None,
             )
             if callable(alternating_update):
-                alternating_update(optimizer_updated=updated)
-            if updated:
-                self.bottleneck.normalize_dictionary_()
-                revive = getattr(self.bottleneck, "revive_dead_atoms_after_step_", None)
-                if callable(revive):
-                    revive(optimizer=self._raw_optimizer(optimizer))
+                alternating_update()
+            self.bottleneck.normalize_dictionary_()
+            revive = getattr(self.bottleneck, "revive_dead_atoms_after_step_", None)
+            if callable(revive):
+                revive(optimizer=self._raw_optimizer(optimizer))
 
     def _empty_sparse_codes_like(self, z_e: torch.Tensor) -> SparseCodes:
         batch_size, _, height, width = z_e.shape
@@ -2168,37 +2165,6 @@ class LASER(VisualsMixin, pl.LightningModule):
     def _raw_optimizer(optimizer):
         return getattr(optimizer, "optimizer", optimizer)
 
-    def _run_optimizer_step(self, optimizer, **kwargs):
-        """Observe an actual parameter update, including GradScaler skips."""
-        updated = False
-        def mark_updated(*_):
-            nonlocal updated
-            updated = True
-        handle = self._raw_optimizer(optimizer).register_step_post_hook(mark_updated)
-        try:
-            optimizer.step(**kwargs)
-        finally:
-            handle.remove()
-        return updated
-
-    def _step_manual_optimizer(self, optimizer, *, autoencoder=False):
-        self._manual_step_is_autoencoder = autoencoder
-        try:
-            return self._run_optimizer_step(optimizer)
-        finally:
-            self._manual_step_is_autoencoder = False
-
-    def _precision_scale(self):
-        plugin = getattr(self._trainer_ref(), "precision_plugin", None)
-        scaler = getattr(plugin, "scaler", None)
-        return float(scaler.get_scale()) if scaler is not None else 1.
-
-    def _scale_optimizer_gradients(self, optimizer, factor):
-        for group in self._raw_optimizer(optimizer).param_groups:
-            for parameter in group['params']:
-                if parameter.grad is not None:
-                    parameter.grad.mul_(factor)
-
     def _clip_manual_optimizer(self, optimizer) -> None:
         trainer = self._trainer_ref()
         clip_val = getattr(self, "manual_gradient_clip_val", None)
@@ -2516,8 +2482,14 @@ class LASER(VisualsMixin, pl.LightningModule):
 
     def _discriminator_loss(self, real: torch.Tensor, fake: torch.Tensor):
         """Critic loss on real images vs detached reconstructions."""
-        logits_real = self.discriminator(real.contiguous())
-        logits_fake = self.discriminator(fake.contiguous())
+        # Match upstream RQ-VAE's fake-then-real PatchGAN forwards. The order
+        # matters for BatchNorm running statistics, even with detached inputs.
+        if self.is_waveform_audio:
+            logits_real = self.discriminator(real.contiguous())
+            logits_fake = self.discriminator(fake.contiguous())
+        else:
+            logits_fake = self.discriminator(fake.contiguous())
+            logits_real = self.discriminator(real.contiguous())
         if self.is_waveform_audio and self.audio_adversarial_type == "encodec_msstft":
             d_fn = multi_encodec_hinge_d_loss
         elif self.is_waveform_audio and self.audio_adversarial_type in {
@@ -2750,11 +2722,15 @@ class LASER(VisualsMixin, pl.LightningModule):
         recon_dn = self._image_to_unit_range(recon_raw.detach(), clamp=True)
 
         if not is_audio and prefix == 'val' and self.val_rfid is not None:
-            self.val_rfid.update(x_dn, real=True)
-            self.val_rfid.update(recon_dn, real=False)
+            # Inception features and the returned FID must not inherit bf16
+            # autocast; otherwise checkpoint scores are quantized to bf16.
+            with torch.autocast(device_type=x_dn.device.type, enabled=False):
+                self.val_rfid.update(x_dn.float(), real=True)
+                self.val_rfid.update(recon_dn.float(), real=False)
         elif not is_audio and prefix == 'test' and self.test_fid is not None:
-            self.test_fid.update(x_dn, real=True)
-            self.test_fid.update(recon_dn, real=False)
+            with torch.autocast(device_type=x_dn.device.type, enabled=False):
+                self.test_fid.update(x_dn.float(), real=True)
+                self.test_fid.update(recon_dn.float(), real=False)
 
         psnr = None
         ssim = None
@@ -3464,8 +3440,6 @@ class LASER(VisualsMixin, pl.LightningModule):
         if batch_idx_int % accum == 0:
             opt_ae.zero_grad(set_to_none=True)
             opt_disc.zero_grad(set_to_none=True)
-            self._manual_accumulated_examples = 0
-            self._manual_accumulation_normalizer = None
 
         self._apply_scheduled_lrs(opt_ae, step=step, base_lrs=self._lr_base_lrs)
 
@@ -3518,30 +3492,36 @@ class LASER(VisualsMixin, pl.LightningModule):
         else:
             weighted_d_loss = self._zero_discriminator_loss_like(loss)
 
-        batch_size = int(x.size(0))
-        if self._manual_accumulation_normalizer is None:
-            self._manual_accumulation_normalizer = batch_size * accum
-        self._manual_accumulated_examples += batch_size
-        self.manual_backward((loss + weighted_d_loss) * (batch_size / self._manual_accumulation_normalizer))
+        self.manual_backward((loss + weighted_d_loss) / float(accum))
         if should_step:
-            correction = self._manual_accumulation_normalizer / self._manual_accumulated_examples
-            self._scale_optimizer_gradients(opt_ae, correction)
-            self._scale_optimizer_gradients(opt_disc, correction)
-            previous_scale = self._precision_scale()
-            updated = self._step_manual_optimizer(opt_ae, autoencoder=True)
-            self._dictionary_after_optimizer_step(opt_ae, updated)
+            # Mirror on_before_optimizer_step (skipped in manual mode): project the
+            # dictionary gradient before stepping only the autoencoder optimizer.
+            if not self.bypass_bottleneck:
+                self.bottleneck.project_dictionary_gradient_()
+            self._clip_manual_optimizer(self._raw_optimizer(opt_ae))
+            opt_ae.step()
+            # Mirror the automatic optimizer_step post-update dictionary maintenance.
+            if not self.bypass_bottleneck:
+                alternating_update = getattr(
+                    self.bottleneck,
+                    "alternating_dictionary_update_after_step_",
+                    None,
+                )
+                if callable(alternating_update):
+                    alternating_update()
+                self.bottleneck.normalize_dictionary_()
+                revive = getattr(self.bottleneck, "revive_dead_atoms_after_step_", None)
+                if callable(revive):
+                    revive(optimizer=self._raw_optimizer(opt_ae))
 
             if disc_should_step:
-                # Both gradients came from one scaled backward. The first
-                # optimizer may have changed the shared scaler's scale.
-                self._scale_optimizer_gradients(opt_disc, self._precision_scale() / previous_scale)
-                self._step_manual_optimizer(opt_disc)
+                self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
+                opt_disc.step()
                 d_log = dict(on_step=True, on_epoch=False, sync_dist=False, batch_size=int(x.size(0)))
                 self.log('train/disc_loss', weighted_d_loss, prog_bar=True, **d_log)
                 self.log('train/logits_real', self._logits_mean(logits_real), **d_log)
                 self.log('train/logits_fake', self._logits_mean(logits_fake), **d_log)
-            if updated:
-                self._manual_train_step += 1
+            self._manual_train_step += 1
         self._adv_cache = None
 
         if self._should_log_images(batch_idx, prefix='train'):
@@ -3619,7 +3599,8 @@ class LASER(VisualsMixin, pl.LightningModule):
                     f"Non-finite train/disc_loss at MDCTCodec step={step}"
                 )
             self.manual_backward(weighted_d_loss)
-            self._step_manual_optimizer(opt_disc)
+            self._clip_manual_optimizer(self._raw_optimizer(opt_disc))
+            opt_disc.step()
             opt_disc.zero_grad(set_to_none=True)
 
         # The generator now sees the just-updated critic, exactly as in the
@@ -3645,8 +3626,24 @@ class LASER(VisualsMixin, pl.LightningModule):
             )
 
         self.manual_backward(loss)
-        updated = self._step_manual_optimizer(opt_ae, autoencoder=True)
-        self._dictionary_after_optimizer_step(opt_ae, updated)
+        if not self.bypass_bottleneck:
+            self.bottleneck.project_dictionary_gradient_()
+        self._clip_manual_optimizer(self._raw_optimizer(opt_ae))
+        opt_ae.step()
+        if not self.bypass_bottleneck:
+            alternating_update = getattr(
+                self.bottleneck,
+                "alternating_dictionary_update_after_step_",
+                None,
+            )
+            if callable(alternating_update):
+                alternating_update()
+            self.bottleneck.normalize_dictionary_()
+            revive = getattr(
+                self.bottleneck, "revive_dead_atoms_after_step_", None
+            )
+            if callable(revive):
+                revive(optimizer=self._raw_optimizer(opt_ae))
 
         if disc_should_step:
             d_log = dict(
@@ -3658,8 +3655,7 @@ class LASER(VisualsMixin, pl.LightningModule):
             self.log("train/disc_loss", weighted_d_loss, prog_bar=True, **d_log)
             self.log("train/logits_real", self._logits_mean(logits_real), **d_log)
             self.log("train/logits_fake", self._logits_mean(logits_fake), **d_log)
-        if updated:
-            self._manual_train_step += 1
+        self._manual_train_step += 1
         self._adv_cache = None
 
         if self._should_log_images(batch_idx, prefix="train"):

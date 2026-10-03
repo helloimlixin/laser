@@ -1,5 +1,34 @@
 import torch
 
+
+def test_orthogonal_coefficients_match_each_least_squares_prefix_of_source():
+    from src.orthogonal_sparse_codec import dictionary_to_orthogonal_coefficients
+    torch.manual_seed(89)
+    support = torch.nn.functional.normalize(torch.randn(20, 4, 16), dim=-1)
+    source = torch.randn(20, 16)
+    coefficients = torch.linalg.lstsq(support.transpose(-1, -2), source[..., None]).solution[..., 0]
+    gamma, basis = dictionary_to_orthogonal_coefficients(support, coefficients)
+    torch.testing.assert_close(gamma, (basis * source[:, None]).sum(-1), atol=2e-6, rtol=2e-5)
+    for depth in range(1, 5):
+        prefix = support[:, :depth]
+        c = torch.linalg.lstsq(prefix.transpose(-1, -2), source[..., None]).solution[..., 0]
+        g, q = dictionary_to_orthogonal_coefficients(prefix, c)
+        torch.testing.assert_close(g, gamma[:, :depth], atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close((g[..., None] * q).sum(-2), (c[..., None] * prefix).sum(-2), atol=2e-6, rtol=2e-5)
+
+
+def test_orthogonal_codec_ignores_bfloat16_autocast():
+    from src.orthogonal_sparse_codec import dictionary_to_orthogonal_coefficients
+    torch.manual_seed(90)
+    support = torch.randn(8, 4, 16)
+    coefficients = torch.randn(8, 4)
+    expected = dictionary_to_orthogonal_coefficients(support, coefficients)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        actual = dictionary_to_orthogonal_coefficients(support, coefficients)
+    for a, b in zip(actual, expected):
+        assert a.dtype == torch.float32
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
 from src.orthogonal_sparse_codec import (
     dictionary_to_orthogonal_coefficients,
     ordered_support_basis,

@@ -1,0 +1,120 @@
+run_id: church-vector96-recovery90-20261002
+seed: 0
+data:
+  dataset: LSUN-church
+  tokenizer: /tmp/laser-church-combination-20260928/tokenizer.pt
+  token_cache: /tmp/laser-church-ffhq-recovered-20260927/source-cache.pt
+  split: /tmp/laser-church-vector-marginal-h200-20260930/split.pt
+  stage1_frozen: true
+  coeff_scales:
+  - 7.662353992462158
+  - 4.1580352783203125
+  - 2.633323907852173
+  - 1.6512117385864258
+arch:
+  type: rq-transformer
+  decoder: physical-prefix-with-dedicated-coefficient-micro-transformer
+  block_size:
+  - 8
+  - 8
+  - 4
+  vocab_size: 16384
+  coefficient_vocabulary: 2048
+  embed_dim: 1024
+  input_embed_dim: 256
+  shared_tok_emb: true
+  shared_cls_emb: true
+  input_emb_vqvae: true
+  head_emb_vqvae: true
+  cumsum_depth_ctx: true
+  vocab_size_cond: 1
+  block_size_cond: 1
+  embd_pdrop: 0.0
+  body:
+    n_layer: 24
+    block:
+      n_head: 16
+      attn_pdrop: 0.0
+      resid_pdrop: 0.1
+  head:
+    n_layer: 4
+    block:
+      n_head: 16
+      attn_pdrop: 0.0
+      resid_pdrop: 0.1
+  coefficient_micro_layers: 2
+optimizer:
+  type: AdamW
+  lr: 0.0005
+  betas:
+  - 0.9
+  - 0.95
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  warmup_epochs: 0
+  schedule: historical-two-phase-cosine
+  schedule_epochs: 200
+  minimum_lr_ratio: 0.0
+  late_schedule_epochs: 300
+  phase_switch_step: 13000
+training:
+  epochs: 90
+  world_size: 4
+  global_batch: 256
+  per_gpu_batch: 64
+  microbatch: 32
+  accumulation: 2
+  drop_last: true
+  precision: fp32
+  linear_tf32: true
+  short_attention_tf32: false
+  from_scratch: true
+  early_stopping: false
+  score_chunk_size: 8192
+  gradient_chunk_size: 1024
+  total_optimizer_steps: 16868
+  late_global_batch: 2048
+  late_per_gpu_batch: 512
+  late_microbatch: 256
+  late_accumulation: 2
+  late_score_chunk_size: 32768
+loss:
+  type: finite-unique-sequence-vector-kernel-nll
+  temperature: 0.33584674003704434
+  scale: 0.125
+  posterior_gradient_samples: 2
+  extra_candidates: 4
+  coefficient_refitting: false
+teacher:
+  temperature: 0.33584674003704434
+  uniform_proposal_mixture: 0.001
+  context_gaussian_noise_ratio: 0.0
+  repeated_atoms: false
+  expanded_combination_search: false
+sampling:
+  primary:
+    atom_top_k: 250
+    atom_top_p: 1.0
+    coefficient_top_p: 0.85
+    atom_temperature: 1.0
+    coefficient_temperature: 1.0
+  diagnostic:
+    atom_top_k: 16384
+    atom_top_p: 1.0
+    coefficient_top_p: 1.0
+    atom_temperature: 1.0
+    coefficient_temperature: 1.0
+evaluation:
+  samples: 50000
+  first_epoch: true
+  every_epochs: 10
+  validation_every_epochs: 1
+  train_probe_every_epochs: 5
+  generation_batch: 128
+  decoder_batch: 32
+  logical_ranks: 8
+  seed: 2026093901
+  independent_seed: 2026093001
+  reference: /tmp/laser-church-combination-20260928/lsun_256_church.npz
+  comparison_published_fid: 7.653229865585274
+  comparison_earlier_laser_fid: 9.669780009477051

@@ -1,0 +1,74 @@
+defaults:
+- _self_
+stage: stage2
+backend: rqtransformer
+options:
+  checkpoint: /mnt/laser-stage2-7h100/assets/best_rfid_slot1_model.pt
+  data: /mnt/laser-stage2-7h100/assets
+  token_cache: /mnt/laser-stage2-7h100/assets/compound-cache.pt
+  token_cache_in_ram: true
+  output: /workspace/Projects/laser/outputs/imagenet-rfid421-ffhq-compound-1400m-7h100-20260923/train
+  dataset: imagenet
+  model_preset: imagenet-1400m
+  distributed_backend: ddp
+  num_atoms: 16384
+  sparsity_level: 4
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  coeff_scale: 1.0
+  coeff_target_space: physical
+  coeff_target_mode: soft
+  coeff_target_temperature: 0.125
+  clip_coefficients: false
+  compound_tokens: true
+  compound_pair_autoregressive: true
+  compound_mask_seen_atoms_training: false
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  compound_distribution_geometry: false
+  geometry_top_k: 4
+  atom_loss_weight: 1.5
+  geometry_loss_weight: 0.0
+  geometry_start_epoch: 2
+  geometry_warmup_epochs: 3
+  epochs: 100
+  batch_size: 96
+  total_batch_size: 2016
+  lr: 0.0004921875
+  lr_schedule: cosine
+  lr_schedule_epochs: 100
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  seed: 0
+  atom_temperature: 1.0
+  atom_top_k: 2048
+  atom_top_p: 1.0
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+  metric_backend: original-rqvae
+  fid_reference_stats: /mnt/laser-stage2-7h100/assets/imagenet_256_train.npz
+  fid_num_samples: 50000
+  fid_batch_size: 128
+  fid_every: 5
+  save_ckpt_freq: 5
+  save_step_freq: 100
+  keep_best_checkpoints: 1
+  model_only_best_checkpoints: true
+  sample_grid_every: 500
+  sample_grid_size: 64
+  sample_grid_batch_size: 64
+  sample_grid_samples_per_class: 8
+  sample_grid_on_start: false
+  upload_checkpoints: true
+  checkpoint_upload_mode: files
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: imagenet-rfid421-ffhq-compound-1400m-7h100-20260923
+  wandb_name: ImageNet rFID4.21 compound RQT-1.4B 7xH100
+  wandb_mode: online
+  resume: true
+  async_checkpoint_copy: true
+  training_precision: bf16
+  compound_pair_attention: compiled

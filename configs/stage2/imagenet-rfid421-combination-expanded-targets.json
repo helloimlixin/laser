@@ -1,0 +1,14 @@
+{
+  "version": "full_combination_cartesian_candidates_correlated_coefficients_v2",
+  "support_temperature": 0.0625,
+  "coefficient_temperature": 1.7737924579079655e-05,
+  "swaps_per_atom": 128,
+  "cartesian_per_atom": 8,
+  "max_variants": 256,
+  "coefficient_kernel_radius": 16,
+  "encoder_chunk_size": 32,
+  "site_chunk_size": 4032,
+  "candidate_policy": "Full-vocabulary complete-refit replacement ranking; union of anchor, 128 alternatives per slot, and 9^4 Cartesian combinations; ordered deduplication, full joint refit, retain anchor plus best255.",
+  "coefficient_policy": "Support-Gram correlated Gaussian with prefix-conditional finite-bin targets; compact kernels omit <=1e-30 relative mass or fall back to complete bin grid.",
+  "calibration_sha256": "0edeb19ee0bc9b7e8ca961c54d7469bcaf315bb3215b2f635ee353778824e1e9"
+}

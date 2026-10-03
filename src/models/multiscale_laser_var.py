@@ -50,13 +50,11 @@ class MultiScaleLaser(nn.Module):
         self.coefficient_bins = int(coefficient_bins)
         self.beta, self.omp_chunk_size = beta, int(omp_chunk_size)
         self.coefficient_range_decay = None
-        self.tokenized_sparse_policy = None
         self.dictionary = DictionaryLearning(
             num_embeddings=atoms, embedding_dim=channels, sparsity_level=sparsity,
             omp_ridge=1e-5, omp_max_support_coherence=.999,
             dictionary_collective_backend="default")
         self.quant_resi = quant_resi
-        self.residual_scale_positions = None
         self.register_buffer("coefficient_max", torch.full((len(patch_nums),), float(coefficient_max)))
         self.register_buffer("companding", torch.tensor(10.))
 
@@ -80,31 +78,13 @@ class MultiScaleLaser(nn.Module):
         x = vectors.transpose(1, 2).reshape(vectors.shape[0], self.Cvae, pn, pn)
         if pn != final:
             x = F.interpolate(x, (final, final), mode="bicubic", align_corners=False)
-        position = (scale / (len(self.v_patch_nums) - 1) if self.residual_scale_positions is None
-                    else self.residual_scale_positions[scale])
-        return self.quant_resi[position](x) if self.quant_resi is not None else x
+        return self.quant_resi[scale / (len(self.v_patch_nums) - 1)](x) if self.quant_resi is not None else x
 
     def next_input(self, accumulated, scale):
         pn = self.v_patch_nums[scale]
         return F.interpolate(accumulated, (pn, pn), mode="area").flatten(2).transpose(1, 2)
 
-    @torch.no_grad()
-    def update_coefficient_range(self, values, scale, *, calibrate=False):
-        if calibrate:
-            bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1)
-            self.coefficient_max[scale].copy_(torch.maximum(self.coefficient_max[scale], bound))
-        elif self.training and self.coefficient_range_decay is not None:
-            bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1) * 1.2
-            if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(bound, op=torch.distributed.ReduceOp.MAX)
-            decay = self.coefficient_range_decay
-            self.coefficient_max[scale].mul_(decay).add_(bound * (1-decay))
-
     def decompose(self, latent, *, calibrate=False):
-        if self.tokenized_sparse_policy is not None:
-            from .sparse_token_codec import decompose_sparse_tokens
-            return decompose_sparse_tokens(self, latent, stochastic=self.training and not calibrate,
-                update_ranges=self.training, calibrate=calibrate, include_probabilities=False)
         with torch.autocast(device_type=latent.device.type, enabled=False):
             z = latent.float()
             if z.shape[1:] != (self.Cvae, self.v_patch_nums[-1], self.v_patch_nums[-1]):
@@ -124,7 +104,18 @@ class MultiScaleLaser(nn.Module):
                              for chunk in signals.split(self.omp_chunk_size)]
                     atoms = torch.cat([p[0] for p in pairs])
                     values = torch.cat([p[1] for p in pairs])
-                    self.update_coefficient_range(values, scale, calibrate=calibrate)
+                    if calibrate:
+                        bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1)
+                        self.coefficient_max[scale].copy_(torch.maximum(self.coefficient_max[scale], bound))
+                    elif self.training and self.coefficient_range_decay is not None:
+                        # A scratch encoder's latent scale changes while learning.
+                        # Track training-only ranges, synchronized across ranks;
+                        # evaluation and the frozen prior never update these bins.
+                        bound = torch.quantile(values.abs().flatten(), .9995).clamp_min(.1) * 1.2
+                        if torch.distributed.is_initialized():
+                            torch.distributed.all_reduce(bound, op=torch.distributed.ReduceOp.MAX)
+                        decay = self.coefficient_range_decay
+                        self.coefficient_max[scale].mul_(decay).add_(bound * (1-decay))
                     clipping.append((values.abs() > self.coefficient_max[scale]).float().mean())
                     coefficients = self.coefficient_ids(values, scale)
                 atoms = atoms.reshape(z.shape[0], pn * pn, self.sparsity)
@@ -142,9 +133,8 @@ class MultiScaleLaser(nn.Module):
     def forward(self, latent, ret_usages=False):
         result = self.decompose(latent)
         self.last_atom_ids = result['atoms'].detach()
-        self.last_coefficient_ids = result['coefficients'].detach()
         self.last_clip_fraction = result['clip_fraction'].detach()
-        straight_through = result["latent"].detach() + (latent.float() - latent.float().detach())
+        straight_through = latent.float() + (result["latent"] - latent.float()).detach()
         return straight_through, None, result["loss"]
 
     def from_codes(self, atoms, coefficients):
@@ -196,20 +186,9 @@ class LaserVAR(VAR):
                          patch_nums=q.v_patch_nums, attn_l2_norm=True,
                          drop_path_rate=.1 * depth / 24, norm_eps=1e-6,
                          flash_if_available=False, fused_if_available=False)
-        expected_length = sum(pn * pn for pn in q.v_patch_nums)
-        if self.L != expected_length:
-            raise RuntimeError(
-                f"LASER changed the VAR spatial sequence: {self.L} != {expected_length}"
-            )
-        # Sparse depth is deliberately local to each spatial position. It must
-        # never be flattened into the transformer's sequence dimension.
-        self.spatial_token_length = self.L
         self.sparsity, self.coefficient_bins = q.sparsity, q.coefficient_bins
-        self.sparse_pairs_per_image = self.L * self.sparsity
-        self.categorical_decisions_per_image = self.sparse_pairs_per_image * 2
         self.coefficient_head = nn.Linear(self.C, q.coefficient_bins)
         self.atom_context = nn.Linear(q.Cvae, self.C, bias=False)
-        self.coefficient_query = nn.Linear(self.C, q.Cvae, bias=False)
         self.depth_context = nn.Sequential(nn.Linear(q.Cvae, self.C), nn.SiLU(), nn.Linear(self.C, self.C))
         self.depth_embedding = nn.Embedding(q.sparsity, self.C)
         self.init_weights(init_adaln=.5, init_adaln_gamma=1e-3, init_head=.02, init_std=-1.)
@@ -221,14 +200,6 @@ class LaserVAR(VAR):
 
     def depth_features(self, features, prefix, depth):
         return features + self.depth_context(prefix) + self.depth_embedding.weight[depth]
-
-    def coefficient_logits(self, hidden, atom_vectors):
-        # A sum of linear projections can only add an atom-specific bias to
-        # the context logits. The product lets the selected atom change how
-        # image context predicts its signed coefficient. Share this exact
-        # boundary between teacher forcing and autoregressive sampling.
-        interaction = atom_vectors * (1 + self.coefficient_query(hidden))
-        return self.coefficient_head(hidden + self.atom_context(interaction))
 
     def token_logits(self, features, atoms, coefficients):
         q = self._q[0]
@@ -243,7 +214,7 @@ class LaserVAR(VAR):
             if depth:
                 logits = logits.scatter(-1, atoms[:, :, :depth], -torch.inf)
             atom_logits.append(logits)
-            coefficient_logits.append(self.coefficient_logits(h, atom_vectors[:, :, depth]))
+            coefficient_logits.append(self.coefficient_head(h + self.atom_context(atom_vectors[:, :, depth])))
             prefix = prefix + atom_vectors[:, :, depth] * values[:, :, depth, None]
         return torch.stack(atom_logits, 2), torch.stack(coefficient_logits, 2)
 
@@ -285,7 +256,7 @@ class LaserVAR(VAR):
                         selected = []
                     selected.append(atoms)
                     vectors = F.embedding(atoms, q.normalized_dictionary().T)
-                    coeff_logits = self.coefficient_logits(h, vectors.repeat(2, 1, 1))
+                    coeff_logits = self.coefficient_head(h + self.atom_context(vectors.repeat(2, 1, 1)))
                     coeff_logits = (1 + guidance) * coeff_logits[:B] - guidance * coeff_logits[B:]
                     ids = sample_with_top_k_top_p_(coeff_logits.clone(), rng=rng, top_k=0, top_p=top_p)[:, :, 0]
                     prefix = prefix + vectors * q.coefficient_values(ids, scale)[..., None]

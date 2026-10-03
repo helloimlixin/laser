@@ -1,0 +1,71 @@
+# @package _global_
+defaults:
+  - _self_
+stage: stage2
+backend: cc3m_compound
+options:
+  checkpoint: /mnt/laser-coco/assets/stage1.pt
+  stage1_sha256: PENDING_STAGE1_SELECTION
+  stage1_attn_resolutions: [16]
+  data: /mnt/image-datasets/coco2014
+  token_cache: /mnt/laser-coco/assets/train.pt
+  validation_cache: /mnt/laser-coco/assets/validation.pt
+  token_cache_in_ram: true
+  fid_reference_stats: /workspace/Projects/laser/outputs/coco2014-laser-k4-compound-20260923/assets/coco2014-val-fid.npz
+  output: /workspace/Projects/laser/outputs/coco2014-laser-k4-compound-20260923/stage2
+  dataset: coco2014
+  dataset_revision: official-train2014-val2014
+  train_items: 414113
+  validation_items: 40504
+  model_preset: ffhq-350m-text
+  latent_shape: [8, 8, 4]
+  sparsity_level: 4
+  num_atoms: 16384
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  clip_coefficients: false
+  coefficient_storage: fp32
+  compound_pair_autoregressive: true
+  dictionary_atom_vector_conditioning: true
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  atom_loss_weight: 1.5
+  geometry_loss_weight: 0.05
+  geometry_start_epoch: 2
+  geometry_warmup_epochs: 3
+  geometry_top_k: 4
+  coeff_target_temperature: 0.5
+  stochastic_coefficient_context: true
+  text_tokenizer: bpe16k_huggingface
+  text_length: 32
+  bpe_dropout: 0.1
+  text_loss_weight: 0.1
+  image_loss_weight: 0.9
+  epochs: 200
+  batch_size: 16
+  accumulation: 2
+  total_batch_size: 128
+  lr: 0.0005
+  lr_schedule: cosine
+  warmup_epochs: 0
+  weight_decay: 0.0001
+  betas: [0.9, 0.95]
+  grad_clip_norm: 1.0
+  seed: 0
+  precision: bf16
+  eval_every: 5
+  eval_batch_size: 16
+  metric_backend: original-rqvae
+  clip_model: ViT-B/32
+  atom_top_k: 2048
+  atom_top_p: 1.0
+  coeff_top_p: 0.85
+  sample_grid_every: 500
+  save_step_freq: 200
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: coco2014-laser-k4-compound-stage2-20260923
+  wandb_name: COCO2014 LASER K4 FFHQ compound text RQT 4xA100
+  wandb_mode: online
+  upload_checkpoints: true
+  resume: true

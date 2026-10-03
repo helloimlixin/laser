@@ -34,6 +34,7 @@ export DATA_DIR=/path/to/datasets
 | LSUN Cat | `lsun/cat/` | `LSUN_CAT_DIR` |
 | ImageNet | `imagenet/` | `IMAGENET_DIR` |
 | CC3M | `cc3m/` | `CC3M_DIR` |
+| COCO2014 captions | `coco/` | `COCO_DIR` |
 
 You can also set `data.data_dir` in a recipe or append
 `data.data_dir=/path/to/dataset` to a command. Without `DATA_DIR`, the default is
@@ -50,6 +51,10 @@ You can also set `data.data_dir` in a recipe or append
 - **CC3M:** local WebDataset `.tar` shards containing image/caption pairs with
   matching stems (`.jpg` plus `.txt`, or a caption in `.json`). Shards can be
   directly in the dataset root or its `wds/` or `webdataset/` directory.
+- **COCO2014:** `train2014.zip`, `val2014.zip`, and
+  `annotations/captions_{train,val}2014.json`, or extracted image directories.
+  The captioned `coco2014` recipes retain the official split. The legacy `coco`
+  dataset remains image-only COCO2017. See the [COCO setup notes](../data/coco/README.md).
 
 ## Stage 1: train the autoencoder
 
@@ -61,6 +66,7 @@ python train.py --config configs/stage1/lsun-bedroom.yaml
 python train.py --config configs/stage1/lsun-cat.yaml
 python train.py --config configs/stage1/imagenet.yaml
 python train.py --config configs/stage1/cc3m.yaml
+python train.py --config configs/stage1/coco2014.yaml
 ```
 
 Choose the command for your dataset. These recipes use 256×256 images and an
@@ -82,6 +88,7 @@ python train.py --config configs/stage2/lsun-bedroom.yaml
 python train.py --config configs/stage2/lsun-cat.yaml
 python train.py --config configs/stage2/imagenet.yaml
 python train.py --config configs/stage2/cc3m.yaml
+python train.py --config configs/stage2/coco2014.yaml
 ```
 
 Stage 2 finds a checkpoint under `outputs/<dataset>/stage1`, builds a token cache,
@@ -90,6 +97,11 @@ and trains the prior. LSUN output directory names use underscores, such as
 conditioning; CC3M caches captions and uses text conditioning; face and LSUN
 priors are unconditional. Shared settings live in
 [`configs/stage2/base.yaml`](configs/stage2/base.yaml).
+
+COCO2014 also uses text conditioning, caching every human caption. Its stage-2
+recipe uses all training pairs and disables the random cache holdout to avoid
+image overlap between caption pairs; checkpoints monitor training loss. Evaluate
+generation on val2014 separately using the selected benchmark's protocol.
 
 To choose the stage-1 checkpoint explicitly:
 

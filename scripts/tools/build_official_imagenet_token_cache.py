@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import hashlib
 
 import torch
 import torch.distributed as dist
@@ -20,6 +21,7 @@ from src.training.rqtransformer import (
     LaserAux,
     source_image_dataset,
     val_image_transform,
+    atomic_torch_save,
 )
 
 
@@ -74,6 +76,9 @@ def main():
     p.add_argument("--coeff-max", type=float, default=20.0)
     p.add_argument("--coeff-scale", type=float, default=6.4)
     p.add_argument("--coeff-scales", type=float, nargs="+")
+    p.add_argument("--clip-coefficients", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--coefficient-storage", choices=("fp16", "fp32"), default="fp16")
+    p.add_argument("--encoder-precision", choices=("bf16", "fp32"), default="bf16")
     p.add_argument(
         "--auto-coeff-scales-percentile", type=float, default=None,
         help=(
@@ -93,6 +98,12 @@ def main():
         ),
     )
     args = p.parse_args()
+    if (not args.clip_coefficients and args.auto_coeff_scales_percentile is not None
+            and args.auto_coeff_scales_percentile != 100):
+        p.error("Unclipped automatic coefficient ranges require the full training maximum (100)")
+    storage_dtype = torch.float32 if args.coefficient_storage == "fp32" else torch.float16
+    with args.checkpoint.open("rb") as handle:
+        checkpoint_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
     if args.sparsity_level <= 0:
         p.error("--sparsity-level must be positive")
     if args.coeff_scales is not None and len(args.coeff_scales) != args.sparsity_level:
@@ -113,7 +124,8 @@ def main():
     dist.init_process_group("gloo")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("highest" if args.encoder_precision == "fp32" else "high")
+    torch.backends.cudnn.allow_tf32 = args.encoder_precision != "fp32"
     base = source_image_dataset(
         args.dataset, args.data, val_image_transform(), split="train"
     )
@@ -134,7 +146,7 @@ def main():
         args.coeff_scale if not calibrating else 1.0,
         attn_resolutions=((16,) if args.dataset in {"celebahq", "ffhq"} else (8,)),
         coeff_scales=args.coeff_scales,
-        clamp_coeffs=not calibrating,
+        clamp_coeffs=args.clip_coefficients and not calibrating,
         sparsity_level=args.sparsity_level,
     ).to(device)
     shard = args.output.with_suffix(f".rank{rank:02d}.pt")
@@ -144,7 +156,7 @@ def main():
         atoms, coeffs, prefix_coeffs, labels, rows = [], [], [], [], []
         with torch.inference_mode():
             for step, (images, target, index) in enumerate(loader):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.encoder_precision == "bf16"):
                     encoded = aux.encode_sparse_components(
                         images.to(device, non_blocking=True),
                         return_prefix_coeffs=args.causal_prefixes,
@@ -155,7 +167,7 @@ def main():
                 else:
                     a, c = encoded
                 atoms.append(a.to(torch.int16).cpu())
-                coeffs.append(c.to(torch.float16).cpu())
+                coeffs.append(c.to(storage_dtype).cpu())
                 labels.append(
                     (
                         torch.zeros_like(target)
@@ -177,7 +189,7 @@ def main():
         }
         if args.causal_prefixes:
             shard_payload["prefix_coeffs"] = torch.cat(prefix_coeffs)
-        torch.save(shard_payload, shard)
+        atomic_torch_save(shard_payload, shard)
     dist.barrier()
     if rank == 0:
         parts = [torch.load(args.output.with_suffix(f".rank{r:02d}.pt"), weights_only=True) for r in range(world)]
@@ -195,9 +207,9 @@ def main():
                 coeff_scales = torch.quantile(absolute, quantile, dim=0) / args.coeff_max
             if not torch.isfinite(coeff_scales).all() or (coeff_scales <= 0).any():
                 raise RuntimeError(f"invalid calibrated coefficient scales: {coeff_scales}")
-            merged_coeffs = (
-                merged_coeffs / coeff_scales.view(1, 1, 1, args.sparsity_level)
-            ).clamp(-args.coeff_max, args.coeff_max)
+            merged_coeffs = merged_coeffs / coeff_scales.view(1, 1, 1, args.sparsity_level)
+            if args.clip_coefficients:
+                merged_coeffs = merged_coeffs.clamp(-args.coeff_max, args.coeff_max)
             aux.coeff_scales.copy_(coeff_scales.to(device))
             aux.coeff_max = float(args.coeff_max)
             aux.coeff_bins.copy_(
@@ -206,12 +218,12 @@ def main():
                     device=device,
                 )
             )
-            aux.clamp_coeffs = True
+            aux.clamp_coeffs = args.clip_coefficients
         else:
             coeff_scales = aux.coeff_scales.detach().cpu()
         merged = {
             "atoms": torch.cat([x["atoms"] for x in parts])[order].contiguous(),
-            "coeffs": merged_coeffs.to(torch.float16).contiguous(),
+            "coeffs": merged_coeffs.to(storage_dtype).contiguous(),
             "labels": torch.cat([x["labels"] for x in parts])[order].contiguous(),
             "meta": {"format": (
                          "laser_compound_causal_prefix_v2"
@@ -223,6 +235,10 @@ def main():
                      "shape": [8, 8, args.sparsity_level], "num_atoms": args.num_atoms,
                      "coeff_vocab_size": args.coeff_vocab_size, "coeff_max": args.coeff_max,
                      "coeff_scale": args.coeff_scale,
+                     "clip_coefficients": args.clip_coefficients,
+                     "coefficient_storage": args.coefficient_storage,
+                     "encoder_precision": args.encoder_precision,
+                     "stage1_checkpoint_sha256": checkpoint_sha256,
                      "coeff_scales": [float(x) for x in coeff_scales],
                      "auto_coeff_scales_percentile": args.auto_coeff_scales_percentile,
                      "stage1_checkpoint": str(args.checkpoint.resolve()),
@@ -238,13 +254,13 @@ def main():
             merged["prefix_coeffs"] = torch.cat(
                 [part["prefix_coeffs"] for part in parts]
             )[order].contiguous()
-        torch.save(merged, args.output)
+        atomic_torch_save(merged, args.output)
         # Structural and numerical verification against a fresh direct encoding.
         n = min(args.verify_samples, len(base))
         verify_loader = DataLoader(Subset(base, range(n)), batch_size=min(args.batch_size, n), shuffle=False)
         direct_a, direct_c, direct_prefix, verify_images = [], [], [], []
         for images, _ in verify_loader:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.encoder_precision == "bf16"):
                 encoded = aux.encode_sparse_components(
                     images.to(device), return_prefix_coeffs=args.causal_prefixes
                 )
@@ -258,6 +274,10 @@ def main():
         direct_a, direct_c = torch.cat(direct_a), torch.cat(direct_c)
         cached_a, cached_c = merged["atoms"][:n].long(), merged["coeffs"][:n].float()
         report = {"samples": n, "items": len(base),
+                  "clip_coefficients": args.clip_coefficients,
+                  "coefficient_storage": args.coefficient_storage,
+                  "encoder_precision": args.encoder_precision,
+                  "stage1_checkpoint_sha256": checkpoint_sha256,
                   "atom_exact_fraction": float((direct_a == cached_a).float().mean()),
                   "coeff_mae": float((direct_c - cached_c).abs().mean()),
                   "coeff_max_error": float((direct_c - cached_c).abs().max()),

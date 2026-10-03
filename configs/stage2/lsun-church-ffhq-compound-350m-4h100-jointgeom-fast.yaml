@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - lsun-church-ffhq-compound-350m-4h100-jointgeom-scratch
+  - _self_
+
+# Resume the scratch run with equivalent fused two-token training attention.
+# All candidate conditionals, dropout, losses, and sampling settings remain.
+options:
+  compound_pair_attention: compiled
+  resume: true

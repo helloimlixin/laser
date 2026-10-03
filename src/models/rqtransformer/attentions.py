@@ -22,6 +22,26 @@ from torch.nn import functional as F
 from .configs import AttentionBlockConfig, AttentionStackConfig
 
 
+def causal_short_attention(query, key, value):
+    """Exact causal attention without padded FlashAttention depth tiles."""
+    dtype = query.dtype
+    compute_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    q, k, v = query.to(compute_dtype), key.to(compute_dtype), value.to(compute_dtype)
+    outputs = [v[..., 0, :]]
+    scale = 1.0 / math.sqrt(query.shape[-1])
+    for index in range(1, query.shape[-2]):
+        logits = torch.stack([
+            (q[..., index, :] * k[..., previous, :]).sum(-1) * scale
+            for previous in range(index + 1)
+        ], dim=-1)
+        weights = logits.softmax(-1)
+        outputs.append(sum(
+            weights[..., previous, None] * v[..., previous, :]
+            for previous in range(index + 1)
+        ))
+    return torch.stack(outputs, dim=-2).to(dtype)
+
+
 class GELU(nn.Module):
     def __init__(self, version='v1'):
         super().__init__()
@@ -56,6 +76,7 @@ class MultiSelfAttention(nn.Module):
 
         self.n_head = config.n_head
         self.mask = mask
+        self.short_attention_backend = 'sdpa'
 
     def forward(self, x, caching=False, past_kv=None):
         (B, T, C) = x.shape
@@ -75,11 +96,22 @@ class MultiSelfAttention(nn.Module):
         # Keep the established explicit path for autoregressive KV caching.
         if not caching and past_kv is None:
             dropout_p = float(self.attn_drop.p) if self.training else 0.0
-            y = F.scaled_dot_product_attention(
-                q4, k4, v4,
-                dropout_p=dropout_p,
-                is_causal=bool(self.mask),
-            )
+            # PyTorch 2.8 FlashAttention backward fails for very large
+            # batches of short depth sequences on this H200 environment.
+            # Attention is independent across batch rows; split that axis
+            # to keep the same causal attention and a safe kernel geometry.
+            if self.short_attention_backend == 'compiled' and self.training and T == 8 and self.mask and dropout_p == 0:
+                y = causal_short_attention(q4, k4, v4)
+            elif T <= 8 and B > 8192:
+                y = torch.cat([
+                    F.scaled_dot_product_attention(q, k, v,
+                        dropout_p=dropout_p, is_causal=bool(self.mask))
+                    for q, k, v in zip(q4.split(8192), k4.split(8192), v4.split(8192))
+                ], dim=0)
+            else:
+                y = F.scaled_dot_product_attention(
+                    q4, k4, v4, dropout_p=dropout_p, is_causal=bool(self.mask),
+                )
             y = y.permute(2, 0, 1, 3).contiguous().view(T, B, C)
             y = self.resid_drop(self.proj(y))
             return y.transpose(0, 1).contiguous()

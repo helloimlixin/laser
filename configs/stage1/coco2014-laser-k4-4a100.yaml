@@ -1,0 +1,38 @@
+# @package _global_
+defaults:
+  - coco2014
+  - _self_
+
+seed: 0
+output_dir: outputs/coco2014-laser-k4-compound-20260923/stage1
+data:
+  data_dir: /mnt/image-datasets/coco2014
+  batch_size: 32
+  eval_batch_size: 32
+  num_workers: 4
+  augment: false
+  coco_caption_mode: first
+model:
+  sparsity_level: 4
+  force_quant_conv: true
+  dictionary_loss_weight: 0.25
+  sparsity_reg_weight: 0.0
+  log_images_every_n_steps: 500
+train:
+  devices: 4
+  strategy: ddp_find_unused_parameters_true
+  max_epochs: 100
+  learning_rate: 4.0e-5
+  precision: bf16-mixed
+  log_every_n_steps: 10
+checkpoint:
+  monitor: val/rfid
+  save_top_k: 1
+  upload_mode: files
+  upload_every_n_train_steps: 200
+  resume_in_place: true
+wandb:
+  id: coco2014-laser-k4-stage1-20260923
+  name: COCO2014 LASER K4 stage1 4xA100
+  group: coco2014-laser-k4-compound-20260923
+  resume: allow

@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - lsun-church-ffhq-compound-350m-4h100-conditional-geometry
+  - _self_
+
+# Fresh stage-2 weights and optimizer; reuse the validated tokenizer and cache.
+options:
+  output: outputs/church-ffhq-compound-350m-4h100-jointgeom-scratch-20260923/train
+  resume: false
+  resume_checkpoint: null
+  init_stage2_checkpoint: null
+  wandb_id: church-ffhq-compound-350m-4h100-jointgeom-scratch-20260923
+  wandb_name: Church FFHQ compound 350M joint geometry scratch 4xH100

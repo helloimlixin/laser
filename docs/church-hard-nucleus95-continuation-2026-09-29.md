@@ -1,0 +1,23 @@
+# Church: sampler-only nucleus0.95 continuation, 2026-09-29
+
+[Active W&B training](https://wandb.ai/helloimlixin-rutgers/laser/runs/church-rq-compound-hard-p95-20260929) continues the deterministic hard-target Church model from completed update3800, epoch61 plus18/62 batches. It keeps the original300-epoch /18600-update horizon, batch2048 on eight H100 GPUs, and64-image previews every200 updates.
+
+The only model-behavior change is generation: atom nucleus0.95 atT1, followed by the selected atom's coefficient nucleus0.95 atT1. Each pair is committed together, repeated atoms remain allowed, and the sampler retains at least95% original probability at each head/depth. Model, cached deterministic targets, hard losses, coefficient grid, optimizer parameters, and training update loop are unchanged. There is no refitting, reward, contrastive term, soft target or stochastic encoding.
+
+The adoption test measured the same epoch40/step2480 checkpoint with a matched50,000-image protocol: full-vocabulary FID39.023496743 → nucleus FID32.160663566, with covariance19.216825600 →16.454355202. [Complete comparison and sources](church-hard-nucleus95-2026-09-29.md).
+
+One-time migration first validated the original full checkpoint against its original source/plan, then changed only allowlisted sampler/location/provenance metadata and reset sampler-specific evaluation/BEST history. The original model tensors, all503 Adam states, scheduler, global step, epoch/batch cursor, initialization digest and eight model/inert-teacher RNG streams were identical after saving and reloading the migrated checkpoint. All eight live ranks loaded the same model and restored those RNG states after W&B initialization. This proves saved-state preservation; it does not assert a bitwise-identical future training trajectory.
+
+Sampler CPU tests(8), continuation tests(4), an actual503-state checkpoint roundtrip, source audits, native1024-image exact-feature replay and the50k evaluation passed. The first regular new-sampler preview was generated at update4000. Steady full training updates remain approximately0.65seconds.
+
+FID remains scheduled every620 updates, with the next continuation measurement at4340(epoch70). It uses the same official reference, eight RNG streams, generation batch1024 and FP32 decoder/Inception batches32. Nucleus BEST starts empty until measured in this sampler; old full-vocabulary scores are preserved separately.
+
+The retired parent run's LAST3800 and full-vocabulary BEST3100(FID32.0948256175) were remotely verified in `helloimlixin-rutgers/laser/church-rq-compound-hard-20260929-selected-checkpoints:v7`. The parent was intentionally finalized, with summary links to this continuation and an explicit flag that it did not complete300epochs. The child independently publishes its full LAST and future nucleus BEST, and its recovery artifact preserves both parent checkpoints without treating them as child BEST.
+
+The handoff's process-exit poll briefly misclassified a disappearing controller command line as PID replacement after successful migration/termination. Root independently verified every original parent PID had exited and no GPU owners remained, preserved the failure log and exact migration proof, then completed the handoff receipt and launched the child. Frozen training sources were not edited. Latest logged unsaved updates at handoff were0; the resumed point is the completed checkpoint, not any in-flight computation.
+
+Runtime: `/tmp/laser-church-rq-compound-hard-p95-20260929`. Durable records: `outputs/church-rq-compound-hard-p95-20260929/`. The decisive receipts are `migration-complete.json`, `handoff-complete.json`, `diagnostics/root-startup-audit.json`, and sampler-specific checkpoint upload receipts.
+
+First continued evaluation: epoch70 / update4340, FID50k **25.098189384**, mean11.489161491, covariance13.609027892, evaluation88.58seconds. Every level/head again retained at least95% probability over all12.8million generated pairs. The step4000 preview image was independently verified in remote W&B history against its local SHA256. Bootstrap full LAST3800 was verified in `church-rq-compound-hard-p95-20260929-selected-checkpoints:v0`; its successors retain sampler-specific LAST/BEST aliases.
+
+The full epoch70/update4340 LAST and nucleus BEST checkpoint entries were independently verified in the committed remote artifact `helloimlixin-rutgers/laser/church-rq-compound-hard-p95-20260929-selected-checkpoints:v1`, including matching manifest digests/sizes, all503 Adam states, all8 RNG streams and the correct nucleus evaluation in the checkpoint. The run remains active beyond this update. Launch completion receipt: `outputs/church-rq-compound-hard-p95-20260929/launch-complete.json`.

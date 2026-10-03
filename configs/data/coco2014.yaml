@@ -1,0 +1,15 @@
+dataset: coco2014
+data_dir: ${oc.env:COCO_DIR,${oc.env:DATA_DIR,../data}/coco}
+batch_size: 8
+eval_batch_size: 8
+num_workers: 4
+pin_memory: true
+prefetch_factor: 2
+image_size: 256
+seed: ${seed}
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
+# Keep left/right caption semantics. Resize short side, then center crop.
+augment: false
+max_items: 0
+coco_caption_mode: first

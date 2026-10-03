@@ -47,12 +47,14 @@ class CompoundCoefficientHistoryDecoder(nn.Module):
     from the current event may enter these inputs.
     """
     def __init__(self, hidden_dim, input_dim, *, width=512, layers=2, heads=8,
-                 dropout=0.1, max_events=256):
+                 dropout=0.1, max_events=256, atom_conditioned=True,
+                 zero_output=True):
         super().__init__()
         if layers < 1 or max_events < 1:
             raise ValueError('positive layer and event counts are required')
         self.hidden_projection = nn.Linear(hidden_dim, width)
-        self.atom_projection = nn.Linear(input_dim, width, bias=False)
+        self.atom_projection = (nn.Linear(input_dim, width, bias=False)
+                                if atom_conditioned else None)
         self.pair_projection = nn.Linear(input_dim, width, bias=False)
         self.prefix_projection = nn.Linear(input_dim, width, bias=False)
         self.position = nn.Parameter(torch.empty(1, max_events, width))
@@ -62,7 +64,8 @@ class CompoundCoefficientHistoryDecoder(nn.Module):
         self.output = nn.Linear(width, hidden_dim, bias=False)
         self.apply(self._initialize)
         nn.init.normal_(self.position, std=0.02)
-        nn.init.zeros_(self.output.weight)
+        if zero_output:
+            nn.init.zeros_(self.output.weight)
         self.reset_cache()
 
     @staticmethod
@@ -88,9 +91,13 @@ class CompoundCoefficientHistoryDecoder(nn.Module):
         length = hidden.shape[1]
         if start + length > self.position.shape[1]:
             raise ValueError('coefficient sequence exceeds decoder event capacity')
-        x = (self.hidden_projection(hidden) + self.atom_projection(atom)
+        if (atom is None) != (self.atom_projection is None):
+            raise ValueError('current atom must be provided only to an atom-conditioned decoder')
+        x = (self.hidden_projection(hidden)
              + self.pair_projection(previous_pair) + self.prefix_projection(prefix)
              + self.position[:, start:start + length])
+        if self.atom_projection is not None:
+            x = x + self.atom_projection(atom)
         for block in self.blocks:
             x = block(x, cached=cached)
         if cached:

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import json
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ from src.orthogonal_sparse_codec import (  # noqa: E402
 
 FORMAT = "laser_orthogonal_compound_v1"
 SUPPORTED_INPUTS = {
+    "laser_compound_image_views_v1",
     "laser_compound_pairs_v1",
     "laser_compound_causal_prefix_v2",
 }
@@ -46,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--verify-sites", type=int, default=65_536)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--physical-noise-margin", type=float, default=0.0)
     args = parser.parse_args()
     if not args.input.is_file():
         parser.error(f"input does not exist: {args.input}")
@@ -83,7 +87,7 @@ def atomic_json_save(payload: dict, target: Path) -> None:
 def main() -> None:
     args = parse_args()
     started = time.monotonic()
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("highest")
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -103,8 +107,8 @@ def main() -> None:
     atoms = source["atoms"]
     coefficients = source["coeffs"]
     labels = source["labels"]
-    if atoms.shape != coefficients.shape or atoms.ndim != 4:
-        raise ValueError("atoms and coefficients must match [N,H,W,K]")
+    if atoms.shape != coefficients.shape or atoms.ndim not in (4, 5):
+        raise ValueError("atoms and coefficients must match [N,H,W,K] or [N,V,H,W,K]")
     if len(labels) != len(atoms):
         raise ValueError("input cache row counts do not match")
     items = len(atoms) if args.max_items == 0 else min(args.max_items, len(atoms))
@@ -169,14 +173,14 @@ def main() -> None:
         scale_numerators = torch.quantile(
             absolute, args.scale_percentile / 100.0, dim=0
         )
-    scales = scale_numerators / coeff_max
+    scales = (scale_numerators + args.physical_noise_margin) / coeff_max
     if not torch.isfinite(scales).all() or (scales <= 0).any():
         raise RuntimeError(f"invalid orthogonal coefficient scales: {scales}")
-    normalized_gamma = (
-        physical_gamma / scales.view(1, 1, 1, depth)
-    ).clamp(-coeff_max, coeff_max).to(torch.float16)
+    normalized_gamma = physical_gamma / scales
+    # Preserve continuous FP32 targets; bin endpoints constrain sampling only.
+    assert torch.isfinite(normalized_gamma).all()
 
-    total_sites = items * int(atoms.shape[1]) * int(atoms.shape[2])
+    total_sites = math.prod(atoms.shape[:-1])
     verify_sites = min(args.verify_sites, total_sites)
     verify_indices = torch.linspace(
         0, total_sites - 1, verify_sites, dtype=torch.long
@@ -203,6 +207,8 @@ def main() -> None:
     quantized_gamma = bins[nearest] * scales.to(device)
     quantized_latents = torch.einsum("...k,...kc->...c", quantized_gamma, basis)
     quantized_error = quantized_latents - source_latents
+    source_nearest = ((source_physical / old_scales.to(device)).clamp(-coeff_max, coeff_max) + coeff_max).mul((len(bins)-1)/(2*coeff_max)).round().long()
+    source_quantized = torch.einsum("...k,...kc->...c", bins[source_nearest] * old_scales.to(device), support)
     report = {
         "passed": bool(
             continuous_error.abs().max() < 2e-4
@@ -215,6 +221,7 @@ def main() -> None:
         "sites": total_sites,
         "verify_sites": verify_sites,
         "coefficient_scales": [float(value) for value in scales],
+        "source_quantized_latent_mse": float((source_quantized-source_latents).square().mean()),
         "continuous_latent_mae": float(continuous_error.abs().mean()),
         "continuous_latent_max_error": float(continuous_error.abs().max()),
         "quantized_latent_mse": float(quantized_error.square().mean()),
@@ -226,7 +233,12 @@ def main() -> None:
 
     output_meta = {
         **meta,
-        "format": FORMAT,
+        "format": "laser_orthogonal_image_views_v1" if atoms.ndim == 5 else FORMAT,
+        "coefficient_storage": "fp32",
+        "clip_coefficients": False,
+        "physical_noise_margin": args.physical_noise_margin,
+        "outside_bin_count_per_depth": (normalized_gamma.abs() > coeff_max).reshape(-1, depth).sum(0).tolist(),
+        "outside_bin_fraction_per_depth": (normalized_gamma.abs() > coeff_max).reshape(-1, depth).float().mean(0).tolist(),
         "items": items,
         "coordinate_system": "ordered_cholesky_orthogonal",
         "coeff_scales": [float(value) for value in scales],
@@ -236,6 +248,12 @@ def main() -> None:
         "causal_prefix_coeffs": True,
         "causal_prefix_coeff_units": "orthogonal_projection",
     }
+    if atoms.ndim == 5:
+        output_meta["orthogonal_source_cache_identity"] = meta["image_view_cache_identity"]
+        output_meta["coeffs_sha256"] = hashlib.sha256(normalized_gamma.numpy().tobytes()).hexdigest()
+        output_meta.pop("image_view_cache_identity", None)
+        output_meta["image_view_cache_identity"] = hashlib.sha256(json.dumps(output_meta, sort_keys=True).encode()).hexdigest()
+    atomic_json_save(output_meta, args.output.with_suffix(".meta.json"))
     atomic_torch_save(
         {
             "atoms": atoms.contiguous(),

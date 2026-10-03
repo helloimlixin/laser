@@ -11,6 +11,7 @@ from src.training.paths import ROOT
 from src.training.common import (
     _configure_training_tempdir,
     _make_selected_checkpoint_artifact_callback,
+    _make_selected_checkpoint_file_callback,
     _sample_text_prompts,
 )
 
@@ -452,6 +453,9 @@ def run(cfg: DictConfig):
     checkpoint_upload_to_wandb = bool(
         getattr(cfg.train_ar, "checkpoint_upload_to_wandb", CHECKPOINT_UPLOAD_TO_WANDB)
     )
+    checkpoint_upload_mode = str(getattr(cfg.train_ar, "checkpoint_upload_mode", "artifact"))
+    if checkpoint_upload_mode not in {"artifact", "files"}:
+        raise ValueError("train_ar.checkpoint_upload_mode must be artifact or files")
     checkpoint_upload_every_n_epochs = max(
         1,
         int(
@@ -653,8 +657,8 @@ def run(cfg: DictConfig):
                 cmode=getattr(cfg.train_ar, "sample_coeff_mode", cfg.ar.sample_coeff_mode),
                 sample_variants=sample_variants,
                 s1_root=str(Path(str(cfg.output_dir)).expanduser().resolve().parent),
-                text_prompts=sample_text_prompts,
-                class_labels=sample_class_labels,
+                # FID uses dataset conditioning; hand-picked preview prompts
+                # and classes would restrict its generated distribution.
             )
         )
     checkpoint_callback = ModelCheckpoint(
@@ -669,14 +673,21 @@ def run(cfg: DictConfig):
     )
     cbs.append(checkpoint_callback)
     if checkpoint_upload_to_wandb:
-        SelectedCheckpointArtifactCallback = _make_selected_checkpoint_artifact_callback(Callback)
-        cbs.append(
-            SelectedCheckpointArtifactCallback(
+        if checkpoint_upload_mode == "files":
+            UploadCallback = _make_selected_checkpoint_file_callback(Callback)
+            upload_callback = UploadCallback(
+                checkpoint_callback,
+                upload_dir=Path(cfg.output_dir) / "wandb_checkpoints",
+                every_n_epochs=checkpoint_upload_every_n_epochs,
+            )
+        else:
+            UploadCallback = _make_selected_checkpoint_artifact_callback(Callback)
+            upload_callback = UploadCallback(
                 checkpoint_callback,
                 artifact_prefix="model-stage2",
                 every_n_epochs=checkpoint_upload_every_n_epochs,
             )
-        )
+        cbs.append(upload_callback)
     early_stopping_patience = int(getattr(cfg.train_ar, "early_stopping_patience", 0) or 0)
     if early_stopping_patience > 0:
         cbs.append(
@@ -815,4 +826,3 @@ def run(cfg: DictConfig):
     best_model_path = str(getattr(checkpoint_callback, "best_model_path", "") or "")
     print(f"Best checkpoint: {best_model_path}")
     return best_model_path
-

@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - lsun-church-ffhq-compound-350m-4a100
+  - _self_
+
+# Continue the existing run and its optimizer/schedule on four H100s.
+# Retain global batch 256; amortize full recovery writes with FFHQ's cadence.
+options:
+  wandb_name: Church FFHQ8.17 compound RQT-350M 4xH100 resumed
+  save_step_freq: 500
+  save_ckpt_freq: 5

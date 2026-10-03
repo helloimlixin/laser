@@ -1137,6 +1137,8 @@ class Stage2GenerationFidCallback(pl.Callback):
         if score is None:
             return
         score_f = float(score)
+        if not math.isfinite(score_f):
+            raise RuntimeError(f"Generation FID checkpoint evaluation is not finite: {score_f}")
         score_t = torch.tensor(score_f, dtype=torch.float32, device=mod.device)
         for store_name in ("callback_metrics", "logged_metrics"):
             store = getattr(trainer, store_name, None)
@@ -1148,15 +1150,16 @@ class Stage2GenerationFidCallback(pl.Callback):
             mod.log("generation/fid", score_t, logger=True, prog_bar=False, sync_dist=False)
         except Exception:
             pass
-        log_wandb_payload(
-            getattr(trainer, "logger", None),
-            payload,
-            step=max(1, int(getattr(trainer, "global_step", 0) or 0)),
-        )
+        if bool(getattr(trainer, "is_global_zero", True)):
+            log_wandb_payload(
+                getattr(trainer, "logger", None),
+                payload,
+                step=max(1, int(getattr(trainer, "global_step", 0) or 0)),
+            )
         print(f"Generation FID for checkpoint monitor: {score_f:.4f}")
 
     @torch.no_grad()
-    def _compute(self, trainer: pl.Trainer, mod: pl.LightningModule) -> None:
+    def _compute(self, trainer: pl.Trainer, mod: pl.LightningModule) -> dict:
         dev = mod.device
         self._saver._ready(dev)
         shape = _prior_token_shape(mod, self._saver._shape)
@@ -1164,24 +1167,38 @@ class Stage2GenerationFidCallback(pl.Callback):
         was_training = bool(mod.training)
         mod.eval()
         try:
-            class_labels = self._saver._class_condition(dev, self.n, model=mod)
-            text_tokens, text_mask, _ = self._saver._text_condition(dev, self.n)
             variant = self._saver.sample_variants[0]
-            batch = _sample_for_preview(
-                mod,
-                self._saver._s1,
-                prior_shape=shape,
-                full_shape=full_shape,
-                n=self.n,
-                temp=float(variant["temp"]),
-                top_k=int(variant["top_k"]),
-                ctemp=variant["ctemp"],
-                cmode=variant["cmode"],
-                class_labels=class_labels,
-                text_tokens=text_tokens,
-                text_mask=text_mask,
-                dev=dev,
-            )
+            batch_size = max(1, int(getattr(self.cfg.train_ar, "generation_fid_batch_size", 32)))
+            images = []
+            # Keep the sample set comparable between epochs without consuming
+            # rank zero's training RNG or allocating all samples on the GPU.
+            devices = [dev] if dev.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(int(getattr(self.cfg, "seed", 42)))
+                class_conditions = self._saver._class_condition(dev, self.n, model=mod)
+                text_conditions, text_masks, _ = self._saver._text_condition(dev, self.n)
+                for start in range(0, self.n, batch_size):
+                    count = min(batch_size, self.n - start)
+                    selection = slice(start, start + count)
+                    class_labels = None if class_conditions is None else class_conditions[selection]
+                    text_tokens = None if text_conditions is None else text_conditions[selection]
+                    text_mask = None if text_masks is None else text_masks[selection]
+                    batch = _sample_for_preview(
+                        mod,
+                        self._saver._s1,
+                        prior_shape=shape,
+                        full_shape=full_shape,
+                        n=count,
+                        temp=float(variant["temp"]),
+                        top_k=int(variant["top_k"]),
+                        ctemp=variant["ctemp"],
+                        cmode=variant["cmode"],
+                        class_labels=class_labels,
+                        text_tokens=text_tokens,
+                        text_mask=text_mask,
+                        dev=dev,
+                    )
+                    images.append(batch.imgs.detach().cpu())
         finally:
             if was_training:
                 mod.train()
@@ -1189,15 +1206,14 @@ class Stage2GenerationFidCallback(pl.Callback):
         from src.stage2_metrics import build_stage2_metrics_payload
 
         payload = build_stage2_metrics_payload(
-            batch.imgs.to(dev),
+            torch.cat(images),
             cfg=self.cfg,
             cache=self._saver._cache,
             max_items=self.n,
             compute_fid=True,
             compute_audio=False,
         )
-        if payload:
-            self._record_metric(trainer, mod, payload)
+        return payload
 
     def on_validation_end(self, trainer, mod):
         if bool(getattr(trainer, "sanity_checking", False)):
@@ -1205,9 +1221,17 @@ class Stage2GenerationFidCallback(pl.Callback):
         epoch = int(getattr(trainer, "current_epoch", 0)) + 1
         if epoch <= 0 or epoch == self._last_epoch or (epoch % self.every_n_epochs) != 0:
             return
+        payload = None
         if bool(getattr(trainer, "is_global_zero", True)):
-            self._compute(trainer, mod)
-        Stage2SamplePreviewCallback._barrier_if_needed(trainer)
+            try:
+                payload = self._compute(trainer, mod)
+            except Exception as exc:
+                payload = {"error": str(exc)}
+        if int(getattr(trainer, "world_size", 1)) > 1:
+            payload = trainer.strategy.broadcast(payload, src=0)
+        if not payload or not any(key in payload for key in ("s2/generation_fid", "generation/fid")):
+            raise RuntimeError(f"Generation FID checkpoint evaluation failed: {payload}")
+        self._record_metric(trainer, mod, payload)
         self._last_epoch = epoch
 
 @torch.no_grad()

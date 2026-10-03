@@ -150,6 +150,28 @@ def log_wandb_metrics(
         raise
 
 
+def _wandb_image_pixels(image: Any) -> Any:
+    """Encode display arrays explicitly; W&B 0.30 no longer scales [0, 1]."""
+    import numpy as np
+    import torch
+
+    if torch.is_tensor(image):
+        image = image.detach().cpu()
+        if image.is_floating_point():
+            image = image.float()
+        image = image.numpy()
+        if image.ndim == 3:
+            image = np.moveaxis(image, 0, -1)
+        if image.ndim == 3 and image.shape[-1] == 1:
+            image = image[..., 0]
+    if isinstance(image, np.ndarray) and np.issubdtype(image.dtype, np.floating):
+        image = np.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
+        if image.min(initial=0.0) >= 0.0 and image.max(initial=0.0) <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0.0, 255.0).astype(np.uint8)
+    return image
+
+
 def log_wandb_images(
     logger: Any,
     key: str,
@@ -176,7 +198,7 @@ def log_wandb_images(
     _configure_wandb_media_tmp(wandb, logger)
 
     wandb_images = [
-        wandb.Image(image, caption=None if caption_list is None else caption_list[idx])
+        wandb.Image(_wandb_image_pixels(image), caption=None if caption_list is None else caption_list[idx])
         for idx, image in enumerate(image_list)
     ]
     payload = {str(key): wandb_images[0] if len(wandb_images) == 1 else wandb_images}

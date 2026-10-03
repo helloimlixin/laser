@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - lsun-church-ffhq-compound-350m-4h100-resume
+  - _self_
+
+# Keep the FFHQ architecture, pair chain, targets, optimizer and sampler.
+# Evaluate each candidate's coefficient conditional in the geometry expectation.
+options:
+  compound_conditional_geometry: true

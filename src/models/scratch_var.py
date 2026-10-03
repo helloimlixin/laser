@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 
 import torch
 from torch.nn import functional as F
@@ -69,7 +68,7 @@ def build_scratch_tokenizer(config, seed):
     if kind not in ('vq', 'laser'):
         raise ValueError('Choose vq or laser for the matched scratch experiment')
     with torch.random.fork_rng(devices=[]):
-        torch.random.default_generator.manual_seed(int(seed))
+        torch.manual_seed(int(seed))
         options = dict(channels=int(config.channels), atoms=int(config.atoms),
                        ch=int(config.vae_width), patch_nums=tuple(config.patch_nums))
         if kind == 'vq':
@@ -78,49 +77,7 @@ def build_scratch_tokenizer(config, seed):
             model = LaserVQVAE(pretrained=None, sparsity=int(config.sparsity),
                                coefficient_bins=int(config.coefficient_bins), **options)
             model.quantize.coefficient_range_decay = float(config.coefficient_range_decay)
-            policy = config.get('tokenized_sparse_policy')
-            if policy is not None:
-                from .sparse_token_codec import TOKEN_POLICY_VERSION
-                expected = {'version', 'atom_temperature_ratio', 'coefficient_temperature_ratio'}
-                if set(policy) != expected or policy['version'] != TOKEN_POLICY_VERSION:
-                    raise ValueError('Unknown sparse-token training policy')
-                if any(not math.isfinite(float(policy[k])) or float(policy[k]) <= 0
-                       for k in expected - {'version'}):
-                    raise ValueError('Sparse-token temperature ratios must be positive and finite')
-                model.quantize.tokenized_sparse_policy = dict(policy)
-
-            positions = config.get('residual_scale_positions')
-            if positions is not None:
-                positions = tuple(float(x) for x in positions)
-                if (len(positions) != len(config.patch_nums) or positions[0] != 0. or positions[-1] != 1.
-                        or any(a >= b for a, b in zip(positions, positions[1:]))):
-                    raise ValueError('Residual scale positions must strictly increase from 0 to 1, one per scale')
-                model.quantize.residual_scale_positions = positions
     return model
-
-
-def load_finetune_tokenizer(model, checkpoint, source_patch_nums):
-    """Project a LASER tokenizer checkpoint onto an explicitly retained scale subset."""
-    source = tuple(int(x) for x in source_patch_nums)
-    target = tuple(model.quantize.v_patch_nums)
-    if (not source or source[0] != 1 or source[-1] != target[-1]
-            or any(a >= b for a, b in zip(source, source[1:]))
-            or any(p not in source for p in target)):
-        raise ValueError('Fine-tuning requires an ordered scale subset with the same final resolution')
-    indices = [source.index(p) for p in target]
-    expected_positions = tuple(i / (len(source)-1) for i in indices)
-    actual_positions = model.quantize.residual_scale_positions
-    if actual_positions is None:
-        actual_positions = tuple(i / (len(target)-1) for i in range(len(target)))
-    if any(abs(a-b) > 1e-12 for a, b in zip(actual_positions, expected_positions)):
-        raise ValueError('Retained scales must preserve the source residual convolution mapping')
-    weights = dict(checkpoint['model'])
-    ranges = weights['quantize.coefficient_max']
-    if tuple(ranges.shape) != (len(source),):
-        raise ValueError('Source scale count does not match checkpoint coefficient ranges')
-    weights['quantize.coefficient_max'] = ranges[indices].clone()
-    model.load_state_dict(weights, strict=True)
-    return indices
 
 
 class VQVAR(VAR):
@@ -148,10 +105,10 @@ def build_scratch_prior(tokenizer, kind, seed, depth=16, width=None, heads=None,
     # Explicitly isolate both constructor randomness (position parameters) and
     # weight initialization, so the shared VAR body and atom head match exactly.
     with torch.random.fork_rng(devices=[]):
-        torch.random.default_generator.manual_seed(int(seed))
+        torch.manual_seed(int(seed))
         cls = VQVAR if kind == 'vq' else LaserVAR
         model = cls(tokenizer, depth=depth, width=width, heads=heads, num_classes=num_classes)
-        torch.random.default_generator.manual_seed(int(seed)+1)
+        torch.manual_seed(int(seed)+1)
         model.init_weights(init_adaln=.5, init_adaln_gamma=1e-3, init_head=.02, init_std=-1.)
         if kind == 'laser':
             model.coefficient_head.weight.data.mul_(.02)
@@ -160,7 +117,7 @@ def build_scratch_prior(tokenizer, kind, seed, depth=16, width=None, heads=None,
 
 def shared_prior_digest(model):
     digest = hashlib.sha256()
-    extra = ('coefficient_head.', 'coefficient_query.', 'atom_context.', 'depth_context.', 'depth_embedding.')
+    extra = ('coefficient_head.', 'atom_context.', 'depth_context.', 'depth_embedding.')
     for name, value in model.state_dict().items():
         if name.startswith(extra):
             continue

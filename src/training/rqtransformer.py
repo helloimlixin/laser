@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import make_dataclass
 from datetime import timedelta
 from functools import partial
+import gc
 import hashlib
 import json
 import math
@@ -59,6 +60,14 @@ from rqvae.models.rqvae.rqvae import RQVAE
 from src.data.imagenet_labels import class_names_for_dataset
 from src.orthogonal_sparse_codec import ordered_support_basis
 from src.stochastic_compound import BANK_FORMAT, sample_compound_bank
+from src.soft_omp_bank import atom_targets as bank_atom_targets, sparse_atom_cross_entropy, sparse_atom_entropy
+from src.training.exact_global_batch import ExactGlobalBatchSampler
+from src.shared_physical_coefficients import (
+    SHARED_PHYSICAL_REPRESENTATION,
+    guard_shared_physical_checkpoint,
+    require_shared_physical_cache,
+)
+from layout_migration import validate_resume_layout, restore_resized_rng
 
 
 FACE_DATASETS = frozenset({"celebahq", "ffhq"})
@@ -228,10 +237,7 @@ def restore_rank_rng_state(resume_payload, device: torch.device, seed: int) -> b
         return False
     expected_world = dist.get_world_size() if dist.is_initialized() else 1
     if len(states) != expected_world:
-        raise ValueError(
-            "exact RNG resume requires the checkpoint world size to match: "
-            f"checkpoint={len(states)}, launch={expected_world}"
-        )
+        return restore_resized_rng(resume_payload, device, rank(), expected_world)
     local_state = states[rank()]
     torch.set_rng_state(local_state["torch_cpu"])
     if device.type == "cuda":
@@ -313,6 +319,8 @@ def optimizer_state_offloaded_for_generation(model, optimizer, device):
     try:
         yield
     finally:
+        gc.collect()
+        torch.cuda.empty_cache()
         move_optimizer_state(optimizer, device)
 
 
@@ -1058,15 +1066,19 @@ class LaserAux(nn.Module):
 
 
 class SparseTokenCacheDataset(torch.utils.data.Dataset):
-    """Memory-mapped-at-load sparse components; no source image access in stage 2."""
+    """RAM-resident prebuilt sparse components; no source image access in stage 2."""
 
     def __init__(self, path: Path, *, include_prefix_coeffs: bool = False):
-        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=False)
         self.atoms = payload["atoms"]
         self.coeffs = payload["coeffs"]
         self.labels = payload["labels"]
         self.meta = payload["meta"]
         self.prefix_coeffs = payload.get("prefix_coeffs")
+        self.bank_log_normalizers = payload.get("bank_log_normalizers")
+        if self.meta.get("soft_atom_targets"):
+            if self.bank_log_normalizers is None or self.bank_log_normalizers.shape != self.coeffs.shape:
+                raise ValueError("Soft atom bank requires aligned exact coefficient log normalizers")
         self.include_prefix_coeffs = bool(include_prefix_coeffs)
         self.stochastic_bank = self.meta.get("format") == BANK_FORMAT
         if self.stochastic_bank:
@@ -1095,6 +1107,8 @@ class SparseTokenCacheDataset(torch.utils.data.Dataset):
                 self.atoms[index], self.coeffs[index], self.prefix_coeffs[index],
                 self.labels[index],
             )
+        if self.meta.get("soft_atom_targets"):
+            return self.atoms[index], self.coeffs[index], self.bank_log_normalizers[index], self.labels[index]
         return self.atoms[index], self.coeffs[index], self.labels[index]
 
 
@@ -1584,16 +1598,15 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
                 amp=True,
                 **sampling_kwargs,
             )
-            decoded = (
-                aux.decode_orthogonal(atoms, coeff_ids)
-                if isinstance(model, OrthogonalCompoundLaserRQTransformer)
-                else aux.decode_coefficient_patterns(atoms, coeff_ids)
-                if isinstance(model, SupportFirstLaserRQTransformer)
-                else aux.decode_prefix_patterns(atoms, coeff_ids)
-                if isinstance(model, CausalPrefixPatternLaserRQTransformer)
-                else aux.decode_compound(atoms, coeff_ids)
-            )
-            images = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+            if isinstance(model, OrthogonalCompoundLaserRQTransformer):
+                decoder = aux.decode_orthogonal
+            elif isinstance(model, SupportFirstLaserRQTransformer):
+                decoder = aux.decode_coefficient_patterns
+            elif isinstance(model, CausalPrefixPatternLaserRQTransformer):
+                decoder = aux.decode_prefix_patterns
+            else:
+                decoder = aux.decode_compound
+            codes = (atoms, coeff_ids)
         else:
             tokens = model.sample_sparse(
                 current,
@@ -1607,11 +1620,23 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
                 coeff_top_p=coeff_top_p,
                 amp=True,
             )
-            images = ((aux.decode_tokens(tokens).float() + 1.0) * 0.5).clamp(0, 1)
-        fid_metric.update(images, real=False)
-        if inception_metric is not None:
-            inception_metric.update(images)
+            decoder = aux.decode_tokens
+            codes = (tokens,)
+        # Token generation and image decoding have different memory demands.
+        # Keep the large AR batch, but bound decoder activations before they
+        # exist. Splitting only the decoded image tensor is too late.
+        for offset in range(0, current, 64):
+            decoded = decoder(*(code[offset:offset + 64] for code in codes))
+            image_chunk = ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+            fid_metric.update(image_chunk, real=False)
+            if inception_metric is not None:
+                inception_metric.update(image_chunk)
+            del decoded, image_chunk
         generated += current
+        if process_rank == 0:
+            print(json.dumps(dict(phase='fid_progress', generated_on_rank=generated,
+                                  samples_on_rank=local_samples, generation_batch=batch_size,
+                                  decode_batch=64)), flush=True)
     if original_metrics:
         fid, inception_mean, inception_std = fid_metric.compute(
             shuffle_for_inception=True
@@ -1684,6 +1709,9 @@ def atomic_torch_save(payload, target: Path):
                 )
                 time.sleep(delay)
     finally:
+        # torch.save's pickler cycle can pin old Adam tensors after offload.
+        # Collect before the next evaluation replaces those GPU allocations.
+        gc.collect()
         if serialized != temporary:
             serialized.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
@@ -1698,7 +1726,7 @@ def snapshot_checkpoint(source: Path, target: Path):
         os.link(source, temporary)
     except OSError:
         # Hard links can fail when a custom checkpoint directory crosses filesystems.
-        shutil.copy2(source, temporary)
+        shutil.copyfile(source, temporary)
     os.replace(temporary, target)
 
 
@@ -1745,7 +1773,7 @@ def _replace_hard_link(source: Path, destination: Path):
     try:
         os.link(source, temporary)
     except OSError:
-        shutil.copy2(source, temporary)
+        shutil.copyfile(source, temporary)
     try:
         os.replace(temporary, destination)
     finally:
@@ -1932,8 +1960,15 @@ class LaserRQTransformer(RQTransformer):
                             sample_loc=(h, w, d),
                         )
                         is_atom = d % 2 == 0
+                        # Filter the valid vocabulary directly. Keeping padded
+                        # invalid entries makes full-support top-k sort them.
+                        offset = 0 if is_atom else int(model_aux.num_atoms)
+                        valid_logits = (
+                            logits[:, :int(model_aux.num_atoms)]
+                            if is_atom else logits[:, int(model_aux.num_atoms):]
+                        )
                         sampled = sample_from_logits(
-                            logits,
+                            valid_logits,
                             temperature=(
                                 float(atom_temperature)
                                 if is_atom else float(coeff_temperature)
@@ -1948,7 +1983,7 @@ class LaserRQTransformer(RQTransformer):
                                 if is_atom else float(coeff_top_p)
                             ),
                         )
-                        tokens[:, h, w, d] = sampled
+                        tokens[:, h, w, d] = sampled + offset
         finally:
             self.init_cache()
         return tokens
@@ -2312,6 +2347,8 @@ class CompoundLaserRQTransformer(RQTransformer):
         super().__init__(config)
         self.num_atoms = int(num_atoms)
         self.coeff_vocab_size = int(coeff_vocab_size)
+        # Training-only candidate evaluation adds no checkpoint parameters.
+        self.geometry_top_k = 0
         input_dim = int(config.input_embed_dim)
         embed_dim = int(config.embed_dim)
         self.coeff_token_embedding = nn.Embedding(self.coeff_vocab_size, input_dim)
@@ -2414,17 +2451,15 @@ class CompoundLaserRQTransformer(RQTransformer):
         return self.compound_pair_embeddings(model_aux, atoms, coeff_ids)
 
     def embed_depth_with_model_aux(self, packed, model_aux):
-        """Construct the history representation inside one OMP site.
+        """Use causal support history inside one OMP site.
 
-        Full-pair autoregression includes the final OMP coefficients of earlier
-        pairs. This is a valid chain-rule factorization even though the encoder
-        solves those coefficients jointly: generation samples each earlier
-        coefficient before predicting later atoms. The caller shifts the input
-        so the current and future pairs remain hidden.
-
-        The other modes instead use support-only history or an explicitly
-        supplied prefix reconstruction. Completed earlier spatial sites use
-        full pair embeddings in every mode.
+        ``encode_sparse_components`` stores coefficients after the final OMP
+        least-squares solve.  A coefficient attached to an early atom therefore
+        depends on atoms selected later in the same site.  Feeding those final
+        values to the depth head leaks future support information during teacher
+        forcing.  Atom identities are causal, while completed earlier spatial
+        sites can still use the full pair embedding through
+        ``embed_with_model_aux``.
         """
         atoms, coeff_ids = self.unpack(packed)
         if self.pair_autoregressive:
@@ -2487,6 +2522,31 @@ class CompoundLaserRQTransformer(RQTransformer):
         refined = self.refine_coefficient_hidden(hidden, atom_vectors)
         return self.classify_coefficients(refined, depth_index=depth_index)
 
+    def geometry_coefficient_logits(self, hidden, outputs, *, orthogonal=False):
+        """Condition every geometry candidate on its own atom inside DDP forward."""
+        atoms = self._teacher_atoms
+        _, candidates, vectors = compound_geometry_candidates(
+            outputs["atom_logits"], atoms, self._model_aux.dictionary,
+            self.geometry_top_k, orthogonal=orthogonal,
+        )
+        count = candidates.shape[-1] - 1  # final slot reuses the teacher branch
+        per_depth = []
+        for d in range(atoms.shape[-1]):
+            context = hidden[..., d, None, :].expand(
+                *hidden.shape[:-2], count, hidden.shape[-1]
+            )
+            logits = self.coefficient_logits(
+                context, vectors[..., d, :count, :], depth_index=d
+            )
+            teacher = outputs["coeff_logits"][..., d, None, :]
+            # Reuse the teacher dropout realization for matching candidates.
+            logits = torch.where(
+                (candidates[..., d, :count] == atoms[..., d, None])[..., None],
+                teacher, logits,
+            )
+            per_depth.append(torch.cat((logits, teacher), dim=-2))
+        return torch.stack(per_depth, dim=-3)
+
     def predict_causal_prefix(self, refined, pair_embedding):
         if not self.causal_prefix_state:
             raise RuntimeError("causal prefix state is disabled")
@@ -2521,6 +2581,10 @@ class CompoundLaserRQTransformer(RQTransformer):
             "atom_logits": atom_logits,
             "coeff_logits": self.classify_coefficients(refined),
         }
+        if self.training and self.geometry_top_k:
+            outputs["geometry_coeff_logits"] = self.geometry_coefficient_logits(
+                head_outputs, outputs
+            )
         if self.causal_prefix_state:
             pair_embedding = self.compound_pair_embeddings(
                 self._model_aux, atoms, coeff_ids
@@ -2588,6 +2652,11 @@ class CompoundLaserRQTransformer(RQTransformer):
             if d == 0:
                 self.head_transformer.init_cache()
             return self.head_transformer.cached_forward(full[:, d:d + 1]).reshape(B, -1)
+
+    def sample_dc_ancestral(self, batch_size, model_aux, **sampling_kwargs):
+        """Tuple sampling, untruncated by default; see the standalone adapter."""
+        from src.compound_ancestral_sampling import sample_dc_ancestral
+        return sample_dc_ancestral(self, batch_size, model_aux, **sampling_kwargs)
 
     @torch.no_grad()
     def sample_compound(self, batch_size, model_aux, cond=None, temperature=1.0,
@@ -2758,6 +2827,10 @@ class OrthogonalCompoundLaserRQTransformer(CompoundLaserRQTransformer):
             "atom_logits": atom_logits,
             "coeff_logits": self.classify_coefficients(refined),
         }
+        if self.training and self.geometry_top_k:
+            outputs["geometry_coeff_logits"] = self.geometry_coefficient_logits(
+                head_outputs, outputs, orthogonal=True
+            )
         if self.causal_prefix_state:
             pair_embedding = self.orthogonal_pair_embeddings(
                 self._model_aux, atoms, coeff_ids
@@ -2864,6 +2937,7 @@ class OrthogonalCompoundLaserRQTransformer(CompoundLaserRQTransformer):
                 flat_target_coeff_ids = flat_coeff_ids.reshape(sites, depth)
                 prefix = basis.new_zeros(sites, basis.shape[-1]).float()
                 head_input = spatial_context.reshape(sites, -1)
+                hidden_by_depth = []
                 atom_logits_by_depth = []
                 coeff_logits_by_depth = []
                 prefix_predictions = []
@@ -2926,6 +3000,7 @@ class OrthogonalCompoundLaserRQTransformer(CompoundLaserRQTransformer):
                         self.predict_causal_prefix(refined, target_pair)
                     )
                     closed_loop_prefixes.append(prefix)
+                    hidden_by_depth.append(hidden)
                     atom_logits_by_depth.append(atom_logits)
                     coeff_logits_by_depth.append(coeff_logits)
                     if self.contribution_head is not None:
@@ -2965,6 +3040,11 @@ class OrthogonalCompoundLaserRQTransformer(CompoundLaserRQTransformer):
                         batch, height, width, depth, basis.shape[-1]
                     ),
                 }
+                if self.training and self.geometry_top_k:
+                    outputs["geometry_coeff_logits"] = self.geometry_coefficient_logits(
+                        torch.stack(hidden_by_depth, dim=1).reshape(batch, height, width, depth, -1),
+                        outputs, orthogonal=True,
+                    )
                 if physical_predictions:
                     outputs["physical_contribution"] = torch.stack(
                         physical_predictions, dim=1
@@ -3688,24 +3768,15 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 compound_depth_specific_coeff_heads=False,
                 compound_causal_prefix_state=False,
                 compound_pair_autoregressive=False,
-                coefficient_history_layers=0,
-                coefficient_history_width=512,
                 support_first_patterns=False, causal_prefix_patterns=False,
                 coefficient_pattern_vocab_size=None,
                 prefix_pattern_vocab_sizes=None,
                 sparsity_level=2,
+                physical_pair_context=False,
                 model_preset="imagenet-1400m"):
-    if coefficient_history_layers < 0:
-        raise ValueError("coefficient history layer count must be nonnegative")
-    if coefficient_history_layers and (
-        not compound or not compound_pair_autoregressive or orthogonal_compound
-        or levelwise_var or compound_causal_prefix_state or compound_geometry_head
-        or coefficient_history_width <= 0 or coefficient_history_width % 8
-    ):
-        raise ValueError(
-            "coefficient history requires plain full-pair compound mode, no "
-            "prefix/geometry head, and a positive width divisible by eight"
-        )
+    if physical_pair_context and (compound or orthogonal_compound or levelwise_var
+                                 or support_first_patterns or causal_prefix_patterns):
+        raise ValueError("physical-pair scalar context requires the scalar-token prior")
     if (compound or orthogonal_compound) and (
         support_first_patterns or causal_prefix_patterns
     ):
@@ -3821,7 +3892,7 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
             OrthogonalCompoundLaserRQTransformer
             if orthogonal_compound else CompoundLaserRQTransformer
         )
-        model = compound_class(
+        return compound_class(
             RQTransformerConfig.create(cfg), num_atoms=num_atoms,
             coeff_vocab_size=coeff_vocab_size,
             refiner_layers=compound_refiner_layers,
@@ -3840,13 +3911,9 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 ),
             } if orthogonal_compound else {}),
         )
-        if coefficient_history_layers:
-            from src.training.compound_history import attach_coefficient_history_decoder
-            attach_coefficient_history_decoder(
-                model, width=coefficient_history_width,
-                layers=coefficient_history_layers,
-            )
-        return model
+    if physical_pair_context:
+        from src.models.physical_pair_scalar_prior import PhysicalPairScalarRQTransformer
+        return PhysicalPairScalarRQTransformer(RQTransformerConfig.create(cfg), num_atoms=num_atoms)
     return LaserRQTransformer(RQTransformerConfig.create(cfg), num_atoms=num_atoms)
 
 
@@ -3915,6 +3982,61 @@ def causal_prefix_pattern_objective(
     }
 
 
+def compound_geometry_candidates(atom_logits, target_atoms, dictionary_matrix,
+                                 top_k, *, orthogonal=False):
+    """Top-k plus teacher support; duplicate teacher slots have zero mass."""
+    depth = target_atoms.shape[-1]
+    candidate_count = min(max(int(top_k), 1), atom_logits.shape[-1])
+    candidate_logits, candidate_atoms = atom_logits.float().topk(candidate_count, dim=-1)
+    target_atom_logits = atom_logits.float().gather(
+        -1, target_atoms.long().unsqueeze(-1)
+    )
+    target_is_candidate = (candidate_atoms == target_atoms.long().unsqueeze(-1)).any(
+        dim=-1, keepdim=True
+    )
+    target_atom_logits = target_atom_logits.masked_fill(
+        target_is_candidate, -float("inf")
+    )
+    candidate_logits = torch.cat((candidate_logits, target_atom_logits), dim=-1)
+    candidate_atoms = torch.cat(
+        (candidate_atoms, target_atoms.long().unsqueeze(-1)), dim=-1
+    )
+    candidate_weights = candidate_logits.softmax(dim=-1)
+    dictionary = dictionary_matrix.float().t()
+    candidate_vectors = dictionary[candidate_atoms]
+    if orthogonal:
+        # q_d for a proposed atom depends only on the ground-truth
+        # support prefix a_{<d} and that proposal. Project every
+        # top-k candidate away from the already selected orthogonal
+        # basis instead of incorrectly treating raw dictionary atoms
+        # as gamma directions.
+        target_vectors = dictionary[target_atoms.long()]
+        target_basis, _ = ordered_support_basis(target_vectors)
+        projections = torch.einsum(
+            "...djc,...ic->...dji",
+            candidate_vectors,
+            target_basis,
+        )
+        depth_mask = torch.tril(
+            torch.ones(
+                depth, depth,
+                device=projections.device,
+                dtype=projections.dtype,
+            ),
+            diagonal=-1,
+        )
+        projections = projections * depth_mask.view(
+            *([1] * (projections.ndim - 3)), depth, 1, depth
+        )
+        candidate_vectors = candidate_vectors - torch.einsum(
+            "...dji,...ic->...djc", projections, target_basis
+        )
+        candidate_vectors = candidate_vectors / candidate_vectors.norm(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-4)
+    return candidate_weights, candidate_atoms, candidate_vectors
+
+
 def compound_objective(
     atom_logits,
     coeff_logits,
@@ -3938,6 +4060,10 @@ def compound_objective(
     geometry_coeff_scales=None,
     geometry_top_k: int = 4,
     geometry_orthogonal: bool = False,
+    geometry_candidate_coeff_logits=None,
+    target_atom_ids=None,
+    target_atom_weights=None,
+    target_atom_probabilities=None,
 ):
     """Weighted token objective plus normalized physical latent geometry.
 
@@ -3952,9 +4078,15 @@ def compound_objective(
         -1, target_atoms.long().unsqueeze(-1)
     ).squeeze(-1)
     coeff_cross_entropy = -(target_coeff_probs * coeff_log_probs).sum(dim=-1)
+    atom_cross_entropy = atom_nll if target_atom_ids is None else sparse_atom_cross_entropy(atom_log_probs, target_atom_ids, target_atom_weights)
+    if target_atom_probabilities is not None:
+        if target_atom_ids is not None or target_atom_probabilities.shape != atom_logits.shape:
+            raise ValueError('dense atom targets must match logits and exclude sparse targets')
+        safe = torch.where(target_atom_probabilities > 0, atom_log_probs, 0.)
+        atom_cross_entropy = -(target_atom_probabilities * safe).sum(-1)
     depth = target_atoms.shape[-1]
     classification = (
-        atom_weight * atom_nll.sum(dim=-1) + coeff_cross_entropy.sum(dim=-1)
+        atom_weight * atom_cross_entropy.sum(dim=-1) + coeff_cross_entropy.sum(dim=-1)
     ).mean() / ((atom_weight + 1.0) * depth)
 
     coefficient_regression = atom_logits.new_zeros((), dtype=torch.float32)
@@ -3996,63 +4128,25 @@ def compound_objective(
         if distribution_geometry:
             if geometry_dictionary is None or geometry_coeff_bins is None or geometry_coeff_scales is None:
                 raise ValueError("distribution geometry requires dictionary, bins, and depth scales")
-            candidate_count = min(max(int(geometry_top_k), 1), atom_logits.shape[-1])
-            candidate_logits, candidate_atoms = atom_logits.float().topk(candidate_count, dim=-1)
-            target_atom_logits = atom_logits.float().gather(
-                -1, target_atoms.long().unsqueeze(-1)
+            if geometry_candidate_coeff_logits is None:
+                raise ValueError("distribution geometry requires atom-conditioned candidate coefficient logits")
+            candidate_weights, candidate_atoms, candidate_vectors = compound_geometry_candidates(
+                atom_logits, target_atoms, geometry_dictionary, geometry_top_k,
+                orthogonal=geometry_orthogonal,
             )
-            target_is_candidate = (candidate_atoms == target_atoms.long().unsqueeze(-1)).any(
-                dim=-1, keepdim=True
-            )
-            target_atom_logits = target_atom_logits.masked_fill(
-                target_is_candidate, -float("inf")
-            )
-            candidate_logits = torch.cat((candidate_logits, target_atom_logits), dim=-1)
-            candidate_atoms = torch.cat(
-                (candidate_atoms, target_atoms.long().unsqueeze(-1)), dim=-1
-            )
-            candidate_weights = candidate_logits.softmax(dim=-1)
-            dictionary = geometry_dictionary.float().t()
-            candidate_vectors = dictionary[candidate_atoms]
-            if geometry_orthogonal:
-                # q_d for a proposed atom depends only on the ground-truth
-                # support prefix a_{<d} and that proposal. Project every
-                # top-k candidate away from the already selected orthogonal
-                # basis instead of incorrectly treating raw dictionary atoms
-                # as gamma directions.
-                target_vectors = dictionary[target_atoms.long()]
-                target_basis, _ = ordered_support_basis(target_vectors)
-                projections = torch.einsum(
-                    "...djc,...ic->...dji",
-                    candidate_vectors,
-                    target_basis,
-                )
-                depth_mask = torch.tril(
-                    torch.ones(
-                        depth, depth,
-                        device=projections.device,
-                        dtype=projections.dtype,
-                    ),
-                    diagonal=-1,
-                )
-                projections = projections * depth_mask.view(
-                    *([1] * (projections.ndim - 3)), depth, 1, depth
-                )
-                candidate_vectors = candidate_vectors - torch.einsum(
-                    "...dji,...ic->...djc", projections, target_basis
-                )
-                candidate_vectors = candidate_vectors / candidate_vectors.norm(
-                    dim=-1, keepdim=True
-                ).clamp_min(1e-4)
-            expected_atom = (
-                candidate_weights.unsqueeze(-1) * candidate_vectors
-            ).sum(dim=-2)
-            coeff_bins = geometry_coeff_bins.float()
-            expected_coeff = (coeff_log_probs.exp() * coeff_bins).sum(dim=-1)
+            if geometry_candidate_coeff_logits.shape != (*candidate_atoms.shape, coeff_logits.shape[-1]):
+                raise ValueError("geometry candidate coefficient logits do not match the candidate pool")
+            expected_coeff = (
+                geometry_candidate_coeff_logits.float().softmax(dim=-1)
+                * geometry_coeff_bins.float()
+            ).sum(dim=-1)
             scales = geometry_coeff_scales.float().view(
-                *([1] * (expected_coeff.ndim - 1)), -1
+                *([1] * (expected_coeff.ndim - 2)), -1, 1
             )
-            prediction = expected_atom * (expected_coeff * scales).unsqueeze(-1)
+            prediction = (
+                candidate_weights.unsqueeze(-1) * candidate_vectors
+                * (expected_coeff * scales).unsqueeze(-1)
+            ).sum(dim=-2)
         else:
             if physical_prediction is None:
                 raise ValueError("auxiliary-head geometry requires physical prediction")
@@ -4093,6 +4187,7 @@ def compound_objective(
     ) / accumulation
     return total, {
         "atom_nll": atom_nll,
+        "atom_cross_entropy": atom_cross_entropy,
         "coeff_cross_entropy": coeff_cross_entropy,
         "classification": classification,
         "coefficient_regression": coefficient_regression,
@@ -4198,6 +4293,9 @@ def initialize_orthogonal_from_compound(
 
 def build_parser():
     p = argparse.ArgumentParser()
+    p.add_argument('--online-omp-temperature', type=float, default=None,
+                   help='Fresh full-vocabulary OMP from encoder latents; supports before coefficients')
+    p.add_argument('--online-omp-site-chunk', type=int, default=256)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--token-cache", type=Path, default=None,
@@ -4259,6 +4357,7 @@ def build_parser():
     p.add_argument("--coeff-max", type=float, default=20.0)
     p.add_argument("--coeff-scale", type=float, default=6.4)
     p.add_argument("--coeff-scales", type=float, nargs="+")
+    p.add_argument("--coeff-target-space", choices=("auto", "normalized", "physical"), default="auto")
     p.add_argument(
         "--coeff-target-mode", choices=("soft", "hard"), default="soft",
         help="Use stochastic soft coefficient targets or deterministic nearest-bin targets",
@@ -4272,6 +4371,10 @@ def build_parser():
         help="Use one compound (atom, coefficient) AR event per sparse component",
     )
     p.add_argument(
+        "--physical-pair-context", action=argparse.BooleanOptionalAction, default=False,
+        help="Use explicit physical pair context and unique atom masks in the scalar-token prior",
+    )
+    p.add_argument(
         "--compound-pair-autoregressive",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -4280,14 +4383,6 @@ def build_parser():
             "(atom, coefficient) pairs; this gives the full discrete chain "
             "rule without a learned prefix-state surrogate"
         ),
-    )
-    p.add_argument(
-        "--coefficient-history-layers", type=int, default=0,
-        help="Add a causal coefficient history residual; zero preserves the original architecture",
-    )
-    p.add_argument(
-        "--coefficient-history-width", type=int, default=512,
-        help="Width of the optional coefficient history decoder, divisible by eight",
     )
     p.add_argument(
         "--orthogonal-compound-tokens",
@@ -4460,6 +4555,8 @@ def build_parser():
     )
     p.add_argument("--fid-every", type=int, default=1,
                    help="Run full FID every N epochs; 0 disables evaluation")
+    p.add_argument("--fid-early-epochs", type=int, default=0,
+                   help="Evaluate each initial epoch up to this count, then use --fid-every")
     p.add_argument("--save-ckpt-freq", type=int, default=2,
                    help="Save the full training checkpoint every N epochs")
     p.add_argument(
@@ -4508,13 +4605,13 @@ def build_parser():
     p.add_argument(
         "--upload-checkpoints",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Upload 16+ GB checkpoints as W&B artifacts (disabled by default)",
+        default=True,
+        help="Upload latest and best-FID checkpoints to W&B (enabled by default)",
     )
     p.add_argument(
         "--checkpoint-upload-mode",
         choices=("artifact", "files"),
-        default="artifact",
+        default="files",
         help=(
             "artifact creates immutable versions; files replaces fixed last and "
             "best-FID slots on the W&B run"
@@ -4673,6 +4770,8 @@ def main(argv=None):
         raise ValueError("--sample-grid-seed cannot be negative")
     if args.fid_every < 0:
         raise ValueError("--fid-every cannot be negative")
+    if args.fid_early_epochs < 0:
+        raise ValueError("--fid-early-epochs cannot be negative")
     if args.fid_reference_stats is not None:
         from src.rqvae_metrics import load_reference_statistics
         load_reference_statistics(args.fid_reference_stats)
@@ -4811,8 +4910,20 @@ def main(argv=None):
     coefficient_pattern_vocab_size = None
     prefix_patterns = None
     prefix_pattern_vocab_sizes = None
+    if args.online_omp_temperature is not None:
+        if not (args.online_omp_temperature > 0 and args.online_omp_site_chunk > 0
+                and args.token_cache and args.compound_tokens
+                and args.compound_pair_autoregressive
+                and args.coeff_target_mode == 'soft' and args.coeff_target_space == 'normalized'
+                and not args.orthogonal_compound_tokens and not args.causal_prefix_state
+                and not args.levelwise_var and not args.compound_distribution_geometry
+                and args.geometry_loss_weight == 0 and args.init_stage2_checkpoint is None):
+            raise ValueError('online OMP requires a fresh plain compound model and normalized soft targets')
     if args.token_cache:
-        if args.causal_prefix_pattern_tokens:
+        if args.online_omp_temperature is not None:
+            from src.training.full_vocab_omp import EncoderLatentDataset
+            dataset = EncoderLatentDataset(args.token_cache)
+        elif args.causal_prefix_pattern_tokens:
             dataset = CausalPrefixPatternCacheDataset(args.token_cache)
             prefix_patterns = dataset.prefix_patterns
             prefix_pattern_vocab_sizes = [
@@ -4833,6 +4944,18 @@ def main(argv=None):
                 ),
             )
         cache_meta = dataset.meta
+        if (cache_meta.get("coefficient_representation") == SHARED_PHYSICAL_REPRESENTATION
+                or cache_meta.get("coefficient_codec_identity") is not None
+                or cache_meta.get("coefficient_quantizer") == "shared_uniform_physical"):
+            require_shared_physical_cache(cache_meta)
+            if args.coeff_scales is not None and any(float(value) != 1. for value in args.coeff_scales):
+                raise ValueError("shared physical coefficient bins require exactly unit depth scales")
+            # Keep the backward-compatible scalar metadata consistent with the
+            # actual all-one per-depth buffers used by this representation.
+            args.coeff_scale = 1.
+        if cache_meta.get("soft_atom_targets"):
+            if cache_meta.get("coefficient_log_partition_temperature") != args.coeff_target_temperature or args.coeff_target_mode != "soft":
+                raise ValueError("Bank posterior requires the cached coefficient temperature and soft sampling")
         if cache_meta.get("format") == BANK_FORMAT and not (
             args.compound_tokens and args.compound_pair_autoregressive
             and not args.orthogonal_compound_tokens and not args.causal_prefix_state
@@ -4962,10 +5085,12 @@ def main(argv=None):
             else class_names_for_dataset("imagenet", image_dataset.classes)
         )
         dataset = image_dataset
-    sampler = ResumableDistributedSampler(dataset, shuffle=True) if world > 1 else None
-    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
-                        shuffle=sampler is None, num_workers=8, pin_memory=True,
-                        persistent_workers=True, drop_last=True)
+    accumulation = int(os.environ.get("LASER_ACCUMULATION", "1"))
+    sampler = ExactGlobalBatchSampler(dataset, args.total_batch_size, world, rank(),
+                                      accumulation=accumulation, seed=args.seed)
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=4,
+                        pin_memory=True, persistent_workers=True,
+                        generator=torch.Generator().manual_seed(args.seed + rank()))
     val_loader = None
     if args.fid_every > 0 and args.fid_reference_stats is None:
         if args.dataset in {"ffhq", "lsun_bedroom", "lsun_church"}:
@@ -5004,7 +5129,8 @@ def main(argv=None):
                    args.coeff_max, args.coeff_scale,
                    attn_resolutions=((16,) if args.dataset in FACE_DATASETS else (8,)),
                    coeff_scales=args.coeff_scales,
-                   soft_target_physical=args.coeff_scales is not None,
+                   soft_target_physical=(args.coeff_target_space == "physical" or
+                       (args.coeff_target_space == "auto" and args.coeff_scales is not None)),
                    clamp_coeffs=(True if cache_meta is None else cache_meta.get("clip_coefficients", True)),
                    coeff_bin_centers=cached_bin_centers,
                    sparsity_level=args.sparsity_level,
@@ -5027,15 +5153,20 @@ def main(argv=None):
         compound_depth_specific_coeff_heads=args.compound_depth_specific_coeff_heads,
         compound_causal_prefix_state=args.causal_prefix_state,
         compound_pair_autoregressive=args.compound_pair_autoregressive,
-        coefficient_history_layers=args.coefficient_history_layers,
-        coefficient_history_width=args.coefficient_history_width,
         support_first_patterns=args.support_first_pattern_tokens,
         causal_prefix_patterns=args.causal_prefix_pattern_tokens,
         coefficient_pattern_vocab_size=coefficient_pattern_vocab_size,
         prefix_pattern_vocab_sizes=prefix_pattern_vocab_sizes,
         sparsity_level=args.sparsity_level,
+        physical_pair_context=args.physical_pair_context,
         model_preset=args.model_preset,
     )
+    if args.online_omp_temperature is not None:
+        from src.training.full_vocab_omp import attach_supports_first_omp
+        unwrapped_model = attach_supports_first_omp(unwrapped_model)
+    if args.compound_distribution_geometry:
+        unwrapped_model.geometry_top_k = args.geometry_top_k
+        args.compound_geometry_version = "atom_conditional_v2"
     parameter_names = [name for name, _ in unwrapped_model.named_parameters()]
 
     resume_payload = None
@@ -5048,10 +5179,19 @@ def main(argv=None):
     if checkpoint_exists:
         should_load = args.distributed_backend != "fsdp" or rank() == 0
         if should_load:
-            raw_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+            raw_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False, mmap=True)
+            guard_shared_physical_checkpoint(raw_payload.get("config", {}), cache_meta)
             if cache_meta is not None and cache_meta.get("format") == BANK_FORMAT:
-                if raw_payload["config"].get("compound_cache_identity") != cache_meta["bank_identity"]:
+                if raw_payload["config"].get("compound_cache_identity") != cache_meta.get("bank_identity"):
                     raise ValueError("resume checkpoint uses a different stochastic compound cache")
+                if cache_meta.get("bank_identity") is None:
+                    # The archived soft-atom cache predates bank_identity. Its exact
+                    # content digest is authenticated by the recovered W&B artifact.
+                    expected = "fd63f614651b89e142cb567bfff0d85f9c07c6bffc91b8c3b9489168dca27549"
+                    with args.token_cache.open("rb") as stream:
+                        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                    if actual != expected:
+                        raise ValueError("legacy stochastic compound cache digest mismatch")
             unwrapped_model.load_state_dict(raw_payload["state_dict"], strict=True)
             resume_optimizer_state = raw_payload["optimizer"]
             resume_payload = {
@@ -5074,6 +5214,7 @@ def main(argv=None):
             weights_only=False,
             mmap=True,
         )
+        guard_shared_physical_checkpoint(init_payload.get("config", {}), cache_meta)
         init_transfer = None
         if args.causal_prefix_pattern_tokens:
             init_config = dict(init_payload.get("config", {}))
@@ -5192,20 +5333,24 @@ def main(argv=None):
                 optimizer_state_for_unwrapped_load(resume_optimizer_state, unwrap(model))
             )
         del resume_optimizer_state
-    accumulation = args.total_batch_size // (args.batch_size * world)
-    if accumulation * args.batch_size * world != args.total_batch_size:
-        raise ValueError("total batch size must be divisible by per-step global batch size")
-    complete_microbatches = (len(loader) // accumulation) * accumulation
-    optimizer_steps_per_epoch = complete_microbatches // accumulation
+    complete_microbatches = len(loader)
+    optimizer_steps_per_epoch = sampler.steps_per_epoch
     if optimizer_steps_per_epoch <= 0:
         raise ValueError("training loader does not contain a complete optimizer step")
     runtime_config = {
         **vars(args),
         "world_size": world,
         "accumulation_steps": accumulation,
-        "stochastic_atom_supports": cache_meta is not None and cache_meta.get("format") == BANK_FORMAT,
-        "compound_cache_variants_per_site": 1 if cache_meta is None else cache_meta.get("variants_per_site", 1),
+        "exact_global_batch": True,
+        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+        "training_images": len(dataset),
+        "stochastic_atom_supports": args.online_omp_temperature is not None or (cache_meta is not None and cache_meta.get("format") == BANK_FORMAT),
+        "compound_cache_variants_per_site": None if args.online_omp_temperature is not None else 1 if cache_meta is None else cache_meta.get("variants_per_site", 1),
+        "compound_event_order": 'all_supports_then_all_coefficients' if args.online_omp_temperature is not None else 'existing_compound_order',
         "compound_cache_identity": None if cache_meta is None else cache_meta.get("bank_identity"),
+        "coefficient_representation": None if cache_meta is None else cache_meta.get("coefficient_representation"),
+        "coefficient_codec_identity": None if cache_meta is None else cache_meta.get("coefficient_codec_identity"),
+        "coeff_scales": aux.coeff_scales.detach().cpu().tolist(),
         "coeff_bin_centers": cached_bin_centers,
         "coefficient_clipping": aux.clamp_coeffs,
         "coefficient_quantizer": None if cache_meta is None else cache_meta.get("coefficient_quantizer", "uniform"),
@@ -5216,7 +5361,7 @@ def main(argv=None):
         import wandb
         wb = wandb.init(entity=args.wandb_entity, project=args.wandb_project,
                         name=args.wandb_name,
-                        id=args.wandb_id, resume="allow" if args.wandb_id else None,
+                        id=args.wandb_id, resume="must" if args.resume and args.wandb_id else None,
                         mode=args.wandb_mode,
                         config={**runtime_config, "architecture": (
                             f"orthogonal-compound-closed-loop-{args.closed_loop_coeff_state}-rqtransformer-{args.model_preset}"
@@ -5253,7 +5398,7 @@ def main(argv=None):
                                 "temp": args.coeff_target_temperature, "top_p": 0.92,
                                 "coefficient_quantizer": (
                                     None if cache_meta is None
-                                    else cache_meta.get("coeff_quantization", "uniform")
+                                    else cache_meta.get("coefficient_quantizer", cache_meta.get("coeff_quantization", "uniform"))
                                 ),
                                 "preview_sampling_settings": preview_sampling_settings(args)})
         wb.define_metric("train/global_step")
@@ -5357,7 +5502,10 @@ def main(argv=None):
         global_step = int(resume_payload.get("global_step", 0))
         start_epoch = int(resume_payload.get("epoch", 0))
         resume_batch_idx = int(resume_payload.get("batch_idx", 0))
-        best_fid = [(float(x[0]), str(x[1])) for x in resume_payload.get("best_fid", [])]
+        best_fid = [(float(x[0]), str(checkpoint_dir / Path(x[1]).name))
+                    for x in resume_payload.get("best_fid", [])]
+        if any(not Path(path).is_file() for _, path in best_fid):
+            raise FileNotFoundError('Recovered best FID checkpoint is missing')
         best_inception = [
             (float(x[0]), str(x[1])) for x in resume_payload.get("best_inception", [])
         ]
@@ -5365,16 +5513,13 @@ def main(argv=None):
             best_inception = []
         saved_config = resume_payload.get("config", {})
         saved_batch_idx = resume_batch_idx
-        resume_batch_idx, old_world_size = remap_resume_batch_index(
-            resume_batch_idx,
-            saved_config=saved_config,
-            batch_size=args.batch_size,
-            world_size=world,
-            total_batch_size=args.total_batch_size,
-            global_step=global_step,
-            start_epoch=start_epoch,
-            optimizer_steps_per_epoch=optimizer_steps_per_epoch,
-        )
+        old_world_size = int(saved_config.get("world_size", -1))
+        layout_changed = validate_resume_layout(saved_config, world, accumulation,
+            args.total_batch_size, resume_batch_idx)
+        if layout_changed and rank() == 0:
+            print("Resuming at saved optimizer boundary with updated GPU layout; global batch 2048, data cursor, optimizer and LR schedule retained", flush=True)
+        sampler.set_start_batch(resume_batch_idx)
+        sampler.set_start_batch(0)
         if rank() == 0 and resume_batch_idx != saved_batch_idx:
             print(
                 "Remapped resume cursor for physical layout change: "
@@ -5397,7 +5542,12 @@ def main(argv=None):
             None if args.fid_reference_stats is None
             else str(args.fid_reference_stats)
         )
-        if previous_reference != current_reference:
+        equivalent_reference = False
+        expected_reference_sha = saved_config.get('amarel_continuation', {}).get('reference_sha256')
+        if expected_reference_sha and args.fid_reference_stats is not None:
+            with args.fid_reference_stats.open('rb') as stream:
+                equivalent_reference = hashlib.file_digest(stream, 'sha256').hexdigest() == expected_reference_sha
+        if previous_reference != current_reference and not equivalent_reference:
             best_fid = []
             if rank() == 0:
                 print(
@@ -5626,7 +5776,8 @@ def main(argv=None):
             print(
                 "RNG resume: "
                 + (
-                    "restored exact per-rank checkpoint streams"
+                    "retained saved streams for surviving ranks; deterministic new streams only when increasing rank count; stochastic trajectory changes"
+                    if restored_rng == "resized" else "restored exact per-rank checkpoint streams"
                     if restored_rng
                     else "legacy checkpoint had no RNG state; applied deterministic rank seeds"
                 ),
@@ -5712,14 +5863,33 @@ def main(argv=None):
         batch_offset = resume_batch_idx if epoch == start_epoch else 0
         if sampler is not None:
             sampler.set_epoch(epoch)
-            sampler.set_start_index(batch_offset * args.batch_size)
+            sampler.set_start_batch(batch_offset)
         model.train()
         for batch_idx, batch in enumerate(loader):
             absolute_batch_idx = batch_idx + batch_offset
             if absolute_batch_idx >= complete_microbatches:
                 break
             causal_prefix_reconstructions = None
-            if args.token_cache:
+            soft_atom_ids = soft_atom_weights = None
+            dense_atom_probs = None
+            source_bank_atoms = source_bank_coeffs = source_bank_logz = None
+            if args.online_omp_temperature is not None:
+                from src.training.full_vocab_omp import online_omp_targets
+                signals, labels = batch
+                labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
+                if num_condition_classes == 1:
+                    labels.zero_()
+                teacher = online_omp_targets(signals.to(device, non_blocking=True), aux,
+                    temperature=args.online_omp_temperature,
+                    coefficient_temperature=args.coeff_target_temperature,
+                    site_chunk_size=args.online_omp_site_chunk)
+                atoms, coeff_ids = teacher['atoms'], teacher['coefficient_ids']
+                dense_atom_probs = teacher['atom_probabilities']
+                target_coeff_probs = teacher['coefficient_probabilities']
+                tokens = atoms * args.coeff_vocab_size + coeff_ids
+                compact_targets = (atoms, target_coeff_probs, None)
+                del teacher
+            elif args.token_cache:
                 if (
                     args.support_first_pattern_tokens
                     or args.causal_prefix_pattern_tokens
@@ -5731,6 +5901,9 @@ def main(argv=None):
                 elif args.causal_prefix_state and not args.orthogonal_compound_tokens:
                     atoms, coeffs, prefix_coeffs, labels = batch
                     prefix_coeffs = prefix_coeffs.to(device, non_blocking=True)
+                elif cache_meta.get("soft_atom_targets"):
+                    atoms, coeffs, source_bank_logz, labels = batch
+                    source_bank_logz = source_bank_logz.to(device, non_blocking=True)
                 else:
                     atoms, coeffs, labels = batch
                 atoms = atoms.to(device, non_blocking=True)
@@ -5742,6 +5915,8 @@ def main(argv=None):
                     if cache_meta.get("format") == BANK_FORMAT:
                         # Select all four pairs together at each spatial site.
                         # CUDA RNG is checkpointed; worker prefetch cannot alter draws.
+                        if cache_meta.get("soft_atom_targets"):
+                            source_bank_atoms, source_bank_coeffs = atoms, coeffs
                         atoms, coeffs, bank_choices = sample_compound_bank(atoms, coeffs)
                 labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
                 if num_condition_classes == 1:
@@ -5768,6 +5943,10 @@ def main(argv=None):
                             stochastic=args.coeff_target_mode == "soft",
                             hard=args.coeff_target_mode == "hard",
                         )
+                        if source_bank_atoms is not None:
+                            soft_atom_ids, soft_atom_weights = bank_atom_targets(
+                                source_bank_atoms, source_bank_coeffs, source_bank_logz,
+                                atoms, coeff_ids, aux.coeff_bins, args.coeff_target_temperature)
                         tokens = atoms.long() * args.coeff_vocab_size + coeff_ids
                         target_physical = (
                             aux.physical_orthogonal_contributions(atoms, coeffs)
@@ -5822,6 +6001,10 @@ def main(argv=None):
                             stochastic=args.coeff_target_mode == "soft",
                             hard=args.coeff_target_mode == "hard",
                         )
+                        if source_bank_atoms is not None:
+                            soft_atom_ids, soft_atom_weights = bank_atom_targets(
+                                source_bank_atoms, source_bank_coeffs, source_bank_logz,
+                                atoms, coeff_ids, aux.coeff_bins, args.coeff_target_temperature)
                         tokens = atoms.long() * args.coeff_vocab_size + coeff_ids
                         target_physical = (
                             aux.physical_orthogonal_contributions(atoms, coeffs)
@@ -5836,6 +6019,13 @@ def main(argv=None):
                                 target_physical.cumsum(dim=-2)
                             )
                         compact_targets = (atoms.long(), target_coeff_probs, target_physical)
+                    elif args.physical_pair_context:
+                        atoms, coeffs = aux.encode_sparse_components(images)
+                        tokens, compact_targets = aux.sparse_targets(
+                            atoms, coeffs, temp=args.coeff_target_temperature,
+                            stochastic=args.coeff_target_mode == "soft",
+                            compact=True, hard=args.coeff_target_mode == "hard",
+                        )
                     else:
                         tokens, soft_targets = aux.encode_sparse(
                             images,
@@ -5843,7 +6033,10 @@ def main(argv=None):
                             stochastic=args.coeff_target_mode == "soft",
                             hard=args.coeff_target_mode == "hard",
                         )
-            sync = args.smoke_test or ((absolute_batch_idx + 1) % accumulation == 0)
+            # Validation uses the same exact global-batch accumulation as
+            # production; a smoke flag must not turn every microbatch into an
+            # optimizer update or inflate reported images per second.
+            sync = (absolute_batch_idx + 1) % accumulation == 0
             # FSDP deliberately reduce-scatters every microbatch. Its no_sync()
             # retains full, unsharded gradients and is too memory-hungry for a
             # 1.45B-parameter model on these 20 GB cards.
@@ -5864,6 +6057,7 @@ def main(argv=None):
                     args.token_cache
                     or args.compound_tokens
                     or args.orthogonal_compound_tokens
+                    or args.physical_pair_context
                 ):
                     if (
                         args.support_first_pattern_tokens
@@ -6002,6 +6196,9 @@ def main(argv=None):
                             target_coeff_probs,
                             target_physical,
                             atom_weight=args.atom_loss_weight,
+                            target_atom_ids=soft_atom_ids,
+                            target_atom_weights=soft_atom_weights,
+                            target_atom_probabilities=dense_atom_probs,
                             causal_prefix_prediction=logits.get(
                                 "causal_prefix_prediction"
                             ) if isinstance(logits, dict) else None,
@@ -6018,111 +6215,115 @@ def main(argv=None):
                             geometry_coeff_scales=aux.coeff_scales,
                             geometry_top_k=args.geometry_top_k,
                             geometry_orthogonal=args.orthogonal_compound_tokens,
+                            geometry_candidate_coeff_logits=logits.get("geometry_coeff_logits"),
                         )
                         atom_loss = objective["atom_nll"]
                         coeff_loss = objective["coeff_cross_entropy"]
-                        with torch.no_grad():
-                            coeff_entropy = -(
-                                target_coeff_probs * target_coeff_probs.clamp_min(1e-30).log()
-                            ).sum(dim=-1)
-                            pred_coeff_ids = coeff_logits.argmax(dim=-1)
-                            target_coeff_ids = target_coeff_probs.argmax(dim=-1)
-                            pair_scales = aux.coeff_scales.view(
-                                1, 1, 1, args.sparsity_level
-                            )
-                            pred_values = aux.coeff_bins[pred_coeff_ids] * pair_scales
-                            target_values = aux.coeff_bins[target_coeff_ids] * pair_scales
-                            predicted_coefficients = objective["predicted_coefficients"]
-                            target_coefficients = objective["target_coefficients"]
-                            if predicted_coefficients is None:
-                                predicted_coefficients = (
-                                    coeff_logits.float().softmax(dim=-1)
-                                    * aux.coeff_bins.float()
+                        if rank() == 0 and sync and (global_step + 1) % 10 == 0:
+                            with torch.no_grad():
+                                coeff_entropy = -(
+                                    target_coeff_probs * target_coeff_probs.clamp_min(1e-30).log()
                                 ).sum(dim=-1)
-                                target_coefficients = (
-                                    target_coeff_probs.float()
-                                    * aux.coeff_bins.float()
-                                ).sum(dim=-1)
-                            expected_abs_error = (
-                                predicted_coefficients - target_coefficients
-                            ).abs()
-                            expected_physical_abs_error = expected_abs_error * pair_scales
-                            diagnostic_metrics = {
-                                "train/atom_nll": float(atom_loss.mean()),
-                                "train/coeff_cross_entropy": float(coeff_loss.mean()),
-                                "train/coeff_target_entropy": float(coeff_entropy.mean()),
-                                "train/coeff_kl": float((coeff_loss - coeff_entropy).mean()),
-                                "train/coeff_regression_loss": float(
-                                    objective["coefficient_regression"]
-                                ),
-                                "train/coeff_crps": float(
-                                    objective["coefficient_crps"]
-                                ),
-                                "train/coeff_expected_mae": float(expected_abs_error.mean()),
-                                "train/coeff_expected_physical_mae": float(
-                                    expected_physical_abs_error.mean()
-                                ),
-                                "train/classification_loss": float(objective["classification"]),
-                                "train/geometry_loss": float(objective["geometry"]),
-                                "train/geometry_weight": geometry_weight,
-                                "train/geometry_pair_mse": float(objective["geometry_pair_mse"]),
-                                "train/geometry_spatial_mse": float(objective["geometry_spatial_mse"]),
-                                "train/causal_prefix_loss": float(objective["causal_prefix"]),
-                                "train/causal_prefix_mse": float(objective["causal_prefix_mse"]),
-                                "train/atom_top1": float(
-                                    (atom_logits.argmax(dim=-1) == target_atoms.long()).float().mean()
-                                ),
-                                "train/coeff_bin_mae": float((pred_values - target_values).abs().mean()),
-                            }
-                            if (
-                                isinstance(logits, dict)
-                                and "closed_loop_prefix" in logits
-                            ):
-                                closed_loop_mse = F.mse_loss(
-                                    logits["closed_loop_prefix"].float(),
-                                    causal_prefix_reconstructions.float(),
+                                pred_coeff_ids = coeff_logits.argmax(dim=-1)
+                                target_coeff_ids = target_coeff_probs.argmax(dim=-1)
+                                pair_scales = aux.coeff_scales.view(
+                                    1, 1, 1, args.sparsity_level
                                 )
-                                prefix_energy = (
-                                    causal_prefix_reconstructions.float()
-                                    .square()
-                                    .mean()
-                                    .clamp_min(1e-6)
-                                )
-                                diagnostic_metrics.update({
-                                    "train/closed_loop_prefix_mse": float(
-                                        closed_loop_mse
+                                pred_values = aux.coeff_bins[pred_coeff_ids] * pair_scales
+                                target_values = aux.coeff_bins[target_coeff_ids] * pair_scales
+                                predicted_coefficients = objective["predicted_coefficients"]
+                                target_coefficients = objective["target_coefficients"]
+                                if predicted_coefficients is None:
+                                    predicted_coefficients = (
+                                        coeff_logits.float().softmax(dim=-1)
+                                        * aux.coeff_bins.float()
+                                    ).sum(dim=-1)
+                                    target_coefficients = (
+                                        target_coeff_probs.float()
+                                        * aux.coeff_bins.float()
+                                    ).sum(dim=-1)
+                                expected_abs_error = (
+                                    predicted_coefficients - target_coefficients
+                                ).abs()
+                                expected_physical_abs_error = expected_abs_error * pair_scales
+                                diagnostic_metrics = {
+                                    "train/atom_nll": float(atom_loss.mean()),
+                                    "train/atom_soft_cross_entropy": float(objective["atom_cross_entropy"].mean()),
+                                    "train/atom_target_entropy": (float(-(dense_atom_probs * dense_atom_probs.clamp_min(1e-30).log()).sum(-1).mean()) if dense_atom_probs is not None else float(sparse_atom_entropy(soft_atom_ids, soft_atom_weights).mean()) if soft_atom_ids is not None else 0.0),
+                                    "train/coeff_cross_entropy": float(coeff_loss.mean()),
+                                    "train/coeff_target_entropy": float(coeff_entropy.mean()),
+                                    "train/coeff_kl": float((coeff_loss - coeff_entropy).mean()),
+                                    "train/coeff_regression_loss": float(
+                                        objective["coefficient_regression"]
                                     ),
-                                    "train/closed_loop_prefix_loss": float(
-                                        closed_loop_mse / prefix_energy
+                                    "train/coeff_crps": float(
+                                        objective["coefficient_crps"]
                                     ),
-                                })
-                            for depth_index in range(target_atoms.shape[-1]):
-                                diagnostic_metrics.update({
-                                    f"train/atom_nll_depth{depth_index}": float(
-                                        atom_loss[..., depth_index].mean()
+                                    "train/coeff_expected_mae": float(expected_abs_error.mean()),
+                                    "train/coeff_expected_physical_mae": float(
+                                        expected_physical_abs_error.mean()
                                     ),
-                                    f"train/atom_top1_depth{depth_index}": float(
-                                        (
-                                            atom_logits[..., depth_index, :].argmax(dim=-1)
-                                            == target_atoms[..., depth_index].long()
-                                        ).float().mean()
+                                    "train/classification_loss": float(objective["classification"]),
+                                    "train/geometry_loss": float(objective["geometry"]),
+                                    "train/geometry_weight": geometry_weight,
+                                    "train/geometry_pair_mse": float(objective["geometry_pair_mse"]),
+                                    "train/geometry_spatial_mse": float(objective["geometry_spatial_mse"]),
+                                    "train/causal_prefix_loss": float(objective["causal_prefix"]),
+                                    "train/causal_prefix_mse": float(objective["causal_prefix_mse"]),
+                                    "train/atom_top1": float(
+                                        (atom_logits.argmax(dim=-1) == target_atoms.long()).float().mean()
                                     ),
-                                    f"train/coeff_cross_entropy_depth{depth_index}": float(
-                                        coeff_loss[..., depth_index].mean()
-                                    ),
-                                    f"train/coeff_bin_mae_depth{depth_index}": float(
-                                        (
-                                            pred_values[..., depth_index]
-                                            - target_values[..., depth_index]
-                                        ).abs().mean()
-                                    ),
-                                    f"train/coeff_expected_mae_depth{depth_index}": float(
-                                        expected_abs_error[..., depth_index].mean()
-                                    ),
-                                    f"train/coeff_expected_physical_mae_depth{depth_index}": float(
-                                        expected_physical_abs_error[..., depth_index].mean()
-                                    ),
-                                })
+                                    "train/coeff_bin_mae": float((pred_values - target_values).abs().mean()),
+                                }
+                                if (
+                                    isinstance(logits, dict)
+                                    and "closed_loop_prefix" in logits
+                                ):
+                                    closed_loop_mse = F.mse_loss(
+                                        logits["closed_loop_prefix"].float(),
+                                        causal_prefix_reconstructions.float(),
+                                    )
+                                    prefix_energy = (
+                                        causal_prefix_reconstructions.float()
+                                        .square()
+                                        .mean()
+                                        .clamp_min(1e-6)
+                                    )
+                                    diagnostic_metrics.update({
+                                        "train/closed_loop_prefix_mse": float(
+                                            closed_loop_mse
+                                        ),
+                                        "train/closed_loop_prefix_loss": float(
+                                            closed_loop_mse / prefix_energy
+                                        ),
+                                    })
+                                for depth_index in range(target_atoms.shape[-1]):
+                                    diagnostic_metrics.update({
+                                        f"train/atom_nll_depth{depth_index}": float(
+                                            atom_loss[..., depth_index].mean()
+                                        ),
+                                        f"train/atom_top1_depth{depth_index}": float(
+                                            (
+                                                atom_logits[..., depth_index, :].argmax(dim=-1)
+                                                == target_atoms[..., depth_index].long()
+                                            ).float().mean()
+                                        ),
+                                        f"train/coeff_cross_entropy_depth{depth_index}": float(
+                                            coeff_loss[..., depth_index].mean()
+                                        ),
+                                        f"train/coeff_bin_mae_depth{depth_index}": float(
+                                            (
+                                                pred_values[..., depth_index]
+                                                - target_values[..., depth_index]
+                                            ).abs().mean()
+                                        ),
+                                        f"train/coeff_expected_mae_depth{depth_index}": float(
+                                            expected_abs_error[..., depth_index].mean()
+                                        ),
+                                        f"train/coeff_expected_physical_mae_depth{depth_index}": float(
+                                            expected_physical_abs_error[..., depth_index].mean()
+                                        ),
+                                    })
                     else:
                         target_atoms, target_coeff_probs = compact_targets
                         atom_log_probs = F.log_softmax(atom_logits.float(), dim=-1)
@@ -6138,12 +6339,13 @@ def main(argv=None):
                 else:
                     log_probs = F.log_softmax(logits.float(), dim=-1)
                     loss = -(soft_targets * log_probs).sum(dim=-1).mean() / accumulation
-            loss.backward()
+            reported_loss = loss.detach() * accumulation
+            (loss * sampler.backward_scale(labels.shape[0], absolute_batch_idx)).backward()
             if sync:
                 grad_norm = (
                     model.clip_grad_norm_(1.0)
                     if is_fsdp_model(model)
-                    else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 )
                 optimizer.step()
                 if scheduler is not None:
@@ -6163,12 +6365,12 @@ def main(argv=None):
                             })
                         wb.log(memory_payload)
                     memory_reported = True
-                if wb is not None and global_step % 10 == 0:
+                if rank() == 0 and global_step % 10 == 0:
                     now = time.monotonic()
                     elapsed = max(now - last_perf_time, 1e-6)
                     completed_steps = max(global_step - last_perf_step, 1)
                     payload = {
-                        "train/loss": float(loss.detach()) * accumulation,
+                        "train/loss": float(reported_loss),
                         "train/epoch": epoch, "train/global_step": global_step,
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": float(grad_norm),
@@ -6176,9 +6378,16 @@ def main(argv=None):
                     }
                     if diagnostic_metrics is not None:
                         payload.update(diagnostic_metrics)
-                    wb.log(payload)
+                    if wb is not None:
+                        wb.log(payload)
+                    print(json.dumps(dict(phase="training", **payload)), flush=True)
+                    with (args.output / "metrics.jsonl").open("a") as metrics_stream:
+                        metrics_stream.write(json.dumps(payload) + "\n")
                     last_perf_step, last_perf_time = global_step, now
-                if args.save_step_freq > 0 and global_step % args.save_step_freq == 0:
+                if args.save_step_freq > 0 and (
+                    global_step % args.save_step_freq == 0
+                    or (args.physical_pair_context and global_step == 1)
+                ):
                     if dist.is_initialized():
                         dist.barrier()
                     model_state, optimizer_state = full_checkpoint_states(
@@ -6254,19 +6463,38 @@ def main(argv=None):
                     stop_training = True
                     break
         if stop_training:
+            # A requested mid-epoch endpoint must be a fully resumable saved
+            # state, even when it does not coincide with the periodic cadence.
+            model_state, optimizer_state = full_checkpoint_states(model, optimizer, parameter_names)
+            rng_state_by_rank = gather_rank_rng_states(device)
             if rank() == 0:
-                print(
-                    f"Stopped after {global_step - launch_start_step} optimizer step(s) "
-                    "as requested; skipped epoch evaluation and checkpointing",
-                    flush=True,
-                )
+                final_snapshot = dict(epoch=epoch, batch_idx=absolute_batch_idx + 1,
+                    global_step=global_step, fid=None, inception_score=None, inception_score_std=None,
+                    state_dict=model_state, optimizer=optimizer_state,
+                    rng_state_by_rank=rng_state_by_rank, checkpoint_world_size=world,
+                    scheduler=None if scheduler is None else scheduler.state_dict(),
+                    config=runtime_config, best_fid=best_fid, best_inception=best_inception)
+                atomic_torch_save(final_snapshot, last_checkpoint)
+                if args.upload_checkpoints:
+                    upload_selected_checkpoint_files(wb, last_checkpoint=last_checkpoint,
+                        best_fid=best_fid, upload_dir=args.output / 'wandb_checkpoints')
+                if wb is not None:
+                    wb.summary['continuation/target_reached'] = True
+                    wb.summary['continuation/final_step'] = global_step
+                    wb.summary['continuation/additional_updates'] = global_step - launch_start_step
+                print(f'Requested endpoint saved at step {global_step}', flush=True)
+            if dist.is_initialized():
+                dist.barrier()
             break
         resume_batch_idx = 0
         if sampler is not None:
-            sampler.set_start_index(0)
+            sampler.set_start_batch(0)
         if dist.is_initialized():
             dist.barrier()
-        run_fid = args.fid_every > 0 and (epoch + 1) % args.fid_every == 0
+        run_fid = args.fid_every > 0 and (
+            epoch == 0 or epoch + 1 <= args.fid_early_epochs
+            or (epoch + 1) % args.fid_every == 0
+        )
         # Every evaluated model must be recoverable, even when the FID cadence
         # does not coincide with the periodic recovery-checkpoint cadence.
         save_epoch = (
@@ -6324,7 +6552,7 @@ def main(argv=None):
                 while len(best_fid) > args.keep_best_checkpoints:
                     _, stale = best_fid.pop()
                     stale_path = Path(stale)
-                    if stale_path.is_file():
+                    if stale_path.is_file() and all(Path(item[1]) != stale_path for item in best_inception):
                         stale_path.unlink()
             qualifies_inception = inception_score is not None and (
                 len(best_inception) < args.keep_best_checkpoints
@@ -6339,7 +6567,7 @@ def main(argv=None):
                 while len(best_inception) > args.keep_best_checkpoints:
                     _, stale = best_inception.pop()
                     stale_path = Path(stale)
-                    if stale_path.is_file():
+                    if stale_path.is_file() and all(Path(item[1]) != stale_path for item in best_fid):
                         stale_path.unlink()
         if save_epoch:
             model_state, optimizer_state = full_checkpoint_states(
@@ -6423,6 +6651,8 @@ def main(argv=None):
         if dist.is_initialized():
             dist.barrier()
     if wb is not None:
+        if hasattr(upload_selected_checkpoint_files, "close"):
+            upload_selected_checkpoint_files.close()
         wb.finish()
     if dist.is_initialized():
         dist.destroy_process_group()

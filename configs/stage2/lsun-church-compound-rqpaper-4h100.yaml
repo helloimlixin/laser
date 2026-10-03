@@ -1,0 +1,85 @@
+# @package _global_
+defaults:
+  - _self_
+stage: stage2
+backend: rqtransformer
+recipe:
+  reference: https://arxiv.org/html/2203.01941v2#A3
+  sampling_reference: https://arxiv.org/html/2203.01941v2#B1
+  recipe_basis: published_paper
+  paper_church_global_batch: 2048
+  repository_yaml_global_batch: 256
+  dictionary_atom_vector_conditioning: true
+  initialization: fresh_stage2_seed0
+  adaptation: LASER atom/coefficient pairs with deterministic atom supports and normalized soft stochastic coefficient targets; not original RQ soft-code targets
+options:
+  checkpoint: /mnt/laser-church/assets/tokenizer.pt
+  data: /workspace/Projects/data/lsun
+  token_cache: /mnt/laser-church/assets/compound-cache.pt
+  token_cache_in_ram: true
+  output: /workspace/Projects/laser/outputs/church-compound-rqpaper-b2048-4h100-20260923/train
+  dataset: lsun_church
+  model_preset: lsun-church-350m
+  distributed_backend: ddp
+  num_atoms: 16384
+  sparsity_level: 4
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  coeff_scale: 1.0
+  coeff_target_space: normalized
+  coeff_target_mode: soft
+  coeff_target_temperature: 0.5
+  clip_coefficients: false
+  compound_tokens: true
+  compound_pair_autoregressive: true
+  compound_mask_seen_atoms_training: false
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  compound_pair_attention: compiled
+  compound_distribution_geometry: false
+  compound_conditional_geometry: false
+  atom_loss_weight: 1.0
+  geometry_loss_weight: 0.0
+  geometry_start_epoch: 0
+  geometry_warmup_epochs: 0
+  epochs: 300
+  batch_size: 128
+  training_precision: bf16
+  total_batch_size: 2048
+  lr: 0.0005
+  lr_schedule: cosine
+  lr_schedule_epochs: 300
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  seed: 0
+  atom_temperature: 1.0
+  atom_top_k: 1400
+  atom_top_p: 1.0
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 1.0
+  metric_backend: original-rqvae
+  fid_reference_stats: /mnt/laser-church/assets/lsun_256_church.npz
+  fid_num_samples: 50000
+  fid_batch_size: 128
+  fid_every: 5
+  save_ckpt_freq: 5
+  save_step_freq: 250
+  keep_best_checkpoints: 1
+  model_only_best_checkpoints: false
+  async_checkpoint_copy: true
+  sample_grid_every: 100
+  sample_grid_size: 64
+  sample_grid_batch_size: 64
+  sample_grid_on_start: false
+  upload_checkpoints: true
+  checkpoint_upload_mode: files
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: church-compound-rqpaper-b2048-4h100-20260923
+  wandb_name: Church compound RQ paper batch2048 fresh 4xH100
+  wandb_mode: online
+  resume: false
+  resume_checkpoint: null
+  init_stage2_checkpoint: null

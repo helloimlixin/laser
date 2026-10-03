@@ -39,6 +39,7 @@ IMAGE_TOKEN_CACHE_DATASETS = [
     "celeba",
     "celebahq",
     "coco",
+    "coco2014",
     "ffhq",
     "imagenet",
     "imagenette2",
@@ -69,6 +70,7 @@ def _build_datamodule(args):
         augment=False,
         seed=int(getattr(args, "seed", 42)),
         max_items=int(args.max_items),
+        coco_caption_mode=str(getattr(args, "coco_caption_mode", "first")),
     )
     return build_stage1_datamodule(data_cfg)
 
@@ -459,6 +461,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42, help="Match the stage-1 dataset split seed.")
+    parser.add_argument("--coco_caption_mode", choices=["first", "all"], default="first",
+                        help="COCO2014: one caption per image, or every image/caption pair.")
     parser.add_argument("--mean", type=float, nargs=3, default=(0.5, 0.5, 0.5))
     parser.add_argument("--std", type=float, nargs=3, default=(0.5, 0.5, 0.5))
     parser.add_argument("--coeff_vocab_size", type=int, default=16, help="Number of coefficient bins.")
@@ -677,6 +681,9 @@ def main():
     if records_source_paths:
         meta["source_paths_key"] = "source_paths"
         meta["source_paths_order"] = "token_rows"
+    if str(args.dataset) == "coco2014":
+        meta["coco_caption_mode"] = str(args.coco_caption_mode)
+        meta["split_protocol"] = "official train2014 / val2014"
     if quantized_cache:
         meta.update(
             {

@@ -15,7 +15,8 @@ BANK_FORMAT = "laser_stochastic_compound_bank_v1"
 
 
 @torch.no_grad()
-def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, generator=None):
+def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, generator=None,
+                   return_probabilities=False):
     """Return sampled atoms and physical least-squares coefficients.
 
     ``signals`` is [..., channels], dictionary is [channels, atoms] with unit
@@ -40,6 +41,7 @@ def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, 
     support = torch.empty(len(x), 0, dtype=torch.long, device=x.device)
     chol = None
     entropy = []
+    targets = []
     for step in range(depth):
         scores = residual_correlation.square().masked_fill(~available, -torch.inf)
         if temperature:
@@ -49,6 +51,10 @@ def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, 
         else:
             entropy.append(torch.zeros(len(x), device=x.device, dtype=x.dtype))
             atom = scores.argmax(-1)
+            if return_probabilities:
+                probabilities = torch.nn.functional.one_hot(atom, dictionary.shape[1]).to(x.dtype)
+        if return_probabilities:
+            targets.append(probabilities)
         available[rows, atom] = False
         if step == 0:
             chol = gram[atom, atom].sqrt()[:, None, None]
@@ -65,10 +71,13 @@ def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, 
         coefficients = torch.cholesky_solve(rhs.unsqueeze(-1), chol).squeeze(-1)
         residual_correlation = correlation - coefficients.unsqueeze(1).bmm(gram[support]).squeeze(1)
     quantized = (dictionary.T[support] * coefficients[..., None]).sum(-2)
-    return dict(atoms=support.reshape(*shape, depth),
+    result = dict(atoms=support.reshape(*shape, depth),
                 coefficients=coefficients.reshape(*shape, depth),
                 quantized=quantized.reshape_as(signals),
                 selection_entropy=torch.stack(entropy, -1).reshape(*shape, depth))
+    if return_probabilities:
+        result['atom_probabilities'] = torch.stack(targets, -2).reshape(*shape, depth, dictionary.shape[1])
+    return result
 
 
 def sample_compound_bank(atoms, coefficients, *, generator=None, choices=None):

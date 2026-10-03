@@ -363,8 +363,13 @@ def _make_selected_checkpoint_file_callback(callback_base):
             if bool(getattr(trainer, "sanity_checking", False)):
                 return
             _refresh_last_checkpoint(trainer, self.checkpoint_callback)
+            # Lightning orders ModelCheckpoint after ordinary callbacks.
+            # Publish after it has incorporated this validation's FID ranking.
+
+        def on_train_epoch_start(self, trainer, pl_module) -> None:
+            del pl_module
             epoch = int(getattr(trainer, "current_epoch", 0))
-            if (epoch + 1) % self.every_n_epochs != 0:
+            if epoch <= 0 or epoch % self.every_n_epochs != 0:
                 return
             self._upload(trainer)
 
@@ -398,4 +403,3 @@ def _stage1_wandb_tags(cfg) -> list[str]:
     if patch_based:
         tags.append(f"patch_size={int(getattr(model_cfg, 'patch_size', 0) or 0)}")
     return tags
-

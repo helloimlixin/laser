@@ -88,7 +88,7 @@ def _compute_generation_fid(
     num_workers = int(_cfg_or_meta(cfg.data, cache_meta, "num_workers", 4) or 0)
     mean = _float_tuple(getattr(cfg.data, "mean", None), fallback=cache_meta.get("mean"), channels=3)
     std = _float_tuple(getattr(cfg.data, "std", None), fallback=cache_meta.get("std"), channels=3)
-    batch_size = min(max(1, int(count)), max(1, int(getattr(cfg.train_ar, "batch_size", count) or count)))
+    batch_size = min(max(1, int(count)), max(1, int(getattr(cfg.train_ar, "generation_fid_batch_size", 32) or 32)))
     dm = dm_cls(
         DataConfig(
             dataset=dataset,
@@ -115,13 +115,22 @@ def _compute_generation_fid(
         print("Warning: skipping generation FID because torch-fidelity has no CPU backend here")
         return {}
 
-    metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    # This evaluator runs only on rank zero; its result is broadcast by the
+    # callback. TorchMetrics must not launch its own distributed collectives.
+    metric = FrechetInceptionDistance(
+        feature=2048, normalize=True, sync_on_compute=False,
+    ).to(device)
     metric.eval()
-    fake = _to_unit_range(generated[:count].to(device=device), mean=mean, std=std)
-    metric.update(fake, real=False)
+    with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+        for start in range(0, count, batch_size):
+            fake = _to_unit_range(
+                generated[start:min(start + batch_size, count)].to(device=device),
+                mean=mean, std=std,
+            )
+            metric.update(fake, real=False)
 
     seen = 0
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
         for batch in loader:
             images = batch[0] if isinstance(batch, (tuple, list)) else batch
             keep = min(int(images.size(0)), count - seen)
@@ -137,12 +146,14 @@ def _compute_generation_fid(
             if seen >= count:
                 break
 
-    if seen <= 0:
+    if seen < 2 or count < 2:
         return {}
     score = float(metric.compute().item())
     return {
         "generation/fid": score,
         "s2/generation_fid": score,
+        "generation/fid_num_real": seen,
+        "generation/fid_num_fake": count,
     }
 
 

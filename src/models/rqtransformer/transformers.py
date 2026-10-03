@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from itertools import product
 
 import torch
@@ -45,11 +46,11 @@ def _top_p_probs(probs, p):
 
 def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None):
     logits = logits.float() / temperature
-    if top_k is not None:
+    if top_k is not None and top_k < logits.shape[-1]:
         logits = _top_k_logits(logits, top_k)
     logits = torch.nan_to_num(logits, nan=-float("inf"))
     probs = F.softmax(logits, dim=-1)
-    if top_p is not None:
+    if top_p is not None and top_p < 1.0:
         probs = _top_p_probs(probs, top_p)
     return torch.multinomial(probs, num_samples=1).view(-1)
 
@@ -160,7 +161,8 @@ class RQTransformer(Stage2Model):
         return self.classifier(head_outputs)
 
     def forward(self, xs, model_aux=None, cond=None, amp=False):
-        with torch.amp.autocast("cuda", enabled=amp):
+        # Respect the BF16 context selected by the outer training loop.
+        with torch.amp.autocast("cuda") if amp else nullcontext():
 
             (B, H, W, D) = xs.shape
 
