@@ -42,6 +42,31 @@ def _checkpoint_upload_source(source: Path):
             pass
     return source
 
+def prune_local_checkpoint_cache(keep_sources):
+    """Discard cold upload buffers while preserving their persistent payloads."""
+    root = os.environ.get('LASER_CHECKPOINT_UPLOAD_CACHE_DIR')
+    if not root:
+        return 0
+    keep = {str(Path(source).resolve()) for source in keep_sources}
+    removed = 0
+    for receipt in (Path(root) / 'objects').glob('*.json'):
+        try:
+            metadata = json.loads(receipt.read_text())
+            source = Path(metadata['source'])
+            local = receipt.with_suffix('.pt')
+            if str(source) in keep:
+                continue
+            # Only discard a buffer with a complete persistent counterpart.
+            # Upload snapshots retain their own links to the local inode.
+            if not source.is_file() or source.stat().st_size != local.stat().st_size:
+                continue
+            local.unlink(missing_ok=True)
+            receipt.unlink(missing_ok=True)
+            removed += 1
+        except (OSError, ValueError, KeyError):
+            continue
+    return removed
+
 def atomic_torch_save(payload, target: Path, *, background=None, on_commit=None):
     """Persist a checkpoint without exposing a partial destination file.
 

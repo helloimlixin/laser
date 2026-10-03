@@ -1,10 +1,12 @@
 from pathlib import Path
 import json
+import os
 
 import pytest
 import torch
 
 from src.training import rqtransformer as training
+from src.training import k4_checkpoint_io
 
 
 @pytest.fixture
@@ -111,3 +113,22 @@ def test_ctime_relaxation_requires_immutable_storage(storage, monkeypatch):
     receipt.write_text(json.dumps(metadata))
     monkeypatch.delenv('LASER_CHECKPOINT_IMMUTABLE_FILES')
     assert training._checkpoint_upload_source(latest) == latest
+
+
+def test_prune_cold_buffers_preserves_archives_active_models_and_upload_pins(storage):
+    archived = storage / 'epochs' / 'epoch_005.pt'
+    latest, best = storage / 'last.pt', storage / 'best.pt'
+    for step, path in enumerate((archived, latest, best)):
+        k4_checkpoint_io.atomic_torch_save({'step': step}, path)
+    archived_local, _ = k4_checkpoint_io._local_checkpoint_paths(archived)
+    pin = storage / 'upload-snapshot.pt'
+    os.link(archived_local, pin)
+
+    assert k4_checkpoint_io.prune_local_checkpoint_cache([latest, best]) == 1
+    assert not archived_local.exists()
+    assert torch.load(archived, weights_only=True)['step'] == 0
+    assert torch.load(pin, weights_only=True)['step'] == 0
+    for path in (latest, best):
+        local, _ = k4_checkpoint_io._local_checkpoint_paths(path)
+        assert local.exists()
+    assert len(list((storage / 'uploads/objects').glob('*.pt'))) == 2

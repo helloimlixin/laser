@@ -12,7 +12,8 @@ def replace(path, value):
     temporary.replace(path)
 
 
-def test_upload_is_nonblocking_immutable_and_keeps_latest_pending(tmp_path):
+@pytest.mark.parametrize('immutable_sources', [False, True])
+def test_upload_is_nonblocking_immutable_and_keeps_latest_pending(tmp_path, immutable_sources):
     started, release = threading.Event(), threading.Event()
     received = []
     checkpoint = tmp_path / 'last.pt'
@@ -23,7 +24,8 @@ def test_upload_is_nonblocking_immutable_and_keeps_latest_pending(tmp_path):
             assert release.wait(5)
         received.append((epoch, paths[0].read_text()))
 
-    uploader = CheckpointUploader(tmp_path / 'snapshots', upload)
+    uploader = CheckpointUploader(tmp_path / 'snapshots', upload,
+                                  immutable_sources=immutable_sources)
     replace(checkpoint, 'one')
     uploader.submit([checkpoint], 1)
     assert started.wait(5)
@@ -40,6 +42,35 @@ def test_upload_is_nonblocking_immutable_and_keeps_latest_pending(tmp_path):
     uploader.close()
     assert received == [(1, 'one'), (3, 'three')]
     assert checkpoint.read_text() == 'three'
+    assert list((tmp_path / 'snapshots').iterdir()) == []
+
+
+def test_immutable_upload_pins_source_inode_without_copying(tmp_path, monkeypatch):
+    checkpoint = tmp_path / 'best-fid-01.pt'
+    checkpoint.write_bytes(b'original')
+    inode = checkpoint.stat().st_ino
+    started, release = threading.Event(), threading.Event()
+    received = []
+
+    def forbidden_copy(*args, **kwargs):
+        raise AssertionError('Immutable upload must not allocate another payload')
+
+    monkeypatch.setattr('src.training.checkpoint_upload.shutil.copyfileobj', forbidden_copy)
+
+    def upload(paths, epoch):
+        assert paths[0].stat().st_ino == inode
+        started.set()
+        assert release.wait(5)
+        received.append(paths[0].read_bytes())
+
+    uploader = CheckpointUploader(tmp_path / 'snapshots', upload, immutable_sources=True)
+    uploader.submit([checkpoint], 1)
+    assert started.wait(5)
+    replace(checkpoint, 'replacement')
+    release.set()
+    uploader.close()
+    assert received == [b'original']
+    assert checkpoint.read_text() == 'replacement'
     assert list((tmp_path / 'snapshots').iterdir()) == []
 
 

@@ -1,0 +1,75 @@
+defaults:
+- _self_
+stage: stage2
+backend: rqtransformer
+options:
+  checkpoint: /tmp/laser-imagenet-stage2/best_rfid_slot1_model.pt
+  data: /tmp/laser-imagenet-stage2/imagenet
+  token_cache: null
+  output: /tmp/laser-imagenet-epoch56-lr24-dualfid-stage2/production/train
+  dataset: imagenet
+  model_preset: imagenet-1400m
+  distributed_backend: ddp
+  num_atoms: 16384
+  sparsity_level: 4
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  coeff_scale: 6.4
+  coeff_scales:
+  - 8.203365325927734
+  - 4.265638828277588
+  - 3.0662174224853516
+  - 1.8273425102233887
+  coeff_target_space: normalized
+  coeff_target_mode: soft
+  coeff_target_temperature: 0.01125
+  compound_tokens: false
+  epochs: 100
+  batch_size: 171
+  total_batch_size: 2048
+  lr: 0.00024
+  lr_schedule: cosine
+  lr_schedule_epochs: 100
+  min_lr: 3.0e-07
+  warmup_epochs: 0.0
+  seed: 261001
+  atom_temperature: 0.9
+  atom_top_k: 0
+  atom_top_p: 0.9
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+  metric_backend: torchmetrics
+  fid_reference_stats: /workspace/Projects/laser/outputs/imagenet-rfid421-epoch45-lr55-5h200-20261003/full-training-fid-20261003/imagenet-train-1281167-torchmetrics.pt
+  fid_num_samples: 50000
+  fid_batch_size: 512
+  fid_every: 1
+  save_ckpt_freq: 5
+  save_step_freq: 200
+  keep_best_checkpoints: 3
+  model_only_best_checkpoints: true
+  sample_grid_every: 500
+  sample_grid_size: 64
+  sample_grid_batch_size: 32
+  sample_grid_samples_per_class: 8
+  sample_grid_on_start: false
+  upload_checkpoints: true
+  checkpoint_upload_mode: files
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: imagenet-rfid421-epoch45-lr55-5h200-20261003
+  wandb_name: ImageNet rFID4.21 K4 | epoch56 LR2.4e-4 | separate full-train and val
+    FID | 6 H200
+  wandb_mode: online
+  resume: true
+  checkpoint_dir: /workspace/Projects/laser/outputs/imagenet-rfid421-epoch45-lr55-5h200-20261003/train/checkpoints/epoch56-lr24-dualfid-20261003
+  fid_real_split: train
+  physical_pair_context: true
+  sample_grid_seed: 261001
+  fid_early_epochs: 6
+  continuation_lr_policy: /tmp/laser-imagenet-epoch56-lr24-dualfid-stage2/fid-plateau-policy.json
+  resume_checkpoint: /dev/shm/laser-imagenet-epoch56-lr24-checkpoints/resume-step35056.pt
+  fid_validation_reference_stats: /workspace/Projects/laser/outputs/imagenet-rfid421-epoch45-lr55-5h200-20261003/epoch56-lr24-dualfid-20261003/imagenet-val-50000-torchmetrics.pt
+  fid_seed: 261056
+  fid_on_resume: false

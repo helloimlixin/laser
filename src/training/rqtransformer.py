@@ -62,6 +62,7 @@ from src.orthogonal_sparse_codec import ordered_support_basis
 from src.stochastic_compound import BANK_FORMAT, sample_compound_bank
 from src.soft_omp_bank import atom_targets as bank_atom_targets, sparse_atom_cross_entropy, sparse_atom_entropy
 from src.training.exact_global_batch import ExactGlobalBatchSampler
+from src.training.fid_reference import with_fixed_evaluation_rng
 from src.shared_physical_coefficients import (
     SHARED_PHYSICAL_REPRESENTATION,
     guard_shared_physical_checkpoint,
@@ -1511,6 +1512,7 @@ def preview_sampling_settings(args):
 
 
 @torch.no_grad()
+@with_fixed_evaluation_rng
 def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_size: int = 64,
                                 num_condition_classes=1000,
                                 atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
@@ -1518,7 +1520,9 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
                                 causal_prefix_sampling="predicted",
                                 compute_inception_score=True,
                                 metric_backend="original-rqvae",
-                                fid_reference_stats=None):
+                                fid_reference_stats=None,
+                                fid_validation_reference_stats=None,
+                                fid_seed=None, reference_metrics=None):
 
     device = next(model.parameters()).device
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -1534,15 +1538,19 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
             reference_stats_path=fid_reference_stats,
         )
     elif metric_backend == "torchmetrics":
-        if fid_reference_stats is not None:
-            raise ValueError(
-                "precomputed RQ-VAE reference statistics require "
-                "--metric-backend original-rqvae"
-            )
         from torchmetrics.image.fid import FrechetInceptionDistance
         fid_metric = FrechetInceptionDistance(
             feature=2048, normalize=True, sync_on_compute=dist.is_initialized()
         ).to(device)
+        if fid_reference_stats is not None:
+            from src.training.fid_reference import seed_torchmetrics_reference
+            reference_metadata = seed_torchmetrics_reference(
+                fid_metric, fid_reference_stats, rank=process_rank
+            )
+            if process_rank == 0:
+                print("FID real reference: " + str(reference_metadata['samples'])
+                      + " images from " + str(reference_metadata.get('real_split', 'unknown')),
+                      flush=True)
     else:
         raise ValueError(f"unsupported metric backend: {metric_backend}")
     inception_metric = None
@@ -1642,7 +1650,23 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
             shuffle_for_inception=True
         )
     else:
-        fid = float(fid_metric.compute().item())
+        if fid_reference_stats is not None:
+            from src.training.fid_reference import compute_reference_fids
+            primary_name = reference_metadata.get('real_split', 'train') + '_full'
+            references = {primary_name: fid_reference_stats}
+            if fid_validation_reference_stats is not None:
+                if primary_name != 'train_full':
+                    raise ValueError('Separate validation FID requires a training primary reference')
+                references['val_full'] = fid_validation_reference_stats
+            scores = compute_reference_fids(fid_metric, references,
+                                            expected_generated_samples=int(num_samples))
+            fid = scores[primary_name]['fid']
+            if reference_metrics is not None:
+                reference_metrics.update(scores)
+            if process_rank == 0:
+                print('FID reference scores: ' + json.dumps(scores), flush=True)
+        else:
+            fid = float(fid_metric.compute().item())
         if inception_metric is None:
             inception_mean = inception_std = None
         else:
@@ -4340,10 +4364,17 @@ def build_parser():
     p.add_argument(
         "--fid-reference-stats", type=Path, default=None,
         help=(
-            "Precomputed original RQ-VAE mu/sigma NPZ. For paper-comparable "
-            "ImageNet FID use assets/fid_stats/imagenet_256_train.npz"
+            "Precomputed real reference matching --metric-backend: TorchMetrics "
+            "sufficient-statistics PT or original RQ-VAE mu/sigma NPZ. For "
+            "original RQ-VAE ImageNet FID use assets/fid_stats/imagenet_256_train.npz"
         ),
     )
+    p.add_argument('--fid-validation-reference-stats', type=Path, default=None,
+                   help='Also score the same generated images against a complete TorchMetrics validation reference')
+    p.add_argument('--fid-seed', type=int, default=None,
+                   help='Fixed per-rank evaluation seed; preserves training RNG state')
+    p.add_argument('--fid-on-resume', action=argparse.BooleanOptionalAction, default=False,
+                   help='Evaluate a model-only resume checkpoint before continuing training')
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--total-batch-size", type=int, default=2048)
@@ -4773,12 +4804,29 @@ def main(argv=None):
     if args.fid_early_epochs < 0:
         raise ValueError("--fid-early-epochs cannot be negative")
     if args.fid_reference_stats is not None:
-        from src.rqvae_metrics import load_reference_statistics
-        load_reference_statistics(args.fid_reference_stats)
-        if args.metric_backend != "original-rqvae":
-            raise ValueError(
-                "--fid-reference-stats requires --metric-backend original-rqvae"
-            )
+        if args.metric_backend == "torchmetrics":
+            from src.training.fid_reference import load_torchmetrics_reference
+            reference = load_torchmetrics_reference(args.fid_reference_stats)
+            if args.dataset == 'imagenet':
+                split = reference['metadata'].get('real_split')
+                expected = {'train': 1281167, 'val': 50000}.get(split)
+                if expected is None or reference['metadata']['samples'] != expected:
+                    raise ValueError('ImageNet FID reference must contain its complete declared split')
+        elif args.metric_backend == "original-rqvae":
+            from src.rqvae_metrics import load_reference_statistics
+            load_reference_statistics(args.fid_reference_stats)
+        else:
+            raise ValueError("Unsupported FID reference backend")
+    if args.fid_seed is not None and args.fid_seed < 0:
+        raise ValueError('--fid-seed cannot be negative')
+    if args.fid_validation_reference_stats is not None:
+        if args.metric_backend != 'torchmetrics' or args.fid_reference_stats is None:
+            raise ValueError('Separate validation FID requires TorchMetrics real references')
+        from src.training.fid_reference import load_torchmetrics_reference
+        metadata = load_torchmetrics_reference(args.fid_validation_reference_stats,
+            expected_samples=50000 if args.dataset == 'imagenet' else None)['metadata']
+        if metadata.get('real_split') != 'val':
+            raise ValueError('Validation FID reference must contain validation images')
     if args.max_optimizer_steps < 0:
         raise ValueError("--max-optimizer-steps cannot be negative")
     if args.smoke_test and args.max_optimizer_steps <= 0:
@@ -5333,6 +5381,7 @@ def main(argv=None):
                 optimizer_state_for_unwrapped_load(resume_optimizer_state, unwrap(model))
             )
         del resume_optimizer_state
+    optimizer_resumed = bool(optimizer.state)
     complete_microbatches = len(loader)
     optimizer_steps_per_epoch = sampler.steps_per_epoch
     if optimizer_steps_per_epoch <= 0:
@@ -5460,11 +5509,8 @@ def main(argv=None):
         for metric_name in metric_names:
             wb.define_metric(metric_name, step_metric="train/global_step")
         if args.fid_reference_stats is not None:
-            fid_metric_name = f"val/fid_rqvae_{args.dataset}_train"
-            wb.define_metric(
-                fid_metric_name, step_metric="train/global_step"
-            )
-            wb.summary["evaluation/fid_reference"] = f"rqvae/{args.dataset}_train"
+            wb.define_metric('eval/*', step_metric='train/global_step')
+            wb.summary["evaluation/fid_reference"] = f"{args.metric_backend}/{args.dataset}_train"
             wb.summary["evaluation/fid_reference_stats"] = str(
                 args.fid_reference_stats.resolve()
             )
@@ -5476,6 +5522,8 @@ def main(argv=None):
                 args.fid_num_samples
             )
             wb.summary["evaluation/fid_feature_extractor"] = (
+                "TorchMetrics torch-fidelity InceptionV3 pool3/2048"
+                if args.metric_backend == "torchmetrics" else
                 "rqvae TensorFlow-FID-compatible InceptionV3 pool3/2048"
             )
             wb.summary["evaluation/generation_conditioning"] = (
@@ -5483,8 +5531,18 @@ def main(argv=None):
                 if args.dataset == "imagenet" else "unconditional"
             )
             wb.summary["evaluation/inception_score"] = (
+                "TorchMetrics Inception Score, 10 splits"
+                if args.metric_backend == "torchmetrics" else
                 "RQ-VAE 1008-logit Inception, shuffled, 10 splits"
             )
+            wb.summary['evaluation/fid_seed'] = args.fid_seed
+            if args.fid_validation_reference_stats is not None:
+                from src.training.fid_reference import load_torchmetrics_reference
+                val_reference = load_torchmetrics_reference(args.fid_validation_reference_stats)
+                wb.summary['evaluation/validation_real_images'] = val_reference['metadata']['samples']
+                wb.summary['evaluation/validation_reference_stats'] = str(args.fid_validation_reference_stats)
+                with args.fid_validation_reference_stats.open('rb') as stream:
+                    wb.summary['evaluation/validation_reference_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
         (args.output / "launch_config.json").write_text(
             json.dumps({k: str(v) for k, v in runtime_config.items()}, indent=2)
         )
@@ -5783,9 +5841,11 @@ def main(argv=None):
                 ),
                 flush=True,
             )
-    if args.fid_only:
+    if args.fid_only or (args.fid_on_resume and resume_payload is not None
+                        and not optimizer_resumed):
         if resume_payload is None:
             raise ValueError("--fid-only requires a resumable checkpoint")
+        reference_metrics = {}
         with optimizer_state_offloaded_for_generation(model, optimizer, device):
             torch.cuda.reset_peak_memory_stats(device)
             with model_for_custom_methods(model) as generation_model:
@@ -5802,6 +5862,8 @@ def main(argv=None):
                     compute_inception_score=uses_inception_score(args.dataset),
                     metric_backend=args.metric_backend,
                     fid_reference_stats=args.fid_reference_stats,
+                    fid_validation_reference_stats=args.fid_validation_reference_stats,
+                    fid_seed=args.fid_seed, reference_metrics=reference_metrics,
                 )
             cuda_memory_report(device, f"step {global_step} catch-up FID generation")
         progress_epoch = start_epoch + resume_batch_idx / complete_microbatches
@@ -5816,6 +5878,8 @@ def main(argv=None):
             "inception_score_std": inception_score_std,
             "num_generated_samples": args.fid_num_samples,
             "metric_backend": args.metric_backend,
+            "fid_seed": args.fid_seed,
+            "reference_metrics": reference_metrics,
             "fid_reference_stats": (
                 None if args.fid_reference_stats is None
                 else str(args.fid_reference_stats.resolve())
@@ -5828,14 +5892,12 @@ def main(argv=None):
             result_path.write_text(json.dumps(result, indent=2) + "\n")
             if wb is not None:
                 evaluation_payload = {
-                    "val/fid": fid,
                     "train/epoch": progress_epoch,
                     "train/global_step": global_step,
                 }
-                if args.fid_reference_stats is not None:
-                    evaluation_payload[
-                        f"val/fid_rqvae_{args.dataset}_train"
-                    ] = fid
+                from src.training.fid_reference import fid_log_values
+                evaluation_payload.update(fid_log_values(reference_metrics, dataset=args.dataset)
+                                          if reference_metrics else {'val/fid': fid})
                 if inception_score is not None:
                     evaluation_payload.update({
                         "val/inception_score": inception_score,
@@ -5848,11 +5910,12 @@ def main(argv=None):
                 f"wrote {result_path}",
                 flush=True,
             )
-        if wb is not None:
-            wb.finish()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        return
+        if args.fid_only:
+            if wb is not None:
+                wb.finish()
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            return
     last_perf_step = global_step
     last_perf_time = time.monotonic()
     launch_start_step = global_step
@@ -6503,6 +6566,7 @@ def main(argv=None):
             or epoch + 1 == args.epochs
         )
         fid = None
+        reference_metrics = {}
         inception_score = None
         inception_score_std = None
         if run_fid:
@@ -6522,6 +6586,8 @@ def main(argv=None):
                         compute_inception_score=uses_inception_score(args.dataset),
                         metric_backend=args.metric_backend,
                         fid_reference_stats=args.fid_reference_stats,
+                        fid_validation_reference_stats=args.fid_validation_reference_stats,
+                        fid_seed=args.fid_seed, reference_metrics=reference_metrics,
                     )
                 cuda_memory_report(device, f"epoch {epoch + 1} FID generation")
         best_path = None
@@ -6529,12 +6595,12 @@ def main(argv=None):
         if rank() == 0:
             if wb is not None and fid is not None:
                 evaluation_payload = {
-                    "val/fid": fid,
                     "train/epoch": epoch + 1,
                     "train/global_step": global_step,
                 }
-                if args.fid_reference_stats is not None:
-                    evaluation_payload[f"val/fid_rqvae_{args.dataset}_train"] = fid
+                from src.training.fid_reference import fid_log_values
+                evaluation_payload.update(fid_log_values(reference_metrics, dataset=args.dataset)
+                                          if reference_metrics else {'val/fid': fid})
                 if inception_score is not None:
                     evaluation_payload.update({
                         "val/inception_score": inception_score,

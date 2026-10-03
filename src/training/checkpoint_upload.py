@@ -1,5 +1,6 @@
 """Bounded asynchronous transfers of atomically replaced checkpoint files."""
 from pathlib import Path
+import os
 import shutil
 import tempfile
 import threading
@@ -12,10 +13,11 @@ class CheckpointUploader:
     file handles pin those inodes until the worker copies them to local staging.
     Intermediate pending uploads can be superseded; close drains the final one.
     """
-    def __init__(self, directory, upload):
+    def __init__(self, directory, upload, *, immutable_sources=False):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.upload = upload
+        self.immutable_sources = immutable_sources
         self.condition = threading.Condition()
         self.pending = None
         self.copy_pending = None
@@ -35,6 +37,8 @@ class CheckpointUploader:
 
     def submit(self, paths, epoch):
         self.check()
+        if self.immutable_sources:
+            return self._submit_immutable(paths, epoch)
         sources = []
         try:
             for source in paths:
@@ -54,6 +58,33 @@ class CheckpointUploader:
             for _, stream in sources:
                 stream.close()
             raise
+
+    def _submit_immutable(self, sources, epoch):
+        """Pin atomically replaced source inodes without duplicating their bytes.
+
+        This mode requires sources on the snapshot filesystem whose contents
+        never change in place. Link immediately, before a later submit can
+        replace the fixed source names.
+        """
+        snapshot = Path(tempfile.mkdtemp(prefix=f'epoch-{epoch:03d}-', dir=self.directory))
+        try:
+            paths = []
+            for source in sources:
+                source = Path(source)
+                target = snapshot / source.name
+                os.link(source, target)
+                paths.append(target)
+            with self.condition:
+                if self.closing or self.error is not None:
+                    raise RuntimeError('Checkpoint uploader is closed') from self.error
+                if self.pending is not None:
+                    shutil.rmtree(self.pending[0])
+                self.pending = (snapshot, paths, epoch)
+                snapshot = None
+                self.condition.notify_all()
+        finally:
+            if snapshot is not None:
+                shutil.rmtree(snapshot, ignore_errors=True)
 
     def _fail(self, error):
         with self.condition:
