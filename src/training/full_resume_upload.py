@@ -9,7 +9,9 @@ import base64
 import json
 import math
 import os
+import errno
 from pathlib import Path
+import shutil
 
 import torch
 
@@ -108,11 +110,44 @@ def cached_payload(receipt_path, cache_dir):
 
 class FullResumeWinners:
     """Pin each complete winner; every upload snapshot contains both winners."""
-    def __init__(self, directory):
+    def __init__(self, directory, *, archive=None):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.state_path = self.directory / 'resume-winners.json'
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
+        archive = Path(archive) if archive is not None else None
+        if not self.state and archive is not None and (archive / 'resume-winners.json').exists():
+            self.state = json.loads((archive / 'resume-winners.json').read_text())
+        restored = {}
+        for kind, metadata in self.state.items():
+            target = self.directory / metadata['file']
+            if not target.exists():
+                if archive is None:
+                    raise FileNotFoundError(f'Full recovery winner is missing: {target}')
+                from .k4_checkpoint_io import _checkpoint_upload_source
+                source = restored.get(metadata['md5']) or _checkpoint_upload_source(
+                    archive / metadata['file'])
+                source = Path(source).resolve(strict=True)
+                temporary = target.with_suffix('.restore')
+                temporary.unlink(missing_ok=True)
+                try:
+                    try:
+                        os.link(source, temporary)
+                    except OSError as error:
+                        if error.errno != errno.EXDEV:
+                            raise
+                        shutil.copyfile(source, temporary)
+                    with temporary.open('rb') as stream:
+                        digest = base64.b64encode(hashlib.file_digest(stream, 'md5').digest()).decode()
+                    if digest != metadata['md5'] or temporary.stat().st_size != metadata['bytes']:
+                        raise ValueError('Durable recovery winner checksum mismatch')
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            restored[metadata['md5']] = target
+            atomic_json(target.with_suffix('.json'), metadata)
+        if self.state:
+            atomic_json(self.state_path, self.state)
 
     def consider(self, source, *, provenance=None):
         source = Path(source)

@@ -129,3 +129,23 @@ def test_cloud_download_corruption_preserves_previous_local_recovery(tmp_path):
         download_verified(Run(), 'last.pt', tmp_path)
     assert target.read_bytes() == b'previous full recovery'
     assert list(tmp_path.iterdir()) == [target]
+
+
+def test_cleared_ram_cache_restores_winners_and_rejects_worse_new_scores(tmp_path, monkeypatch):
+    monkeypatch.setenv('LASER_CHECKPOINT_IMMUTABLE_FILES', '1')
+    source = tmp_path / 'candidate.pt'
+    checkpoint(source, fid=17, inception=75)
+    winners = FullResumeWinners(tmp_path / 'first-allocation')
+    winners.consider(source)
+    archive = tmp_path / 'durable'
+    winners.persist(archive)
+    recovered = FullResumeWinners(tmp_path / 'new-allocation', archive=archive)
+    assert recovered.state['fid']['score'] == 17
+    assert recovered.state['is']['score'] == 75
+    # Coincident winners share the recovered inode rather than duplicating RAM.
+    assert (tmp_path / 'new-allocation/best-fid-resume.pt').stat().st_ino == (
+        tmp_path / 'new-allocation/best-is-resume.pt').stat().st_ino
+    source.unlink()
+    checkpoint(source, fid=20, inception=65, step=20)
+    assert recovered.consider(source) == []
+    assert recovered.state['fid']['global_step'] == 10

@@ -97,7 +97,8 @@ def main():
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, stop)
-    winners = FullResumeWinners(args.local_dir / 'winners')
+    winners = FullResumeWinners(args.local_dir / 'winners',
+                               archive=args.evidence_dir / 'checkpoints')
     uploader = CheckpointUploader(
         args.local_dir / 'snapshots',
         VerifiedCloudUpload(args.run, args.evidence_dir / 'cloud-full-resume-receipt.json'),
