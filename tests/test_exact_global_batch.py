@@ -52,3 +52,20 @@ def test_resume_preserves_order_and_does_not_consume_global_rng():
     assert list(sampler) != batches[24:]
     with pytest.raises(ValueError, match='optimizer boundary'):
         sampler.set_start_batch(3)
+
+
+def test_exact_sampler_advances_epoch_for_fresh_image_augmentation(tmp_path):
+    from tests.test_fresh_orthogonal_images import make_dataset
+    from torch.utils.data import DataLoader
+
+    dataset = make_dataset(tmp_path)
+    sampler = ExactGlobalBatchSampler(dataset, 4, 1, 0, seed=83)
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=2, persistent_workers=True)
+    sampler.set_epoch(0)
+    first = next(iter(loader))[0].clone()
+    sampler.set_epoch(1)
+    second = next(iter(loader))[0].clone()
+    sampler.set_epoch(1)
+    replay = next(iter(loader))[0]
+    assert not torch.equal(first, second)
+    torch.testing.assert_close(second, replay, rtol=0, atol=0)

@@ -1,0 +1,82 @@
+# Run through the frozen entry.py with LASER_BRANCH=cross-attention.
+# entry.py attaches the recorded architecture and migrates the step-1250 optimizer.
+defaults:
+- _self_
+stage: stage2
+backend: rqtransformer
+options:
+  checkpoint: /tmp/laser-imagenet-classcond-20261007/inputs/stage1-tokenizer.pt
+  data: /tmp/laser-imagenet-classcond-20261007/imagenet
+  token_cache: /tmp/laser-imagenet-classcond-20261007/inputs/compound-cache.pt
+  output: /workspace/Projects/laser/outputs/imagenet-cross-attention-trial-20261007/cross-attention/train
+  dataset: imagenet
+  model_preset: imagenet-1400m
+  distributed_backend: ddp
+  num_atoms: 16384
+  sparsity_level: 4
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  coeff_scale: 6.4
+  coeff_scales:
+  - 8.203365325927734
+  - 4.265638828277588
+  - 3.0662174224853516
+  - 1.8273425102233887
+  coeff_target_space: normalized
+  coeff_target_mode: soft
+  coeff_target_temperature: 0.5
+  compound_tokens: true
+  epochs: 100
+  batch_size: 64
+  total_batch_size: 2048
+  lr: 0.0005
+  lr_schedule: cosine
+  lr_schedule_epochs: 100
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  seed: 261001
+  atom_temperature: 1.0
+  atom_top_k: 256
+  atom_top_p: 0.95
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.95
+  metric_backend: original-rqvae
+  fid_reference_stats: /tmp/laser-imagenet-classcond-20261007/inputs/imagenet_256_train.npz
+  fid_num_samples: 2048
+  fid_batch_size: 64
+  fid_every: 0
+  save_ckpt_freq: 100
+  save_step_freq: 0
+  keep_best_checkpoints: 1
+  model_only_best_checkpoints: false
+  sample_grid_every: 0
+  sample_grid_size: 64
+  sample_grid_batch_size: 32
+  sample_grid_samples_per_class: 8
+  sample_grid_on_start: false
+  upload_checkpoints: true
+  checkpoint_upload_mode: files
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: imagenet-rfid421-cross-attention-8h100-trial-20261007
+  wandb_name: ImageNet rFID4.21 | cross-attention | matched 1250+256 | 8 H100
+  wandb_mode: online
+  resume: true
+  checkpoint_dir: /workspace/Projects/laser/outputs/imagenet-cross-attention-trial-20261007/cross-attention/train/checkpoints
+  fid_real_split: train
+  physical_pair_context: false
+  sample_grid_seed: 261001
+  fid_early_epochs: 0
+  compound_pair_autoregressive: true
+  compound_refiner_layers: 0
+  compound_micro_transformer_layers: 0
+  compound_depth_specific_coeff_heads: false
+  compound_distribution_geometry: false
+  geometry_loss_weight: 0.0
+  atom_loss_weight: 1.0
+  resume_checkpoint: /tmp/laser-imagenet-cross-attention-20261007/anchor.pt
+  init_stage2_checkpoint: null
+  max_optimizer_steps: 256
+  fid_seed: 261001

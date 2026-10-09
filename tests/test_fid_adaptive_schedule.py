@@ -57,3 +57,47 @@ def test_monotonic_curve_floor_and_schedule_contract():
         make(state_dict={'kind': 'old-cosine'})
     with pytest.raises(ValueError, match='finite'):
         make().observe(float('nan'))
+
+
+def test_continuation_cosine_anneals_at_saved_step_and_stays_at_floor():
+    optimizer = SimpleNamespace(param_groups=[{'lr': 99.}])
+    policy = dict(initial_lr=5e-5, min_lr=1e-5, total_steps=100,
+        baseline_fid=25.14, decay_start_step=20, decay_steps=10)
+    initial = FidAdaptiveSchedule(optimizer, **policy)
+    state = initial.state_dict()
+    state.update(last_epoch=20, last_observation_step=20)
+    schedule = FidAdaptiveSchedule(optimizer, **policy, completed_steps=20, state_dict=state)
+    assert optimizer.param_groups[0]['lr'] == 5e-5
+    for _ in range(5):schedule.step()
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(3e-5)
+    clone = SimpleNamespace(param_groups=[{}])
+    restored = FidAdaptiveSchedule(clone, **policy, completed_steps=25,
+        state_dict=copy.deepcopy(schedule.state_dict()))
+    for _ in range(15):
+        schedule.step();restored.step()
+        assert optimizer.param_groups == clone.param_groups
+    assert optimizer.param_groups[0]['lr'] == 1e-5
+def test_fresh_warmup_and_fid_reductions_resume_without_a_previous_run_baseline():
+    from types import SimpleNamespace
+    import copy
+    from src.training.fid_adaptive_schedule import FidAdaptiveSchedule
+    policy = dict(initial_lr=.0002, min_lr=.00001, total_steps=40,
+        baseline_fid=None, patience=3, min_delta=.1, factor=.5, cooldown=2,
+        warmup_steps=4, decay_start_step=4, decay_steps=36)
+    optimizer = SimpleNamespace(param_groups=[dict(lr=.0002)])
+    scheduler = FidAdaptiveSchedule(optimizer, **policy)
+    assert optimizer.param_groups[0]['lr'] == .00005
+    scheduler.step(); scheduler.observe(195.)
+    for _ in range(3): scheduler.step()
+    assert optimizer.param_groups[0]['lr'] == .0002
+    scheduler.observe(80.)
+    for fid in (40., 41.):
+        scheduler.step(); scheduler.observe(fid)
+    resumed_optimizer = SimpleNamespace(param_groups=copy.deepcopy(optimizer.param_groups))
+    resumed = FidAdaptiveSchedule(resumed_optimizer, **policy,
+        completed_steps=scheduler.last_epoch, state_dict=scheduler.state_dict())
+    for fid in (42., 41., 40., 39., 38.):
+        scheduler.step(); resumed.step()
+        assert scheduler.observe(fid) == resumed.observe(fid)
+        assert scheduler.state_dict() == resumed.state_dict()
+    assert scheduler.reductions == 1

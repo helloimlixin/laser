@@ -15,8 +15,8 @@ from src.training.rqtransformer import LaserRQTransformer
 class PhysicalPairScalarRQTransformer(LaserRQTransformer):
     def __init__(self, config, num_atoms):
         super().__init__(config, num_atoms)
-        if self.block_size_cond != 1 or self.block_size[-1] % 2:
-            raise ValueError("Physical pairs require one class token and alternating scalar fields")
+        if self.block_size[-1] % 2:
+            raise ValueError("Physical pairs require alternating scalar fields")
         dimension, width = int(config.input_embed_dim), int(config.embed_dim)
         self.selected_atom_projection = nn.Linear(dimension, width, bias=False)
         self.pair_features = nn.Linear(2 * dimension + 1, width, bias=False)
@@ -49,9 +49,10 @@ class PhysicalPairScalarRQTransformer(LaserRQTransformer):
             # not multiply the projection bias or enter spatial context alone.
             embedded = self.input_mlp(contributions.sum(-2)) + self.pos_emb_hw[:, :height * width]
             if cond is None:
-                cond = torch.zeros(batch, 1, dtype=torch.long, device=tokens.device)
-            start = self.cond_emb(cond.reshape(batch, 1)) + self.pos_emb_cond
-            spatial = self.body_transformer(self.embed_drop(torch.cat((start, embedded[:, :-1]), 1)))
+                cond = torch.zeros(batch, self.block_size_cond, dtype=torch.long, device=tokens.device)
+            start = self.cond_emb(cond.reshape(batch, self.block_size_cond)) + self.pos_emb_cond
+            body = self.body_transformer(self.embed_drop(torch.cat((start, embedded[:, :-1]), 1)))
+            spatial = body[:, self.block_size_cond - 1:]
             inputs = self._pair_inputs(spatial.reshape(-1, spatial.shape[-1]),
                                        sequence.reshape(-1, depth), model_aux)
             hidden = self.head_transformer(inputs).reshape(batch, height, width, depth, -1)
@@ -59,6 +60,8 @@ class PhysicalPairScalarRQTransformer(LaserRQTransformer):
             atoms = atoms.reshape(batch, height, width, depth // 2)
             for index in range(1, depth // 2):
                 output["atom_logits"][..., index, :].scatter_(-1, atoms[..., :index], -torch.inf)
+            if self.block_size_cond > 1:
+                return output, self.cond_classifier(body[:, :self.block_size_cond - 1])
             return output
 
     @torch.no_grad()
@@ -72,8 +75,8 @@ class PhysicalPairScalarRQTransformer(LaserRQTransformer):
                 _, _, _, contributions = self._physical_pairs(history, model_aux)
                 embedded = self.input_mlp(contributions.sum(-2)) + self.pos_emb_hw[:, :site + 1]
                 if cond is None:
-                    cond = torch.zeros(batch, 1, dtype=torch.long, device=tokens.device)
-                start = self.cond_emb(cond.reshape(batch, 1)) + self.pos_emb_cond
+                    cond = torch.zeros(batch, self.block_size_cond, dtype=torch.long, device=tokens.device)
+                start = self.cond_emb(cond.reshape(batch, self.block_size_cond)) + self.pos_emb_cond
                 inputs = self.embed_drop(torch.cat((start, embedded[:, :-1]), 1))
                 inputs = inputs if self._cache["spatial_ctx_hw"] is None else inputs[:, -1:]
                 self._cache["spatial_ctx_hw"] = self.body_transformer.cached_forward(inputs)[:, -1:]

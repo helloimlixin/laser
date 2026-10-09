@@ -1,0 +1,88 @@
+# @package _global_
+defaults:
+- _self_
+stage: stage2
+backend: rqtransformer
+options:
+  checkpoint: /tmp/laser-imagenet-ffhq-q995-clipped-scratch-20261009/inputs/stage1-tokenizer.pt
+  data: /tmp/laser-imagenet-ffhq-q995-clipped-scratch-20261009/imagenet
+  token_cache: null
+  output: /workspace/Projects/laser/outputs/imagenet-rfid421-ffhq-q995-clipped-sigma170p58-scratch-4h200-20261009/train
+  dataset: imagenet
+  model_preset: imagenet-1400m
+  distributed_backend: ddp
+  num_atoms: 16384
+  sparsity_level: 4
+  coeff_vocab_size: 2048
+  coeff_max: 3.0
+  coeff_scale: 6.4
+  coeff_scales:
+  - 4.58794163534094
+  - 2.4749883832735313
+  - 1.610666424691696
+  - 1.0176019238502931
+  coeff_target_space: normalized
+  coeff_target_mode: soft
+  coeff_target_temperature: 0.5
+  compound_tokens: true
+  epochs: 100
+  batch_size: 128
+  total_batch_size: 2048
+  lr: 0.0005
+  lr_schedule: cosine
+  lr_schedule_epochs: 100
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  seed: 261001
+  atom_temperature: 0.9
+  atom_top_k: 0
+  atom_top_p: 0.9
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+  metric_backend: original-rqvae
+  fid_reference_stats: /tmp/laser-imagenet-ffhq-q995-clipped-scratch-20261009/inputs/imagenet_256_train.npz
+  fid_num_samples: 50000
+  fid_batch_size: 128
+  fid_every: 2
+  save_ckpt_freq: 2
+  save_step_freq: 250
+  keep_best_checkpoints: 1
+  model_only_best_checkpoints: false
+  sample_grid_every: 626
+  sample_grid_size: 64
+  sample_grid_batch_size: 32
+  sample_grid_samples_per_class: 8
+  sample_grid_on_start: false
+  upload_checkpoints: true
+  checkpoint_upload_mode: files
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: imagenet-rfid421-ffhq-q995-clipped-sigma170p58-scratch-4h200-20261009
+  wandb_name: ImageNet K4 | FFHQ q99.5 scaling + clamping + sigma0.5 | scratch | 4
+    H200
+  wandb_mode: online
+  resume: false
+  checkpoint_dir: /workspace/Projects/laser/outputs/imagenet-rfid421-ffhq-q995-clipped-sigma170p58-scratch-4h200-20261009/train/checkpoints
+  fid_real_split: train
+  physical_pair_context: false
+  sample_grid_seed: 261001
+  fid_early_epochs: 0
+  compound_pair_autoregressive: true
+  compound_refiner_layers: 0
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  compound_distribution_geometry: true
+  geometry_loss_weight: 0.05
+  atom_loss_weight: 1.5
+  resume_checkpoint: null
+  init_stage2_checkpoint: null
+  max_optimizer_steps: 0
+  fid_seed: 261001
+  geometry_top_k: 4
+  geometry_start_epoch: 2.0
+  geometry_warmup_epochs: 3.0
+  coeff_regression_weight: 0.0
+  coeff_crps_weight: 0.0
+  fid_validation_reference_stats: null

@@ -1,0 +1,79 @@
+backend: rqtransformer
+defaults:
+- _self_
+options:
+  atom_loss_weight: 1.0
+  atom_temperature: 1.0
+  atom_top_k: 256
+  atom_top_p: 0.95
+  batch_size: 64
+  checkpoint: /tmp/laser-imagenet-classcond-20261007/inputs/stage1-tokenizer.pt
+  checkpoint_dir: /workspace/Projects/laser/outputs/imagenet-site-pooling-trial-20261007/mlp/train/checkpoints
+  checkpoint_upload_mode: files
+  coeff_max: 3.0
+  coeff_scale: 6.4
+  coeff_scales:
+  - 8.203365325927734
+  - 4.265638828277588
+  - 3.0662174224853516
+  - 1.8273425102233887
+  coeff_target_mode: soft
+  coeff_target_space: normalized
+  coeff_target_temperature: 0.5
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.95
+  coeff_vocab_size: 2048
+  compound_depth_specific_coeff_heads: false
+  compound_distribution_geometry: false
+  compound_micro_transformer_layers: 0
+  compound_pair_autoregressive: true
+  compound_refiner_layers: 0
+  compound_tokens: true
+  data: /tmp/laser-imagenet-classcond-20261007/imagenet
+  dataset: imagenet
+  distributed_backend: ddp
+  epochs: 100
+  fid_batch_size: 64
+  fid_early_epochs: 0
+  fid_every: 0
+  fid_num_samples: 50000
+  fid_real_split: train
+  fid_reference_stats: /tmp/laser-imagenet-classcond-20261007/inputs/imagenet_256_train.npz
+  geometry_loss_weight: 0.0
+  init_stage2_checkpoint: null
+  keep_best_checkpoints: 1
+  lr: 0.0005
+  lr_schedule: cosine
+  lr_schedule_epochs: 100
+  max_optimizer_steps: 2048
+  metric_backend: original-rqvae
+  min_lr: 0.0
+  model_only_best_checkpoints: false
+  model_preset: imagenet-1400m
+  num_atoms: 16384
+  output: /workspace/Projects/laser/outputs/imagenet-site-pooling-trial-20261007/mlp/train
+  physical_pair_context: false
+  resume: true
+  resume_checkpoint: /tmp/laser-imagenet-site-pooling-20261007/anchor.pt
+  sample_grid_batch_size: 32
+  sample_grid_every: 626
+  sample_grid_on_start: false
+  sample_grid_samples_per_class: 8
+  sample_grid_seed: 261001
+  sample_grid_size: 64
+  save_ckpt_freq: 100
+  save_step_freq: 512
+  seed: 261001
+  sparsity_level: 4
+  token_cache: /tmp/laser-imagenet-classcond-20261007/inputs/compound-cache.pt
+  total_batch_size: 2048
+  upload_checkpoints: false
+  upload_token_cache: false
+  wandb_entity: helloimlixin-rutgers
+  wandb_id: imagenet-rfid421-site-pool-mlp-20261007
+  wandb_mode: online
+  wandb_name: ImageNet rFID4.21 | site pooling mlp | matched 2048 updates
+  wandb_project: laser
+  warmup_epochs: 0.0
+stage: stage2

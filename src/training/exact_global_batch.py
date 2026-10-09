@@ -13,6 +13,7 @@ class ExactGlobalBatchSampler(Sampler):
     """
 
     def __init__(self, dataset, global_batch_size, world_size, rank, accumulation=1, seed=0):
+        self.dataset = dataset
         self.size = len(dataset)
         self.global_batch_size = int(global_batch_size)
         self.world_size = int(world_size)
@@ -32,6 +33,8 @@ class ExactGlobalBatchSampler(Sampler):
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(self.epoch)
 
     def set_start_batch(self, batch):
         if not 0 <= batch <= self.steps_per_epoch * self.accumulation:

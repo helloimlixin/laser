@@ -24,9 +24,9 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> DictCon
         cfg = compose(config_name=config_name, overrides=overrides or [])
     if cfg.get("stage") not in {"stage1", "stage2"}:
         raise ValueError("Config stage must be stage1 or stage2.")
-    if cfg.get("backend", "lightning") not in {"lightning", "rqtransformer", "var_laser", "compact_rq", "church_finetune"}:
+    if cfg.get("backend", "lightning") not in {"lightning", "rqtransformer", "var_laser", "compact_rq", "church_finetune", "cc3m_text"}:
         raise ValueError("Unknown training backend.")
-    if cfg.get("backend") in {"rqtransformer", "compact_rq"} and cfg.stage != "stage2":
+    if cfg.get("backend") in {"rqtransformer", "compact_rq", "cc3m_text"} and cfg.stage != "stage2":
         raise ValueError(f"The {cfg.backend} backend requires stage2.")
     if cfg.get("backend") == "church_finetune" and cfg.stage != "stage1":
         raise ValueError("The church_finetune backend requires stage1.")
@@ -36,7 +36,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> DictCon
 def run(cfg: DictConfig) -> None:
     """Import only the requested stage, after configuration has been validated."""
     backend = cfg.get("backend", "lightning")
-    module = backend if backend in {"rqtransformer", "var_laser", "compact_rq", "church_finetune"} else cfg.stage
+    module = backend if backend in {"rqtransformer", "var_laser", "compact_rq", "church_finetune", "cc3m_text"} else cfg.stage
     import_module(f"src.training.{module}").run(cfg)
 
 

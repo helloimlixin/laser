@@ -18,6 +18,8 @@ class ParameterEMA:
                     raise ValueError(f'incompatible EMA shape: {k}')
                 v.copy_(state['values'][k])
             self.updates = int(state['updates'])
+            if self.updates < 0:
+                raise ValueError('EMA update count must be nonnegative')
 
     @torch.no_grad()
     def update(self, model):
@@ -28,9 +30,11 @@ class ParameterEMA:
                              [params[k].detach() for k in self.values], 1 - self.decay)
         self.updates += 1
 
-    def state_dict(self):
+    def state_dict(self, *, cpu=True):
+        """Return a CPU copy, or live tensors for a synchronous snapshotter."""
         return dict(decay=self.decay, updates=self.updates,
-                    values={k: v.detach().to('cpu', copy=True) for k, v in self.values.items()})
+                    values={k: v.detach().to('cpu', copy=True) if cpu else v.detach()
+                            for k, v in self.values.items()})
 
     @contextmanager
     def apply(self, model):

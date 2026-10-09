@@ -160,6 +160,10 @@ class RQTransformer(Stage2Model):
         """Classify depth outputs; subclasses may return a compact representation."""
         return self.classifier(head_outputs)
 
+    def pool_spatial_pairs(self, pair_embeddings):
+        """Summarize a completed site before its shifted spatial input."""
+        return pair_embeddings.sum(dim=-2)
+
     def forward(self, xs, model_aux=None, cond=None, amp=False):
         # Respect the BF16 context selected by the outer training loop.
         with torch.amp.autocast("cuda") if amp else nullcontext():
@@ -183,7 +187,7 @@ class RQTransformer(Stage2Model):
                 xs_emb = self.tok_emb(xs)
 
             conds_emb = self.cond_emb(cond) + self.pos_emb_cond[:, :cond_len, :]
-            xs_emb = xs_emb.sum(dim=-2) + self.pos_emb_hw[:, :seq_len, :]
+            xs_emb = self.pool_spatial_pairs(xs_emb) + self.pos_emb_hw[:, :seq_len, :]
             latents = torch.cat(
                 [
                     conds_emb,
@@ -273,7 +277,7 @@ class RQTransformer(Stage2Model):
                     xs_emb = self.tok_emb(xs)
 
                 conds_emb = self.cond_emb(cond) + self.pos_emb_cond[:, :cond_len, :]
-                xs_emb = xs_emb.sum(dim=-2) + self.pos_emb_hw[:, :seq_len, :]
+                xs_emb = self.pool_spatial_pairs(xs_emb) + self.pos_emb_hw[:, :seq_len, :]
                 latents = torch.cat(
                     [
                         conds_emb,

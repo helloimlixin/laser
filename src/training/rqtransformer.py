@@ -62,6 +62,7 @@ from src.orthogonal_sparse_codec import ordered_support_basis
 from src.stochastic_compound import BANK_FORMAT, sample_compound_bank
 from src.soft_omp_bank import atom_targets as bank_atom_targets, sparse_atom_cross_entropy, sparse_atom_entropy
 from src.training.exact_global_batch import ExactGlobalBatchSampler
+from src.training.physical_pair_crps import physical_pair_objective, crps_weight_at_step
 from src.training.fid_reference import with_fixed_evaluation_rng
 from src.shared_physical_coefficients import (
     SHARED_PHYSICAL_REPRESENTATION,
@@ -721,8 +722,18 @@ class LaserAux(nn.Module):
 
     @torch.no_grad()
     def encode_sparse_components(
-        self, images: torch.Tensor, *, return_prefix_coeffs: bool = False
+        self, images: torch.Tensor, *, return_prefix_coeffs: bool = False,
+        stochastic_atom_temperature: float | None = None,
+        stochastic_atom_site_chunk: int = 128,
+        dictionary_gram: torch.Tensor | None = None,
     ):
+        if stochastic_atom_temperature is not None:
+            if return_prefix_coeffs:
+                raise ValueError('stochastic image pairs do not provide refitted prefix states')
+            from src.training.stochastic_image_pairs import stochastic_image_components
+            return stochastic_image_components(self, images,
+                temperature=stochastic_atom_temperature,
+                site_chunk_size=stochastic_atom_site_chunk)
         z = self.quant_conv(self.encoder(images)).permute(0, 2, 3, 1).float()
         b, h, w, c = z.shape
         signals = z.reshape(-1, c)
@@ -731,7 +742,7 @@ class LaserAux(nn.Module):
         with torch.autocast(device_type=signals.device.type, enabled=False):
             signals = signals.float()
             dictionary = self.dictionary.float()
-            gram = dictionary.t() @ dictionary
+            gram = dictionary.t() @ dictionary if dictionary_gram is None else dictionary_gram
             corr_init = signals @ dictionary
             corr = corr_init
             num_signals = signals.shape[0]
@@ -1810,8 +1821,9 @@ def upload_selected_checkpoint_files(
     last_checkpoint: Path,
     best_fid,
     upload_dir: Path,
+    best_inception=(),
 ):
-    """Replace fixed W&B run-file slots with last plus the best three FIDs.
+    """Replace fixed W&B run-file slots with last and ranked best FID/IS.
 
     Artifact versions are immutable and therefore accumulate indefinitely.
     Run files keep stable online names, matching the Stage-1 retention policy,
@@ -1824,6 +1836,12 @@ def upload_selected_checkpoint_files(
             sorted(best_fid, key=lambda item: float(item[0]))[:3], start=1
         )
     )
+    sources.extend(
+        (f"best-is-{rank_index:02d}.pt", Path(saved_path))
+        for rank_index, (_, saved_path) in enumerate(
+            sorted(best_inception, key=lambda item: float(item[0]), reverse=True)[:3], start=1
+        )
+    )
     sources = [(slot, source.resolve()) for slot, source in sources if source.is_file()]
     if not sources:
         return []
@@ -1831,9 +1849,10 @@ def upload_selected_checkpoint_files(
     upload_dir = upload_dir.expanduser().resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
     active_names = {slot for slot, _ in sources}
-    for stale in upload_dir.glob("best-fid-*.pt"):
-        if stale.name not in active_names:
-            stale.unlink(missing_ok=True)
+    for pattern in ('best-fid-*.pt', 'best-is-*.pt'):
+        for stale in upload_dir.glob(pattern):
+            if stale.name not in active_names:
+                stale.unlink(missing_ok=True)
 
     uploaded = []
     for slot, source in sources:
@@ -2658,7 +2677,7 @@ class CompoundLaserRQTransformer(RQTransformer):
             if d == 0:
                 xs_emb = self.input_mlp(self.embed_with_model_aux(xs, model_aux))
                 conds_emb = self.cond_emb(cond) + self.pos_emb_cond[:, :cond_len]
-                spatial_inputs = xs_emb.sum(dim=-2) + self.pos_emb_hw[:, :seq_len]
+                spatial_inputs = self.pool_spatial_pairs(xs_emb) + self.pos_emb_hw[:, :seq_len]
                 latents = torch.cat((conds_emb, spatial_inputs[:, :-1]), dim=1)
                 latents = self.embed_drop(latents)[:, :cond_len + sampling_idx]
                 if self._cache["spatial_ctx_hw"] is None:
@@ -4405,6 +4424,14 @@ def build_parser():
         "--physical-pair-context", action=argparse.BooleanOptionalAction, default=False,
         help="Use explicit physical pair context and unique atom masks in the scalar-token prior",
     )
+    p.add_argument('--stochastic-atom-temperature', type=float, default=None,
+        help='Sample fresh full-vocabulary OMP supports for image-based physical pair training')
+    p.add_argument('--stochastic-atom-site-chunk', type=int, default=128,
+        help='OMP site chunk size; recorded because it affects stochastic target RNG order')
+    p.add_argument('--stochastic-atom-soft-target-variants', type=int, default=0,
+        help='Fresh OMP alternatives for prefix-consistent soft labels; zero uses sampled atom labels')
+    p.add_argument('--stochastic-atom-backend', choices=('eager','cudagraph'),default='eager',
+        help='Execution backend for the same fresh stochastic OMP teacher')
     p.add_argument(
         "--compound-pair-autoregressive",
         action=argparse.BooleanOptionalAction,
@@ -4522,6 +4549,10 @@ def build_parser():
             "over the full predicted coefficient distribution"
         ),
     )
+    p.add_argument("--coeff-crps-ramp-steps", type=int, default=0,
+                   help="Physical-pair CRPS weight ramp in completed optimizer steps")
+    p.add_argument("--coeff-crps-start-step", type=int, default=0,
+                   help="Saved global cursor at the start of the physical-pair CRPS ramp")
     p.add_argument("--geometry-loss-weight", type=float, default=0.0)
     p.add_argument("--geometry-start-epoch", type=float, default=0.0)
     p.add_argument("--geometry-warmup-epochs", type=float, default=0.0)
@@ -4771,8 +4802,12 @@ def main(argv=None):
         raise ValueError("--pattern-loss-weight must be positive")
     if args.coeff_regression_weight < 0:
         raise ValueError("--coeff-regression-weight cannot be negative")
-    if args.coeff_crps_weight < 0:
-        raise ValueError("--coeff-crps-weight cannot be negative")
+    if not math.isfinite(args.coeff_crps_weight) or args.coeff_crps_weight < 0:
+        raise ValueError("--coeff-crps-weight must be finite and nonnegative")
+    if args.coeff_crps_ramp_steps < 0 or args.coeff_crps_start_step < 0:
+        raise ValueError("CRPS schedule steps cannot be negative")
+    if (args.coeff_crps_ramp_steps or args.coeff_crps_start_step) and not args.physical_pair_context:
+        raise ValueError("CRPS step ramp requires --physical-pair-context")
     if args.causal_prefix_loss_weight < 0:
         raise ValueError("--causal-prefix-loss-weight cannot be negative")
     if args.closed_loop_gumbel_temperature <= 0:
@@ -4924,6 +4959,18 @@ def main(argv=None):
         raise ValueError("sampling temperatures must be positive")
     if args.coeff_target_temperature <= 0:
         raise ValueError("coefficient target temperature must be positive")
+    if args.stochastic_atom_temperature is not None:
+        from src.training.stochastic_image_pairs import validate_policy
+        validate_policy(args.stochastic_atom_temperature, args.stochastic_atom_site_chunk)
+        if (not args.physical_pair_context or args.token_cache is not None
+                or args.compound_tokens or args.orthogonal_compound_tokens
+                or args.coeff_target_mode != 'soft' or args.online_omp_temperature is not None):
+            raise ValueError('stochastic image pairs require fresh images, physical pair context, and soft coefficient sampling')
+    if args.stochastic_atom_soft_target_variants != 0:
+        if args.stochastic_atom_temperature is None or args.stochastic_atom_soft_target_variants < 2:
+            raise ValueError('soft stochastic atom targets require a temperature and at least two fresh alternatives')
+        if args.coeff_target_space != 'normalized':
+            raise ValueError('soft stochastic image pairs require normalized coefficient targets')
     if args.atom_top_k < 0 or args.coeff_top_k < 0:
         raise ValueError("sampling top-k values cannot be negative")
     if not 0 < args.atom_top_p <= 1 or not 0 < args.coeff_top_p <= 1:
@@ -5179,7 +5226,8 @@ def main(argv=None):
                    coeff_scales=args.coeff_scales,
                    soft_target_physical=(args.coeff_target_space == "physical" or
                        (args.coeff_target_space == "auto" and args.coeff_scales is not None)),
-                   clamp_coeffs=(True if cache_meta is None else cache_meta.get("clip_coefficients", True)),
+                   clamp_coeffs=(False if args.stochastic_atom_temperature is not None else
+                       True if cache_meta is None else cache_meta.get("clip_coefficients", True)),
                    coeff_bin_centers=cached_bin_centers,
                    sparsity_level=args.sparsity_level,
                    coefficient_patterns=coefficient_patterns,
@@ -5393,7 +5441,9 @@ def main(argv=None):
         "exact_global_batch": True,
         "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
         "training_images": len(dataset),
-        "stochastic_atom_supports": args.online_omp_temperature is not None or (cache_meta is not None and cache_meta.get("format") == BANK_FORMAT),
+        "stochastic_atom_supports": (args.stochastic_atom_temperature is not None
+            or args.online_omp_temperature is not None
+            or (cache_meta is not None and cache_meta.get("format") == BANK_FORMAT)),
         "compound_cache_variants_per_site": None if args.online_omp_temperature is not None else 1 if cache_meta is None else cache_meta.get("variants_per_site", 1),
         "compound_event_order": 'all_supports_then_all_coefficients' if args.online_omp_temperature is not None else 'existing_compound_order',
         "compound_cache_identity": None if cache_meta is None else cache_meta.get("bank_identity"),
@@ -5628,6 +5678,7 @@ def main(argv=None):
                     wb,
                     last_checkpoint=last_checkpoint,
                     best_fid=best_fid,
+                    best_inception=best_inception,
                     upload_dir=args.output / "wandb_checkpoints",
                 )
     if wb is not None and cache_rfid_preflight is not None:
@@ -6083,12 +6134,27 @@ def main(argv=None):
                             )
                         compact_targets = (atoms.long(), target_coeff_probs, target_physical)
                     elif args.physical_pair_context:
-                        atoms, coeffs = aux.encode_sparse_components(images)
-                        tokens, compact_targets = aux.sparse_targets(
-                            atoms, coeffs, temp=args.coeff_target_temperature,
-                            stochastic=args.coeff_target_mode == "soft",
-                            compact=True, hard=args.coeff_target_mode == "hard",
-                        )
+                        if args.stochastic_atom_soft_target_variants:
+                            from src.training.stochastic_image_pairs import stochastic_soft_image_targets
+                            teacher = stochastic_soft_image_targets(aux, images,
+                                atom_temperature=args.stochastic_atom_temperature,
+                                coefficient_temperature=args.coeff_target_temperature,
+                                variants=args.stochastic_atom_soft_target_variants,
+                                site_chunk_size=args.stochastic_atom_site_chunk,
+                                backend=args.stochastic_atom_backend)
+                            tokens = teacher['tokens']
+                            compact_targets = (teacher['atoms'], teacher['coefficient_probabilities'])
+                            soft_atom_ids, soft_atom_weights = teacher['atom_ids'], teacher['atom_weights']
+                            del teacher
+                        else:
+                            atoms, coeffs = aux.encode_sparse_components(images,
+                                stochastic_atom_temperature=args.stochastic_atom_temperature,
+                                stochastic_atom_site_chunk=args.stochastic_atom_site_chunk)
+                            tokens, compact_targets = aux.sparse_targets(
+                                atoms, coeffs, temp=args.coeff_target_temperature,
+                                stochastic=args.coeff_target_mode == "soft",
+                                compact=True, hard=args.coeff_target_mode == "hard",
+                            )
                     else:
                         tokens, soft_targets = aux.encode_sparse(
                             images,
@@ -6388,17 +6454,18 @@ def main(argv=None):
                                         ),
                                     })
                     else:
-                        target_atoms, target_coeff_probs = compact_targets
-                        atom_log_probs = F.log_softmax(atom_logits.float(), dim=-1)
-                        coeff_log_probs = F.log_softmax(coeff_logits.float(), dim=-1)
-                        atom_loss = -atom_log_probs.gather(
-                            -1, target_atoms.long().unsqueeze(-1)
-                        ).squeeze(-1)
-                        coeff_loss = -(target_coeff_probs * coeff_log_probs).sum(dim=-1)
-                        depth = target_atoms.shape[-1]
-                        loss = (
-                            atom_loss.sum(dim=-1) + coeff_loss.sum(dim=-1)
-                        ).mean() / (2 * depth * accumulation)
+                        crps_weight = coeff_logits.new_tensor(
+                            crps_weight_at_step(args.coeff_crps_weight, global_step,
+                                                args.coeff_crps_start_step, args.coeff_crps_ramp_steps),
+                            dtype=torch.float32,
+                        )
+                        soft_atom_options = ({} if soft_atom_ids is None else dict(
+                            target_atom_ids=soft_atom_ids, target_atom_weights=soft_atom_weights))
+                        loss = physical_pair_objective(
+                            atom_logits, coeff_logits, *compact_targets,
+                            aux.coeff_bins, crps_weight, accumulation,
+                            **soft_atom_options,
+                        )
                 else:
                     log_probs = F.log_softmax(logits.float(), dim=-1)
                     loss = -(soft_targets * log_probs).sum(dim=-1).mean() / accumulation
@@ -6487,6 +6554,7 @@ def main(argv=None):
                                 wb,
                                 last_checkpoint=last_checkpoint,
                                 best_fid=best_fid,
+                                best_inception=best_inception,
                                 upload_dir=args.output / "wandb_checkpoints",
                             )
                         del recovery_snapshot
@@ -6540,7 +6608,8 @@ def main(argv=None):
                 atomic_torch_save(final_snapshot, last_checkpoint)
                 if args.upload_checkpoints:
                     upload_selected_checkpoint_files(wb, last_checkpoint=last_checkpoint,
-                        best_fid=best_fid, upload_dir=args.output / 'wandb_checkpoints')
+                        best_fid=best_fid, best_inception=best_inception,
+                        upload_dir=args.output / 'wandb_checkpoints')
                 if wb is not None:
                     wb.summary['continuation/target_reached'] = True
                     wb.summary['continuation/final_step'] = global_step
@@ -6700,6 +6769,7 @@ def main(argv=None):
                         wb,
                         last_checkpoint=last_checkpoint,
                         best_fid=best_fid,
+                        best_inception=best_inception,
                         upload_dir=args.output / "wandb_checkpoints",
                     )
                 del snapshot

@@ -48,8 +48,15 @@ def recovery_metadata(payload):
         if not {'step', 'exp_avg', 'exp_avg_sq'} <= state.keys():
             raise ValueError('Missing Adam counter or moments')
         steps.add(int(state['step']))
-    if len(steps) != 1:
+    compound_ages = None
+    if payload.get('compound_transfer') is not None:
+        from .physical_compound_resume import validate_optimizer_ages
+        compound_ages = validate_optimizer_ages(payload)
+        adam_step = compound_ages['common_adam_step']
+    elif len(steps) != 1:
         raise ValueError('Adam counters disagree across parameters')
+    else:
+        adam_step = steps.pop()
     schedule = config.get('lr_schedule')
     if schedule not in {'constant', 'cosine'}:
         raise ValueError('Unspecified learning-rate schedule')
@@ -66,11 +73,11 @@ def recovery_metadata(payload):
     # A previous evaluation copied into a mid-epoch save is not a scored model.
     if original is not None and int(original['global_step']) != int(payload['global_step']):
         raise ValueError('Metric record does not belong to the saved model')
-    return dict(
+    result = dict(
         schema='laser-full-recovery-v1', epoch=int(payload['epoch']),
         next_microbatch=batch, global_step=int(payload['global_step']),
         world_size=world, optimizer='AdamW', adam_parameters=len(parameters),
-        adam_step=steps.pop(), saved_learning_rates=[float(g['lr']) for g in groups],
+        adam_step=adam_step, saved_learning_rates=[float(g['lr']) for g in groups],
         learning_rate_schedule=dict(kind=schedule, state=payload['scheduler'],
                                     config={k: config.get(k) for k in
                                             ('lr', 'min_lr', 'warmup_epochs',
@@ -83,6 +90,12 @@ def recovery_metadata(payload):
         precision='bfloat16', gradient_scaler=dict(enabled=False, state=None),
         configuration=config, original_rqtransformer_metrics=original,
         fid=payload.get('fid'), inception_score=payload.get('inception_score'))
+    if compound_ages is not None:
+        result['compound_optimizer_ages'] = compound_ages
+    if payload.get('parameter_ema') is not None:
+        from .ema_recovery import ema_recovery_metadata
+        result['parameter_ema'] = ema_recovery_metadata(payload)
+    return result
 
 
 def metric_scores(metadata):

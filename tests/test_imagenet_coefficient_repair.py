@@ -5,6 +5,30 @@ import torch
 from src.training.rqtransformer import LaserAux, compound_objective
 
 
+def test_requested_200_bin_gaussian_on_ffhq_uniform_centers():
+    bins = torch.linspace(-3, 3, 2048)
+    width = 6 / 2047
+    temperature = 2 * (200 * width)**2
+    aux = SimpleNamespace(coeff_bins=bins, coeff_scales=torch.tensor([8.2, 4.3, 3.1, 1.8]),
+        sparsity_level=4, coeff_vocab_size=2048, num_atoms=16, vocab_size=2064,
+        soft_target_physical=False)
+    coefficients = torch.tensor([0., 0., 0., 0., 3., 3., 3., 3.]).reshape(2, 1, 1, 4)
+    atoms = torch.arange(4).expand_as(coefficients)
+    tokens, (_, p) = LaserAux.sparse_targets(aux, atoms, coefficients,
+        stochastic=False, compact=True, temp=temperature)
+    mean = (p.double() * bins.double()).sum(-1)
+    std = (p.double() * (bins.double() - mean[..., None]).square()).sum(-1).sqrt()
+    # Center widths match the requested ratio. Finite-range edge distributions
+    # are deliberately truncated, as in the archived FFHQ Gaussian targets.
+    torch.testing.assert_close(std[0]/width, torch.full_like(std[0], 200.), atol=.002, rtol=0)
+    assert ((std[1]/width > 100) & (std[1]/width < 200)).all()
+    torch.testing.assert_close(p.sum(-1), torch.ones_like(coefficients))
+    assert torch.isfinite(p).all() and torch.equal(tokens[..., 0::2], atoms)
+    # Physical depth scales multiply noise and spacing together.
+    torch.testing.assert_close(std[0] * aux.coeff_scales / (width * aux.coeff_scales),
+                               torch.full_like(std[0], 200.), atol=.002, rtol=0)
+
+
 def test_physical_targets_have_depth_independent_quarter_unit_std():
     scales = torch.tensor([8.21, 4.26, 3.07, 1.83])
     aux = SimpleNamespace(coeff_bins=torch.linspace(-3, 3, 2048),

@@ -126,7 +126,7 @@ def prepare_reference(options, device):
 
 
 @torch.inference_mode()
-def evaluate(model, aux, validation, options, device, wb, step):
+def evaluate(model, aux, validation, options, device, wb, step, generator=generate):
     from src.rqvae_metrics import DistributedOriginalRQVAEMetrics
     import clip
     from PIL import Image
@@ -141,7 +141,7 @@ def evaluate(model, aux, validation, options, device, wb, step):
     for offset in range(0, len(indices), options['eval_batch_size']):
         rows = indices[offset:offset+options['eval_batch_size']]
         text = validation['text_ids'][rows].long().to(device)
-        pixels = generate(model, aux, text, options)
+        pixels = generator(model, aux, text, options)
         # The official CLIP implementation truncates pixels to uint8 PIL images.
         uint8 = (pixels * 255).to(torch.uint8).cpu().permute(0,2,3,1).numpy()
         metric.update(torch.from_numpy(uint8).permute(0,3,1,2).float().to(device)/255, real=False)
