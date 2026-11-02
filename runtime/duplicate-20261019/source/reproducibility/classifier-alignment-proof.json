@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "native_loss": 10.074603080749512,
+  "aligned_loss": 10.074604988098145,
+  "maximum_gradient_difference": 1.9073486328125e-06,
+  "classifier_speedup": 4.7,
+  "unchanged_valid_softmax_domain": 20481,
+  "unchanged_parameter_objects": true
+}

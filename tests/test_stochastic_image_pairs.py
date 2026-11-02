@@ -147,10 +147,13 @@ def test_cuda_graph_teacher_preserves_eager_draws_joint_labels_and_rng(chunk):
     def draw(backend):
         return stochastic_soft_image_targets(aux,images,atom_temperature=.4,
             coefficient_temperature=.01125,variants=16,site_chunk_size=chunk,backend=backend)
+    original_linalg = torch.backends.cuda.preferred_linalg_library()
     reference = draw('eager')
+    assert torch.backends.cuda.preferred_linalg_library() == original_linalg
     reference_rng = torch.cuda.get_rng_state()
     torch.cuda.set_rng_state(start)
     actual = draw('cudagraph')
+    assert torch.backends.cuda.preferred_linalg_library() == original_linalg
     assert torch.equal(reference_rng,torch.cuda.get_rng_state())
     for key in reference:
         torch.testing.assert_close(actual[key],reference[key],rtol=0,atol=0)

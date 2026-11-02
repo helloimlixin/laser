@@ -1,0 +1,20 @@
+{
+  "kind": "laser_joint_vector_rq",
+  "format_version": 1,
+  "encoder_decoder_frozen": true,
+  "source_stage1_checkpoint_sha256": "dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab",
+  "codebook_sha256": "12e6d92dcb461ff648a9f737dd24f61f58f769b2b297bfec4e982eaeda0410e4",
+  "vocabulary": 32768,
+  "code_shape": [
+    8,
+    8,
+    4
+  ],
+  "tokens_per_image": 256,
+  "measured_rfid": 4.477845124140117,
+  "metric_reference": "same full ImageNet validation 50000",
+  "validation_images": 50000,
+  "learned_vector_codebook": true,
+  "continuous_side_information": false,
+  "shared_codebook_across_depths": false
+}

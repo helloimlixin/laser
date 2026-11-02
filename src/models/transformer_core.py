@@ -45,6 +45,7 @@ class CausalSelfAttention(nn.Module):
         chunk_causal_batches: bool = False,
         window_size: Optional[int] = None,
         n_global_prefix_tokens: int = 0,
+        residual_dropout: Optional[float] = None,
     ):
         super().__init__()
         if d_model % n_heads != 0:
@@ -63,7 +64,7 @@ class CausalSelfAttention(nn.Module):
             )
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=qkv_bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=out_proj_bias)
-        self.resid_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout if residual_dropout is None else residual_dropout)
 
     def _trim_kv_cache(
         self,
@@ -283,24 +284,27 @@ class TransformerBlock(nn.Module):
         chunk_causal_batches: bool = False,
         window_size: Optional[int] = None,
         n_global_prefix_tokens: int = 0,
+        attention_dropout: Optional[float] = None,
+        ffn_intermediate_dropout: Optional[float] = None,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(
             d_model,
             n_heads,
-            dropout,
+            dropout if attention_dropout is None else attention_dropout,
             qkv_bias=attn_bias,
             out_proj_bias=out_proj_bias,
             chunk_causal_batches=chunk_causal_batches,
             window_size=window_size,
             n_global_prefix_tokens=n_global_prefix_tokens,
+            residual_dropout=dropout,
         )
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout if ffn_intermediate_dropout is None else ffn_intermediate_dropout),
             nn.Linear(d_ff, d_model),
             nn.Dropout(dropout),
         )

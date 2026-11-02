@@ -1,0 +1,13 @@
+{
+  "ready": true,
+  "training_images": 1281167,
+  "classes": 1000,
+  "archive": {
+    "source": "/workspace/Projects/data/imagenet/archives/ILSVRC2012_img_train.verified-20261005.tar",
+    "target": "/tmp/laser-sharedjoint20k-repair-2b300-20261018/data/ILSVRC2012_img_train.tar",
+    "bytes": 147897477120,
+    "md5": "1d675b47d978889d74fa0da5fadfb00e",
+    "verified": true
+  },
+  "time": 1792353274.8867915
+}

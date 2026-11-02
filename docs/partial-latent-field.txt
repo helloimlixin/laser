@@ -1,0 +1,105 @@
+Explicit partial latent field conditioning
+=========================================
+
+Status: implemented as an opt-in native RQ compound feature. It is OFF in the
+running ImageNet K4 experiment. No new training job has been launched.
+
+What the branch receives
+-----------------------
+The frozen LASER codec supplies signed physical contributions
+    coeff_bins[coefficient_id] * coeff_scales[depth] * dictionary[:, atom_id].
+For each target chunk, sum only contributions strictly before its first event
+into a complete H x W x C map. Unknown cells remain zero, and a separate
+observed-depth fraction distinguishes an unknown cell from a known zero.
+The projection also receives log(1 + field norm), keeping explicit magnitude
+information alongside raw physical values. Spatial row/column embeddings
+identify every cell. Existing DCTransformer ReZero/PAR blocks encode this map
+bidirectionally; all its contents precede the chunk, so this is causal.
+
+The current event's query has an explicit site embedding. It cross-attends to
+the encoded map and gathers the encoded feature at that site. The result is a
+shared hidden-state residual used by BOTH the atom and coefficient predictions.
+The existing coefficient-history decoder can remain enabled. The field output
+projection starts at zero, preserving the source model's evaluation logits.
+
+The initial implementation keeps the current raster/depth event order. With an
+8 x 8 x 4 sequence and 32 events per chunk, it encodes eight snapshots of 64
+spatial cells. Within each chunk, the existing causal decoder supplies newer
+pair history; the bidirectional field encoder is refreshed at the next chunk.
+It does not encode the complete ground-truth latent and mask it afterward.
+Sampling rebuilds exactly the same prefix snapshot at each chunk boundary.
+
+Configuration
+-------------
+The native trainer/factory accepts these opt-in options:
+    partial_field_encoder_layers: 2
+    partial_field_encoder_width: 256
+    partial_field_encoder_heads: 8
+    partial_field_chunk_events: 32
+    partial_field_encoder_dropout: 0.1
+
+The default layer count is zero. The branch requires plain compound full-pair
+autoregression, with geometry and causal-prefix auxiliary heads disabled.
+The 1.466B ImageNet backbone gains 3,706,118 parameters with these settings.
+Parameter count alone does not establish GPU activation memory or throughput.
+
+Checkpoint handling
+-------------------
+Existing base tensor names and parameter order are retained and new parameters
+are appended. New checkpoints load strictly with matching architecture flags.
+The explicit --init-stage2-checkpoint path can copy a complete matching legacy
+model while initializing only the new branch. Missing or incompatible legacy
+tensors are rejected. That command deliberately starts optimizer, scheduler,
+epoch, and RNG states fresh; it is not an optimizer-preserving continuation.
+An old checkpoint cannot be silently resumed as the new architecture. A full
+Adam/RNG/data-cursor migration would need a separate explicit implementation.
+
+Position information and position prediction
+-------------------------------------------
+The RQ body already receives one learned embedding per raster site. Completed
+site inputs are shifted for next-site prediction, with the class/start token
+providing the first query. The depth transformer receives the spatial context
+and a learned embedding for each residual depth. Both compound heads receive
+that resulting hidden state. The coefficient history branch additionally has
+an embedding for each of the flattened H*W*D events, and depth-specific heads
+also distinguish the coefficient depth. The micro-transformer's two positions
+identify its hidden/atom slots; they are not image row/column embeddings.
+
+Thus both heads already have access to location. The field encoder adds
+explicit geometry for the already reconstructed physical map and its query;
+it does not repair an established absence of position IDs.
+
+A learned position predictor would change the sequence design. Under fixed
+raster order, the next location is deterministic. Meaningful location choice
+would require tuples such as (atom, spatial site, coefficient), a canonical
+training order, and occupied-site/distinct-atom masks in sampling. Keeping K4
+at every site still requires 256 events; adding a location head alone does not
+reduce that count. Variable sparsity/budget would additionally require new
+targets and stopping rules. OMP rank-dependent coefficient scales would need
+an explicitly defined depth/rank convention under the new ordering.
+
+Primary references
+------------------
+Nash et al., Generating images with sparse representations, sections 3.1-3.2:
+https://proceedings.mlr.press/v139/nash21a/nash21a.pdf
+Official RQ implementation:
+https://github.com/kakaobrain/rq-vae-transformer/blob/main/rqvae/models/rqtransformer/transformers.py
+
+Validation scope
+----------------
+Tests cover signed/depth-scaled physical snapshots, occupancy, baseline logit
+preservation, current/future token causality, both prediction heads, growing
+prefix cache parity across chunk and spatial boundaries, finite branch/encoder
+gradients, sampling cleanup, checkpoint initialization guards, native factory
+construction, and a single-graph torch.compile check using backend='eager'.
+
+A CPU integration probe used the actual trained epoch-4 model and four real
+calibration token examples. A zero output preserved predictions exactly. Three
+updates of only the new branch produced finite gradients. All 256 cached
+positions on one real sequence matched full forward probabilities within
+0.0000064 total variation; future coefficient changes altered prior logits by
+zero. These are implementation checks, not held-out or generation evidence.
+
+GPU memory, throughput, CUDA compiled backward, distributed operation, and
+sample FID/IS for the new architecture have NOT been measured. The running
+experiment still uses its previously frozen source/configuration.

@@ -1,0 +1,30 @@
+# @package _global_
+defaults:
+  - imagenet-var-scratch
+  - _self_
+
+# A new matched ImageNet-only ablation; four GPUs per arm. The tokenizer
+# schedule is shared experimental protocol, not the unpublished VAR recipe.
+output_dir: outputs/imagenet-var-dl-comparison-20261024/${model.bottleneck}
+data:
+  format: indexed_tar
+  root: /mnt/laser-var-20261024/data
+  manifests: null
+  workers: 4
+tokenizer:
+  batch_size: 32
+  accumulation: 1
+prior:
+  batch_size: 96
+  accumulation: 2
+evaluation:
+  fid_reference: outputs/imagenet-var-dl-comparison-20261024/assets/imagenet_256_train.npz
+  adm_python: /opt/laser-var-eval/bin/python
+  adm_evaluator: outputs/imagenet-var-dl-comparison-20261024/assets/adm_evaluator.py
+  adm_reference: outputs/imagenet-var-dl-comparison-20261024/assets/VIRTUAL_imagenet256_labeled.npz
+logging:
+  every_steps: 20
+wandb:
+  group: imagenet-var-dl-matched-20261024
+  id: imagenet-var-${model.bottleneck}-scratch-f16-d16-20261024
+  mode: offline

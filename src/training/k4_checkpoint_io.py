@@ -182,7 +182,10 @@ def _persist_immutable_checkpoint(serialized: Path, target: Path):
     link = target.with_suffix(target.suffix + '.link.tmp')
     committed = False
     try:
-        shutil.copyfile(serialized, payload)
+        # Large buffered writes avoid the small sendfile requests made by
+        # shutil.copyfile on the object-backed checkpoint mount.
+        with serialized.open('rb') as reader, payload.open('wb') as writer:
+            shutil.copyfileobj(reader, writer, length=16 * 1024**2)
         if payload.stat().st_size != serialized.stat().st_size:
             raise OSError('Immutable checkpoint copy size mismatch')
         # Probe both ends after close: this mount can stat an unreadable payload.
@@ -203,7 +206,9 @@ def _persist_immutable_checkpoint(serialized: Path, target: Path):
             _replace_hard_link(serialized, local)
             receipt.write_text(json.dumps({'source': str(target.resolve()),
                 'identity': _checkpoint_file_identity(target)}) + '\n')
-        if previous is not None and previous.parent == folder and previous != payload:
+        if (previous is not None and previous.parent == folder and previous != payload
+                and not any(p.is_symlink() and p.resolve() == previous
+                            for p in target.parent.glob('*.pt'))):
             old_paths = _local_checkpoint_paths(previous)
             previous.unlink(missing_ok=True)
             for path in old_paths or ():

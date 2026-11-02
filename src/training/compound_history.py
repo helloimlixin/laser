@@ -55,6 +55,14 @@ class _CoefficientHistoryMixin:
             self._coefficient_sample_context = None
         return original + residual
 
+    def coefficient_candidate_logits(self, hidden, atom_vectors, previous_pair, prefix,
+                                     *, depth_index, event, rows):
+        """Final conditional logits for independent current-atom branches."""
+        original = super().refine_coefficient_hidden(hidden, atom_vectors)
+        residual = self.coefficient_history_decoder.forward_candidates(
+            hidden, atom_vectors, previous_pair, prefix, event=event, rows=rows)
+        return self.classify_coefficients(original + residual, depth_index=depth_index)
+
 
 class HistoryConditionedCompoundTransformer(_CoefficientHistoryMixin, CompoundLaserRQTransformer):
     def _history_pairs(self, aux, atoms, coeffs):
@@ -95,7 +103,8 @@ class HistoryConditionedOrthogonalTransformer(_CoefficientHistoryMixin, Orthogon
         return aux.orthogonal_embeddings(atoms, coeffs).cumsum(dim=1)[:, -1]
 
 
-def attach_coefficient_history_decoder(model, *, width=512, layers=2, heads=8, dropout=0.1):
+def attach_coefficient_history_decoder(model, *, width=512, layers=2, heads=8,
+                                       dropout=0.1, normalize_fields=False):
     """Append new parameters without reordering or replacing checkpoint weights.
 
     The model must use full-pair autoregression. This adapter retains the old
@@ -111,6 +120,7 @@ def attach_coefficient_history_decoder(model, *, width=512, layers=2, heads=8, d
     model.coefficient_history_decoder = CompoundCoefficientHistoryDecoder(
         model.config.embed_dim, model.config.input_embed_dim, width=width,
         layers=layers, heads=heads, dropout=dropout, max_events=math.prod(model.block_size),
+        normalize_fields=normalize_fields,
     ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
     model.coefficient_history_decoder.train(model.training)
     model._coefficient_sample_context = None

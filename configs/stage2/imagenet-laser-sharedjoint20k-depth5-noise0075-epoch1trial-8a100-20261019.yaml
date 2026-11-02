@@ -1,0 +1,76 @@
+version: laser-shared-scalar-noise-epoch1-search-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-sharedjoint20k-depth5-noise0075-epoch1trial-8a100-20261019
+name: LASER shared dictionary | common noise 0.075 | paired epoch1 trial
+seed: 261001
+epochs: 100
+global_batch: 2048
+microbatch: 64
+lr_schedule_epochs: 100
+decoder: native_joint_integer
+target_mode: joint_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 97c398da445aae2f209047aca15d94514c6ef0a21b4804e1a051a23c2a9265ed
+  vocab_size: 20481
+  depth: 5
+  measured_rfid: 4.3222964750380015
+  source_measured_rfid: 4.215039034200402
+  candidate: shared8192
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  atoms: 8192
+  coefficient_levels_per_atom: adaptive 2/4/6/8 or uniform4; selected by measured
+    reconstruction
+  adaptive_coefficient_allocation: true
+  first_four_depths_unchanged: false
+  shared_codebook_across_depths: true
+  coefficient_values_shared: true
+  coefficient_gain: 1.0
+targets:
+  temperature: 0.075
+  chunk_size: 1024
+  encoding: native_residual_quantization_over_fixed_joint_codewords
+  stochastic_prefixes: true
+  noise_shared_across_depths: true
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature: 1.0
+  top_k: 2048
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+initialization:
+  reference_vocab_size: 65537
+  paired_fresh_backbone: true
+preview:
+  designated_classes: true
+  every_updates: 626
+  first_update: 10
+  fixed_seed: 261001
+  overview_per_class: 10
+  grid_rows: 8
+  grid_columns: 8
+training_rng:
+  policy: independent_rank_v1
+  base_seed: 261001
+lineage:
+  suite: imagenet-laser-shared-epoch1-search-20261019
+  control: imagenet-laser-sharedjoint20k-depth5-noise005-scratch100-8a100-20261019
+  prior_trial: imagenet-laser-sharedjoint20k-depth5-noise00625-epoch1trial-8a100-20261019
+  stage2_initialization: scratch
+  only_training_change: common target temperature
+  actual_stop_epochs: 1
+optimization:
+  probe_initial_weight_sha256: 46386ed8076a513a67894cdeb591aead1167801c0c35cbca79063ecae98d4fc6
+checkpoint:
+  every_updates: 100
+  every_epochs: 1
+  preserve_best_fid: true

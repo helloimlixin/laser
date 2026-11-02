@@ -1,0 +1,17 @@
+{
+  "stage1_checkpoint": "/workspace/Projects/laser/outputs/imagenet-rfid421-combination-soft-20260927/assets/laser-tokenizer.pt",
+  "codebook": "/workspace/Projects/laser/recovered/joint-vocabulary-20261024/stage2-32k/joint-codebook.pt",
+  "codebook_loader": "src.models.laser_joint_tokenizer.FrozenJointLaserTokenizer",
+  "vocabulary": 32768,
+  "code_shape": [
+    8,
+    8,
+    4
+  ],
+  "tokens_per_image": 256,
+  "measured_rfid": 4.477845124140117,
+  "cnn_frozen": true,
+  "target_policy": "hard_deterministic",
+  "soft_target_temperature_calibrated": false,
+  "stage2_generation_quality_measured": false
+}

@@ -1,0 +1,1744 @@
+{
+  "data": {
+    "project": {
+      "run": {
+        "id": "UnVuOnYxOmltYWdlbmV0LWxhc2VyLWpvaW50MjBrLWRlcHRoNS1ycW5vaXNlLXJuZ2ZpeC1zY3JhdGNoMTAwLTJiMzAwLTIwMjYxMDE4Omxhc2VyOmhlbGxvaW1saXhpbi1ydXRnZXJz",
+        "name": "imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018",
+        "displayName": "LASER joint20k depth5 | validated RQ noise + independent RNG | fresh100 | 2 B300",
+        "state": "running",
+        "config": "{\"pid\": {\"value\": 4163}, \"_wandb\": {\"value\": {\"m\": [{\"1\": \"train/global_step\", \"6\": [3], \"7\": []}, {\"1\": \"train/epoch\", \"6\": [3], \"7\": []}, {\"1\": \"samples/global_step\", \"6\": [3], \"7\": []}, {\"1\": \"eval/fid\", \"5\": 2, \"6\": [1, 3], \"7\": []}, {\"1\": \"eval/inception_score\", \"5\": 2, \"6\": [1, 3], \"7\": [2, 5]}, {\"1\": \"eval/inception_score_std\", \"5\": 2, \"6\": [1, 3], \"7\": []}, {\"2\": \"train/*\", \"5\": 1, \"6\": [1], \"7\": []}, {\"2\": \"samples/*\", \"5\": 3, \"6\": [1], \"7\": []}], \"t\": {\"1\": [1, 41], \"2\": [1, 41], \"3\": [3, 7, 13, 14, 16, 62, 63], \"4\": \"3.12.3\", \"5\": \"0.31.0\", \"12\": \"0.31.0\", \"13\": \"linux-x86_64\"}, \"code_path\": \"code/train.py\", \"cli_version\": \"0.31.0\", \"python_version\": \"3.12.3\"}}, \"recipe\": {\"value\": {\"name\": \"LASER joint20k depth5 | validated RQ noise + independent RNG | fresh100 | 2 B300\", \"seed\": 261001, \"epochs\": 100, \"run_id\": \"imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018\", \"decoder\": \"native_joint_integer\", \"lineage\": {\"source_bad_run\": \"imagenet-laser-sharedjoint20k-depth5-uniformce-k2048-scratch4-4b200-20261018\", \"changes_from_bad_run\": [\"Restore validated depth-specific coefficient tables\", \"Restore target temperatures calibrated for this codebook\", \"Independent per-rank dropout and stochastic-target RNG\", \"Full 100-epoch execution on both available B300 GPUs\"], \"epoch_one_target_fid\": 85, \"validated_recipe_run\": \"imagenet-laser-joint20k-depth5-rqnoise-k2048-rngfix-scratch100-8h100-20261017\", \"stage2_initialization\": \"scratch\", \"stage2_checkpoint_loaded\": false, \"new_run_quality_established\": false, \"validated_recipe_epoch1_fid50k\": 86.2801978147807}, \"preview\": {\"grid_rows\": 8, \"fixed_seed\": 261001, \"first_update\": 10, \"grid_columns\": 8, \"every_updates\": 626, \"designated_classes\": true, \"overview_per_class\": 10}, \"targets\": {\"encoding\": \"native_residual_quantization_over_fixed_joint_codewords\", \"chunk_size\": 1024, \"calibration\": {\"policy\": \"joint five-depth original-RQ corruption matching\", \"report\": \"/workspace/Projects/laser/outputs/imagenet-laser-joint20k-depth5-rq-noise-calibration-20261017/report.json\", \"matching\": \"normalized extra distance by hard residual-error progress, then total latent-error ratio\", \"training_launched\": true, \"validation_images\": 128, \"calibration_images\": 128, \"first_four_temperatures_unchanged\": false}, \"temperature\": [0.05048883910784363, 0.02833188551776767, 0.05758083809087873, 0.054547438539303536, 0.0459920263323772], \"stochastic_prefixes\": true}, \"version\": \"laser-native-joint20k-depth5-rqnoise-k2048-rngfix-v1\", \"backbone\": \"upstream_rqtransformer\", \"sampling\": {\"top_k\": 2048, \"top_p\": 0.95, \"temperature\": 1}, \"objective\": \"native_soft_target_cross_entropy\", \"tokenizer\": {\"atoms\": 8192, \"depth\": 5, \"sha256\": \"dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab\", \"candidate\": \"adaptive8192\", \"vocab_size\": 20481, \"measured_rfid\": 4.192409404011698, \"codebook_sha256\": \"922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9\", \"source_measured_rfid\": 4.215039034200402, \"encoder_decoder_frozen\": true, \"learned_compact_dictionary\": true, \"coefficient_levels_per_atom\": \"adaptive 2/4/6/8 or uniform4; selected by measured reconstruction\", \"first_four_depths_unchanged\": true, \"shared_codebook_across_depths\": false, \"adaptive_coefficient_allocation\": true, \"source_four_depth_codebook_sha256\": \"974fdaf42f041a02e93c7321b65d57900088ab7a2339ada6a5ffcc062ee9ac54\"}, \"checkpoint\": {\"every_epochs\": 1, \"every_updates\": 100, \"preserve_best_fid\": true}, \"evaluation\": {\"batch_size\": 128, \"real_images\": 1281167, \"every_epochs\": 2, \"reference_split\": \"train\", \"generated_images\": 50000, \"reference_sha256\": \"3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260\", \"include_epoch_one\": true}, \"microbatch\": 512, \"target_mode\": \"joint_residual_codes\", \"global_batch\": 2048, \"optimization\": {\"probe_initial_weight_sha256\": \"46386ed8076a513a67894cdeb591aead1167801c0c35cbca79063ecae98d4fc6\"}, \"training_rng\": {\"policy\": \"independent_rank_v1\", \"base_seed\": 261001}, \"initialization\": {\"reference_vocab_size\": 65537, \"paired_fresh_backbone\": true}, \"lr_schedule_epochs\": 100, \"auxiliary_loss_terms\": 0}}, \"stage1\": {\"value\": \"frozen LASER encoder/decoder with learned compact pair dictionary\"}, \"wandb_id\": {\"value\": \"imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018\"}, \"execution\": {\"value\": {\"align_classifier\": true, \"alignment_multiple\": 64}}, \"objective\": {\"value\": \"native_soft_target_cross_entropy\"}, \"initial_lr\": {\"value\": 0.0005}, \"microbatch\": {\"value\": 512}, \"minimum_lr\": {\"value\": 0}, \"vocabulary\": {\"value\": 20481}, \"world_size\": {\"value\": 2}, \"global_step\": {\"value\": 0}, \"soft_labels\": {\"value\": true}, \"architecture\": {\"value\": \"unmodified upstream RQTransformer\"}, \"fresh_stage2\": {\"value\": true}, \"global_batch\": {\"value\": 2048}, \"sampler_top_k\": {\"value\": 2048}, \"sampler_top_p\": {\"value\": 0.95}, \"target_policy\": {\"value\": \"soft_stochastic\"}, \"warmup_epochs\": {\"value\": 0}, \"fid_real_split\": {\"value\": \"train\"}, \"initialization\": {\"value\": {\"reference_vocab_size\": 65537, \"paired_fresh_backbone\": true}}, \"codebook_sha256\": {\"value\": \"922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9\"}, \"fid_num_samples\": {\"value\": 50000}, \"fresh_optimizer\": {\"value\": true}, \"native_sampling\": {\"value\": {\"top_k\": [2048], \"top_p\": [0.95], \"temperature\": 1}}, \"parameter_count\": {\"value\": 1393828353}, \"shared_upstream\": {\"value\": {\"core_files\": {\"rqvae/optimizer/loss.py\": \"93260cc4b6009a5f999449d985360538bb4d40e3ac639205c9f3f1522f69fc21\", \"rqvae/models/rqvae/rqvae.py\": \"968453f61782c2761b1f97fa6749e4f1363cb815b541684a5b47ca398ada8b1f\", \"rqvae/optimizer/optimizer.py\": \"b2127d71d427b5474c7b85e4caa57abd9716c2ddd86a047db07a673bb8d686ad\", \"rqvae/optimizer/scheduler.py\": \"af5882253ace43872fedc68949f79d72bf276a76be31f69338324020a7795cb7\", \"rqvae/img_datasets/transforms.py\": \"48bc1bd5c467527205725d62045335550be642fefa7a37160d0c71e971bc0c4b\", \"rqvae/models/rqtransformer/configs.py\": \"b86750e1a4f1a5712199345ca9158843a276ecee257ff6565f452ce9d2f15cf2\", \"rqvae/models/rqtransformer/attentions.py\": \"cfcb3bb5e005cfc6e9a1641fe87e2c18db7afc8ae775b6711f64e5de3761561b\", \"rqvae/models/rqtransformer/primitives.py\": \"7df3e7a69e73593893daf4f9e1a5e8198e8400ffc4b8263d8b66559e5bca660c\", \"rqvae/models/rqtransformer/transformers.py\": \"e2e5c7e36dd97cfa02d42aabbc5699baed9953b9afdbc221ddda65b10719698e\"}, \"upstream_commit\": \"341395e562ac347f5eb62db9f5f08b9f2cc42a60\", \"compatibility_patch\": \"Python 3.12 dataclass default_factory\"}}, \"training_epochs\": {\"value\": 100}, \"published_config\": {\"value\": {\"arch\": {\"ema\": null, \"body\": {\"block\": {\"gelu\": \"v1\", \"n_head\": 24, \"mlp_bias\": true, \"attn_bias\": true, \"embed_dim\": 1536, \"attn_pdrop\": 0, \"resid_pdrop\": 0.1}, \"n_layer\": 42}, \"head\": {\"block\": {\"gelu\": \"v1\", \"n_head\": 24, \"mlp_bias\": true, \"attn_bias\": true, \"embed_dim\": 1536, \"attn_pdrop\": 0, \"resid_pdrop\": 0.1}, \"n_layer\": 6}, \"type\": \"rq-transformer\", \"embed_dim\": 1536, \"block_size\": [8, 8, 5], \"embd_pdrop\": 0, \"vocab_size\": [20481, 20481, 20481, 20481, 20481], \"ar_hierarchy\": null, \"head_emb_vqvae\": true, \"shared_cls_emb\": true, \"shared_tok_emb\": true, \"block_size_cond\": 1, \"input_emb_vqvae\": true, \"input_embed_dim\": 256, \"use_padding_emb\": false, \"vocab_size_cond\": 1000, \"cumsum_depth_ctx\": true, \"scaled_head_emb_vqvae\": false}, \"loss\": {\"temp\": [0.05048883910784363, 0.02833188551776767, 0.05758083809087873, 0.054547438539303536, 0.0459920263323772], \"type\": \"soft_target_cross_entropy\", \"stochastic_codes\": true}, \"dataset\": {\"type\": \"imagenet\", \"transforms\": {\"type\": \"imagenet256x256\"}, \"vocab_size\": 20481}, \"optimizer\": {\"type\": \"adamW\", \"betas\": [0.9, 0.95], \"max_gn\": 1, \"warmup\": {\"mode\": \"fix\", \"epoch\": 0, \"min_lr\": 0, \"multiplier\": 1, \"buffer_epoch\": 0, \"start_from_zero\": true}, \"init_lr\": 0.0005, \"weight_decay\": 0.0001}, \"experiment\": {\"amp\": true, \"epochs\": 100, \"sample\": {\"temp\": 1, \"top_k\": 2048, \"top_p\": 0.95}, \"test_freq\": 2, \"batch_size\": 512, \"save_ckpt_freq\": 1, \"total_batch_size\": 2048}}}, \"stochastic_codes\": {\"value\": true}, \"integer_joint_ids\": {\"value\": true}, \"parameter_tensors\": {\"value\": 780}, \"training_rng_seed\": {\"value\": 261001}, \"accumulation_steps\": {\"value\": 2}, \"depth_loss_weights\": {\"value\": null}, \"lr_schedule_epochs\": {\"value\": 100}, \"sampler_temperature\": {\"value\": 1}, \"training_rng_policy\": {\"value\": \"independent_rank_v1\"}, \"auxiliary_loss_terms\": {\"value\": 0}, \"fid_reference_images\": {\"value\": 1281167}, \"fid_reference_sha256\": {\"value\": \"3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260\"}, \"initial_optimizer_lr\": {\"value\": 0.0005}, \"sampled_trajectories\": {\"value\": 0}, \"coefficient_refitting\": {\"value\": false}, \"joint_codebook_sha256\": {\"value\": \"922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9\"}, \"sampler_top_k_by_depth\": {\"value\": [2048, 2048, 2048, 2048, 2048]}, \"scalar_events_per_site\": {\"value\": 5}, \"soft_label_temperature\": {\"value\": [0.05048883910784363, 0.02833188551776767, 0.05758083809087873, 0.054547438539303536, 0.0459920263323772]}, \"training_rng_seed_base\": {\"value\": 261001}, \"measured_tokenizer_rfid\": {\"value\": 4.192409404011698}, \"stage1_checkpoint_sha256\": {\"value\": \"dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab\"}, \"learned_compact_dictionary\": {\"value\": true}, \"optimizer_updates_per_epoch\": {\"value\": 626}, \"codebook_shared_across_depths\": {\"value\": false}, \"training_rng_restored_from_checkpoint\": {\"value\": false}}",
+        "summaryMetrics": "{\"_runtime\":20364.833250642,\"_step\":303,\"_timestamp\":1792373952.464091,\"_wandb.runtime\":20364,\"eval/fid\":57.60843407558991,\"eval/inception_score.last\":18.853607177734375,\"eval/inception_score.max\":18.853607177734375,\"eval/inception_score_std\":0.4128062129020691,\"evaluation/generated_images\":50000,\"evaluation/reference_images\":1281167,\"evaluation/reference_split\":\"train\",\"samples/bald_eagle\":{\"path\": \"media/images/samples/bald_eagle_259_380e7f51adeaba9518f1.png\", \"size\": 7162397, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"380e7f51adeaba9518f1e6b3596b5b68d98484f2af33b3dafa4c1907ecac2ca6\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; bald eagle; 64 samples, fixed seed.\"},\"samples/cheeseburger\":{\"path\": \"media/images/samples/cheeseburger_259_7ebf44effe32dbfd8444.png\", \"size\": 7195702, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"7ebf44effe32dbfd8444b9746fd00e9b134fff2197c00996f1973388dc43efe0\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; cheeseburger; 64 samples, fixed seed.\"},\"samples/fixed\":{\"path\": \"media/images/samples/fixed_259_638bbd1debb22c2bfd72.png\", \"size\": 9548266, \"_type\": \"image-file\", \"width\": 2752, \"format\": \"png\", \"height\": 2048, \"sha256\": \"638bbd1debb22c2bfd721deb1309eea45e57f9a248d4d9214edf4f3252709d77\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; 10 per class, fixed seed.\"},\"samples/global_step\":2504,\"samples/hotpot\":{\"path\": \"media/images/samples/hotpot_259_5cd950987c76642e422a.png\", \"size\": 7299044, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"5cd950987c76642e422a3adcee7f935ae26efb450818ebbe99494ed7140256d2\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; hotpot; 64 samples, fixed seed.\"},\"samples/red_fox\":{\"path\": \"media/images/samples/red_fox_259_98c0a4a3905a93a38b8b.png\", \"size\": 8341843, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"98c0a4a3905a93a38b8b34f88641eaa373cf5a595fb771296751b7af09d5c0ff\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; red fox; 64 samples, fixed seed.\"},\"samples/samoyed\":{\"path\": \"media/images/samples/samoyed_259_3de5695732a9f3cac176.png\", \"size\": 7223639, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"3de5695732a9f3cac176b9d3f51dfb7b0becf837ea8f96674b4190766a79a26d\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; samoyed; 64 samples, fixed seed.\"},\"samples/teapot\":{\"path\": \"media/images/samples/teapot_259_47ea2d81d0470cfda4fd.png\", \"size\": 6547537, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"47ea2d81d0470cfda4fdc7721d0969ca39b42929cf7528f1bd4e326dfac4fd85\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; teapot; 64 samples, fixed seed.\"},\"samples/timber_wolf\":{\"path\": \"media/images/samples/timber_wolf_259_8a68fdb18d469fc2fb10.png\", \"size\": 8519079, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"8a68fdb18d469fc2fb108effca1ca30d78f7485de3842998519dc9de20dbede7\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; timber wolf; 64 samples, fixed seed.\"},\"samples/wombat\":{\"path\": \"media/images/samples/wombat_259_ac9eca1c51ec8358475c.png\", \"size\": 9132268, \"_type\": \"image-file\", \"width\": 2048, \"format\": \"png\", \"height\": 2088, \"sha256\": \"ac9eca1c51ec8358475ce411bc7b083118c578c9b1d55ebced966807a9f60bff\", \"caption\": \"Step 2504; Pair-token T=1, top-k=2048, top-p=0.95; wombat; 64 samples, fixed seed.\"},\"train/amp_overflow_retries\":0,\"train/amp_scale\":131072,\"train/epoch\":4,\"train/global_step\":2930,\"train/grad_norm\":0.3942165970802307,\"train/images_per_second\":391.29148794917234,\"train/loss\":8.124767303466797,\"train/lr\":0.0004973021755732086,\"training/auxiliary_loss_terms\":0,\"training/objective\":\"native_soft_target_cross_entropy\",\"training/reused_empty_wandb_run\":false,\"training/status\":\"running\",\"training/stop_after_epochs\":100}",
+        "commit": null,
+        "host": "d97cbbf381b9",
+        "createdAt": "2026-10-18T19:59:46Z",
+        "updatedAt": "2026-10-19T01:39:34Z",
+        "historyKeys": {
+          "keys": {
+            "_runtime": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 304
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 20364.833250642
+            },
+            "_step": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 304
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 303
+            },
+            "_timestamp": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 304
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 1792373952.464091
+            },
+            "eval/fid": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 3
+                }
+              ],
+              "previousValue": 57.60843407558991
+            },
+            "eval/inception_score": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 3
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 18.853607177734375
+            },
+            "eval/inception_score_std": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 3
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 0.4128062129020691
+            },
+            "samples/bald_eagle": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/cheeseburger": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/fixed": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/global_step": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 5
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 2504
+            },
+            "samples/hotpot": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/red_fox": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/samoyed": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/teapot": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/timber_wolf": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "samples/wombat": {
+              "typeCounts": [
+                {
+                  "type": "image-file",
+                  "count": 5,
+                  "keys": {
+                    "caption": [
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "nestedTypes": [
+                    "default"
+                  ]
+                }
+              ],
+              "monotonic": true
+            },
+            "system/cpu": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk./.usageGB": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk./.usagePercent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-0.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-0.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-2.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-2.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-3.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-3.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-4.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.dm-4.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.md0.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.md0.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.md0p1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.md0p1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme0n1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme0n1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme0n1p1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme0n1p1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme0n1p2.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme0n1p2.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme1n1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme1n1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme1n1p1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme1n1p1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme1n1p2.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme1n1p2.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme2c2n1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme2c2n1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme2n1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme2n1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme3c3n1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme3c3n1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme3n1.in": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/disk.nvme3n1.out": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.correctedMemoryErrors": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.dramActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.energyJoules": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.enforcedPowerLimitWatts": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.gpu": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.memory": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.memoryAllocated": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.memoryAllocatedBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.memoryClock": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.nvlinkRxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.nvlinkTxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pcieRxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pcieTxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pipeFp16Active": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pipeFp32Active": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pipeFp64Active": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pipeTensorActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.pipeTensorHmmaActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.powerPercent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.powerWatts": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.smActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.smClock": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.smOccupancy": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.temp": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.0.uncorrectedMemoryErrors": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.correctedMemoryErrors": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.dramActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.energyJoules": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.enforcedPowerLimitWatts": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.gpu": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.memory": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.memoryAllocated": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.memoryAllocatedBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.memoryClock": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.nvlinkRxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.nvlinkTxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pcieRxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pcieTxBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pipeFp16Active": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pipeFp32Active": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pipeFp64Active": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pipeTensorActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.pipeTensorHmmaActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.powerPercent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.powerWatts": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.smActive": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.smClock": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.smOccupancy": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.temp": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.1.uncorrectedMemoryErrors": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.enforcedPowerLimitWatts": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.gpu": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.memory": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.memoryAllocated": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.memoryAllocatedBytes": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.powerPercent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.powerWatts": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/gpu.process.0.temp": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/memory_percent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/network.recv": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/network.sent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/network.tcpRetransmits": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/proc.cpu.threads": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/proc.cpu.throttledPercent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/proc.memory.availableMB": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/proc.memory.oomKills": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/proc.memory.percent": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "system/proc.memory.rssMB": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 1360
+                }
+              ]
+            },
+            "train/amp_overflow_retries": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 296
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 0
+            },
+            "train/amp_scale": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 296
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 131072
+            },
+            "train/epoch": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 299
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 4
+            },
+            "train/global_step": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 299
+                }
+              ],
+              "monotonic": true,
+              "previousValue": 2930
+            },
+            "train/grad_norm": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 296
+                }
+              ],
+              "previousValue": 0.3942165970802307
+            },
+            "train/images_per_second": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 296
+                }
+              ],
+              "previousValue": 391.29148794917234
+            },
+            "train/loss": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 296
+                }
+              ],
+              "previousValue": 8.124767303466797
+            },
+            "train/lr": {
+              "typeCounts": [
+                {
+                  "type": "number",
+                  "count": 296
+                }
+              ],
+              "previousValue": 0.0004973021755732086
+            }
+          },
+          "lastStep": 303,
+          "sets": []
+        },
+        "files": {
+          "edges": [
+            {
+              "node": {
+                "name": "code/train.py",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/code/train.py",
+                "sizeBytes": 98
+              }
+            },
+            {
+              "node": {
+                "name": "evaluations/epoch001.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/evaluations/epoch001.json",
+                "sizeBytes": 291
+              }
+            },
+            {
+              "node": {
+                "name": "evaluations/epoch002.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/evaluations/epoch002.json",
+                "sizeBytes": 292
+              }
+            },
+            {
+              "node": {
+                "name": "evaluations/epoch004.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/evaluations/epoch004.json",
+                "sizeBytes": 292
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/bald_eagle_131_733eb0e797a82f685abc.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/bald_eagle_131_733eb0e797a82f685abc.png",
+                "sizeBytes": 7392265
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/bald_eagle_195_afdc2542b50d8a498c6a.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/bald_eagle_195_afdc2542b50d8a498c6a.png",
+                "sizeBytes": 7200798
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/bald_eagle_259_380e7f51adeaba9518f1.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/bald_eagle_259_380e7f51adeaba9518f1.png",
+                "sizeBytes": 7162397
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/bald_eagle_4_fb0e5664cba837ca00f5.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/bald_eagle_4_fb0e5664cba837ca00f5.png",
+                "sizeBytes": 6838535
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/bald_eagle_66_fa10eb738d5aa05183f8.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/bald_eagle_66_fa10eb738d5aa05183f8.png",
+                "sizeBytes": 6480931
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/cheeseburger_131_aae820ea2e8e7aa8cffc.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/cheeseburger_131_aae820ea2e8e7aa8cffc.png",
+                "sizeBytes": 7519738
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/cheeseburger_195_e03beeaf12c0928dc09e.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/cheeseburger_195_e03beeaf12c0928dc09e.png",
+                "sizeBytes": 6934458
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/cheeseburger_259_7ebf44effe32dbfd8444.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/cheeseburger_259_7ebf44effe32dbfd8444.png",
+                "sizeBytes": 7195702
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/cheeseburger_4_3949a292b53543ed84cf.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/cheeseburger_4_3949a292b53543ed84cf.png",
+                "sizeBytes": 6805759
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/cheeseburger_66_2b5f89b795ab439347ed.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/cheeseburger_66_2b5f89b795ab439347ed.png",
+                "sizeBytes": 6097526
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/fixed_131_31344c499add116d9dda.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/fixed_131_31344c499add116d9dda.png",
+                "sizeBytes": 10095861
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/fixed_195_54f8e02cba924b6807df.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/fixed_195_54f8e02cba924b6807df.png",
+                "sizeBytes": 9144092
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/fixed_259_638bbd1debb22c2bfd72.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/fixed_259_638bbd1debb22c2bfd72.png",
+                "sizeBytes": 9548266
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/fixed_4_7185c4efdb34180dc8e0.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/fixed_4_7185c4efdb34180dc8e0.png",
+                "sizeBytes": 8543448
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/fixed_66_4047c9e9b2522dfb31a0.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/fixed_66_4047c9e9b2522dfb31a0.png",
+                "sizeBytes": 8404586
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/hotpot_131_93950891f6a6fb6b494b.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/hotpot_131_93950891f6a6fb6b494b.png",
+                "sizeBytes": 7490140
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/hotpot_195_2e187e8f7c93bca2beb3.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/hotpot_195_2e187e8f7c93bca2beb3.png",
+                "sizeBytes": 7101054
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/hotpot_259_5cd950987c76642e422a.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/hotpot_259_5cd950987c76642e422a.png",
+                "sizeBytes": 7299044
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/hotpot_4_4928c6398cac696f4adb.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/hotpot_4_4928c6398cac696f4adb.png",
+                "sizeBytes": 6763585
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/hotpot_66_d9af1d80bc83af252999.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/hotpot_66_d9af1d80bc83af252999.png",
+                "sizeBytes": 5763758
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/red_fox_131_a3161a7d1013fc7ebf2d.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/red_fox_131_a3161a7d1013fc7ebf2d.png",
+                "sizeBytes": 9001228
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/red_fox_195_f1018cc9f096e230f86b.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/red_fox_195_f1018cc9f096e230f86b.png",
+                "sizeBytes": 8240631
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/red_fox_259_98c0a4a3905a93a38b8b.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/red_fox_259_98c0a4a3905a93a38b8b.png",
+                "sizeBytes": 8341843
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/red_fox_4_b7f888776d9d0145f84a.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/red_fox_4_b7f888776d9d0145f84a.png",
+                "sizeBytes": 6831034
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/red_fox_66_19e5fffb6f978055098b.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/red_fox_66_19e5fffb6f978055098b.png",
+                "sizeBytes": 7363986
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/samoyed_131_f5bf5a804c5578a6f3c5.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/samoyed_131_f5bf5a804c5578a6f3c5.png",
+                "sizeBytes": 7789161
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/samoyed_195_7dfd0be0690e87809250.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/samoyed_195_7dfd0be0690e87809250.png",
+                "sizeBytes": 7153652
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/samoyed_259_3de5695732a9f3cac176.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/samoyed_259_3de5695732a9f3cac176.png",
+                "sizeBytes": 7223639
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/samoyed_4_14db6e7444c179381b45.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/samoyed_4_14db6e7444c179381b45.png",
+                "sizeBytes": 6851304
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/samoyed_66_7a8921dd2191631a536f.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/samoyed_66_7a8921dd2191631a536f.png",
+                "sizeBytes": 6743604
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/teapot_131_c113838c64ba5aab38ec.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/teapot_131_c113838c64ba5aab38ec.png",
+                "sizeBytes": 6605547
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/teapot_195_a23908ff035ab52326ba.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/teapot_195_a23908ff035ab52326ba.png",
+                "sizeBytes": 6471463
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/teapot_259_47ea2d81d0470cfda4fd.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/teapot_259_47ea2d81d0470cfda4fd.png",
+                "sizeBytes": 6547537
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/teapot_4_1b4678f83e65ddd485b4.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/teapot_4_1b4678f83e65ddd485b4.png",
+                "sizeBytes": 6829765
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/teapot_66_e40ad029b1207a4ce252.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/teapot_66_e40ad029b1207a4ce252.png",
+                "sizeBytes": 6001453
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/timber_wolf_131_682695ee4d9b343316e4.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/timber_wolf_131_682695ee4d9b343316e4.png",
+                "sizeBytes": 8460741
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/timber_wolf_195_6cce7a34b8542e8b9ae9.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/timber_wolf_195_6cce7a34b8542e8b9ae9.png",
+                "sizeBytes": 8123549
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/timber_wolf_259_8a68fdb18d469fc2fb10.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/timber_wolf_259_8a68fdb18d469fc2fb10.png",
+                "sizeBytes": 8519079
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/timber_wolf_4_6a43a6815d30083186b9.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/timber_wolf_4_6a43a6815d30083186b9.png",
+                "sizeBytes": 6839225
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/timber_wolf_66_076b515e5c4078acfba4.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/timber_wolf_66_076b515e5c4078acfba4.png",
+                "sizeBytes": 7592701
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/wombat_131_1dd724592c3b8bfe8054.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/wombat_131_1dd724592c3b8bfe8054.png",
+                "sizeBytes": 9208261
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/wombat_195_56d9ab1c7c01e5f3c8a4.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/wombat_195_56d9ab1c7c01e5f3c8a4.png",
+                "sizeBytes": 8534985
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/wombat_259_ac9eca1c51ec8358475c.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/wombat_259_ac9eca1c51ec8358475c.png",
+                "sizeBytes": 9132268
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/wombat_4_624b937e6d7e2fd38336.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/wombat_4_624b937e6d7e2fd38336.png",
+                "sizeBytes": 6857118
+              }
+            },
+            {
+              "node": {
+                "name": "media/images/samples/wombat_66_41e3ddf80771bb781fbc.png",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/media/images/samples/wombat_66_41e3ddf80771bb781fbc.png",
+                "sizeBytes": 8119918
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/chunk-benchmark.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/chunk-benchmark.json",
+                "sizeBytes": 640
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/classifier-alignment-proof.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/classifier-alignment-proof.json",
+                "sizeBytes": 261
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/classifier-benchmark.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/classifier-benchmark.json",
+                "sizeBytes": 746
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/code-manifest.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/code-manifest.json",
+                "sizeBytes": 13167
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/diagnosis.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/diagnosis.json",
+                "sizeBytes": 1135
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/execution.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/execution.json",
+                "sizeBytes": 59
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/gpu-preflight.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/gpu-preflight.json",
+                "sizeBytes": 3785
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/joint-codebook.pt",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/joint-codebook.pt",
+                "sizeBytes": 9620666
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/launch_laser_joint20k_repaired_imagenet.py",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/launch_laser_joint20k_repaired_imagenet.py",
+                "sizeBytes": 8044
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/preflight-preview-verification-rank0.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/preflight-preview-verification-rank0.json",
+                "sizeBytes": 123
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/preflight-preview-verification-rank1.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/preflight-preview-verification-rank1.json",
+                "sizeBytes": 123
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/preflight-rng-startup-rank0.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/preflight-rng-startup-rank0.json",
+                "sizeBytes": 408
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/preflight-rng-startup-rank1.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/preflight-rng-startup-rank1.json",
+                "sizeBytes": 408
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/preflight-startup-rank0.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/preflight-startup-rank0.json",
+                "sizeBytes": 2878
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/preflight-startup-rank1.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/preflight-startup-rank1.json",
+                "sizeBytes": 2878
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/prepare_original_rq_imagenet_data.py",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/prepare_original_rq_imagenet_data.py",
+                "sizeBytes": 6506
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/prepare_train_index.py",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/prepare_train_index.py",
+                "sizeBytes": 706
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/recipe.yaml",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/recipe.yaml",
+                "sizeBytes": 3290
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/requirements-freeze.txt",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/requirements-freeze.txt",
+                "sizeBytes": 4058
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/rq-upstream-core.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/rq-upstream-core.json",
+                "sizeBytes": 1137
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/source.zip",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/source.zip",
+                "sizeBytes": 192657
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/stage2-archive-config.yaml",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/stage2-archive-config.yaml",
+                "sizeBytes": 825
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/stage2-training-config.yaml",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/stage2-training-config.yaml",
+                "sizeBytes": 1042
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/target-audit.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/target-audit.json",
+                "sizeBytes": 500
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/tests.xml",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/tests.xml",
+                "sizeBytes": 6418
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/train-data-verification.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/train-data-verification.json",
+                "sizeBytes": 412
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/validated-imagenet-laser-joint20k-depth5-rq-noise-calibration-20261017-report.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/validated-imagenet-laser-joint20k-depth5-rq-noise-calibration-20261017-report.json",
+                "sizeBytes": 133621
+              }
+            },
+            {
+              "node": {
+                "name": "reproducibility/validated-imagenet-laser-joint20k-refinement-rfid-20261017-full-rfid.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/reproducibility/validated-imagenet-laser-joint20k-refinement-rfid-20261017-full-rfid.json",
+                "sizeBytes": 1449
+              }
+            },
+            {
+              "node": {
+                "name": "requirements.txt",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/requirements.txt",
+                "sizeBytes": 4089
+              }
+            },
+            {
+              "node": {
+                "name": "wandb-metadata.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/wandb-metadata.json",
+                "sizeBytes": 1474
+              }
+            },
+            {
+              "node": {
+                "name": "workspace.json",
+                "url": "https://api.wandb.ai/files/helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-rngfix-scratch100-2b300-20261018/workspace.json",
+                "sizeBytes": 268
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

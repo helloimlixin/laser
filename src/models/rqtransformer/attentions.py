@@ -100,7 +100,9 @@ class MultiSelfAttention(nn.Module):
             # batches of short depth sequences on this H200 environment.
             # Attention is independent across batch rows; split that axis
             # to keep the same causal attention and a safe kernel geometry.
-            if self.short_attention_backend == 'compiled' and self.training and T == 8 and self.mask and dropout_p == 0:
+            if (self.short_attention_backend == 'compiled' and self.training
+                    and torch.is_grad_enabled() and T in (2, 4, 8)
+                    and self.mask and dropout_p == 0):
                 y = causal_short_attention(q4, k4, v4)
             elif T <= 8 and B > 8192:
                 y = torch.cat([

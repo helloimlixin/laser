@@ -192,3 +192,36 @@ def test_sampling_filter_validation_and_top_one():
     for kwargs in [dict(temperature=0), dict(top_k=-1), dict(top_p=0), dict(top_p=1.1)]:
         with pytest.raises(ValueError):
             sample_categorical(logits, **kwargs)
+
+
+def test_class_conditioning_affects_predictions_and_matches_cached_decoding():
+    torch.manual_seed(7)
+    model = CompoundDCTransformer(num_atoms=13, coeff_vocab_size=7,
+        block_size=(2, 3, 3), dictionary_dim=5, width=24, heads=3,
+        encoder_ffn_layers=(1,), atom_ffn_layers=(1,),
+        coefficient_ffn_layers=(1,), overlap=2, dropout=0., num_classes=1000).eval()
+    _, aux, atoms, coefficients = setup()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if 'gate' in name:
+                parameter.fill_(.23)
+        label = torch.tensor([999])
+        dense = model(atoms * 7 + coefficients, model_aux=aux, cond=label)
+        other = model(atoms * 7 + coefficients, model_aux=aux, cond=torch.tensor([0]))
+        for key in dense:
+            assert not torch.equal(dense[key], other[key])
+        flat_atoms = model.depth_major(atoms)
+        for event in range(model.events):
+            actual_atom = model.cached_atom_logits(atoms, coefficients, aux, event, cond=label)
+            actual_coeff = model.cached_coefficient_logits(atoms, coefficients, flat_atoms[:, event], aux, event)
+            torch.testing.assert_close(actual_atom, model.depth_major(dense['atom_logits'])[:, event], rtol=2e-5, atol=2e-6)
+            torch.testing.assert_close(actual_coeff, model.depth_major(dense['coeff_logits'])[:, event], rtol=2e-5, atol=2e-6)
+        model.init_cache()
+        sampled, _ = model.sample_compound(1, aux, cond=label, amp=False)
+        assert sampled.shape == atoms.shape
+    for invalid in [None, torch.tensor([-1]), torch.tensor([1000]), torch.tensor([1.5])]:
+        with pytest.raises(ValueError):
+            model(atoms * 7 + coefficients, model_aux=aux, cond=invalid)
+    model.train()
+    target_loss(model(atoms * 7 + coefficients, model_aux=aux, cond=label), atoms, coefficients).backward()
+    assert model.class_embedding.weight.grad[999].abs().sum() > 0

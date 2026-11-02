@@ -1,0 +1,146 @@
+# @package _global_
+# Scratch A4096/K4; preserved rFID4.21 objective, batch128 and BN64.
+# Double the reference training budget; evaluate matched validation rFID-50k each epoch.
+defaults:
+- _self_
+stage: stage1
+backend: rqvae_stage1
+output_dir: outputs/imagenet-stage1-a4096-k4-rfid421-20261031
+runtime_root: /tmp/laser-imagenet-a4096-k4-20261031/runtime/runtime
+devices: 8
+smoke: false
+resume: null
+recipe:
+  gan:
+    disc:
+      arch:
+        ndf: 64
+        num_layers: 2
+        in_channels: 3
+        use_actnorm: false
+        spectral_norm: false
+      batchnorm:
+        mode: reference-replica
+        reference_per_replica_batch_size: 64
+      optimizer:
+        type: adam
+        betas:
+        - 0.5
+        - 0.9
+        max_gn: null
+        warmup:
+          mode: fix
+          epoch: 0.5
+          min_lr: 0
+          multiplier: 1
+          buffer_epoch: 0
+          start_from_zero: true
+        init_lr: 4.0e-05
+        weight_decay: 0
+    loss:
+      gen_loss: vanilla
+      disc_loss: hinge
+      disc_start: 0
+      disc_weight: 0.75
+      perceptual_weight: 1
+  arch:
+    ema: null
+    type: rq-vae
+    hparams:
+      decay: 0.99
+      n_embed: 4096
+      embed_dim: 256
+      loss_type: mse
+      code_shape:
+      - 8
+      - 8
+      - 4
+      patch_size: 1
+      patch_based: false
+      latent_shape:
+      - 8
+      - 8
+      - 256
+      patch_stride: 1
+      masked_dropout: 0
+      sparsity_level: 4
+      bottleneck_type: laser
+      commitment_cost: 1
+      shared_codebook: true
+      use_padding_idx: false
+      progressive_loss: true
+      dead_atom_revival: true
+      latent_loss_weight: 0.25
+      restart_unused_codes: true
+      omp_compute_precision: float32
+      dictionary_update_mode: alternating_residual
+      dead_atom_revival_noise: 0.05
+      data_init_from_first_batch: true
+      dead_atom_revival_interval: 500
+      dead_atom_revival_patience: 5
+      dictionary_update_min_usage: 2
+      dictionary_update_relaxation: 0.25
+      dead_atom_revival_max_fraction: 0.05
+      dictionary_update_max_backtracks: 6
+      dictionary_update_max_atoms_per_step: 4096
+    ddconfig:
+      ch: 128
+      out_ch: 3
+      ch_mult:
+      - 1
+      - 1
+      - 2
+      - 2
+      - 4
+      - 4
+      dropout: 0
+      double_z: false
+      resolution: 256
+      z_channels: 256
+      in_channels: 3
+      num_res_blocks: 2
+      attn_resolutions:
+      - 8
+    code_hier: 1
+    checkpointing: false
+  seed: 261031
+  dataset:
+    root: /tmp/laser-imagenet-a4096-k4-20261031/data
+    type: imagenet
+    transform:
+      type: null
+    transforms:
+      type: imagenet256x256
+  optimizer:
+    type: adam
+    betas:
+    - 0.5
+    - 0.9
+    max_gn: null
+    warmup:
+      mode: fix
+      epoch: 0.5
+      min_lr: 0
+      multiplier: 1
+      buffer_epoch: 0
+      start_from_zero: true
+    init_lr: 4.0e-05
+    weight_decay: 0
+    grad_accm_steps: 1
+  experiment:
+    amp: false
+    epochs: 20
+    precision: float32
+    test_freq: 1
+    batch_size: 16
+    num_workers: 8
+    compute_rfid: true
+    rfid_backend: original-rqvae
+    save_ckpt_freq: 1
+    total_batch_size: 128
+    visual_freq_steps: 250
+    validation_visual_items: 64
+    recovery_ckpt_freq_steps: 250
+    dictionary_visual_freq_steps: 0
+    nvidia_flip_workers_per_rank: 2
+    compute_reconstruction_metrics: false

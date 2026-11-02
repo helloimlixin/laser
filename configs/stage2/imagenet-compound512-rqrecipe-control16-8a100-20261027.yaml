@@ -1,0 +1,90 @@
+# @package _global_
+# Prepared control; not launched. Requires a fresh source snapshot and launch verification.
+# LASER_ACCUMULATION=4 with 8 GPUs and microbatch 64 gives global batch 2048.
+# Neutral ancestral sampling represents the complete joint distribution at T=1.
+defaults:
+- _self_
+stage: stage2
+backend: rqtransformer
+runtime_profile: imagenet_compound
+audit_directory: /tmp/laser-imagenet-compound512-rqrecipe-control16-20261027/records
+options:
+  checkpoint: /tmp/laser-imagenet-compound512-audit-20261026/inputs/stage1-tokenizer.pt
+  data: /tmp/laser-imagenet-compound512-audit-20261026/data
+  output: /tmp/laser-imagenet-compound512-rqrecipe-control16-20261027/train
+  checkpoint_dir: /tmp/laser-imagenet-compound512-rqrecipe-control16-20261027/recovery/checkpoints
+  dataset: imagenet
+  model_preset: imagenet-1400m
+  backbone: rqtransformer
+  sparsity_level: 4
+  num_atoms: 16384
+  coeff_vocab_size: 512
+  coeff_max: 3.0
+  coeff_scales:
+  - 4.587941646575928
+  - 2.4749884605407715
+  - 1.6106663942337036
+  - 1.0176019668579102
+  coeff_target_space: normalized
+  coeff_target_mode: hard
+  stochastic_coefficient_inputs: false
+  compound_tokens: false
+  physical_pair_context: true
+  efficient_pair_backbone: true
+  compound_micro_transformer_layers: 2
+  compound_depth_specific_coeff_heads: true
+  coefficient_history_layers: 2
+  coefficient_history_width: 512
+  coefficient_history_heads: 8
+  coefficient_history_normalize_fields: true
+  coefficient_history_dropout: 0.1
+  mask_seen_atoms_training: true
+  rq_initialization: upstream
+  atom_loss_weight: 1.0
+  geometry_loss_weight: 0.0
+  lr: 0.0005
+  epochs: 16
+  lr_schedule_epochs: 100
+  lr_schedule: cosine
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  batch_size: 64
+  total_batch_size: 2048
+  distributed_backend: ddp
+  seed: 261001
+  resume: false
+  fid_every: 2
+  fid_early_epochs: 1
+  fid_num_samples: 50000
+  fid_batch_size: 64
+  fid_seed: 261027
+  metric_backend: original-rqvae
+  fid_real_split: train
+  fid_reference_stats: /tmp/laser-imagenet-compound512-audit-20261026/inputs/imagenet_256_train.npz
+  sample_grid_every: 626
+  sample_grid_size: 64
+  sample_grid_samples_per_class: 8
+  sample_grid_batch_size: 8
+  sample_grid_seed: 261027
+  sample_grid_on_start: false
+  atom_temperature: 1.0
+  atom_top_k: 0
+  atom_top_p: 1.0
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 1.0
+  save_ckpt_freq: 1
+  save_step_freq: 100
+  keep_best_checkpoints: 1
+  checkpoint_upload_mode: files
+  upload_checkpoints: true
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  wandb_id: imagenet-compound512-rqrecipe-control16-8a100-20261027
+  wandb_name: ImageNet compound512 | RQ recipe control | fresh16 | LR5e-4 no warmup
+  wandb_mode: online
+  compound_gradient_diagnostics_every: 100
+  coefficient_head: categorical
+  joint_pair_top_k: 0
+  joint_pair_temperature: 1.0
+  joint_pair_top_p: 1.0

@@ -1,0 +1,35 @@
+"""Measure each CE branch at the shared RQ hidden state without changing it.
+
+These are interface gradients on the current microbatch, before accumulation
+scaling and clipping. They are diagnostics, not full parameter gradient norms
+or a rule for automatically changing a likelihood objective.
+"""
+import math
+
+import torch
+
+
+def shared_hidden_gradient_metrics(atom_ce, coefficient_ce, hidden, *, atom_weight=1.):
+    if not math.isfinite(atom_weight) or atom_weight <= 0:
+        raise ValueError('atom weight must be positive and finite')
+    atom, = torch.autograd.grad(atom_ce.mean(), hidden, retain_graph=True)
+    coefficient, = torch.autograd.grad(coefficient_ce.mean(), hidden, retain_graph=True)
+    with torch.no_grad():
+        atom, coefficient = atom.float(), coefficient.float()
+        a, c = atom.norm(), coefficient.norm()
+        tiny = torch.finfo(torch.float32).tiny
+        result = {
+            'train/shared_atom_gradient_norm_rank0': a,
+            'train/shared_coefficient_gradient_norm_rank0': c,
+            'train/weighted_shared_gradient_ratio_rank0': atom_weight * a / c.clamp_min(tiny),
+            'train/equal_norm_atom_weight_rank0': c / a.clamp_min(tiny),
+            'train/shared_gradient_cosine_rank0': (atom * coefficient).sum() / (a * c).clamp_min(tiny),
+        }
+        # The penultimate axis is OMP depth, including for spatial grids.
+        for depth in range(hidden.shape[-2]):
+            ad, cd = atom[..., depth, :].norm(), coefficient[..., depth, :].norm()
+            result[f'train/shared_atom_gradient_norm_depth{depth}_rank0'] = ad
+            result[f'train/shared_coefficient_gradient_norm_depth{depth}_rank0'] = cd
+            result[f'train/weighted_shared_gradient_ratio_depth{depth}_rank0'] = (
+                atom_weight * ad / cd.clamp_min(tiny))
+        return {name: float(value) for name, value in result.items()}

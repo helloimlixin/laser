@@ -1,0 +1,36 @@
+# @package _global_
+defaults:
+  - imagenet-var-scratch
+  - _self_
+
+# Matched ImageNet-only ablation, NOT a reproduction of the OpenImages tokenizer.
+# One B300 per arm. Both stages start randomly; smoke outputs are separate.
+output_dir: outputs/imagenet-var-dictionary-256-20261024/${model.bottleneck}
+data:
+  root: /tmp/laser-imagenet-var/data
+  manifests: outputs/imagenet-var-dictionary-256-20261024/data
+  workers: 8
+tokenizer:
+  batch_size: 64
+  accumulation: 2
+prior:
+  batch_size: 128
+  accumulation: 6
+evaluation:
+  batch_size: 32
+  fid_reference: /tmp/laser-imagenet-var/assets/fid_stats/imagenet_256_train.npz
+  adm_python: /tmp/laser-var-eval/bin/python
+  adm_evaluator: /tmp/laser-imagenet-var/assets/adm_evaluator.py
+  adm_reference: /tmp/laser-imagenet-var/assets/VIRTUAL_imagenet256_labeled.npz
+logging:
+  every_steps: 10
+  checkpoint_every_steps: 100
+wandb:
+  group: imagenet256-var-dictionary-matched-20261024
+  id: imagenet256-var-${model.bottleneck}-d16-20261024
+  notes: >-
+    256px matched ImageNet-only scratch VQ vs OMP dictionary ablation; all trainable
+    weights random. Tokenizer 100 epochs/global batch 128; VAR-d16 prior 200
+    epochs/global batch 768. Published VAR used an OpenImages tokenizer, so this
+    is a matched ablation rather than an exact reproduction. Paper Table 1 d16
+    FID 3.30; released model table d16 FID 3.55. Sparse codes use 3.5x nominal bits.

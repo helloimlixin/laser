@@ -1,0 +1,78 @@
+version: laser-native-joint20k-depth5-uniformce-k512-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-joint20k-depth5-uniformce-k512-scratch100-4b200-20261018
+name: LASER joint20k depth5 | uniform CE + K512 | fresh100 | 4 B200
+seed: 261001
+epochs: 100
+global_batch: 2048
+microbatch: 256
+lr_schedule_epochs: 100
+decoder: native_joint_integer
+target_mode: joint_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9
+  vocab_size: 20481
+  depth: 5
+  measured_rfid: 4.192409404011698
+  source_measured_rfid: 4.215039034200402
+  candidate: adaptive8192
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  atoms: 8192
+  coefficient_levels_per_atom: adaptive 2/4/6/8 or uniform4; selected by measured
+    reconstruction
+  adaptive_coefficient_allocation: true
+  source_four_depth_codebook_sha256: 974fdaf42f041a02e93c7321b65d57900088ab7a2339ada6a5ffcc062ee9ac54
+  first_four_depths_unchanged: true
+targets:
+  temperature:
+  - 0.15819901962280272
+  - 0.13549085464477534
+  - 0.08794634933471679
+  - 0.055382978057861326
+  - 0.0394969670343399
+  chunk_size: 128
+  encoding: native_residual_quantization_over_fixed_joint_codewords
+  stochastic_prefixes: true
+  calibration:
+    policy: fifth-depth expected excess quantization error / nearest-code error matches
+      original RQ final-depth budget
+    first_four_temperatures_unchanged: true
+    calibration_split: train
+    independent_original_augmentation_audit_before_production: true
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature: 1.0
+  top_k: 2048
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+initialization:
+  reference_vocab_size: 65537
+  paired_fresh_backbone: true
+preview:
+  designated_classes: true
+  every_updates: 200
+  first_update: 1
+  fixed_seed: 261001
+  overview_per_class: 10
+  grid_rows: 8
+  grid_columns: 8
+lineage:
+  supersedes_run: imagenet-laser-joint20k-depth5-depthwce-epoch1to3-8h100-20261018
+  stage2_initialization: fresh_random
+  stage2_checkpoint_loaded: false
+  optimizer_initialization: fresh
+  scheduler_initialization: fresh
+  reason: User requested a single fresh uniform-CE top-k512 run using all GPUs
+loss:
+  type: soft_target_cross_entropy
+  reduction: mean

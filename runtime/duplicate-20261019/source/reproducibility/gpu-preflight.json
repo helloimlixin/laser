@@ -1,0 +1,98 @@
+{
+  "passed": true,
+  "proof": {
+    "passed": true,
+    "global_step": 3,
+    "optimizer_state_count": 780,
+    "all_adam_steps": 3,
+    "frozen_tokenizer_unchanged": true,
+    "initialization": {
+      "fresh_stage2": true,
+      "fresh_optimizer": true,
+      "global_step": 0,
+      "parameter_count": 1393828353,
+      "parameter_tensors": 780,
+      "world_size": 2,
+      "microbatch": 512,
+      "accumulation_steps": 2,
+      "global_batch": 2048,
+      "optimizer_updates_per_epoch": 626,
+      "training_epochs": 100,
+      "lr_schedule_epochs": 100,
+      "initial_lr": 0.0005,
+      "initial_optimizer_lr": 0.0005,
+      "minimum_lr": 0.0,
+      "warmup_epochs": 0.0,
+      "pid": 3776,
+      "architecture": "unmodified upstream RQTransformer",
+      "stage1": "frozen LASER encoder/decoder with learned compact pair dictionary",
+      "codebook_shared_across_depths": false,
+      "integer_joint_ids": true,
+      "scalar_events_per_site": 5,
+      "vocabulary": 20481,
+      "soft_labels": true,
+      "stochastic_codes": true,
+      "target_policy": "soft_stochastic",
+      "soft_label_temperature": [
+        0.05048883910784363,
+        0.02833188551776767,
+        0.05758083809087873,
+        0.054547438539303536,
+        0.0459920263323772
+      ],
+      "objective": "native_soft_target_cross_entropy",
+      "depth_loss_weights": null,
+      "auxiliary_loss_terms": 0,
+      "sampled_trajectories": 0,
+      "coefficient_refitting": false,
+      "codebook_sha256": "922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9",
+      "native_sampling": {
+        "temperature": 1.0,
+        "top_k": [
+          2048
+        ],
+        "top_p": [
+          0.95
+        ]
+      },
+      "measured_tokenizer_rfid": 4.192409404011698,
+      "learned_compact_dictionary": true,
+      "initialization": {
+        "reference_vocab_size": 65537,
+        "paired_fresh_backbone": true
+      },
+      "execution": {},
+      "shared_upstream": {
+        "upstream_commit": "341395e562ac347f5eb62db9f5f08b9f2cc42a60",
+        "compatibility_patch": "Python 3.12 dataclass default_factory",
+        "core_files": {
+          "rqvae/models/rqtransformer/transformers.py": "e2e5c7e36dd97cfa02d42aabbc5699baed9953b9afdbc221ddda65b10719698e",
+          "rqvae/models/rqtransformer/attentions.py": "cfcb3bb5e005cfc6e9a1641fe87e2c18db7afc8ae775b6711f64e5de3761561b",
+          "rqvae/models/rqtransformer/primitives.py": "7df3e7a69e73593893daf4f9e1a5e8198e8400ffc4b8263d8b66559e5bca660c",
+          "rqvae/models/rqtransformer/configs.py": "b86750e1a4f1a5712199345ca9158843a276ecee257ff6565f452ce9d2f15cf2",
+          "rqvae/optimizer/loss.py": "93260cc4b6009a5f999449d985360538bb4d40e3ac639205c9f3f1522f69fc21",
+          "rqvae/optimizer/optimizer.py": "b2127d71d427b5474c7b85e4caa57abd9716c2ddd86a047db07a673bb8d686ad",
+          "rqvae/optimizer/scheduler.py": "af5882253ace43872fedc68949f79d72bf276a76be31f69338324020a7795cb7",
+          "rqvae/img_datasets/transforms.py": "48bc1bd5c467527205725d62045335550be642fefa7a37160d0c71e971bc0c4b",
+          "rqvae/models/rqvae/rqvae.py": "968453f61782c2761b1f97fa6749e4f1363cb815b541684a5b47ca398ada8b1f"
+        }
+      },
+      "training_rng_policy": "independent_rank_v1",
+      "training_rng_seed_base": 261001,
+      "training_rng_seed": 261001,
+      "training_rng_restored_from_checkpoint": false
+    }
+  },
+  "microbatch": 512,
+  "accumulation_steps": 2,
+  "rank_rng_independent": true,
+  "probe_weights_discarded": true,
+  "production_starts_from_zero": true,
+  "initialization": {
+    "passed": true,
+    "initial_weight_sha256": "46386ed8076a513a67894cdeb591aead1167801c0c35cbca79063ecae98d4fc6",
+    "same_initial_weights_as_lr_screen": true,
+    "stage2_checkpoint_loaded": false,
+    "global_step": 0
+  }
+}

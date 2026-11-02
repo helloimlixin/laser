@@ -1,7 +1,10 @@
 """Validated manifest loading and dataset-specific VAR image preprocessing."""
+import io
 import json
+import os
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -71,12 +74,71 @@ class Images(Dataset):
     def __getitem__(self, index):
         index = int(index)  # NumPy permutations are used by evaluation subsets.
         name, label = self.rows[index]
+        with Image.open(self.root / name) as im:
+            image = self.transform_image(im, index)
+        return image, label
+
+    def transform_image(self, im, index):
         with torch.random.fork_rng(devices=[]):
             # Seed CPU augmentation only. torch.manual_seed also resets CUDA
             # dropout when num_workers=0, despite fork_rng(devices=[])!
             torch.random.default_generator.manual_seed(self.seed + self.epoch * 10000019 + index)
-            with Image.open(self.root / name) as im:
-                image = self.transform(im.convert('RGB'))
+            image = self.transform(im.convert('RGB'))
         if image.shape != (3, 256, 256) or not torch.isfinite(image).all():
-            raise ValueError(f'Invalid image tensor: {self.root / name}')
-        return image, label
+            raise ValueError(f'Invalid image tensor at index {index}')
+        return image
+
+
+class IndexedImageNet(Images):
+    """Read original JPEG bytes from a verified, uncompressed ImageNet tar.
+
+    The offset indices are produced by prepare_original_rq_imagenet_data.py.
+    Pixel transforms and epoch/index augmentation seeds match folder loading.
+    Each process opens its own descriptor; pread does not share seek state.
+    """
+    def __init__(self, root, split, seed):
+        if split not in ('train', 'val'):
+            raise ValueError(f'Invalid ImageNet split: {split}')
+        super().__init__(root, {'samples': []}, split == 'train', seed)
+        self.archive = self.root / f'ILSVRC2012_img_{split}.tar'
+        with np.load(self.root / f'{split}-index.npz', allow_pickle=False) as index:
+            self.offsets = index['offsets']
+            self.sizes = index['sizes']
+            self.labels = index['labels']
+            self.classes = index['classes'].tolist()
+        if (self.offsets.ndim != 1 or self.sizes.shape != self.offsets.shape or
+                self.labels.shape != self.offsets.shape or not len(self.offsets) or
+                any(a.dtype.kind not in 'iu' for a in (self.offsets, self.sizes, self.labels)) or
+                self.classes != sorted(set(self.classes)) or not self.classes or
+                np.any(self.labels < 0) or np.any(self.labels >= len(self.classes)) or
+                np.any(self.offsets < 0) or np.any(self.sizes <= 0) or
+                np.any(self.offsets + self.sizes > self.archive.stat().st_size)):
+            raise ValueError(f'Invalid ImageNet {split} archive index')
+        self._descriptor = None
+        self._pid = None
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        index = int(index)
+        if self._pid != os.getpid():
+            if self._descriptor is not None:
+                os.close(self._descriptor)
+            self._descriptor = os.open(self.archive, os.O_RDONLY)
+            self._pid = os.getpid()
+        size = int(self.sizes[index])
+        data = os.pread(self._descriptor, size, int(self.offsets[index]))
+        if len(data) != size:
+            raise OSError(f'Truncated ImageNet JPEG at index {index}')
+        with Image.open(io.BytesIO(data)) as im:
+            image = self.transform_image(im, index)
+        return image, int(self.labels[index])
+
+    def __getstate__(self):
+        return dict(self.__dict__, _descriptor=None, _pid=None)
+
+    def __del__(self):
+        descriptor = getattr(self, '_descriptor', None)
+        if descriptor is not None:
+            os.close(descriptor)

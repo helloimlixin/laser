@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import make_dataclass
+from dataclasses import asdict, make_dataclass
 from datetime import timedelta
 from functools import partial
 import gc
@@ -55,6 +55,7 @@ from omegaconf.nodes import AnyNode, BooleanNode, BytesNode, FloatNode, IntegerN
 from src.models.rqtransformer.configs import RQTransformerConfig
 from src.models.rqtransformer.attentions import AttentionBlock, AttentionStack
 from src.models.rqtransformer.transformers import RQTransformer, sample_from_logits
+from src.models.compound_gpt import CompoundGPT, CompoundGPTConfig
 from rqvae.img_datasets.lsun import LSUNClass
 from rqvae.models.rqvae.rqvae import RQVAE
 from src.data.imagenet_labels import class_names_for_dataset
@@ -223,8 +224,24 @@ def gather_rank_rng_states(device: torch.device):
         local_state["torch_cuda"] = torch.cuda.get_rng_state(device)
     if not dist.is_initialized():
         return [local_state]
-    gathered = [None] * dist.get_world_size() if rank() == 0 else None
-    dist.gather_object(local_state, gathered, dst=0)
+    # RNG streams are small fixed-size byte tensors. Using ordinary tensor
+    # collectives avoids NCCL's object-gather path and Python serialization,
+    # while preserving every rank's exact stream without consuming RNG.
+    transport_device = device if dist.get_backend() == "nccl" else torch.device("cpu")
+    fields = list(local_state.items())
+    packed = torch.cat([state.to(transport_device) for _, state in fields])
+    received = [torch.empty_like(packed) for _ in range(dist.get_world_size())]
+    dist.all_gather(received, packed)
+    if rank() != 0:
+        return None
+    gathered = []
+    for stream in received:
+        offset = 0
+        state = {}
+        for name, template in fields:
+            state[name] = stream[offset:offset + template.numel()].cpu().clone()
+            offset += template.numel()
+        gathered.append(state)
     return gathered
 
 
@@ -1383,14 +1400,28 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
                       setting_name="default",
                       atom_temperature=1.0, atom_top_k=0, atom_top_p=0.92,
                       coeff_temperature=1.0, coeff_top_k=0, coeff_top_p=0.92,
-                      causal_prefix_sampling="predicted"):
+                      causal_prefix_sampling="predicted", class_ids=None,
+                      joint_pair_top_k=0, joint_pair_temperature=1.,
+                      joint_pair_top_p=1., joint_pair_candidate_chunk=16384):
+    if joint_pair_top_k and not hasattr(model, 'sample_joint_sparse'):
+        raise ValueError('joint pair sampling requires the offset compound model')
     device = next(model.parameters()).device
     num_samples = int(num_samples)
     samples_per_class = int(samples_per_class)
     if samples_per_class <= 0 or num_samples <= 0 or num_samples % samples_per_class:
         raise ValueError("preview sample count must be divisible by samples per class")
     num_class_rows = num_samples // samples_per_class
-    if num_condition_classes == 1:
+    from src.training.rq_sample_panels import CLASSES
+    fixed_classes = [label for _, label in CLASSES]
+    if class_ids is None and num_condition_classes == 1000 and num_class_rows == len(CLASSES):
+        class_ids = fixed_classes
+    if class_ids is not None:
+        class_ids = [int(value) for value in class_ids]
+        if (len(class_ids) != num_class_rows or len(set(class_ids)) != len(class_ids)
+                or any(value < 0 or value >= num_condition_classes for value in class_ids)):
+            raise ValueError("preview classes must be distinct, in range, and match the number of rows")
+        chosen = torch.tensor(class_ids, device=device, dtype=torch.long)
+    elif num_condition_classes == 1:
         chosen = torch.zeros(num_class_rows, device=device, dtype=torch.long)
     else:
         chosen = torch.randperm(num_condition_classes, device=device)[:num_class_rows]
@@ -1406,6 +1437,7 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
             model,
             (
                 CompoundLaserRQTransformer,
+                CompoundGPT,
                 LevelwiseLaserVAR,
                 SupportFirstLaserRQTransformer,
                 CausalPrefixPatternLaserRQTransformer,
@@ -1417,16 +1449,17 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
             coefficient_vocab_size = getattr(
                 model, "coefficient_pattern_vocab_size", aux.coeff_vocab_size
             )
-            atoms, coeff_ids = model.sample_compound(
-                current, aux, cond=batch_labels,
-                atom_temperature=atom_temperature,
-                atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
-                coeff_temperature=coeff_temperature,
-                coeff_top_k=coeff_top_k or coefficient_vocab_size,
-                coeff_top_p=coeff_top_p,
-                amp=True,
-                **sampling_kwargs,
-            )
+            if joint_pair_top_k:
+                sampling_kwargs.update(joint_pair_top_k=joint_pair_top_k,
+                    joint_pair_temperature=joint_pair_temperature, joint_pair_top_p=joint_pair_top_p,
+                    joint_pair_candidate_chunk=joint_pair_candidate_chunk)
+            else:
+                sampling_kwargs.update(atom_temperature=atom_temperature,
+                    atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
+                    coeff_temperature=coeff_temperature,
+                    coeff_top_k=coeff_top_k or coefficient_vocab_size, coeff_top_p=coeff_top_p)
+            atoms, coeff_ids = model.sample_compound(current, aux, cond=batch_labels,
+                                                   amp=True, **sampling_kwargs)
             batch_images = (
                 aux.decode_orthogonal(atoms, coeff_ids)
                 if isinstance(model, OrthogonalCompoundLaserRQTransformer)
@@ -1455,7 +1488,14 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
     sample_dir = output_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     target = sample_dir / f"step_{step:07d}_{setting_name}.png"
-    if num_condition_classes == 1:
+    designated_full_grid = (chosen.tolist() == fixed_classes and samples_per_class == 64
+                            and tuple(images.shape[1:]) == (3, 256, 256))
+    full_panel_paths = None
+    if designated_full_grid:
+        from src.training.rq_sample_panels import save_panels
+        full_panel_paths = save_panels(images.mul(255).round().to(torch.uint8), sample_dir, step)
+        target = full_panel_paths["samples/fixed"]
+    elif num_condition_classes == 1:
         save_unlabeled_grid(images, target, nrow=samples_per_class)
     else:
         save_class_labeled_grid(
@@ -1465,18 +1505,35 @@ def sample_class_grid(model, aux, class_names, output_dir: Path, step: int, wb=N
             target,
             samples_per_class=samples_per_class,
         )
+    panel_paths = {f"samples/{setting_name}": target}
+    if full_panel_paths is not None:
+        panel_paths.update(full_panel_paths)
+    elif chosen.tolist() == fixed_classes:
+        panel_paths["samples/fixed"] = target
+        for row, (name, _) in enumerate(CLASSES):
+            key = name.replace(" ", "_")
+            path = sample_dir / f"step_{step:07d}_{setting_name}_{key}.png"
+            save_unlabeled_grid(images[row*samples_per_class:(row+1)*samples_per_class],
+                                path, nrow=samples_per_class)
+            panel_paths[f"samples/{key}"] = path
+    target.with_suffix('.json').write_text(json.dumps(dict(
+        global_step=step, class_ids=chosen.tolist(), samples_per_class=samples_per_class,
+        num_samples=num_samples, media={key: str(path) for key, path in panel_paths.items()}),
+        indent=2) + '\n')
     if wb is not None:
         import wandb
-        wb.log({
-            f"samples/{setting_name}": wandb.Image(str(target)),
-            "train/global_step": step,
-        })
+        wb.log({**{key: wandb.Image(str(path)) for key, path in panel_paths.items()},
+                "train/global_step": step, "samples/global_step": step})
     if was_training:
         model.train()
     return target
 
 
 def preview_sampling_settings(args):
+    if getattr(args, 'joint_pair_top_k', 0):
+        return [dict(setting_name=(f'joint_t{args.joint_pair_temperature:g}'
+            f'_k{args.joint_pair_top_k}_p{args.joint_pair_top_p:g}'),
+            **joint_pair_sampling_options(args))]
     original = {
         "setting_name": "at1_k250_p1__ct1_k250_p1",
         "atom_temperature": 1.0, "atom_top_k": 250, "atom_top_p": 1.0,
@@ -1522,6 +1579,14 @@ def preview_sampling_settings(args):
     ]
 
 
+def joint_pair_sampling_options(args):
+    """Optional inference policy; this never changes training targets or weights."""
+    if not getattr(args, 'joint_pair_top_k', 0):
+        return {}
+    return {name: getattr(args, name) for name in ('joint_pair_top_k',
+        'joint_pair_temperature', 'joint_pair_top_p', 'joint_pair_candidate_chunk')}
+
+
 @torch.no_grad()
 @with_fixed_evaluation_rng
 def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_size: int = 64,
@@ -1533,7 +1598,12 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
                                 metric_backend="original-rqvae",
                                 fid_reference_stats=None,
                                 fid_validation_reference_stats=None,
-                                fid_seed=None, reference_metrics=None):
+                                fid_seed=None, reference_metrics=None,
+                                joint_pair_top_k=0, joint_pair_temperature=1.,
+                                joint_pair_top_p=1., joint_pair_candidate_chunk=16384):
+
+    if joint_pair_top_k and not hasattr(model, 'sample_joint_sparse'):
+        raise ValueError('joint pair sampling requires the offset compound model')
 
     device = next(model.parameters()).device
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -1596,6 +1666,7 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
             model,
             (
                 CompoundLaserRQTransformer,
+                CompoundGPT,
                 LevelwiseLaserVAR,
                 SupportFirstLaserRQTransformer,
                 CausalPrefixPatternLaserRQTransformer,
@@ -1607,16 +1678,17 @@ def evaluate_generation_metrics(model, aux, val_loader, num_samples: int, batch_
             coefficient_vocab_size = getattr(
                 model, "coefficient_pattern_vocab_size", aux.coeff_vocab_size
             )
-            atoms, coeff_ids = model.sample_compound(
-                current, aux, cond=labels,
-                atom_temperature=atom_temperature,
-                atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
-                coeff_temperature=coeff_temperature,
-                coeff_top_k=coeff_top_k or coefficient_vocab_size,
-                coeff_top_p=coeff_top_p,
-                amp=True,
-                **sampling_kwargs,
-            )
+            if joint_pair_top_k:
+                sampling_kwargs.update(joint_pair_top_k=joint_pair_top_k,
+                    joint_pair_temperature=joint_pair_temperature, joint_pair_top_p=joint_pair_top_p,
+                    joint_pair_candidate_chunk=joint_pair_candidate_chunk)
+            else:
+                sampling_kwargs.update(atom_temperature=atom_temperature,
+                    atom_top_k=atom_top_k or aux.num_atoms, atom_top_p=atom_top_p,
+                    coeff_temperature=coeff_temperature,
+                    coeff_top_k=coeff_top_k or coefficient_vocab_size, coeff_top_p=coeff_top_p)
+            atoms, coeff_ids = model.sample_compound(current, aux, cond=labels,
+                                                   amp=True, **sampling_kwargs)
             if isinstance(model, OrthogonalCompoundLaserRQTransformer):
                 decoder = aux.decode_orthogonal
             elif isinstance(model, SupportFirstLaserRQTransformer):
@@ -2386,8 +2458,10 @@ class CompoundLaserRQTransformer(RQTransformer):
                  micro_transformer_layers: int = 0,
                  depth_specific_coeff_heads: bool = False,
                  causal_prefix_state: bool = False,
-                 pair_autoregressive: bool = False):
+                 pair_autoregressive: bool = False,
+                 mask_seen_atoms_training: bool = True):
         super().__init__(config)
+        self.mask_seen_atoms_training = bool(mask_seen_atoms_training)
         self.num_atoms = int(num_atoms)
         self.coeff_vocab_size = int(coeff_vocab_size)
         # Training-only candidate evaluation adds no checkpoint parameters.
@@ -2617,13 +2691,17 @@ class CompoundLaserRQTransformer(RQTransformer):
         coeff_ids = self._teacher_coeff_ids
         if atoms is None or coeff_ids is None:
             raise RuntimeError("compound teacher atoms were not set")
-        atom_logits = self.mask_seen_atoms(self.classifier(head_outputs), atoms)
+        atom_logits = self.classifier(head_outputs)
+        if self.mask_seen_atoms_training:
+            atom_logits = self.mask_seen_atoms(atom_logits, atoms)
         atom_vectors = self._model_aux.dictionary.t()[atoms.long()]
         refined = self.refine_coefficient_hidden(head_outputs, atom_vectors)
         outputs = {
             "atom_logits": atom_logits,
             "coeff_logits": self.classify_coefficients(refined),
         }
+        if getattr(self, 'capture_shared_hidden', False):
+            outputs['shared_hidden'] = head_outputs
         if self.training and self.geometry_top_k:
             outputs["geometry_coeff_logits"] = self.geometry_coefficient_logits(
                 head_outputs, outputs
@@ -3799,7 +3877,7 @@ class CausalPrefixPatternLaserRQTransformer(RQTransformer):
         return atoms, pattern_ids
 
 
-def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
+def _build_model_uninitialized(total_vocab_size: int, num_atoms: int, *, compound=False,
                 orthogonal_compound=False,
                 closed_loop_orthogonal=False,
                 closed_loop_coeff_state="expected",
@@ -3811,12 +3889,80 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 compound_depth_specific_coeff_heads=False,
                 compound_causal_prefix_state=False,
                 compound_pair_autoregressive=False,
+                compound_mask_seen_atoms_training=True,
+                coefficient_history_layers=0,
+                coefficient_history_width=512,
+                coefficient_history_heads=8,
+                coefficient_history_dropout=0.1,
+                coefficient_history_normalize_fields=False,
                 support_first_patterns=False, causal_prefix_patterns=False,
                 coefficient_pattern_vocab_size=None,
                 prefix_pattern_vocab_sizes=None,
                 sparsity_level=2,
                 physical_pair_context=False,
-                model_preset="imagenet-1400m"):
+                efficient_pair_backbone=False,
+                model_preset="imagenet-1400m", backbone="rqtransformer",
+                gpt_attention_dropout=None, gpt_embedding_dropout=None,
+                gpt_ffn_intermediate_dropout=None,
+                gpt_coefficient_conditioner_layers=0,
+                gpt_coefficient_conditioner_width=512,
+                gpt_coefficient_conditioner_heads=8):
+    if backbone == "gpt":
+        if (not compound or model_preset != "imagenet-1400m"
+                or orthogonal_compound or levelwise_var or efficient_pair_backbone
+                or physical_pair_context or closed_loop_orthogonal
+                or support_first_patterns or causal_prefix_patterns
+                or compound_causal_prefix_state or compound_geometry_head
+                or coefficient_history_layers or compound_refiner_layers
+                or compound_micro_transformer_layers or compound_depth_specific_coeff_heads):
+            raise ValueError("flat GPT requires plain ImageNet compound pair targets and no RQ refiners")
+        return CompoundGPT(CompoundGPTConfig(
+            block_size=(8, 8, sparsity_level), num_atoms=num_atoms,
+            coeff_vocab_size=coeff_vocab_size,
+            mask_seen_atoms_training=compound_mask_seen_atoms_training,
+            attention_dropout=gpt_attention_dropout,
+            embedding_dropout=gpt_embedding_dropout,
+            ffn_intermediate_dropout=gpt_ffn_intermediate_dropout,
+            coefficient_conditioner_layers=gpt_coefficient_conditioner_layers,
+            coefficient_conditioner_width=gpt_coefficient_conditioner_width,
+            coefficient_conditioner_heads=gpt_coefficient_conditioner_heads))
+    if backbone != "rqtransformer":
+        raise ValueError(f"unknown backbone: {backbone}")
+    if efficient_pair_backbone:
+        if (not physical_pair_context or compound or orthogonal_compound
+                or levelwise_var or support_first_patterns or causal_prefix_patterns
+                or compound_causal_prefix_state or compound_geometry_head
+                or closed_loop_orthogonal):
+            raise ValueError("efficient pair backbone requires offset scalar targets and plain pair autoregression")
+        if coefficient_history_layers < 1:
+            raise ValueError("efficient pair backbone preserves the coefficient-history decoder")
+        from src.models.offset_pair_prior import OffsetPairRQTransformer
+        native = _build_model_uninitialized(total_vocab_size, num_atoms, compound=True,
+            coeff_vocab_size=coeff_vocab_size,
+            compound_refiner_layers=compound_refiner_layers,
+            compound_micro_transformer_layers=compound_micro_transformer_layers,
+            compound_depth_specific_coeff_heads=compound_depth_specific_coeff_heads,
+            compound_pair_autoregressive=True,
+            compound_mask_seen_atoms_training=compound_mask_seen_atoms_training,
+            coefficient_history_layers=coefficient_history_layers,
+            coefficient_history_width=coefficient_history_width,
+            coefficient_history_heads=coefficient_history_heads,
+            coefficient_history_dropout=coefficient_history_dropout,
+            coefficient_history_normalize_fields=coefficient_history_normalize_fields,
+            sparsity_level=sparsity_level, model_preset=model_preset)
+        return OffsetPairRQTransformer.from_pair_backbone(native)
+    if coefficient_history_layers < 0:
+        raise ValueError("coefficient history layers must be nonnegative")
+    if coefficient_history_layers:
+        if (not (orthogonal_compound or (compound and compound_pair_autoregressive))
+                or levelwise_var or compound_causal_prefix_state
+                or compound_geometry_head or closed_loop_orthogonal):
+            raise ValueError("coefficient history requires a plain full-pair or orthogonal compound prior")
+        if (coefficient_history_width < 1 or coefficient_history_heads < 1
+                or coefficient_history_width % coefficient_history_heads
+                or not math.isfinite(coefficient_history_dropout)
+                or not 0 <= coefficient_history_dropout < 1):
+            raise ValueError("invalid coefficient history width, heads or dropout")
     if physical_pair_context and (compound or orthogonal_compound or levelwise_var
                                  or support_first_patterns or causal_prefix_patterns):
         raise ValueError("physical-pair scalar context requires the scalar-token prior")
@@ -3935,7 +4081,7 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
             OrthogonalCompoundLaserRQTransformer
             if orthogonal_compound else CompoundLaserRQTransformer
         )
-        return compound_class(
+        model = compound_class(
             RQTransformerConfig.create(cfg), num_atoms=num_atoms,
             coeff_vocab_size=coeff_vocab_size,
             refiner_layers=compound_refiner_layers,
@@ -3945,6 +4091,7 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
             causal_prefix_state=compound_causal_prefix_state,
             **({
                 "pair_autoregressive": compound_pair_autoregressive,
+                "mask_seen_atoms_training": compound_mask_seen_atoms_training,
             } if compound_class is CompoundLaserRQTransformer else {}),
             **({
                 "closed_loop_coefficients": closed_loop_orthogonal,
@@ -3954,10 +4101,44 @@ def build_model(total_vocab_size: int, num_atoms: int, *, compound=False,
                 ),
             } if orthogonal_compound else {}),
         )
+        if coefficient_history_layers:
+            from src.training.compound_history import attach_coefficient_history_decoder
+            model = attach_coefficient_history_decoder(
+                model, width=coefficient_history_width, layers=coefficient_history_layers,
+                heads=coefficient_history_heads, dropout=coefficient_history_dropout,
+                normalize_fields=coefficient_history_normalize_fields,
+            )
+        return model
     if physical_pair_context:
         from src.models.physical_pair_scalar_prior import PhysicalPairScalarRQTransformer
         return PhysicalPairScalarRQTransformer(RQTransformerConfig.create(cfg), num_atoms=num_atoms)
     return LaserRQTransformer(RQTransformerConfig.create(cfg), num_atoms=num_atoms)
+
+
+
+def build_model(total_vocab_size: int, num_atoms: int, *, rq_initialization="upstream",
+                coefficient_head="categorical", coefficient_mixture_components=8,
+                coefficient_mixture_width=256, coefficient_mixture_min_scale=1.e-3,
+                coefficient_mixture_max=3., **kwargs):
+    """Build the complete prior, then initialize fresh RQ weights once.
+
+    The legacy policy reproduces constructor defaults for controlled ablations
+    and checkpoint restores. VAR models retain their own initialization.
+    """
+    if rq_initialization not in {"upstream", "legacy"}:
+        raise ValueError(f"Unknown RQ initialization policy: {rq_initialization}")
+    model = _build_model_uninitialized(total_vocab_size, num_atoms, **kwargs)
+    if rq_initialization == "upstream" and isinstance(model, RQTransformer):
+        from src.training.rq_initialization import initialize_rq_prior
+        initialize_rq_prior(model)
+    if coefficient_head == "discretized-logistic-mixture":
+        from src.models.discretized_coefficient_mixture import install_coefficient_mixture
+        install_coefficient_mixture(model, coefficient_max=coefficient_mixture_max,
+            components=coefficient_mixture_components, width=coefficient_mixture_width,
+            min_scale=coefficient_mixture_min_scale)
+    elif coefficient_head != "categorical":
+        raise ValueError(f"Unknown coefficient head: {coefficient_head}")
+    return model
 
 
 def support_first_objective(
@@ -4089,6 +4270,8 @@ def compound_objective(
     target_physical,
     *,
     atom_weight: float,
+    atom_depth_weights=None,
+    coefficient_depth_weights=None,
     causal_prefix_prediction=None,
     target_causal_prefix=None,
     causal_prefix_weight: float = 0.0,
@@ -4104,6 +4287,7 @@ def compound_objective(
     geometry_top_k: int = 4,
     geometry_orthogonal: bool = False,
     geometry_candidate_coeff_logits=None,
+    geometry_estimator="candidate_conditional",
     target_atom_ids=None,
     target_atom_weights=None,
     target_atom_probabilities=None,
@@ -4128,9 +4312,11 @@ def compound_objective(
         safe = torch.where(target_atom_probabilities > 0, atom_log_probs, 0.)
         atom_cross_entropy = -(target_atom_probabilities * safe).sum(-1)
     depth = target_atoms.shape[-1]
-    classification = (
-        atom_weight * atom_cross_entropy.sum(dim=-1) + coeff_cross_entropy.sum(dim=-1)
-    ).mean() / ((atom_weight + 1.0) * depth)
+    from src.training.compound_depth_loss import compound_depth_classification
+    classification, weighted_atom_ce, weighted_coefficient_ce = compound_depth_classification(
+        atom_cross_entropy, coeff_cross_entropy, atom_weight=atom_weight,
+        atom_depth_weights=atom_depth_weights, coefficient_depth_weights=coefficient_depth_weights,
+    )
 
     coefficient_regression = atom_logits.new_zeros((), dtype=torch.float32)
     coefficient_crps = atom_logits.new_zeros((), dtype=torch.float32)
@@ -4171,25 +4357,38 @@ def compound_objective(
         if distribution_geometry:
             if geometry_dictionary is None or geometry_coeff_bins is None or geometry_coeff_scales is None:
                 raise ValueError("distribution geometry requires dictionary, bins, and depth scales")
-            if geometry_candidate_coeff_logits is None:
-                raise ValueError("distribution geometry requires atom-conditioned candidate coefficient logits")
-            candidate_weights, candidate_atoms, candidate_vectors = compound_geometry_candidates(
-                atom_logits, target_atoms, geometry_dictionary, geometry_top_k,
-                orthogonal=geometry_orthogonal,
-            )
-            if geometry_candidate_coeff_logits.shape != (*candidate_atoms.shape, coeff_logits.shape[-1]):
-                raise ValueError("geometry candidate coefficient logits do not match the candidate pool")
-            expected_coeff = (
-                geometry_candidate_coeff_logits.float().softmax(dim=-1)
-                * geometry_coeff_bins.float()
-            ).sum(dim=-1)
-            scales = geometry_coeff_scales.float().view(
-                *([1] * (expected_coeff.ndim - 2)), -1, 1
-            )
-            prediction = (
-                candidate_weights.unsqueeze(-1) * candidate_vectors
-                * (expected_coeff * scales).unsqueeze(-1)
-            ).sum(dim=-2)
+            if geometry_estimator == "ffhq_reference":
+                # Exact surrogate from ffhqcmp0804205803: the coefficient
+                # distribution is conditioned on the teacher atom. This is a
+                # physical auxiliary loss, not an exact joint expectation.
+                weights, _, vectors = compound_geometry_candidates(
+                    atom_logits, target_atoms, geometry_dictionary, geometry_top_k)
+                expected_atom = (weights.unsqueeze(-1) * vectors).sum(dim=-2)
+                expected_coeff = (coeff_log_probs.exp() * geometry_coeff_bins.float()).sum(-1)
+                scales = geometry_coeff_scales.float().view(*([1] * (expected_coeff.ndim-1)), -1)
+                prediction = expected_atom * (expected_coeff * scales).unsqueeze(-1)
+            elif geometry_estimator == "candidate_conditional":
+                if geometry_candidate_coeff_logits is None:
+                    raise ValueError("distribution geometry requires atom-conditioned candidate coefficient logits")
+                candidate_weights, candidate_atoms, candidate_vectors = compound_geometry_candidates(
+                    atom_logits, target_atoms, geometry_dictionary, geometry_top_k,
+                    orthogonal=geometry_orthogonal,
+                )
+                if geometry_candidate_coeff_logits.shape != (*candidate_atoms.shape, coeff_logits.shape[-1]):
+                    raise ValueError("geometry candidate coefficient logits do not match the candidate pool")
+                expected_coeff = (
+                    geometry_candidate_coeff_logits.float().softmax(dim=-1)
+                    * geometry_coeff_bins.float()
+                ).sum(dim=-1)
+                scales = geometry_coeff_scales.float().view(
+                    *([1] * (expected_coeff.ndim - 2)), -1, 1
+                )
+                prediction = (
+                    candidate_weights.unsqueeze(-1) * candidate_vectors
+                    * (expected_coeff * scales).unsqueeze(-1)
+                ).sum(dim=-2)
+            else:
+                raise ValueError(f"Unknown geometry estimator: {geometry_estimator}")
         else:
             if physical_prediction is None:
                 raise ValueError("auxiliary-head geometry requires physical prediction")
@@ -4232,6 +4431,8 @@ def compound_objective(
         "atom_nll": atom_nll,
         "atom_cross_entropy": atom_cross_entropy,
         "coeff_cross_entropy": coeff_cross_entropy,
+        "depth_weighted_atom_cross_entropy": weighted_atom_ce,
+        "depth_weighted_coeff_cross_entropy": weighted_coefficient_ce,
         "classification": classification,
         "coefficient_regression": coefficient_regression,
         "coefficient_crps": coefficient_crps,
@@ -4336,6 +4537,20 @@ def initialize_orthogonal_from_compound(
 
 def build_parser():
     p = argparse.ArgumentParser()
+    p.add_argument("--backbone", choices=("rqtransformer", "gpt"), default="rqtransformer")
+    p.add_argument("--gpt-attention-dropout", type=float, default=None)
+    p.add_argument("--gpt-embedding-dropout", type=float, default=None)
+    p.add_argument("--gpt-ffn-intermediate-dropout", type=float, default=None)
+    p.add_argument("--gpt-coefficient-conditioner-layers", type=int, default=0)
+    p.add_argument("--gpt-coefficient-conditioner-width", type=int, default=512)
+    p.add_argument("--gpt-coefficient-conditioner-heads", type=int, default=8)
+    p.add_argument('--mask-seen-atoms-training', action=argparse.BooleanOptionalAction,
+                   default=True, help='Mask repeated supports in teacher-forced atom logits; FFHQ reference disables this')
+    p.add_argument('--geometry-estimator', choices=('candidate_conditional','ffhq_reference'),
+                   default='candidate_conditional',
+                   help='Candidate-conditional expectation or exact FFHQ reference geometry surrogate')
+    p.add_argument('--rq-initialization', choices=('upstream', 'legacy'), default='upstream',
+                   help='Fresh RQ prior initialization; checkpoint restores retain saved weights')
     p.add_argument('--online-omp-temperature', type=float, default=None,
                    help='Fresh full-vocabulary OMP from encoder latents; supports before coefficients')
     p.add_argument('--online-omp-site-chunk', type=int, default=256)
@@ -4410,7 +4625,14 @@ def build_parser():
     p.add_argument("--coeff-target-space", choices=("auto", "normalized", "physical"), default="auto")
     p.add_argument(
         "--coeff-target-mode", choices=("soft", "hard"), default="soft",
-        help="Use stochastic soft coefficient targets or deterministic nearest-bin targets",
+        help="Use soft coefficient loss targets or nearest-bin one-hot loss targets",
+    )
+    p.add_argument(
+        "--stochastic-coefficient-inputs", action=argparse.BooleanOptionalAction,
+        default=None,
+        help=("Sample coefficient input IDs from soft targets; disable to retain "
+              "nearest-bin training prefixes independently of the loss targets. "
+              "Default follows coeff-target-mode for backward compatibility."),
     )
     p.add_argument(
         "--coeff-target-temperature", type=float, default=0.5,
@@ -4420,6 +4642,8 @@ def build_parser():
         "--compound-tokens", action=argparse.BooleanOptionalAction, default=False,
         help="Use one compound (atom, coefficient) AR event per sparse component",
     )
+    p.add_argument("--efficient-pair-backbone", action=argparse.BooleanOptionalAction,
+                   default=False, help="Keep four RQ pair positions with explicit offset scalar token IDs")
     p.add_argument(
         "--physical-pair-context", action=argparse.BooleanOptionalAction, default=False,
         help="Use explicit physical pair context and unique atom masks in the scalar-token prior",
@@ -4502,6 +4726,20 @@ def build_parser():
     )
     p.add_argument("--compound-refiner-layers", type=int, default=0)
     p.add_argument("--compound-micro-transformer-layers", type=int, default=0)
+    p.add_argument("--coefficient-history-layers", type=int, default=0,
+                   help="Causal coefficient decoder over completed raster/depth pairs; zero disables it")
+    p.add_argument("--coefficient-history-width", type=int, default=512)
+    p.add_argument("--coefficient-history-heads", type=int, default=8)
+    p.add_argument("--coefficient-history-dropout", type=float, default=0.1)
+    p.add_argument("--coefficient-history-normalize-fields",
+                   action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--coefficient-head", choices=("categorical", "discretized-logistic-mixture"),
+                   default="categorical")
+    p.add_argument("--coefficient-mixture-components", type=int, default=8)
+    p.add_argument("--coefficient-mixture-width", type=int, default=256)
+    p.add_argument("--coefficient-mixture-min-scale", type=float, default=1.e-3)
+    p.add_argument("--compound-gradient-diagnostics-every", type=int, default=100,
+                   help="Rank-0 shared-hidden CE gradient probes at logged DDP updates; zero disables them")
     p.add_argument(
         "--compound-depth-specific-coeff-heads",
         action=argparse.BooleanOptionalAction,
@@ -4529,6 +4767,10 @@ def build_parser():
     )
     p.add_argument("--geometry-top-k", type=int, default=4)
     p.add_argument("--atom-loss-weight", type=float, default=1.0)
+    p.add_argument("--atom-depth-loss-weights", type=float, nargs='+', default=None,
+                   help="Positive per-depth atom CE weights, normalized to mean one; compound prior only")
+    p.add_argument("--coeff-depth-loss-weights", type=float, nargs='+', default=None,
+                   help="Positive per-depth coefficient CE weights, normalized to mean one; compound prior only")
     p.add_argument(
         "--pattern-loss-weight",
         type=float,
@@ -4564,11 +4806,16 @@ def build_parser():
     p.add_argument("--coeff-top-k", type=int, default=0,
                    help="0 keeps all coefficient logits")
     p.add_argument("--coeff-top-p", type=float, default=0.92)
+    p.add_argument('--joint-pair-top-k', type=int, default=0,
+                   help='Global top-k complete atom/coefficient contributions; zero uses legacy field sampling')
+    p.add_argument('--joint-pair-temperature', type=float, default=1.)
+    p.add_argument('--joint-pair-top-p', type=float, default=1.)
+    p.add_argument('--joint-pair-candidate-chunk', type=int, default=16384)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--seed", type=int, default=0,
                    help="Base seed; distributed ranks use seed + rank")
     p.add_argument(
-        "--lr-schedule", choices=("cosine", "warmup-linear", "constant"), default="cosine",
+        "--lr-schedule", choices=("cosine", "warmup-cosine", "warmup-linear", "constant"), default="cosine",
         help=(
             "Optimizer-step LR schedule; warmup-linear matches FoundationVision VAR"
         ),
@@ -4619,6 +4866,8 @@ def build_parser():
                    help="Run full FID every N epochs; 0 disables evaluation")
     p.add_argument("--fid-early-epochs", type=int, default=0,
                    help="Evaluate each initial epoch up to this count, then use --fid-every")
+    p.add_argument('--fid-extra-epochs', type=int, nargs='*', default=[],
+                   help='Additional absolute epoch numbers for generation evaluation')
     p.add_argument("--save-ckpt-freq", type=int, default=2,
                    help="Save the full training checkpoint every N epochs")
     p.add_argument(
@@ -4708,8 +4957,20 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def main(argv=None, *, epoch_validation_callback=None, deferred_checkpoint_restore=None):
     args = build_parser().parse_args(argv)
+    if args.backbone == "gpt" and not (args.compound_tokens and args.compound_pair_autoregressive):
+        raise ValueError("--backbone gpt requires --compound-tokens --compound-pair-autoregressive")
+    if args.stochastic_coefficient_inputs is None:
+        args.stochastic_coefficient_inputs = args.coeff_target_mode == "soft"
+    if args.efficient_pair_backbone and not args.physical_pair_context:
+        raise ValueError("--efficient-pair-backbone requires --physical-pair-context")
+    if (args.compound_gradient_diagnostics_every > 0
+            and ((args.compound_tokens and args.compound_pair_autoregressive)
+                 or args.physical_pair_context)
+            and args.distributed_backend == 'ddp'):
+        from src.training.compound_balance import configure_retained_gradient_probes
+        configure_retained_gradient_probes()
     cache_rfid_preflight = None
     if args.cache_rfid_preflight is not None:
         expected_modes = (
@@ -4747,6 +5008,14 @@ def main(argv=None):
             cache_rfid_preflight[expected_mode] = value
     if args.sparsity_level <= 0:
         raise ValueError("--sparsity-level must be positive")
+    if args.atom_depth_loss_weights is not None or args.coeff_depth_loss_weights is not None:
+        if not (args.compound_tokens or args.orthogonal_compound_tokens or args.physical_pair_context) or args.levelwise_var:
+            raise ValueError("per-depth pair CE weights require a scalar-pair or compound RQ prior")
+        from src.training.depth_weighted_ce import normalize_depth_weights
+        for field in ('atom_depth_loss_weights', 'coeff_depth_loss_weights'):
+            values = getattr(args, field)
+            if values is not None:
+                setattr(args, field, normalize_depth_weights(values, args.sparsity_level))
     if args.coeff_scales is not None and len(args.coeff_scales) != args.sparsity_level:
         raise ValueError(
             f"--coeff-scales requires {args.sparsity_level} values for "
@@ -4754,6 +5023,8 @@ def main(argv=None):
         )
     if args.compound_refiner_layers < 0:
         raise ValueError("--compound-refiner-layers cannot be negative")
+    if args.compound_gradient_diagnostics_every < 0:
+        raise ValueError("gradient diagnostic interval must be nonnegative")
     if args.compound_micro_transformer_layers < 0:
         raise ValueError("--compound-micro-transformer-layers cannot be negative")
     if args.compound_refiner_layers > 0 and args.compound_micro_transformer_layers > 0:
@@ -4796,8 +5067,8 @@ def main(argv=None):
         )
     if args.geometry_top_k <= 0:
         raise ValueError("--geometry-top-k must be positive")
-    if args.atom_loss_weight <= 0:
-        raise ValueError("--atom-loss-weight must be positive")
+    if not math.isfinite(args.atom_loss_weight) or args.atom_loss_weight <= 0:
+        raise ValueError("--atom-loss-weight must be positive and finite")
     if args.pattern_loss_weight <= 0:
         raise ValueError("--pattern-loss-weight must be positive")
     if args.coeff_regression_weight < 0:
@@ -4834,8 +5105,16 @@ def main(argv=None):
         raise ValueError("--sample-grid-batch-size must be in [1, --sample-grid-size]")
     if args.sample_grid_seed < 0:
         raise ValueError("--sample-grid-seed cannot be negative")
+    if args.joint_pair_top_k < 0 or args.joint_pair_candidate_chunk < 1:
+        raise ValueError('joint top-k must be nonnegative and candidate chunk positive')
+    if not math.isfinite(args.joint_pair_temperature) or args.joint_pair_temperature <= 0:
+        raise ValueError('joint pair temperature must be positive and finite')
+    if not math.isfinite(args.joint_pair_top_p) or not 0 < args.joint_pair_top_p <= 1:
+        raise ValueError('joint pair top-p must lie in (0, 1]')
     if args.fid_every < 0:
         raise ValueError("--fid-every cannot be negative")
+    if any(epoch < 1 for epoch in args.fid_extra_epochs):
+        raise ValueError('--fid-extra-epochs must be positive epoch numbers')
     if args.fid_early_epochs < 0:
         raise ValueError("--fid-early-epochs cannot be negative")
     if args.fid_reference_stats is not None:
@@ -4889,10 +5168,10 @@ def main(argv=None):
         and not args.init_stage2_checkpoint.is_file()
     ):
         raise FileNotFoundError(args.init_stage2_checkpoint)
-    if args.lr_schedule == "warmup-linear" and args.warmup_epochs >= args.lr_schedule_epochs:
+    if args.lr_schedule in {"warmup-linear", "warmup-cosine"} and args.warmup_epochs >= args.lr_schedule_epochs:
         raise ValueError("--warmup-epochs must be shorter than the LR schedule")
     if (
-        args.lr_schedule in {"cosine", "warmup-linear"}
+        args.lr_schedule in {"cosine", "warmup-cosine", "warmup-linear"}
         and not args.lr_schedule_restart_id
         and args.epochs > args.lr_schedule_epochs
     ):
@@ -4911,12 +5190,15 @@ def main(argv=None):
     compound_scalar_mode = (
         args.compound_tokens or args.orthogonal_compound_tokens
     )
-    if args.geometry_loss_weight > 0 and not compound_scalar_mode:
+    if args.geometry_loss_weight > 0 and not (compound_scalar_mode or args.efficient_pair_backbone):
         raise ValueError("geometry contribution loss requires --compound-tokens")
     if args.compound_distribution_geometry and args.geometry_loss_weight <= 0:
         raise ValueError("distribution geometry requires a positive geometry loss weight")
-    if args.compound_depth_specific_coeff_heads and not compound_scalar_mode:
+    if args.compound_depth_specific_coeff_heads and not (compound_scalar_mode or args.efficient_pair_backbone):
         raise ValueError("depth-specific coefficient heads require --compound-tokens")
+    if args.coefficient_history_layers and ((args.compound_distribution_geometry
+            and args.geometry_estimator != "ffhq_reference") or args.online_omp_temperature is not None):
+        raise ValueError("coefficient history does not support candidate geometry or support-first online OMP")
     if args.compound_pair_autoregressive and not args.compound_tokens:
         raise ValueError(
             "full-pair autoregression requires dictionary --compound-tokens"
@@ -5233,8 +5515,15 @@ def main(argv=None):
                    coefficient_patterns=coefficient_patterns,
                    prefix_patterns=prefix_patterns,
                    prefix_pattern_vocab_sizes=prefix_pattern_vocab_sizes).to(device)
+    checkpoint_exists = args.resume and resume_checkpoint.is_file()
     unwrapped_model = build_model(
         total_vocab_size, args.num_atoms, compound=args.compound_tokens,
+        rq_initialization="legacy" if checkpoint_exists else args.rq_initialization,
+        coefficient_head=args.coefficient_head,
+        coefficient_mixture_components=args.coefficient_mixture_components,
+        coefficient_mixture_width=args.coefficient_mixture_width,
+        coefficient_mixture_min_scale=args.coefficient_mixture_min_scale,
+        coefficient_mixture_max=args.coeff_max,
         orthogonal_compound=args.orthogonal_compound_tokens,
         closed_loop_orthogonal=args.closed_loop_orthogonal_training,
         closed_loop_coeff_state=args.closed_loop_coeff_state,
@@ -5249,25 +5538,40 @@ def main(argv=None):
         compound_depth_specific_coeff_heads=args.compound_depth_specific_coeff_heads,
         compound_causal_prefix_state=args.causal_prefix_state,
         compound_pair_autoregressive=args.compound_pair_autoregressive,
+        compound_mask_seen_atoms_training=args.mask_seen_atoms_training,
+        coefficient_history_layers=args.coefficient_history_layers,
+        coefficient_history_width=args.coefficient_history_width,
+        coefficient_history_heads=args.coefficient_history_heads,
+        coefficient_history_dropout=args.coefficient_history_dropout,
+        coefficient_history_normalize_fields=args.coefficient_history_normalize_fields,
         support_first_patterns=args.support_first_pattern_tokens,
         causal_prefix_patterns=args.causal_prefix_pattern_tokens,
         coefficient_pattern_vocab_size=coefficient_pattern_vocab_size,
         prefix_pattern_vocab_sizes=prefix_pattern_vocab_sizes,
         sparsity_level=args.sparsity_level,
         physical_pair_context=args.physical_pair_context,
+        efficient_pair_backbone=args.efficient_pair_backbone,
         model_preset=args.model_preset,
+        backbone=args.backbone,
+        gpt_attention_dropout=args.gpt_attention_dropout,
+        gpt_embedding_dropout=args.gpt_embedding_dropout,
+        gpt_ffn_intermediate_dropout=args.gpt_ffn_intermediate_dropout,
+        gpt_coefficient_conditioner_layers=args.gpt_coefficient_conditioner_layers,
+        gpt_coefficient_conditioner_width=args.gpt_coefficient_conditioner_width,
+        gpt_coefficient_conditioner_heads=args.gpt_coefficient_conditioner_heads,
     )
     if args.online_omp_temperature is not None:
         from src.training.full_vocab_omp import attach_supports_first_omp
         unwrapped_model = attach_supports_first_omp(unwrapped_model)
     if args.compound_distribution_geometry:
-        unwrapped_model.geometry_top_k = args.geometry_top_k
-        args.compound_geometry_version = "atom_conditional_v2"
+        unwrapped_model.geometry_top_k = (args.geometry_top_k
+            if args.geometry_estimator == "candidate_conditional" else 0)
+        args.compound_geometry_version = ("atom_conditional_v2"
+            if args.geometry_estimator == "candidate_conditional" else "ffhq_reference_v4")
     parameter_names = [name for name, _ in unwrapped_model.named_parameters()]
 
     resume_payload = None
     resume_optimizer_state = None
-    checkpoint_exists = args.resume and resume_checkpoint.is_file()
     if checkpoint_exists and args.init_stage2_checkpoint is not None:
         raise ValueError(
             "weights-only initialization requires a new output directory or --no-resume"
@@ -5436,6 +5740,8 @@ def main(argv=None):
         raise ValueError("training loader does not contain a complete optimizer step")
     runtime_config = {
         **vars(args),
+        "backbone_config": asdict(unwrapped_model.config) if isinstance(unwrapped_model, CompoundGPT) else None,
+        "rq_initialization_effective": "restored" if checkpoint_exists else args.rq_initialization,
         "world_size": world,
         "accumulation_steps": accumulation,
         "exact_global_batch": True,
@@ -5463,7 +5769,9 @@ def main(argv=None):
                         id=args.wandb_id, resume="must" if args.resume and args.wandb_id else None,
                         mode=args.wandb_mode,
                         config={**runtime_config, "architecture": (
-                            f"orthogonal-compound-closed-loop-{args.closed_loop_coeff_state}-rqtransformer-{args.model_preset}"
+                            "flat-causal-compound-gpt-1400m"
+                            if args.backbone == "gpt"
+                            else f"orthogonal-compound-closed-loop-{args.closed_loop_coeff_state}-rqtransformer-{args.model_preset}"
                             if args.closed_loop_orthogonal_training
                             else f"orthogonal-compound-causal-prefix-rqtransformer-{args.model_preset}"
                             if args.orthogonal_compound_tokens and args.causal_prefix_state
@@ -5612,10 +5920,13 @@ def main(argv=None):
         resume_batch_idx = int(resume_payload.get("batch_idx", 0))
         best_fid = [(float(x[0]), str(checkpoint_dir / Path(x[1]).name))
                     for x in resume_payload.get("best_fid", [])]
-        if any(not Path(path).is_file() for _, path in best_fid):
+        missing_best = [(score, path) for score, path in best_fid if not Path(path).is_file()]
+        if missing_best and not (deferred_checkpoint_restore is not None
+                and deferred_checkpoint_restore(missing_best, resume_payload, args)):
             raise FileNotFoundError('Recovered best FID checkpoint is missing')
         best_inception = [
-            (float(x[0]), str(x[1])) for x in resume_payload.get("best_inception", [])
+            (float(x[0]), str(checkpoint_dir / Path(x[1]).name))
+            for x in resume_payload.get("best_inception", [])
         ]
         if not uses_inception_score(args.dataset):
             best_inception = []
@@ -5624,6 +5935,11 @@ def main(argv=None):
         old_world_size = int(saved_config.get("world_size", -1))
         layout_changed = validate_resume_layout(saved_config, world, accumulation,
             args.total_batch_size, resume_batch_idx)
+        if saved_config.get('world_size') == world and saved_config.get('accumulation_steps') != accumulation:
+            from src.training.microbatch_migration import remap_microbatch_cursor
+            resume_batch_idx = remap_microbatch_cursor(saved_config, world=world,
+                accumulation=accumulation, total_batch=args.total_batch_size,
+                batch_idx=resume_batch_idx)
         if layout_changed and rank() == 0:
             print("Resuming at saved optimizer boundary with updated GPU layout; global batch 2048, data cursor, optimizer and LR schedule retained", flush=True)
         sampler.set_start_batch(resume_batch_idx)
@@ -5700,7 +6016,7 @@ def main(argv=None):
             flush=True,
         )
     scheduler = None
-    if args.lr_schedule in {"cosine", "warmup-linear"}:
+    if args.lr_schedule in {"cosine", "warmup-cosine", "warmup-linear"}:
         schedule_steps = args.lr_schedule_epochs * optimizer_steps_per_epoch
         saved_config = {} if resume_payload is None else resume_payload.get("config", {})
         restart_scheduler_now = (
@@ -5737,7 +6053,15 @@ def main(argv=None):
             # incorrectly reinterpret the W&B/checkpoint global-step counter.
             for param_group in optimizer.param_groups:
                 param_group["lr"] = args.lr
-        if args.lr_schedule == "cosine":
+        if args.lr_schedule == "warmup-cosine":
+            from src.training.warmup_cosine_schedule import WarmupCosineSchedule
+            scheduler = WarmupCosineSchedule(
+                optimizer, initial_lr=args.lr, min_lr=args.min_lr,
+                total_steps=schedule_steps,
+                warmup_steps=round(args.warmup_epochs * optimizer_steps_per_epoch),
+                completed_steps=schedule_completed_steps, state_dict=scheduler_state,
+            )
+        elif args.lr_schedule == "cosine":
             scheduler = create_cosine_lr_scheduler(
                 optimizer,
                 initial_lr=args.lr,
@@ -5815,6 +6139,7 @@ def main(argv=None):
                     generation_model,
                     (
                         CompoundLaserRQTransformer,
+                        CompoundGPT,
                         LevelwiseLaserVAR,
                         SupportFirstLaserRQTransformer,
                         CausalPrefixPatternLaserRQTransformer,
@@ -5915,6 +6240,7 @@ def main(argv=None):
                     fid_reference_stats=args.fid_reference_stats,
                     fid_validation_reference_stats=args.fid_validation_reference_stats,
                     fid_seed=args.fid_seed, reference_metrics=reference_metrics,
+                    **joint_pair_sampling_options(args),
                 )
             cuda_memory_report(device, f"step {global_step} catch-up FID generation")
         progress_epoch = start_epoch + resume_batch_idx / complete_microbatches
@@ -6054,7 +6380,7 @@ def main(argv=None):
                         coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
                             coeffs,
                             temp=args.coeff_target_temperature,
-                            stochastic=args.coeff_target_mode == "soft",
+                            stochastic=args.stochastic_coefficient_inputs,
                             hard=args.coeff_target_mode == "hard",
                         )
                         if source_bank_atoms is not None:
@@ -6081,7 +6407,7 @@ def main(argv=None):
                             atoms,
                             coeffs,
                             temp=args.coeff_target_temperature,
-                            stochastic=args.coeff_target_mode == "soft",
+                            stochastic=args.stochastic_coefficient_inputs,
                             compact=True,
                             hard=args.coeff_target_mode == "hard",
                         )
@@ -6112,7 +6438,7 @@ def main(argv=None):
                         coeff_ids, target_coeff_probs = aux.compound_coeff_ids(
                             coeffs,
                             temp=args.coeff_target_temperature,
-                            stochastic=args.coeff_target_mode == "soft",
+                            stochastic=args.stochastic_coefficient_inputs,
                             hard=args.coeff_target_mode == "hard",
                         )
                         if source_bank_atoms is not None:
@@ -6152,14 +6478,20 @@ def main(argv=None):
                                 stochastic_atom_site_chunk=args.stochastic_atom_site_chunk)
                             tokens, compact_targets = aux.sparse_targets(
                                 atoms, coeffs, temp=args.coeff_target_temperature,
-                                stochastic=args.coeff_target_mode == "soft",
+                                stochastic=args.stochastic_coefficient_inputs,
                                 compact=True, hard=args.coeff_target_mode == "hard",
                             )
+                    elif args.efficient_pair_backbone and args.geometry_loss_weight > 0:
+                        atoms, coeffs = aux.encode_sparse_components(images)
+                        tokens, compact_targets = aux.sparse_targets(atoms, coeffs,
+                            temp=args.coeff_target_temperature,
+                            stochastic=args.stochastic_coefficient_inputs, compact=True,
+                            hard=args.coeff_target_mode == "hard")
                     else:
                         tokens, soft_targets = aux.encode_sparse(
                             images,
                             temp=args.coeff_target_temperature,
-                            stochastic=args.coeff_target_mode == "soft",
+                            stochastic=args.stochastic_coefficient_inputs,
                             hard=args.coeff_target_mode == "hard",
                         )
             # Validation uses the same exact global-batch accumulation as
@@ -6180,7 +6512,20 @@ def main(argv=None):
                         causal_prefix_reconstructions=causal_prefix_reconstructions,
                     )
                 else:
-                    logits = model(tokens, model_aux=aux, cond=labels, amp=False)
+                    unwrapped_model.capture_shared_hidden = bool(
+                        args.compound_gradient_diagnostics_every
+                        and rank() == 0 and sync
+                        and (global_step + 1) % args.compound_gradient_diagnostics_every == 0
+                        and (global_step + 1) % 10 == 0
+                        and args.distributed_backend == 'ddp'
+                        and ((args.compound_tokens and args.compound_pair_autoregressive)
+                             or args.physical_pair_context)
+                        and args.online_omp_temperature is None
+                    )
+                    try:
+                        logits = model(tokens, model_aux=aux, cond=labels, amp=False)
+                    finally:
+                        unwrapped_model.capture_shared_hidden = False
                 diagnostic_metrics = None
                 if (
                     args.token_cache
@@ -6325,6 +6670,8 @@ def main(argv=None):
                             target_coeff_probs,
                             target_physical,
                             atom_weight=args.atom_loss_weight,
+                            atom_depth_weights=args.atom_depth_loss_weights,
+                            coefficient_depth_weights=args.coeff_depth_loss_weights,
                             target_atom_ids=soft_atom_ids,
                             target_atom_weights=soft_atom_weights,
                             target_atom_probabilities=dense_atom_probs,
@@ -6345,9 +6692,18 @@ def main(argv=None):
                             geometry_top_k=args.geometry_top_k,
                             geometry_orthogonal=args.orthogonal_compound_tokens,
                             geometry_candidate_coeff_logits=logits.get("geometry_coeff_logits"),
+                            geometry_estimator=args.geometry_estimator,
                         )
                         atom_loss = objective["atom_nll"]
                         coeff_loss = objective["coeff_cross_entropy"]
+                        gradient_metrics = {}
+                        if 'shared_hidden' in logits:
+                            from src.training.compound_balance import shared_hidden_gradient_metrics
+                            gradient_metrics = shared_hidden_gradient_metrics(
+                                objective['depth_weighted_atom_cross_entropy'],
+                                objective['depth_weighted_coeff_cross_entropy'],
+                                logits.pop('shared_hidden'), atom_weight=args.atom_loss_weight,
+                            )
                         if rank() == 0 and sync and (global_step + 1) % 10 == 0:
                             with torch.no_grad():
                                 coeff_entropy = -(
@@ -6377,6 +6733,12 @@ def main(argv=None):
                                 expected_physical_abs_error = expected_abs_error * pair_scales
                                 diagnostic_metrics = {
                                     "train/atom_nll": float(atom_loss.mean()),
+                                    **gradient_metrics,
+                                    "train/atom_loss_weight": args.atom_loss_weight,
+                                    "train/weighted_atom_ce": float(objective['depth_weighted_atom_cross_entropy'].mean())
+                                        * args.atom_loss_weight / (args.atom_loss_weight + 1.),
+                                    "train/weighted_coefficient_ce": float(objective['depth_weighted_coeff_cross_entropy'].mean())
+                                        / (args.atom_loss_weight + 1.),
                                     "train/atom_soft_cross_entropy": float(objective["atom_cross_entropy"].mean()),
                                     "train/atom_target_entropy": (float(-(dense_atom_probs * dense_atom_probs.clamp_min(1e-30).log()).sum(-1).mean()) if dense_atom_probs is not None else float(sparse_atom_entropy(soft_atom_ids, soft_atom_weights).mean()) if soft_atom_ids is not None else 0.0),
                                     "train/coeff_cross_entropy": float(coeff_loss.mean()),
@@ -6431,6 +6793,14 @@ def main(argv=None):
                                         f"train/atom_nll_depth{depth_index}": float(
                                             atom_loss[..., depth_index].mean()
                                         ),
+                                        f"train/atom_soft_cross_entropy_depth{depth_index}": float(
+                                            objective['atom_cross_entropy'][..., depth_index].mean()),
+                                        f"train/atom_depth_loss_weight_depth{depth_index}": (
+                                            args.atom_depth_loss_weights[depth_index]
+                                            if args.atom_depth_loss_weights is not None else 1.),
+                                        f"train/coeff_depth_loss_weight_depth{depth_index}": (
+                                            args.coeff_depth_loss_weights[depth_index]
+                                            if args.coeff_depth_loss_weights is not None else 1.),
                                         f"train/atom_top1_depth{depth_index}": float(
                                             (
                                                 atom_logits[..., depth_index, :].argmax(dim=-1)
@@ -6454,18 +6824,42 @@ def main(argv=None):
                                         ),
                                     })
                     else:
-                        crps_weight = coeff_logits.new_tensor(
-                            crps_weight_at_step(args.coeff_crps_weight, global_step,
-                                                args.coeff_crps_start_step, args.coeff_crps_ramp_steps),
-                            dtype=torch.float32,
-                        )
+                        crps_weight = crps_weight_at_step(
+                            args.coeff_crps_weight, global_step,
+                            args.coeff_crps_start_step, args.coeff_crps_ramp_steps)
                         soft_atom_options = ({} if soft_atom_ids is None else dict(
                             target_atom_ids=soft_atom_ids, target_atom_weights=soft_atom_weights))
-                        loss = physical_pair_objective(
+                        from src.training.scalar_pair_loss import scalar_pair_objective, scalar_pair_metrics
+                        progress_epochs = epoch + min(absolute_batch_idx+1, complete_microbatches)/complete_microbatches
+                        geometry_weight = scheduled_geometry_weight(args.geometry_loss_weight,
+                            progress_epochs,args.geometry_start_epoch,args.geometry_warmup_epochs)
+                        physical_target = (aux.physical_contributions(compact_targets[0], coeffs)
+                                           if geometry_weight > 0 else None)
+                        loss, scalar_details = scalar_pair_objective(
                             atom_logits, coeff_logits, *compact_targets,
-                            aux.coeff_bins, crps_weight, accumulation,
+                            aux.coeff_bins, crps_weight=crps_weight, accumulation=accumulation,
+                            atom_weight=args.atom_loss_weight,
+                            atom_depth_weights=args.atom_depth_loss_weights,
+                            coefficient_depth_weights=args.coeff_depth_loss_weights,
+                            geometry_weight=geometry_weight, target_physical=physical_target,
+                            geometry_dictionary=aux.dictionary, geometry_coeff_scales=aux.coeff_scales,
+                            geometry_top_k=args.geometry_top_k, geometry_estimator=args.geometry_estimator,
+                            geometry_candidate_coeff_logits=logits.get("geometry_coeff_logits"),
                             **soft_atom_options,
                         )
+                        scalar_gradient_metrics = {}
+                        if isinstance(logits, dict) and 'shared_hidden' in logits:
+                            from src.training.compound_balance import shared_hidden_gradient_metrics
+                            scalar_gradient_metrics = shared_hidden_gradient_metrics(
+                                scalar_details['depth_weighted_atom_cross_entropy'],
+                                scalar_details['depth_weighted_coeff_cross_entropy'],
+                                logits.pop('shared_hidden'), atom_weight=args.atom_loss_weight)
+                        if rank() == 0 and sync and (global_step + 1) % 10 == 0:
+                            diagnostic_metrics = scalar_pair_metrics(
+                                atom_logits, coeff_logits, *compact_targets,
+                                aux.coeff_bins, aux.coeff_scales, scalar_details,
+                                atom_weight=args.atom_loss_weight, geometry_weight=geometry_weight)
+                            diagnostic_metrics.update(scalar_gradient_metrics)
                 else:
                     log_probs = F.log_softmax(logits.float(), dim=-1)
                     loss = -(soft_targets * log_probs).sum(dim=-1).mean() / accumulation
@@ -6623,8 +7017,11 @@ def main(argv=None):
             sampler.set_start_batch(0)
         if dist.is_initialized():
             dist.barrier()
+        if epoch_validation_callback is not None:
+            epoch_validation_callback(model, aux, device, epoch, global_step, wb, args.output)
         run_fid = args.fid_every > 0 and (
             epoch == 0 or epoch + 1 <= args.fid_early_epochs
+            or epoch + 1 in args.fid_extra_epochs
             or (epoch + 1) % args.fid_every == 0
         )
         # Every evaluated model must be recoverable, even when the FID cadence
@@ -6657,6 +7054,7 @@ def main(argv=None):
                         fid_reference_stats=args.fid_reference_stats,
                         fid_validation_reference_stats=args.fid_validation_reference_stats,
                         fid_seed=args.fid_seed, reference_metrics=reference_metrics,
+                        **joint_pair_sampling_options(args),
                     )
                 cuda_memory_report(device, f"epoch {epoch + 1} FID generation")
         best_path = None
@@ -6798,7 +7196,13 @@ def run(cfg):
     """Run the historical compound recipe with options declared in YAML."""
     from src.training.options import options_to_argv
 
-    main(options_to_argv(OmegaConf.to_container(cfg.options, resolve=True)))
+    if cfg.get("runtime_profile") == "imagenet_compound":
+        from src.training.imagenet_compound_runtime import install, HeldoutValidation
+        install(cfg)
+        main(options_to_argv(OmegaConf.to_container(cfg.options, resolve=True)),
+             epoch_validation_callback=HeldoutValidation(cfg.options.data))
+    else:
+        main(options_to_argv(OmegaConf.to_container(cfg.options, resolve=True)))
 
 
 if __name__ == "__main__":

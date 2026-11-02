@@ -1,5 +1,5 @@
 """Resumable matched ImageNet VQ/LASER tokenizer -> next-scale VAR pipeline."""
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 import hashlib
 import json
@@ -14,21 +14,19 @@ import time
 from types import ModuleType
 
 import numpy as np
-from PIL import Image
 from omegaconf import OmegaConf
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader, DistributedSampler, Subset
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torchvision.utils import save_image
 
 from src.models.multiscale_laser_var import LaserVQVAE, LaserVAR, VQVAE, UPSTREAM, UPSTREAM_REVISION
 from src.models.scratch_var import build_scratch_tokenizer, build_scratch_prior, state_digest, shared_prior_digest
 from src.models.discriminator import NLayerDiscriminator
 from src.models.rqvae.lpips import LPIPS
+from src.data.var_images import Images, IndexedImageNet, load_manifests
 from src.original_rq_training import FeatureMoments, atomic_json, file_sha256
 from utils.lr_control import lr_wd_annealing
 
@@ -41,26 +39,17 @@ sys.modules.setdefault(_metrics.__name__, _metrics)
 from _laser_var_metrics.fid import get_inception_model, frechet_distance
 
 
-class Images(Dataset):
-    def __init__(self, root, manifest, train, seed):
-        self.root, self.rows, self.seed = Path(root), manifest["samples"], seed
-        self.epoch = 0
-        self.transform = transforms.Compose([
-            transforms.Resize(288, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop(256) if train else transforms.CenterCrop(256),
-            transforms.ToTensor(), transforms.Normalize(.5, .5)])
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __getitem__(self, index):
-        name, label = self.rows[index]
-        # Fresh image augmentation each epoch, reproducible across worker counts.
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(self.seed + self.epoch * 10000019 + index)
-            with Image.open(self.root / name) as im:
-                image = self.transform(im.convert("RGB"))
-        return image, label
+@contextmanager
+def evaluation_rng():
+    """Keep evaluation from changing the subsequent training random stream."""
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    try:
+        devices = [torch.cuda.current_device()] if torch.cuda.is_initialized() else []
+        with torch.random.fork_rng(devices=devices):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
 def optimizer_groups(model):
@@ -108,13 +97,34 @@ class Experiment:
         self.device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
+        data_format = cfg.data.get('format', 'folders')
+        if data_format == 'indexed_tar':
+            ready = json.loads((Path(cfg.data.root) / 'ready.json').read_text())
+            if not ready.get('ready') or not all(a.get('verified') for a in ready['archives']):
+                raise ValueError('ImageNet archives have not passed integrity verification')
+            self.train = IndexedImageNet(cfg.data.root, 'train', cfg.seed)
+            self.val = IndexedImageNet(cfg.data.root, 'val', cfg.seed)
+            if (self.train.classes != self.val.classes or len(self.train.classes) != 1000 or
+                    len(self.train) != 1281167 or len(self.val) != 50000):
+                raise ValueError('Incomplete ImageNet archive indices or mismatched class labels')
+            data_fingerprints = {f'{s}_index_sha256': file_sha256(Path(cfg.data.root)/f'{s}-index.npz')
+                                 for s in ('train', 'val')}
+            data_fingerprints['verified_archives'] = [
+                {key: a[key] for key in ('bytes', 'md5')} for a in ready['archives']]
+        elif data_format == 'folders':
+            manifests = load_manifests(cfg.data.manifests, 'imagenet')
+            self.train = Images(Path(cfg.data.root)/'train', manifests['train'], True, cfg.seed)
+            self.val = Images(Path(cfg.data.root)/'val', manifests['val'], False, cfg.seed)
+            data_fingerprints = {f'{s}_manifest_sha256': file_sha256(Path(cfg.data.manifests)/f'{s}-manifest.json')
+                                 for s in ('train', 'val')}
+        else:
+            raise ValueError(f'Unsupported ImageNet data format: {data_format}')
         if self.rank == 0:
             contract = {key:OmegaConf.to_container(cfg[key], resolve=True)
                         for key in ('model', 'tokenizer', 'prior')}
             contract.update(seed=int(cfg.seed), world_size=self.world,
                             data_root=str(Path(cfg.data.root).resolve()),
-                            train_manifest_sha256=file_sha256(Path(cfg.data.manifests)/'train-manifest.json'),
-                            val_manifest_sha256=file_sha256(Path(cfg.data.manifests)/'val-manifest.json'))
+                            **data_fingerprints)
             contract_path = self.out/'training-contract.json'
             if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
                 raise ValueError('Training configuration changed; use a new output directory')
@@ -132,14 +142,6 @@ class Experiment:
                                  config=OmegaConf.to_container(cfg, resolve=True))
             OmegaConf.save(cfg, self.out / "resolved-config.yaml", resolve=True)
         self.global_log_step = 0
-        manifests = {s: json.loads((Path(cfg.data.manifests) / f"{s}-manifest.json").read_text()) for s in ("train", "val")}
-        if manifests["train"]["classes"] != manifests["val"]["classes"]:
-            raise ValueError("Train and validation label mappings differ")
-        for split, expected in (("train", 1281167), ("val", 50000)):
-            if len(manifests[split]["samples"]) != expected or len(manifests[split]["classes"]) != 1000:
-                raise ValueError(f"Incomplete ImageNet {split} manifest")
-        self.train = Images(Path(cfg.data.root) / "train", manifests["train"], True, cfg.seed)
-        self.val = Images(Path(cfg.data.root) / "val", manifests["val"], False, cfg.seed)
         if self.initialization == 'scratch':
             self.vae = build_scratch_tokenizer(cfg.model, cfg.seed)
         else:
@@ -163,7 +165,7 @@ class Experiment:
             atomic_json(self.out / "provenance.json", dict(
                 upstream_revision=revision, source_sha256={str(p.relative_to(ROOT)): file_sha256(p) for p in files},
                 vae_sha256=file_sha256(cfg.model.pretrained_vae) if cfg.model.pretrained_vae else None,
-                manifest_sha256={s:file_sha256(Path(cfg.data.manifests)/f'{s}-manifest.json') for s in ('train','val')},
+                data_format=data_format, data_fingerprints=data_fingerprints,
                 train_images=len(self.train), val_images=len(self.val), classes=1000,
                 downsampling=16, spatial_sites=sum(p*p for p in cfg.model.patch_nums),
                 sparse_pairs=sites*cfg.model.sparsity if self.kind=='laser' else None,
@@ -223,6 +225,7 @@ class Experiment:
             atomic_json(self.out / "coefficient-ranges.json", self.vae.quantize.coefficient_max.tolist())
 
     @torch.no_grad()
+    @evaluation_rng()
     def reconstruction(self, epoch, count):
         self.vae.eval()
         if self.inception is None:
@@ -414,6 +417,7 @@ class Experiment:
         return True
 
     @torch.no_grad()
+    @evaluation_rng()
     def validate_prior(self, model, epoch):
         model.eval()
         n = self.cfg.evaluation.validation_images
@@ -434,6 +438,7 @@ class Experiment:
                  atom_nll=(total[1]/total[3]).item(), coefficient_nll=(total[2]/total[3]).item())
 
     @torch.no_grad()
+    @evaluation_rng()
     def generate(self, model, epoch, count, official=False):
         model.eval()
         if self.inception is None:

@@ -1,0 +1,53 @@
+# @package _global_
+defaults:
+- _self_
+stage: stage2
+backend: dc_transformer
+options:
+  checkpoint: /tmp/laser-imagenet-dctransformer-20261029/laser-tokenizer.pt
+  stage1_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  token_cache: /tmp/laser-imagenet-dctransformer-20261029/training-pairs.pt
+  cache_sha256: null
+  training_images: 1281167
+  coeff_scales: [8.203365325927734, 4.265638828277588, 3.0662174224853516, 1.8273425102233887]
+  output: /workspace/Projects/laser/outputs/imagenet-rfid421-dctransformer-classcond-2b300-20261029/train
+  local_checkpoint_dir: /tmp/laser-imagenet-dctransformer-20261029/checkpoints
+  model:
+    num_atoms: 16384
+    coeff_vocab_size: 2048
+    block_size: [8, 8, 4]
+    dictionary_dim: 256
+    width: 896
+    heads: 14
+    encoder_ffn_layers: [2, 2, 2, 2]
+    atom_ffn_layers: [2, 2, 2, 4]
+    coefficient_ffn_layers: [2, 2, 2, 2, 2, 7]
+    overlap: 8
+    dropout: 0.1
+    num_classes: 1000
+  epochs: 100
+  global_batch: 2048
+  microbatch: 128
+  lr: 0.0005
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  cpu_threads: 4
+  seed: 261029
+  resume_checkpoint: null
+  max_steps: 0
+  save_every: 250
+  sample_every: 250
+  preview_classes: [207, 281, 360, 388, 417, 973, 980, 933]
+  preview_per_class: 4
+  sample_batch_size: 16
+  fid_every_epochs: 5
+  fid_num_samples: 50000
+  fid_batch_size: 128
+  decode_batch_size: 16
+  fid_reference: /tmp/laser-imagenet-dctransformer-20261029/imagenet_256_train.npz
+  upload_checkpoints: true
+  wandb_mode: online
+  wandb_entity: helloimlixin-rutgers
+  wandb_project: laser
+  run_id: imagenet-rfid421-dctransformer-classcond-2b300-20261029
+  wandb_name: ImageNet rFID4.21 | DCTransformer 337M | class conditional | scratch100 | 2 B300

@@ -45,8 +45,8 @@ class MultiScaleLaser(nn.Module):
         if (len(patch_nums) < 2 or patch_nums[0] != 1 or
                 any(a >= b for a, b in zip(patch_nums, patch_nums[1:]))):
             raise ValueError("Scales must increase strictly, starting at 1")
-        if coefficient_bins < 3 or coefficient_bins % 2 != 1 or coefficient_max <= 0:
-            raise ValueError("Use an odd coefficient vocabulary and positive range")
+        if coefficient_bins < 3 or coefficient_max <= 0:
+            raise ValueError("Use at least three coefficient bins and a positive range")
         self.coefficient_bins = int(coefficient_bins)
         self.beta, self.omp_chunk_size = beta, int(omp_chunk_size)
         self.coefficient_range_decay = None
@@ -187,6 +187,9 @@ class LaserVAR(VAR):
                          drop_path_rate=.1 * depth / 24, norm_eps=1e-6,
                          flash_if_available=False, fused_if_available=False)
         self.sparsity, self.coefficient_bins = q.sparsity, q.coefficient_bins
+        self.spatial_token_length = self.L
+        self.sparse_pairs_per_image = self.L * self.sparsity
+        self.categorical_decisions_per_image = self.sparse_pairs_per_image * 2
         self.coefficient_head = nn.Linear(self.C, q.coefficient_bins)
         self.atom_context = nn.Linear(q.Cvae, self.C, bias=False)
         self.depth_context = nn.Sequential(nn.Linear(q.Cvae, self.C), nn.SiLU(), nn.Linear(self.C, self.C))
@@ -201,6 +204,11 @@ class LaserVAR(VAR):
     def depth_features(self, features, prefix, depth):
         return features + self.depth_context(prefix) + self.depth_embedding.weight[depth]
 
+    def coefficient_logits(self, features, atom_vectors):
+        # Nonlinearity lets the selected atom change how image context affects
+        # the coefficient distribution, instead of adding a fixed class bias.
+        return self.coefficient_head(F.silu(features + self.atom_context(atom_vectors)))
+
     def token_logits(self, features, atoms, coefficients):
         q = self._q[0]
         atom_vectors = F.embedding(atoms, q.normalized_dictionary().T).detach()
@@ -214,7 +222,7 @@ class LaserVAR(VAR):
             if depth:
                 logits = logits.scatter(-1, atoms[:, :, :depth], -torch.inf)
             atom_logits.append(logits)
-            coefficient_logits.append(self.coefficient_head(h + self.atom_context(atom_vectors[:, :, depth])))
+            coefficient_logits.append(self.coefficient_logits(h, atom_vectors[:, :, depth]))
             prefix = prefix + atom_vectors[:, :, depth] * values[:, :, depth, None]
         return torch.stack(atom_logits, 2), torch.stack(coefficient_logits, 2)
 
@@ -256,7 +264,7 @@ class LaserVAR(VAR):
                         selected = []
                     selected.append(atoms)
                     vectors = F.embedding(atoms, q.normalized_dictionary().T)
-                    coeff_logits = self.coefficient_head(h + self.atom_context(vectors.repeat(2, 1, 1)))
+                    coeff_logits = self.coefficient_logits(h, vectors.repeat(2, 1, 1))
                     coeff_logits = (1 + guidance) * coeff_logits[:B] - guidance * coeff_logits[B:]
                     ids = sample_with_top_k_top_p_(coeff_logits.clone(), rng=rng, top_k=0, top_p=top_p)[:, :, 0]
                     prefix = prefix + vectors * q.coefficient_values(ids, scale)[..., None]

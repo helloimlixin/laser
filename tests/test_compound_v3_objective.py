@@ -476,6 +476,8 @@ def test_distribution_geometry_uses_sampling_logits_and_backpropagates():
         geometry_coeff_bins=coeff_bins,
         geometry_coeff_scales=scales,
         geometry_top_k=2,
+        # This fixture defines the same coefficient conditional for each candidate atom.
+        geometry_candidate_coeff_logits=coeff_logits.unsqueeze(-2).expand(-1,-1,-1,-1,3,-1),
     )
     loss.backward()
 

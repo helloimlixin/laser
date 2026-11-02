@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 import torch
+from src.training.omp_math import solve_lower,solve_cholesky,residual_correlation as update_residual_correlation
+from src.training.omp_math import support_probabilities,extend_cholesky
 
 
 BANK_FORMAT = "laser_stochastic_compound_bank_v1"
@@ -43,12 +45,12 @@ def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, 
     entropy = []
     targets = []
     for step in range(depth):
-        scores = residual_correlation.square().masked_fill(~available, -torch.inf)
         if temperature:
-            probabilities = ((scores - scores.amax(-1, keepdim=True)) / temperature).softmax(-1)
+            probabilities = support_probabilities(residual_correlation,available,temperature)
             entropy.append(-(probabilities * probabilities.clamp_min(1e-30).log()).sum(-1))
             atom = torch.multinomial(probabilities, 1, generator=generator).squeeze(-1)
         else:
+            scores = residual_correlation.square().masked_fill(~available,-torch.inf)
             entropy.append(torch.zeros(len(x), device=x.device, dtype=x.dtype))
             atom = scores.argmax(-1)
             if return_probabilities:
@@ -56,20 +58,14 @@ def stochastic_omp(signals, dictionary, *, depth=4, temperature=0.0, gram=None, 
         if return_probabilities:
             targets.append(probabilities)
         available[rows, atom] = False
-        if step == 0:
-            chol = gram[atom, atom].sqrt()[:, None, None]
-        else:
-            cross = gram[support, atom[:, None]].unsqueeze(-1)
-            solved = torch.linalg.solve_triangular(chol, cross, upper=False).transpose(1, 2)
-            diagonal = gram[atom, atom][:, None, None] - solved.square().sum(-1, keepdim=True)
-            if (diagonal <= 1e-7).any():
-                raise ValueError("sampled support is numerically dependent; reject this trajectory")
-            chol = torch.cat((torch.cat((chol, x.new_zeros(len(x), step, 1)), dim=-1),
-                              torch.cat((solved, diagonal.sqrt()), dim=-1)), dim=-2)
+        chol,bad=extend_cholesky(chol,gram,support,atom)
+        if bad.any():
+            raise ValueError("sampled support is numerically dependent; reject this trajectory")
         support = torch.cat((support, atom[:, None]), dim=-1)
         rhs = correlation.gather(1, support)
-        coefficients = torch.cholesky_solve(rhs.unsqueeze(-1), chol).squeeze(-1)
-        residual_correlation = correlation - coefficients.unsqueeze(1).bmm(gram[support]).squeeze(1)
+        coefficients = solve_cholesky(chol, rhs.unsqueeze(-1)).squeeze(-1)
+        if step+1 < depth:
+            residual_correlation = update_residual_correlation(correlation, coefficients, gram, support)
     quantized = (dictionary.T[support] * coefficients[..., None]).sum(-2)
     result = dict(atoms=support.reshape(*shape, depth),
                 coefficients=coefficients.reshape(*shape, depth),

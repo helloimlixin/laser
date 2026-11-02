@@ -1,0 +1,31 @@
+# Frozen-backbone coefficient-head experiment; run with the dedicated launcher.
+run_id: imagenet-compound512-logistic8-headpilot-20261026
+source_checkpoint: /tmp/laser-imagenet-compound512-audit-20261026/quality/evaluation-checkpoint.pt
+source_step: 6260
+components: 8
+width: 512
+minimum_scale: 0.001
+coefficient_bins: 512
+coefficient_range: [-3.0, 3.0]
+training_images: 32768
+validation_images: 4096
+feature_seed: 261028
+augmentation_epoch: 10
+distill_epochs: 3
+fit_epochs: 8
+batch_sites_per_rank: 1024
+world_size: 8
+screening_samples: 5000
+confirmation_samples: 50000
+screening_minimum_fid_gain: 1.0
+fid_seed: 261027
+sampling:
+  atom_temperature: 0.8
+  atom_top_k: 16384
+  atom_top_p: 0.9
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+stored_original_fid5000: 49.38672324702435
+stored_original_fid50000: 43.371578839378856
+stored_original_inception50000: 26.75251579284668

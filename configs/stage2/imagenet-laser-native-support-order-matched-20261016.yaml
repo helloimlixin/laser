@@ -1,0 +1,69 @@
+version: native-support-order-matched-v1
+status: preflight_passed_training_not_launched
+objective: Compare a substantial native-depth decoder redesign at fixed tokenizer and data budget.
+preflight: outputs/imagenet-native-support-order-preflight-20261016/verification.json
+throughput_verification: outputs/imagenet-native-support-order-speed-20261016/verification.json
+source_tokenizer:
+  run_id: imagenet-laser-compound512-native-scratch2-4h100-20261016
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  measured_rfid: 4.21400802130438
+  frozen: true
+  atoms: 16384
+  coefficient_bins: 512
+  codec_and_reconstruction_changed: false
+model:
+  factory: src.models.laser_native_support_order_adapter.build_native_support_order_model
+  recipe: src.training.laser_native_support_order_recipe.NativeSupportOrderRecipe
+  training_kind: laser_native_support_order
+  parameters: 1388322816
+  parameter_tensors: 780
+  spatial_layers: 42
+  depth_layers: 6
+  depth_events_per_site: 8
+  coefficient_micro_transformer: false
+  shared_native_classifier_with_typed_slices: true
+  attention_and_cache_implementation: Original pinned RQ code.
+arms:
+  control:
+    event_order: interleaved
+    sequence: [a1, c1, a2, c2, a3, c3, a4, c4]
+  candidate:
+    event_order: support_first
+    sequence: [a1, a2, a3, a4, c1, c2, c3, c4]
+    coefficient_context: All four selected supports and earlier coefficients.
+    support_context: Earlier support IDs and previous completed spatial sites.
+training:
+  fresh_weights_and_optimizer: true
+  why_fresh: Depth positions and probability factorization change; old compound Adam moments are inappropriate.
+  identical_initial_parameter_hash_required: true
+  objective: (atom_cross_entropy + coefficient_cross_entropy) / 2
+  atom_ce_weight: 1.0
+  coefficient_ce_weight: 1.0
+  auxiliary_loss_terms: 0
+  sampled_trajectory_banks: 0
+  same_original_targets_and_coefficient_prefix_rng: true
+  encoder_batch_size: 8
+  attention_backend: native
+  coefficient_temperature: 0.03125
+  normalized_coefficient_sigma: 0.125
+  world_size: 4
+  microbatch: 64
+  accumulation_steps: 8
+  global_batch: 2048
+  updates_per_epoch: 626
+  planned_epochs_per_arm: 2
+  learning_rate: 0.0005
+  schedule: Original 100-epoch cosine, with no warmup.
+  augmentation: Original ImageNet resize, random crop and horizontal flip.
+evaluation:
+  checkpoints: [1, 2]
+  generated_images_per_checkpoint: 50000
+  real_split: train
+  real_images: 1281167
+  sampler: Same source settings in both arms, no rejection or sweep.
+  adoption_metric: Matched full FID; held-out joint NLL is a diagnostic.
+  atom_ce_caveat: Different event orders have different atom conditionals; compare total joint NLL rather than atom CE alone.
+  original_rq_epoch2_fid_reference_only: 65.87001562357716
+  control_definition: Fresh native eight-event interleaved arm, not the already trained compound checkpoint.
+training_launched: false
+automatic_training_extension: false

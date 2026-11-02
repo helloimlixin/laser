@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - imagenet256-var-dictionary-20261024
+  - _self_
+model:
+  bottleneck: vq

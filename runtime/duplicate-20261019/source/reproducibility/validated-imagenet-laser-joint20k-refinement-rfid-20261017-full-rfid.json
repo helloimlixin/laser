@@ -1,0 +1,38 @@
+{
+  "completed": true,
+  "results": {
+    "5": {
+      "measured_rfid": 4.192409404011698,
+      "depth": 5,
+      "vocabulary": 20481,
+      "tokens_per_image": 320,
+      "baseline_full_rfid": 4.689409482068868,
+      "baseline_depth": 4,
+      "baseline_tokens_per_image": 256,
+      "change_from_baseline": -0.4970000780571695,
+      "codebook_path": "/workspace/Projects/laser/outputs/imagenet-laser-joint20k-refinement-rfid-20261017/joint20k-depth5-codebook.pt",
+      "codebook_sha256": "922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9"
+    },
+    "6": {
+      "measured_rfid": 4.040928695720993,
+      "depth": 6,
+      "vocabulary": 20481,
+      "tokens_per_image": 384,
+      "baseline_full_rfid": 4.689409482068868,
+      "baseline_depth": 4,
+      "baseline_tokens_per_image": 256,
+      "change_from_baseline": -0.648480786347875,
+      "codebook_path": "/workspace/Projects/laser/outputs/imagenet-laser-joint20k-refinement-rfid-20261017/joint20k-depth6-codebook.pt",
+      "codebook_sha256": "4fec882650c85d5d0e0a2033d2d9e4add79307c7f1ccfe5786d12af9b76e4f62"
+    }
+  },
+  "real_images": 50000,
+  "reconstructed_images_per_candidate": 50000,
+  "reference": "matched full validation, original RQ Inception",
+  "encoder_decoder_dictionary_frozen": true,
+  "first_four_depths_unchanged": true,
+  "vocabulary": 20481,
+  "longer_sequence_required": true,
+  "current_training_unchanged": true,
+  "time": 1792217894.3946342
+}

@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - imagenet-var-dl-comparison-20261024
+  - _self_
+model:
+  bottleneck: vq

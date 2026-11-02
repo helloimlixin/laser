@@ -14,6 +14,27 @@ class BackgroundCheckpointWriter:
         if self._pending is not None and self._pending.done():
             self._pending.result()
 
+    @property
+    def completion(self):
+        """Capture the current commit without blocking the training thread."""
+        return self._pending
+
+    def append(self, function):
+        """Queue file-only work behind the current immutable snapshot.
+
+        Full tensor snapshots still use ``submit`` to bound their memory and
+        disk usage. Dependent aliases can be published in order without
+        making the caller wait for shared storage.
+        """
+        previous = self._pending
+
+        def ordered():
+            if previous is not None:
+                previous.result()
+            return function()
+
+        self._pending = self._executor.submit(ordered)
+
     def wait(self):
         if self._pending is not None:
             pending, self._pending = self._pending, None

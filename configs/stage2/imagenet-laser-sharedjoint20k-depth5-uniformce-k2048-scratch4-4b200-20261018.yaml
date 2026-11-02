@@ -1,0 +1,80 @@
+version: laser-shared-joint20k-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-sharedjoint20k-depth5-uniformce-k2048-scratch4-4b200-20261018
+name: LASER shared joint20k depth5 | uniform CE K2048 | paired fresh4 | 4 B200
+seed: 261001
+epochs: 100
+global_batch: 2048
+microbatch: 256
+lr_schedule_epochs: 100
+decoder: native_joint_integer
+target_mode: joint_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 97c398da445aae2f209047aca15d94514c6ef0a21b4804e1a051a23c2a9265ed
+  vocab_size: 20481
+  depth: 5
+  measured_rfid: 4.3222964750380015
+  source_measured_rfid: 4.215039034200402
+  candidate: adaptive8192
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  atoms: 8192
+  coefficient_levels_per_atom: adaptive 2/4/6/8 or uniform4; selected by measured
+    reconstruction
+  adaptive_coefficient_allocation: true
+  source_four_depth_codebook_sha256: 974fdaf42f041a02e93c7321b65d57900088ab7a2339ada6a5ffcc062ee9ac54
+  first_four_depths_unchanged: false
+  shared_codebook_across_depths: true
+  coefficient_values_shared: true
+targets:
+  temperature:
+  - 0.15819901962280272
+  - 0.13549085464477534
+  - 0.08794634933471679
+  - 0.055382978057861326
+  - 0.0394969670343399
+  chunk_size: 128
+  encoding: native_residual_quantization_over_fixed_joint_codewords
+  stochastic_prefixes: true
+  calibration:
+    policy: Inherited numerical target temperatures; codebook-only training comparison
+    temperatures_unchanged: true
+    new_shared_book_noise_verified_before_production: true
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature: 1.0
+  top_k: 2048
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+initialization:
+  reference_vocab_size: 65537
+  paired_fresh_backbone: true
+preview:
+  designated_classes: true
+  every_updates: 200
+  first_update: 1
+  fixed_seed: 261001
+  overview_per_class: 10
+  grid_rows: 8
+  grid_columns: 8
+lineage:
+  control_run: imagenet-laser-joint20k-depth5-uniformce-k512-scratch100-4b200-20261018
+  stage2_initialization: paired_fresh_random
+  stage2_checkpoint_loaded: false
+  change: One identical physical sparse codebook at every depth
+  bounded_trial_epochs: 4
+  auto_promote: false
+loss:
+  type: soft_target_cross_entropy
+  reduction: mean
+optimization:
+  probe_initial_weight_sha256: 46386ed8076a513a67894cdeb591aead1167801c0c35cbca79063ecae98d4fc6

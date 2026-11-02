@@ -597,6 +597,16 @@ def run(cfg: DictConfig):
         every_n_epochs=checkpoint_every_n_epochs,
     )
     callbacks = [checkpoint_callback]
+    recovery_interval = int(getattr(cfg.checkpoint, "recovery_every_n_train_steps", 0) or 0)
+    if recovery_interval > 0:
+        callbacks.append(ModelCheckpoint(
+            dirpath=run_ckpt_dir,
+            filename="recovery-{step:07d}",
+            save_top_k=1,
+            monitor=None,
+            every_n_train_steps=recovery_interval,
+            save_on_train_epoch_end=False,
+        ))
     if checkpoint_upload_to_wandb:
         if checkpoint_upload_mode == "files":
             SelectedCheckpointFileCallback = _make_selected_checkpoint_file_callback(Callback)

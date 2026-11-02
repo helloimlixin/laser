@@ -1,0 +1,65 @@
+version: laser-compound512-augmented-scratch100-v1
+run_id: imagenet-laser-compound512-augwarm-scratch100-4h100-20261016
+name: LASER compound512 | augmentation from step0 | LR screened warmup | fresh100
+seed: 261001
+epochs: 100
+global_batch: 2048
+microbatch: 64
+lr_schedule_epochs: 100
+decoder: native_compound_pair
+target_mode: fixed_support_soft_coefficients
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  source_rfid: 4.210914134979248
+  num_atoms: 16384
+  depth: 4
+  coefficient_bins: 512
+  coefficient_max: 3.0
+  coefficient_scales: [8.203365325927734, 4.265638828277588, 3.0662174224853516, 1.8273425102233887]
+targets:
+  temperature: 0.01125
+  encoder_batch_size: 8
+  clip_centers: false
+  support: original deterministic frozen stage1 support and final coefficients
+  coefficient_centers: continuous normalized source values before bin rounding
+  sigma_bins: 6.3875
+atom_ce_weight: 1.0
+objective: mean_joint_atom_and_soft_coefficient_negative_log_likelihood
+auxiliary_loss_terms: 0
+optimization:
+  candidate_peak_lrs: [0.0002, 0.0003, 0.0005]
+  probe_updates: 24
+  probe_warmup_updates: 8
+  probe_heldout_images: 256
+  near_best_tolerance_nats: 0.01
+  selection: lowest stable LR within 0.01 held-out CE of the best candidate
+  warmup_epochs: 2
+  minimum_lr_ratio: 0.01
+  schedule: linear warmup from zero then cosine to epoch100; no FID-triggered changes
+augmentation: original RQ Resize256 RandomCrop256 RandomHorizontalFlip from the first training batch
+sampling:
+  atom_temperature: 0.9
+  atom_top_k: 0
+  atom_top_p: 0.9
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.85
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+preview:
+  every_updates: 200
+  images: 32
+  fixed_seed: 261001
+verification:
+  maximum_reconstruction_rfid: 4.4
+  reference_original_checkpoint_rfid: 4.210914134979248
+initialization:
+  paired_fresh_backbone: true
+  reference_vocab_size: 65537
+  reset_stage2_seed_after_tokenizer: true

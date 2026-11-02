@@ -1,0 +1,73 @@
+version: compound512-atom-identity-matched-pilot-v1
+status: completed
+training_runner_prepared: true
+result: outputs/imagenet-compound512-atom-identity-pilot-20261016/comparison.json
+decision: Retain the control; the learned atom-ID pilot worsened FID50k despite slightly better held-out prediction losses.
+hypothesis: Learned atom-ID inputs improve support prediction beyond frozen dictionary geometry.
+source:
+  run_id: imagenet-laser-compound512-native-scratch2-4h100-20261016
+  epoch: 2
+  global_step: 1252
+  checkpoint: outputs/imagenet-laser-compound512-native-scratch2-4h100-20261016/persistent-train/checkpoints/epoch002-gap-audit.pt
+  checkpoint_sha256: d966e98be339503c8d692f9e49d062516a5b2555dd3c0bbfd77ca09250335979
+  base_parameter_count: 1448144384
+  base_parameter_tensors: 837
+branches:
+  control:
+    adapter: native_compound_pair
+    added_parameters: 0
+  atom_identity:
+    adapter: src.models.laser_atom_identity_adapter.build_atom_identity_model
+    table_shape: [16384, 256]
+    added_parameters: 4194304
+    parameter_count: 1452338688
+    initialization: zeros
+    insertion: Add the learned ID vector to each completed pair embedding before native spatial and depth execution.
+    coefficient_atom_conditioning: Existing frozen dictionary vectors, unchanged.
+training:
+  additional_updates_per_branch: 128
+  final_global_step: 1380
+  world_size: 4
+  microbatch: 64
+  accumulation_steps: 8
+  global_batch: 2048
+  same_augmented_images_order_labels_and_rng_streams: true
+  data: Fresh full-ImageNet training batches; no fitting on the held-out probe.
+  restore_existing_adam_moments_and_ages: true
+  restore_original_scheduler_and_amp_scaler: true
+  new_table_optimizer_state: Empty; its Adam age starts at zero.
+  lr_schedule_epochs: 100
+  objective: Existing normalized atom-CE weight 1.5 plus coefficient-CE weight 1.0.
+  auxiliary_loss_terms: 0
+  sampled_trajectory_banks: 0
+tokenizer:
+  stage1_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  frozen_encoder_dictionary_decoder: true
+  atoms: 16384
+  coefficient_bins: 512
+  normalized_coefficient_sigma: 0.125
+verification:
+  require_identical_initial_logits_and_existing_parameter_gradients: true
+  require_full_and_cached_prediction_parity_after_identity_training: true
+  require_original_tokenizer_digest_unchanged: true
+evaluation:
+  heldout_images: 1024
+  heldout_seed: 261016781
+  exclude_previous_diagnostic_validation_images: true
+  same_precomputed_targets_and_coefficient_prefix_draws_for_both_branches: true
+  evaluate_frozen_source_and_both_continued_branches: true
+  primary_metric: Atom cross entropy, with paired bootstrap by image.
+  gate:
+    candidate_atom_ce_below_frozen_source: true
+    candidate_minus_control_atom_ce_upper_95_interval_below_zero: true
+    candidate_joint_pair_ce_no_worse_than_control: true
+    inspect_coefficient_sign_accuracy_by_depth: true
+  if_gate_passes:
+    evaluate_both_branches: true
+    generated_images_per_branch: 50000
+    reference_split: train
+    reference_images: 1281167
+    source_sampling_settings: true
+    rejection_sampling: false
+automatic_training_extension: false
+automatic_adoption: false

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from src.training.background_checkpoint import BackgroundCheckpointWriter
-from src.training import rqtransformer as training
+from src.training import k4_checkpoint_io as training
 
 
 def test_background_save_is_immutable_and_upload_waits_for_commit(tmp_path, monkeypatch):

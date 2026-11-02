@@ -75,6 +75,7 @@ def omp_bank_joint_targets(bank_atoms, bank_coefficients, sampled_atoms,
         atom_weights = centers.new_empty(len(atoms), depth, variants)
         conditional_weights = torch.empty_like(atom_weights)
         coefficient_targets = centers.new_empty(len(atoms), depth, len(coefficient_bins))
+        invalid_prefix = torch.zeros((),device=bank_atoms.device,dtype=torch.bool)
         for start in range(0, len(atoms), site_chunk_size):
             stop = min(start + site_chunk_size, len(atoms))
             a, c = atoms[start:stop], centers[start:stop]
@@ -83,8 +84,7 @@ def omp_bank_joint_targets(bank_atoms, bank_coefficients, sampled_atoms,
                 atom_weights[start:stop, d] = log_posterior.softmax(-1)
                 consistent = a[..., d] == observed_atoms[start:stop, d, None]
                 conditioned = log_posterior.masked_fill(~consistent, -torch.inf)
-                if not torch.isfinite(conditioned).any(-1).all():
-                    raise ValueError('sampled support prefix is absent from the bank')
+                invalid_prefix |= ~torch.isfinite(conditioned).any(-1).all()
                 weights = conditioned.softmax(-1)
                 conditional_weights[start:stop, d] = weights
                 log_kernels = (-(c[..., d, None] - coefficient_bins).square()
@@ -97,6 +97,8 @@ def omp_bank_joint_targets(bank_atoms, bank_coefficients, sampled_atoms,
                     log_posterior = conditioned + likelihood
                     # A common shift preserves the posterior and avoids drift.
                     log_posterior -= log_posterior.logsumexp(-1, keepdim=True)
+        if invalid_prefix.item():
+            raise ValueError('sampled support prefix is absent from the bank')
         return OMPJointTargets(
             bank_atoms.transpose(-1, -2).long(),
             atom_weights.reshape(*leading, depth, variants),

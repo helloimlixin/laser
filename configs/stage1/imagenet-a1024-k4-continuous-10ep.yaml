@@ -1,0 +1,68 @@
+# @package _global_
+defaults:
+  - imagenet
+  - _self_
+
+seed: 261029
+output_dir: outputs/imagenet-stage1-a1024-k4-continuous-10ep-20261029
+ckpt_path: null
+init_ckpt_path: null
+
+model:
+  num_embeddings: 1024
+  embedding_dim: 256
+  sparsity_level: 4
+  coefficient_quantization_bits: 0
+  coefficient_quantization_max: null
+  coef_max: null
+  attn_resolutions: [8]
+  commitment_cost: 1.0
+  bottleneck_loss_weight: 0.25
+  dictionary_loss_weight: 0.25
+  progressive_loss: true
+  dictionary_update_mode: gradient
+  data_init_from_first_batch: true
+  dead_atom_revival: true
+  dead_atom_revival_interval: 500
+  dead_atom_revival_max_fraction: 0.05
+  dead_atom_revival_noise: 0.05
+  dead_atom_revival_patience: 5
+  adversarial_start_step: 5000
+  disc_start_step: 5000
+  compute_fid: true
+  log_images_every_n_steps: 250
+
+data:
+  data_dir: /tmp/laser-stage1-a1024-k4-10ep-20261029/data
+  batch_size: 16
+  eval_batch_size: 32
+  num_workers: 4
+  pin_memory: true
+
+train:
+  devices: 8
+  strategy: ddp_find_unused_parameters_true
+  max_epochs: 10
+  precision: bf16-mixed
+  learning_rate: 4.0e-5
+  beta: 0.5
+  beta2: 0.9
+  accumulate_grad_batches: 1
+  warmup_steps: 5000
+  min_lr_ratio: 1.0
+  log_every_n_steps: 20
+  run_test_after_fit: false
+
+checkpoint:
+  save_top_k: 2
+  save_last: true
+  every_n_epochs: 1
+  recovery_every_n_train_steps: 250
+  upload_to_wandb: true
+
+wandb:
+  project: laser
+  name: ImageNet stage1 | 1024 atoms | K4 | continuous coefficients | scratch10
+  id: imagenet-stage1-a1024-k4-continuous-10ep-20261029
+  group: imagenet-small-dictionary-stage1-20261029
+  tags: [stage1, imagenet, scratch, a1024, k4, continuous-coefficients]

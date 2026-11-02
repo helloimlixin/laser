@@ -1,0 +1,53 @@
+version: laser-native-joint32k-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-native-joint32k-scratch2-4h100-20261016
+name: LASER native joint integer | compact8192 atoms | fresh2
+seed: 261001
+epochs: 2
+global_batch: 2048
+microbatch: 64
+lr_schedule_epochs: 100
+decoder: native_joint_integer
+target_mode: joint_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: e378029c56a5a9e9096b0a18b56e0c592ccfe6dff69b5061860578d00c680611
+  vocab_size: 32769
+  depth: 4
+  measured_rfid: 4.631902793749532
+  source_measured_rfid: 4.215039034200402
+  candidate: compact8192-refined-gain110
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  atoms: 8192
+  coefficient_levels_per_atom: 4
+targets:
+  temperature:
+  - 0.15819901962280272
+  - 0.13549085464477534
+  - 0.08794634933471679
+  - 0.055382978057861326
+  chunk_size: 128
+  encoding: native_residual_quantization_over_fixed_joint_codewords
+  stochastic_prefixes: true
+  calibration:
+    policy: held fixed from the 65537-class per-depth trial for vocabulary ablation
+    source_recipe: /workspace/Projects/laser/configs/stage2/imagenet-laser-native-joint-depthtemp-scratch2-20261016.yaml
+    compact_corruption_audit: required before production; temperatures not refitted
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature: 1.0
+  top_k: 1024
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+initialization:
+  reference_vocab_size: 65537
+  paired_fresh_backbone: true

@@ -1,0 +1,48 @@
+arch:
+  type: rq-transformer
+  ema: null
+  ar_hierarchy: null
+  vocab_size: 16384
+  block_size:
+  - 8
+  - 8
+  - 4
+  vocab_size_cond: 1000
+  block_size_cond: 1
+  embed_dim: 1536
+  input_embed_dim: 256
+  input_emb_vqvae: true
+  head_emb_vqvae: true
+  cumsum_depth_ctx: true
+  shared_tok_emb: true
+  embd_pdrop: 0.0
+  body:
+    n_layer: 42
+    block:
+      embed_dim: 1536
+      n_head: 24
+      mlp_bias: true
+      attn_bias: true
+      attn_pdrop: 0.0
+      resid_pdrop: 0.1
+      gelu: v1
+  head:
+    n_layer: 6
+    block:
+      embed_dim: 1536
+      n_head: 24
+      mlp_bias: true
+      attn_bias: true
+      attn_pdrop: 0.0
+      resid_pdrop: 0.1
+      gelu: v1
+  shared_cls_emb: true
+dataset:
+  type: imagenet
+  vocab_size: 16384
+  transforms:
+    type: imagenet256x256
+sampling:
+  temp: 1.0
+  top_k: 2048
+  top_p: 0.95

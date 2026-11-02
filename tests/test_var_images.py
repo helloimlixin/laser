@@ -1,11 +1,13 @@
 import json
+import io
+import tarfile
 
 import numpy as np
 from PIL import Image
 import pytest
 import torch
 
-from src.data.var_images import Images, load_manifests
+from src.data.var_images import Images, IndexedImageNet, load_manifests
 
 
 def manifests(tmp_path, train=None, val=None, classes=None):
@@ -80,3 +82,39 @@ def test_training_flip_is_reproducible_and_validation_is_unflipped(tmp_path):
         assert torch.equal(pixels, original) or torch.equal(pixels, original.flip(2))
         torch.testing.assert_close(val[0][0], original)
     assert orientations == {True, False}
+
+
+@pytest.mark.parametrize('split', ['train', 'val'])
+def test_archive_pixels_labels_and_epoch_crops_match_folders(tmp_path, monkeypatch, split):
+    pixels = np.random.default_rng(7).integers(0, 256, (321, 379, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(tmp_path/'image.JPEG')
+    payload = (tmp_path/'image.JPEG').read_bytes()
+    with tarfile.open(tmp_path/f'ILSVRC2012_img_{split}.tar', 'w') as archive:
+        member = tarfile.TarInfo('image.JPEG')
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    with tarfile.open(tmp_path/f'ILSVRC2012_img_{split}.tar') as archive:
+        offset = archive.getmember('image.JPEG').offset_data
+    np.savez(tmp_path/f'{split}-index.npz', offsets=np.array([offset]),
+             sizes=np.array([len(payload)]), labels=np.array([0]), classes=np.array(['n00000001']))
+    folder = Images(tmp_path, dict(samples=[['image.JPEG', 0]]), split == 'train', 13)
+    indexed = IndexedImageNet(tmp_path, split, 13)
+    cuda_seeds = []
+    monkeypatch.setattr(torch.cuda, 'manual_seed_all', lambda seed: cuda_seeds.append(seed))
+    before = torch.get_rng_state().clone()
+    views = []
+    for epoch in (0, 1, 7):
+        folder.epoch = indexed.epoch = epoch
+        image, label = indexed[np.int64(0)]
+        torch.testing.assert_close(image, folder[0][0], atol=0, rtol=0)
+        assert label == folder[0][1] == 0
+        views.append(image)
+    assert not cuda_seeds and torch.equal(before, torch.get_rng_state())
+    assert torch.equal(views[0], views[1]) == (split == 'val')
+    # Truncated archives must fail instead of silently replacing a sample.
+    with indexed.archive.open('r+b') as archive:
+        archive.truncate(offset + len(payload) - 1)
+    with pytest.raises(OSError, match='Truncated'):
+        indexed[0]
+    with pytest.raises(ValueError, match='archive index'):
+        IndexedImageNet(tmp_path, split, 13)

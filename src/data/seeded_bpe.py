@@ -10,12 +10,12 @@ import random
 import re
 from types import SimpleNamespace
 
-from scripts.tools.build_cc3m_compound_cache import text_tokenizer
-
-
 class SeededBPE:
-    def __init__(self, dropout=0.1):
-        self.tokenizer = text_tokenizer(0.)
+    def __init__(self, dropout=0.1, tokenizer=None):
+        if tokenizer is None:
+            from scripts.tools.build_cc3m_compound_cache import text_tokenizer
+            tokenizer = text_tokenizer(0.)
+        self.tokenizer = tokenizer
         config = json.loads(self.tokenizer.to_str())
         self.vocab = config['model']['vocab']
         self.unknown = self.vocab[config['model']['unk_token']]

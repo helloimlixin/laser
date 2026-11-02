@@ -1,0 +1,56 @@
+{
+  "os":  "Linux-6.8.0-136-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2026-10-18T19:59:46.063873Z",
+  "args":  [
+    "--epochs",
+    "100",
+    "--microbatch",
+    "512"
+  ],
+  "program":  "/tmp/laser-sharedjoint20k-repair-2b300-20261018/train.py",
+  "codePath":  "train.py",
+  "codePathLocal":  "train.py",
+  "email":  "helloimlixin@gmail.com",
+  "root":  "/tmp/laser-sharedjoint20k-repair-2b300-20261018/wandb",
+  "host":  "d97cbbf381b9",
+  "executable":  "/usr/local/bin/python",
+  "cpu_count":  192,
+  "cpu_count_logical":  192,
+  "gpu":  "NVIDIA B300 SXM6 AC",
+  "gpu_count":  2,
+  "disk":  {
+    "/":  {
+      "total":  "2199023255552",
+      "used":  "195997855744"
+    }
+  },
+  "memory":  {
+    "total":  "2164064043008"
+  },
+  "cpu":  {
+    "model":  "Intel(R) Xeon(R) 6740E"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA B300 SXM6 AC",
+      "memoryTotal":  "288400343040",
+      "cudaCores":  18944,
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-41e328d0-fa35-cf3c-4637-61d17fe10ec6",
+      "pciBusId":  "00000000:1A:00.0",
+      "numaNode":  0
+    },
+    {
+      "name":  "NVIDIA B300 SXM6 AC",
+      "memoryTotal":  "288400343040",
+      "cudaCores":  18944,
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-7eaaf4f7-c98f-a4c5-27fd-254476dafbe8",
+      "pciBusId":  "00000000:5D:00.0",
+      "numaNode":  0
+    }
+  ],
+  "cudaVersion":  "13.0",
+  "writerId":  "01a15099-4b9c-7b38-a213-7bd8f88f3497"
+}

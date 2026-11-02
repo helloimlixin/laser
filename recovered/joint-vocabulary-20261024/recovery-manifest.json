@@ -1,0 +1,23 @@
+{
+  "status": "selected_codebook_recovered_and_verified",
+  "selection": "selection.json",
+  "codec": "stage2-32k/joint-codebook.pt",
+  "codec_sha256": "08efb61ea9c37cbf05df55fb9102382ba28108c4fab774346480499d129310c3",
+  "codec_parts": "stage2-32k/shards.json",
+  "verification": "stage2-32k/verification.json",
+  "tests": "tests.xml",
+  "tests_passed": 31,
+  "provenance": {
+    "entity": "helloimlixin-rutgers",
+    "project": "laser",
+    "run": "imagenet-laser-joint-neural-rate-distortion-20261024",
+    "artifact": "joint-neural-rd-selected-codecs:v0",
+    "file": "vq32768.pt",
+    "source_sha256": "12e6d92dcb461ff648a9f737dd24f61f58f769b2b297bfec4e982eaeda0410e4"
+  },
+  "note": "The four depth tensors are shared codec parameters. Each image still transmits only 256 integer IDs.",
+  "full_unsharded_local_copy": "Do not depend on neural/books/vq32768.pt; that persistent write stalled. Use the verified stage2-32k bundle.",
+  "stage2_production_started": false,
+  "runtime_verification": "runtime-verification.json",
+  "runtime_cuda_check_passed": true
+}

@@ -88,3 +88,19 @@ def test_pair_recipes_match_and_have_no_pretrained_initialization():
     assert vq.seed==laser.seed
     assert vq.output_dir != laser.output_dir
     assert vq.wandb.id != laser.wandb.id
+
+
+def test_current_comparison_keeps_matched_global_batches_and_evaluation():
+    root=Path(__file__).resolve().parents[1]/'configs/experiments'
+    laser=load_config(root/'imagenet-var-dl-comparison-20261024.yaml')
+    vq=load_config(root/'imagenet-var-vq-comparison-20261024.yaml')
+    assert laser.model.bottleneck == 'laser' and vq.model.bottleneck == 'vq'
+    assert laser.tokenizer == vq.tokenizer and laser.prior == vq.prior
+    assert laser.data == vq.data and laser.evaluation == vq.evaluation
+    assert laser.tokenizer.batch_size * laser.tokenizer.accumulation * 4 == 128
+    assert laser.prior.batch_size * laser.prior.accumulation * 4 == 768
+    assert laser.tokenizer.epochs == 100 and laser.prior.epochs == 200
+    assert laser.model.initialization == vq.model.initialization == 'scratch'
+    assert laser.model.pretrained_vae is vq.model.pretrained_vae is None
+    assert sum(p*p for p in laser.model.patch_nums) == 680
+    assert laser.output_dir != vq.output_dir and laser.wandb.id != vq.wandb.id

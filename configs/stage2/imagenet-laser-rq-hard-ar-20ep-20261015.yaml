@@ -1,0 +1,39 @@
+version: laser-rq-hard-autoregressive-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-rq-hard-ar-rfid421-scratch20-20261015
+name: LASER hard AR sparse support and coefficients 20 epochs
+seed: 261001
+epochs: 20
+global_batch: 2048
+microbatch: 64
+lr_schedule_epochs: 100
+target_mode: hard_sparse_tokens
+tokenizer:
+  source_reported_rfid: 4.21091413
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  num_atoms: 16384
+  depth: 4
+  coefficient_bins: 2048
+  coefficient_max: 3.0
+  coefficient_scales: [8.203365325927734, 4.265638828277588, 3.0662174224853516, 1.8273425102233887]
+targets:
+  encoding: deterministic_stage1_sparse_support_and_coefficients
+  coefficient_quantization: nearest_bin
+  encoder_batch_size: 16
+objective: hard_next_token_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  atom_temperature: 1.0
+  atom_top_k: 256
+  atom_top_p: 0.95
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260

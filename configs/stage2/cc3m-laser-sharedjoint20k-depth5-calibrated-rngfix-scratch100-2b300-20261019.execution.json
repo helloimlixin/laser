@@ -1,0 +1,5 @@
+{
+  "short_sequence_math": true,
+  "target_chunk": 8192,
+  "ce_chunk_size": 8192
+}

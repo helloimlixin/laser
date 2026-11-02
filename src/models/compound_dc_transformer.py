@@ -127,7 +127,7 @@ class DCCompoundTransformer(nn.Module):
                  encoder_ffn_layers=(2, 2, 2, 2),
                  atom_ffn_layers=(2, 2, 2, 4),
                  coefficient_ffn_layers=(2, 2, 2, 2, 2, 7),
-                 overlap=8, dropout=.1):
+                 overlap=8, dropout=.1, num_classes=1):
         super().__init__()
         if len(block_size) != 3 or min(block_size) < 1:
             raise ValueError('block_size must contain height, width and depths')
@@ -141,6 +141,10 @@ class DCCompoundTransformer(nn.Module):
             raise ValueError('encoder and both decoders require blocks')
         self.num_atoms, self.coeff_vocab_size = num_atoms, coeff_vocab_size
         self.dictionary_dim, self.width, self.overlap = dictionary_dim, width, overlap
+        if not isinstance(num_classes, int) or num_classes < 1:
+            raise ValueError('num_classes must be a positive integer')
+        self.num_classes = num_classes
+        self.class_embedding = nn.Embedding(num_classes, width) if num_classes > 1 else None
         self.amp_dtype = torch.bfloat16
         self.atom_embedding = nn.Embedding(num_atoms, width)
         self.coefficient_embedding = nn.Embedding(coeff_vocab_size, width)
@@ -228,12 +232,28 @@ class DCCompoundTransformer(nn.Module):
         depths = torch.arange(chunk, device=atoms.device)
         return self.pair_physical(a, c, depths, aux).sum(-2)
 
-    def encode_prefix(self, atoms, coefficients, aux, chunk):
+    def condition_embedding(self, cond, batch_size, device):
+        if self.class_embedding is None:
+            if cond is not None and torch.count_nonzero(cond):
+                raise ValueError('unconditional model requires zero or absent labels')
+            return self.start.new_zeros(batch_size, 1, self.width)
+        if cond is None or cond.shape not in ((batch_size,), (batch_size, 1)):
+            raise ValueError('class-conditional model requires one label per image')
+        if cond.dtype not in (torch.int16, torch.int32, torch.int64):
+            raise ValueError('class labels must be integers')
+        labels = cond.reshape(batch_size).to(device=device, dtype=torch.long)
+        if bool(((labels < 0) | (labels >= self.num_classes)).any()):
+            raise ValueError('class label outside configured vocabulary')
+        return self.class_embedding(labels)[:, None]
+
+    def encode_prefix(self, atoms, coefficients, aux, chunk, condition=None):
         latent = self.prefix_latent(atoms, coefficients, aux, chunk)
         sites = torch.arange(self.sites, device=atoms.device)
         chunk_id = torch.tensor(chunk, device=atoms.device)
         encoded = (self.prefix_projection(latent) + self.prefix_site_embedding(sites)[None]
                    + self.prefix_depth_embedding(chunk_id)[None, None])
+        if condition is not None:
+            encoded = encoded + condition
         for block in self.prefix_encoder:
             encoded = block(encoded)
         return self.prefix_output_norm(encoded)
@@ -267,8 +287,7 @@ class DCCompoundTransformer(nn.Module):
     def forward(self, packed, model_aux=None, cond=None, amp=False):
         if tuple(packed.shape[1:]) != self.block_size:
             raise ValueError('all spatial/depth pairs are required')
-        if cond is not None and torch.count_nonzero(cond):
-            raise ValueError('Church model is unconditional')
+        condition = self.condition_embedding(cond, packed.shape[0], packed.device)
         self._validate_aux(model_aux)
         atoms, coefficients = packed.long() // self.coeff_vocab_size, packed.long() % self.coeff_vocab_size
         flat_atoms, flat_coefficients = self.depth_major(atoms), self.depth_major(coefficients)
@@ -278,8 +297,8 @@ class DCCompoundTransformer(nn.Module):
                 begin = max(0, chunk * self.sites - self.overlap)
                 end = (chunk + 1) * self.sites
                 indices = torch.arange(begin, end, device=packed.device)
-                prefix = self.encode_prefix(atoms, coefficients, model_aux, chunk)
-                hidden = self._previous_inputs(flat_atoms, flat_coefficients, indices, model_aux) + self._positions(indices)
+                prefix = self.encode_prefix(atoms, coefficients, model_aux, chunk, condition)
+                hidden = self._previous_inputs(flat_atoms, flat_coefficients, indices, model_aux) + self._positions(indices) + condition
                 for block in self.atom_decoder:
                     hidden = block(hidden, prefix)
                 values = self.coefficient_inputs(hidden, flat_atoms[:, indices], prefix[:, indices % self.sites], model_aux)
@@ -298,12 +317,13 @@ class DCCompoundTransformer(nn.Module):
             block.reset_cache()
         self._next_atom = self._next_coefficient = 0
         self._cached_prefix = self._cached_hidden = None
+        self._cached_condition = None
         self._chunk_begin = None
 
     def _cached_support(self, flat_atoms, flat_coefficients, aux, event):
         index = torch.tensor([event], device=flat_atoms.device)
         previous = self._previous_inputs(flat_atoms, flat_coefficients, index, aux)
-        hidden = previous + self._positions(index, event - self._chunk_begin)
+        hidden = previous + self._positions(index, event - self._chunk_begin) + self._cached_condition
         for block in self.atom_decoder:
             hidden = block(hidden, self._cached_prefix, cached=True)
         return hidden
@@ -316,7 +336,7 @@ class DCCompoundTransformer(nn.Module):
         return values
 
     @torch.no_grad()
-    def cached_atom_logits(self, atoms, coefficients, aux, event, *, amp=False):
+    def cached_atom_logits(self, atoms, coefficients, aux, event, *, amp=False, cond=None):
         """Consume one depth-major event after all prior pairs are completed."""
         if self.training or event != self._next_atom or event != self._next_coefficient:
             raise ValueError('atom and coefficient calls must alternate in depth-major order')
@@ -329,7 +349,8 @@ class DCCompoundTransformer(nn.Module):
             if site == 0:
                 for block in [*self.atom_decoder, *self.coefficient_decoder]:
                     block.reset_cache()
-                self._cached_prefix = self.encode_prefix(atoms, coefficients, aux, chunk)
+                self._cached_condition = self.condition_embedding(cond, atoms.shape[0], atoms.device)
+                self._cached_prefix = self.encode_prefix(atoms, coefficients, aux, chunk, self._cached_condition)
                 self._chunk_begin = max(0, event - self.overlap)
                 for overlap_event in range(self._chunk_begin, event):
                     hidden = self._cached_support(flat_atoms, flat_coefficients, aux, overlap_event)
@@ -360,15 +381,14 @@ class DCCompoundTransformer(nn.Module):
                         coeff_top_k=0, coeff_top_p=None, amp=True):
         if self.training:
             raise ValueError('sampling requires eval mode')
-        if cond is not None and torch.count_nonzero(cond):
-            raise ValueError('Church model is unconditional')
         device = next(self.parameters()).device
+        self.condition_embedding(cond, batch_size, device)
         atoms = torch.zeros(batch_size, *self.block_size, device=device, dtype=torch.long)
         coefficients = torch.zeros_like(atoms)
         self.init_cache()
         try:
             for event in range(self.events):
-                atom_logits = self.cached_atom_logits(atoms, coefficients, model_aux, event, amp=amp)
+                atom_logits = self.cached_atom_logits(atoms, coefficients, model_aux, event, amp=amp, cond=cond)
                 atom = sample_categorical(atom_logits, temperature=atom_temperature, top_k=atom_top_k, top_p=atom_top_p)
                 coefficient_logits = self.cached_coefficient_logits(atoms, coefficients, atom, model_aux, event, amp=amp)
                 coefficient = sample_categorical(coefficient_logits, temperature=coeff_temperature,

@@ -1,0 +1,134 @@
+run_id: cc3m-laser-joint20k-depth5-rqnoise-paper-eval-k1024-rngfix-scratch100-8a100-20261018
+name: CC3M LASER joint20k depth5 | paper FID + CLIP | K1024 p0.9 | scratch100 | 8
+  A100
+wandb_entity: helloimlixin-rutgers
+wandb_dir: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/wandb
+source_run: helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-k2048-rngfix-scratch100-8h100-20261017
+stage1: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/stage1.pt
+codebook: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/reference/inputs/joint-codebook.pt
+stage1_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+codebook_sha256: 922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9
+tokenizer_recipe:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 922c33037770287facb9ba8f2c477224087155ff14af3b9d6d7390b5a40485a9
+  vocab_size: 20481
+  depth: 5
+  measured_rfid: 4.192409404011698
+  source_measured_rfid: 4.215039034200402
+  candidate: adaptive8192
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  atoms: 8192
+  coefficient_levels_per_atom: adaptive 2/4/6/8 or uniform4; selected by measured
+    reconstruction
+  adaptive_coefficient_allocation: true
+  source_four_depth_codebook_sha256: 974fdaf42f041a02e93c7321b65d57900088ab7a2339ada6a5ffcc062ee9ac54
+  first_four_depths_unchanged: true
+arch:
+  type: rq-transformer
+  block_size:
+  - 8
+  - 8
+  - 5
+  embed_dim: 1280
+  input_embed_dim: 256
+  shared_tok_emb: true
+  shared_cls_emb: true
+  input_emb_vqvae: true
+  head_emb_vqvae: true
+  cumsum_depth_ctx: true
+  vocab_size_cond: 16384
+  block_size_cond: 32
+  body:
+    n_layer: 26
+    block:
+      n_head: 20
+  head:
+    n_layer: 4
+    block:
+      n_head: 20
+  vocab_size: 20481
+temperatures:
+- 0.05048883910784363
+- 0.02833188551776767
+- 0.05758083809087873
+- 0.054547438539303536
+- 0.0459920263323772
+target_chunk: 128
+encoder_batch: 8
+sampling:
+  temperature: 1.0
+  top_k: 1024
+  top_p: 0.9
+data_source: /workspace/Projects/data/cc3m/shards
+data_local: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/data
+data_manifest: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/data-manifest.json
+dataset_revision: 46f3d69f840e59d77d52e8decfe5baec97e94c7f
+train_items: 2905954
+validation_items: 13443
+world_size: 8
+global_batch: 2048
+microbatch: 128
+accumulation: 2
+epochs: 100
+lr: 0.0005
+betas:
+- 0.9
+- 0.95
+weight_decay: 0.0001
+grad_clip: 1.0
+warmup_epochs: 0
+min_lr: 0.0
+image_loss_weight: 0.9
+text_loss_weight: 0.1
+bpe_dropout: 0.1
+text_length: 32
+text_vocab_size: 16384
+image_transform: upstream dalle-vqvae random augmentation; eval resize256 square
+augmentation_source_url: https://raw.githubusercontent.com/kakaobrain/rq-vae-transformer/main/rqvae/txtimg_datasets/transforms.py
+augmentation_sha256: c9769a33d2b9b4b4ddc1d875aa20eaec9431797cfd227a56cd3157534120f168
+augmentation_matches_upstream_byte_for_byte: true
+image_target_mode: fresh stochastic residual prefixes and full soft distributions
+  on each visit
+shuffle_group_shards: 16
+order_policy: shuffle shard order and images within 16-shard groups each epoch; exact
+  distributed split
+precision: bf16
+frozen_encoder_precision: fp32
+attention: SDPA; unchanged upstream parameters
+seed: 261017
+workers: 4
+eval_batch: 32
+save_every: 500
+preview_every: 500
+output: /workspace/Projects/laser/outputs/cc3m-laser-joint20k-depth5-rqnoise-paper-eval-k1024-rngfix-scratch100-8a100-20261018
+local_checkpoints: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/checkpoints
+optimizer_recipe_url: https://raw.githubusercontent.com/kakaobrain/rq-vae-transformer/main/configs/cc3m/cc3m-rqtransformer-8x8x4-650M.yaml
+official_config_sha256: 4b80e24ea60fd756ef7c1edd507da9375b99de24cedd448da48ec20985b20fe2
+stage2_initialization: fresh_random
+stage2_checkpoint_loaded: false
+original_source_run: helloimlixin-rutgers/laser/imagenet-laser-joint20k-depth5-rqnoise-k2048-scratch100-4h100-20261017
+replaces_run: cc3m-laser-joint20k-depth5-rqnoise-k2048-rngfix-scratch100-8a100-20261017
+training_rng:
+  policy: independent_rank_v1
+  base_seed: 261017
+evaluation_rng_policy: isolated_python_numpy_cpu_and_local_cuda_including_metric_setup
+dataloader_rng_policy: dedicated_generator_and_cpu_only_augmentation_seed
+initialization_rng_reset_after_tokenizer: true
+checkpoint_uploads:
+- last.pt
+- best-fid.pt
+- best-clip_score.pt
+evaluate_at_start: true
+evaluation:
+  protocol: rq_transformer_cc3m_paper_v1
+  fid_reference: /tmp/laser-cc3m-joint20k-depth5-paper-eval-8a100-20261018/reference/cc3m_256_val.npz
+  fid_reference_sha256: 49603d7520746d63a92036be30a28d5e0717b99b0d62e0a26e091ef89886b564
+  fid_reference_source: https://twg.kakaocdn.net/brainrepo/etc/RQVAE/8b325b628f49bf60a3094fcf9419398c/fid_stats.tar.gz
+  fid_reference_archive_member: fid_stats/cc3m_256_val.npz
+  clip_implementation: rqvae.metrics.clip_score.clip_score
+  clip_weights_precision: fp32_loaded_on_cpu
+  clip_image_preprocessing: released uint8/PIL official CLIP transform
+  generated_images: 13443
+  caption_membership_matches_original_paper: unverified; available validation subset
+  original_paper: https://openaccess.thecvf.com/content/CVPR2022/supplemental/Lee_Autoregressive_Image_Generation_CVPR_2022_supplemental.pdf#page=14

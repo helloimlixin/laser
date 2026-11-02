@@ -14,6 +14,10 @@ def optimizer_boundary_migration(saved, world, accumulation, batch_idx):
 def validate_resume_layout(saved,world,accumulation,total_batch,batch_idx):
  same=(saved.get('exact_global_batch') and saved.get('world_size')==world and saved.get('accumulation_steps')==accumulation and saved.get('total_batch_size')==total_batch)
  if same:return False
+ if (os.environ.get('LASER_ALLOW_ACCUMULATION_CHANGE')=='1' and saved.get('world_size')==world):
+  from src.training.microbatch_migration import remap_microbatch_cursor
+  remap_microbatch_cursor(saved,world=world,accumulation=accumulation,total_batch=total_batch,batch_idx=batch_idx)
+  return True
  old=saved.get('world_size');oldacc=saved.get('accumulation_steps')
  valid=(total_batch==2048 and optimizer_boundary_migration(saved,world,accumulation,batch_idx)) or (os.environ.get('LASER_ALLOW_EPOCH_BOUNDARY_WORLD_SIZE_CHANGE')=='1' and saved.get('exact_global_batch') and old in LAYOUTS and world in LAYOUTS and oldacc in LAYOUTS[old] and accumulation in LAYOUTS[world] and saved.get('total_batch_size')==total_batch==2048 and saved.get('batch_size')==math.ceil(2048/(old*oldacc)) and batch_idx==0)
  if not valid:raise ValueError('Unsupported exact-global-batch epoch-boundary layout change')

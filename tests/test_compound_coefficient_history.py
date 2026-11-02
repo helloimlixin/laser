@@ -9,7 +9,7 @@ from src.training.rqtransformer import CompoundLaserRQTransformer, build_model
 from tests.test_compound_pair_autoregressive import tiny_aux, tiny_config
 
 
-def setup_model(*, activate=False):
+def setup_model(*, activate=False, normalize_fields=False):
     torch.manual_seed(31)
     config = tiny_config(depth=3)
     config.block_size = [2, 2, 3]
@@ -17,7 +17,7 @@ def setup_model(*, activate=False):
                                      micro_transformer_layers=1,
                                      depth_specific_coeff_heads=True).eval()
     model = attach_coefficient_history_decoder(copy.deepcopy(base), width=12, heads=3,
-                                              layers=2, dropout=0.)
+                                              layers=2, dropout=0., normalize_fields=normalize_fields)
     if activate:
         torch.nn.init.normal_(model.coefficient_history_decoder.output.weight, std=.1)
     atoms = torch.tensor([[[[0, 2, 4], [1, 3, 5]], [[2, 4, 6], [0, 3, 6]]]])
@@ -36,8 +36,9 @@ def test_zero_residual_preserves_predictions_and_parameter_order():
         assert torch.equal(expected[key], actual[key])
 
 
-def test_active_decoder_uses_current_atom_without_current_or_future_coefficients():
-    _, model, aux, atoms, coeffs = setup_model(activate=True)
+@pytest.mark.parametrize('normalize_fields', [False, True])
+def test_active_decoder_uses_current_atom_without_current_or_future_coefficients(normalize_fields):
+    _, model, aux, atoms, coeffs = setup_model(activate=True, normalize_fields=normalize_fields)
     tokens = atoms * 5 + coeffs
     with torch.no_grad():
         expected = model(tokens, model_aux=aux)
@@ -56,8 +57,9 @@ def test_active_decoder_uses_current_atom_without_current_or_future_coefficients
         assert not torch.equal(expected['coeff_logits'][0, 0, 0, 1], actual['coeff_logits'][0, 0, 0, 1])
 
 
-def test_active_cached_decoder_matches_dense_across_spatial_boundaries():
-    _, model, aux, atoms, coeffs = setup_model(activate=True)
+@pytest.mark.parametrize('normalize_fields', [False, True])
+def test_active_cached_decoder_matches_dense_across_spatial_boundaries(normalize_fields):
+    _, model, aux, atoms, coeffs = setup_model(activate=True, normalize_fields=normalize_fields)
     tokens = atoms * 5 + coeffs
     with torch.no_grad():
         expected = model(tokens, model_aux=aux)['coeff_logits'].reshape(12, -1)
@@ -73,6 +75,25 @@ def test_active_cached_decoder_matches_dense_across_spatial_boundaries():
         model.init_cache()
         assert model.coefficient_history_decoder._next_event == 0
         assert all(block._kv is None for block in model.coefficient_history_decoder.blocks)
+
+
+def test_normalized_history_cache_reads_only_generated_prefix():
+    _, model, aux, atoms, coeffs = setup_model(activate=True, normalize_fields=True)
+    truth = atoms * 5 + coeffs
+    generated = torch.full_like(truth, 2)
+    with torch.no_grad():
+        expected = model(truth, model_aux=aux)
+        model.init_cache()
+        for event in range(12):
+            site, depth = divmod(event, 3)
+            h, w = divmod(site, 2)
+            hidden = model.cached_head_output(generated, aux, None, (h, w, depth), amp=False)
+            actual = model.coefficient_logits(hidden, aux.dictionary.T[atoms[:, h, w, depth]],
+                                              depth_index=depth)
+            torch.testing.assert_close(actual[0], expected['coeff_logits'].reshape(12, -1)[event],
+                                       atol=2e-6, rtol=1e-5)
+            generated.reshape(-1)[event] = truth.reshape(-1)[event]
+        model.init_cache()
 
 
 def test_physical_prefix_is_local_and_strictly_shifted_with_signed_raw_values():
@@ -129,3 +150,44 @@ def test_model_factory_rejects_incompatible_history_settings():
         build_model(12, 7, coefficient_history_layers=2)
     with pytest.raises(ValueError, match='nonnegative'):
         build_model(12, 7, coefficient_history_layers=-1)
+
+
+def test_factory_builds_normalized_history_and_cli_exposes_options(monkeypatch):
+    from src.training import rqtransformer as training
+    original = CompoundLaserRQTransformer
+    def tiny_model(config, **kwargs):
+        return original(tiny_config(depth=3), **kwargs)
+    monkeypatch.setattr(training, 'CompoundLaserRQTransformer', tiny_model)
+    model = training.build_model(12, 7, compound=True, compound_pair_autoregressive=True,
+                                 coeff_vocab_size=5, coefficient_history_layers=2,
+                                 coefficient_history_width=12, coefficient_history_heads=3,
+                                 coefficient_history_normalize_fields=True)
+    assert len(model.coefficient_history_decoder.blocks) == 2
+    assert model.coefficient_history_decoder.field_norms is not None
+    options = {action.dest for action in training.build_parser()._actions}
+    assert {'coefficient_history_layers', 'coefficient_history_normalize_fields',
+            'compound_gradient_diagnostics_every'} <= options
+
+
+def test_shared_gradient_probe_preserves_backward_and_detects_both_branches():
+    from src.training.compound_balance import shared_hidden_gradient_metrics
+    _, model, aux, atoms, coeffs = setup_model(activate=True)
+    reference = copy.deepcopy(model)
+    model.capture_shared_hidden = True
+    output = model(atoms * 5 + coeffs, model_aux=aux)
+    a = -output['atom_logits'].log_softmax(-1).gather(-1, atoms[..., None]).squeeze(-1)
+    c = -output['coeff_logits'].log_softmax(-1).gather(-1, coeffs[..., None]).squeeze(-1)
+    metrics = shared_hidden_gradient_metrics(a, c, output['shared_hidden'], atom_weight=.5)
+    assert all(parameter.grad is None for parameter in model.parameters())
+    an = metrics['train/shared_atom_gradient_norm_rank0']
+    cn = metrics['train/shared_coefficient_gradient_norm_rank0']
+    assert an > 0 and cn > 0
+    assert metrics['train/weighted_shared_gradient_ratio_rank0'] == pytest.approx(.5 * an / cn)
+    assert metrics['train/equal_norm_atom_weight_rank0'] == pytest.approx(cn / an)
+    (.5 * a.mean() + c.mean()).backward()
+    expected = reference(atoms * 5 + coeffs, model_aux=aux)
+    ar = -expected['atom_logits'].log_softmax(-1).gather(-1, atoms[..., None]).mean()
+    cr = -expected['coeff_logits'].log_softmax(-1).gather(-1, coeffs[..., None]).mean()
+    (.5 * ar + cr).backward()
+    for left, right in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(left.grad, right.grad, rtol=0, atol=0)

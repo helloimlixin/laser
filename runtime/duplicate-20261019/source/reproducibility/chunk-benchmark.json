@@ -1,0 +1,27 @@
+[
+  {
+    "chunk": 1024,
+    "targets_seconds": 0.006260197842493653,
+    "ce_forward_backward_seconds": 1.1769598480314016
+  },
+  {
+    "chunk": 128,
+    "targets_seconds": 0.0259575170930475,
+    "ce_forward_backward_seconds": 0.04070864710956812
+  },
+  {
+    "chunk": 512,
+    "targets_seconds": 0.007364083081483841,
+    "ce_forward_backward_seconds": 0.011416448978707194
+  },
+  {
+    "chunk": 1024,
+    "targets_seconds": 0.0061279048677533865,
+    "ce_forward_backward_seconds": 0.006396036129444838
+  },
+  {
+    "chunk": 128,
+    "targets_seconds": 0.02681355900131166,
+    "ce_forward_backward_seconds": 0.040483490098267794
+  }
+]

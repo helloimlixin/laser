@@ -1,0 +1,52 @@
+model:
+  backbone: gpt
+  parameters: 1396875264
+  width: 2048
+  layers: 26
+  heads: 32
+  coefficient_conditioner_layers: 2
+  coefficient_conditioner_width: 512
+  coefficient_conditioner_heads: 8
+  coefficient_conditioner_zero_initial_output: true
+  coefficient_conditioner_inputs: [causal_context, current_atom, previous_completed_pair]
+  joint_codebook: false
+training:
+  compound_tokens: true
+  sparsity_level: 4
+  num_atoms: 16384
+  coeff_vocab_size: 512
+  coeff_target_mode: hard
+  total_batch_size: 2048
+  batch_size: 64
+  accumulation: 4
+  attention_dropout: 0.0
+  embedding_dropout: 0.0
+  ffn_intermediate_dropout: 0.0
+  residual_dropout: 0.1
+  atom_loss_weight: 1.0
+  atom_depth_loss_weights: [1.0, 1.25, 1.5, 2.0]
+  coeff_depth_loss_weights: [1.0, 1.25, 1.5, 2.0]
+  resume_global_step: 6260
+  resume_epoch: 10
+  epochs: 20
+  lr_schedule_epochs: 100
+  existing_optimizer_state: preserve
+  added_conditioner_optimizer_state: zero_step_and_moments
+sampling:
+  atom_temperature: 0.9
+  atom_top_k: 16384
+  atom_top_p: 0.9
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+evaluation:
+  metric_backend: original-rqvae
+  fid_num_samples: 50000
+  fid_real_split: train
+  fid_every: 5
+  fid_extra_epochs: [12]
+  classes: [933, 849, 258, 22, 277, 926, 106, 269]
+execution:
+  gpus: 8
+  isolated_trial: /tmp/laser-compound512-gpt1400m-strongcoeff-20261024
+  recipe: /tmp/laser-compound512-gpt1400m-strongcoeff-20261024/recipe.json

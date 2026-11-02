@@ -29,12 +29,20 @@ def validate_policy(temperature, site_chunk_size):
 @contextmanager
 def omp_precision(device):
     previous = torch.backends.cuda.matmul.allow_tf32
+    previous_linalg = None
+    if device.type == 'cuda':
+        previous_linalg = torch.backends.cuda.preferred_linalg_library()
+        # MAGMA's batched Cholesky solve allocates during CUDA graph capture.
+        # cuSOLVER supports capture; use it for both eager and graph teachers.
+        torch.backends.cuda.preferred_linalg_library('cusolver')
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
         with torch.autocast(device_type=device.type, enabled=False):
             yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+        if previous_linalg is not None:
+            torch.backends.cuda.preferred_linalg_library(previous_linalg)
 
 
 @torch.no_grad()
@@ -134,7 +142,8 @@ def stochastic_soft_image_targets(aux, images, *, atom_temperature,
             stochastic=True, compact=True, hard=False)
         coefficient_ids = tokens[..., 1::2] - aux.num_atoms
         labels = omp_bank_joint_targets(bank_atoms, bank_coefficients, atoms, coefficient_ids,
-            aux.coeff_bins.float(), temperature=coefficient_temperature, site_chunk_size=site_chunk_size)
+            aux.coeff_bins.float(), temperature=coefficient_temperature,
+            site_chunk_size=max(site_chunk_size,1024) if signals.device.type=='cuda' else site_chunk_size)
     return dict(tokens=tokens, atoms=atoms, coefficients=coefficients,
         atom_ids=labels.atom_ids, atom_weights=labels.atom_weights,
         coefficient_probabilities=labels.coefficient_probabilities, trajectory_choices=choices)

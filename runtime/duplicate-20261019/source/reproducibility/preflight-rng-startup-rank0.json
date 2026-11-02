@@ -1,0 +1,10 @@
+{
+  "rank": 0,
+  "training_rng_policy": "independent_rank_v1",
+  "training_rng_seed_base": 261001,
+  "training_rng_seed": 261001,
+  "training_rng_restored_from_checkpoint": false,
+  "rng_state_sha256": "437f3bd0de21aa333f9d5bf329df6cdf908f096a5e33699e9c8b9382c9018642",
+  "dropout_probe_sha256": "f3e912d41b595f9f38a6a641c7d3ec593cd4cb99205998ad2e92f039f672753b",
+  "training_rng_unchanged_by_audit": true
+}

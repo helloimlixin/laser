@@ -1,0 +1,15 @@
+{
+  "upstream_commit": "341395e562ac347f5eb62db9f5f08b9f2cc42a60",
+  "compatibility_patch": "Python 3.12 dataclass default_factory",
+  "core_files": {
+    "rqvae/models/rqtransformer/transformers.py": "e2e5c7e36dd97cfa02d42aabbc5699baed9953b9afdbc221ddda65b10719698e",
+    "rqvae/models/rqtransformer/attentions.py": "cfcb3bb5e005cfc6e9a1641fe87e2c18db7afc8ae775b6711f64e5de3761561b",
+    "rqvae/models/rqtransformer/primitives.py": "7df3e7a69e73593893daf4f9e1a5e8198e8400ffc4b8263d8b66559e5bca660c",
+    "rqvae/models/rqtransformer/configs.py": "b86750e1a4f1a5712199345ca9158843a276ecee257ff6565f452ce9d2f15cf2",
+    "rqvae/optimizer/loss.py": "93260cc4b6009a5f999449d985360538bb4d40e3ac639205c9f3f1522f69fc21",
+    "rqvae/optimizer/optimizer.py": "b2127d71d427b5474c7b85e4caa57abd9716c2ddd86a047db07a673bb8d686ad",
+    "rqvae/optimizer/scheduler.py": "af5882253ace43872fedc68949f79d72bf276a76be31f69338324020a7795cb7",
+    "rqvae/img_datasets/transforms.py": "48bc1bd5c467527205725d62045335550be642fefa7a37160d0c71e971bc0c4b",
+    "rqvae/models/rqvae/rqvae.py": "968453f61782c2761b1f97fa6749e4f1363cb815b541684a5b47ca398ada8b1f"
+  }
+}

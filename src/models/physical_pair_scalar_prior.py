@@ -55,8 +55,15 @@ class PhysicalPairScalarRQTransformer(LaserRQTransformer):
             spatial = body[:, self.block_size_cond - 1:]
             inputs = self._pair_inputs(spatial.reshape(-1, spatial.shape[-1]),
                                        sequence.reshape(-1, depth), model_aux)
+            if getattr(self, 'capture_shared_hidden', False):
+                # Group the two scalar input states per sparse depth. The view
+                # must feed the transformer so diagnostic gradients exist.
+                shared = inputs.reshape(batch, height, width, depth // 2, -1)
+                inputs = shared.reshape_as(inputs)
             hidden = self.head_transformer(inputs).reshape(batch, height, width, depth, -1)
             output = self.classify_head_outputs(hidden)
+            if getattr(self, 'capture_shared_hidden', False):
+                output['shared_hidden'] = shared
             atoms = atoms.reshape(batch, height, width, depth // 2)
             for index in range(1, depth // 2):
                 output["atom_logits"][..., index, :].scatter_(-1, atoms[..., :index], -torch.inf)

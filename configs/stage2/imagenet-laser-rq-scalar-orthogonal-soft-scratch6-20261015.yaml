@@ -1,0 +1,48 @@
+version: laser-rq-clean-scalar-orthogonal-soft-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-rq-scalar-orthogonal-soft-scratch6-4h100-20261015
+name: LASER scalar orthogonal soft from scratch six epochs
+seed: 261001
+epochs: 6
+global_batch: 2048
+microbatch: 32
+lr_schedule_epochs: 100
+target_mode: hard_sparse_tokens
+tokenizer:
+  source_reported_rfid: 4.21091413
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  num_atoms: 16384
+  depth: 4
+  coefficient_bins: 2048
+  coefficient_max: 3.0
+  coefficient_scales:
+  - 8.203365325927734
+  - 4.265638828277588
+  - 3.0662174224853516
+  - 1.8273425102233887
+targets:
+  encoding: deterministic_stage1_sparse_support_and_coefficients
+  coefficient_quantization: nearest_bin
+  encoder_batch_size: 16
+objective: fixed_support_soft_coefficient_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  atom_temperature: 1.0
+  atom_top_k: 2048
+  atom_top_p: 1.0
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.85
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+ar_factors:
+  coordinates: orthogonal
+  coefficient_bins: 2048
+decoder: scalar
+coefficient_policy: soft

@@ -1,0 +1,68 @@
+# Flat GPT over completed pairs; packed integers are transport only.
+model:
+  backbone: gpt
+  parameters: 1386367488
+  width: 2048
+  layers: 26
+  heads: 32
+  ffn_width: 8192
+  events_per_image: 256
+  atom_vocabulary: 16384
+  coefficient_vocabulary: 512
+  joint_codebook: false
+training:
+  model_preset: imagenet-1400m
+  backbone: gpt
+  compound_tokens: true
+  compound_pair_autoregressive: true
+  sparsity_level: 4
+  num_atoms: 16384
+  coeff_vocab_size: 512
+  coeff_max: 3.0
+  coeff_scales: [4.587941646575928, 2.4749884605407715, 1.6106663942337036, 1.0176019668579102]
+  coeff_target_space: normalized
+  coeff_target_mode: hard
+  stochastic_coefficient_inputs: false
+  atom_loss_weight: 1.0
+  atom_depth_loss_weights: [1.0, 1.25, 1.5, 2.0]
+  coeff_depth_loss_weights: [1.0, 1.25, 1.5, 2.0]
+  geometry_loss_weight: 0.0
+  total_batch_size: 2048
+  batch_size: 64
+  distributed_backend: ddp
+  epochs: 20
+  lr_schedule_epochs: 100
+  lr: 0.0005
+  lr_schedule: cosine
+  min_lr: 0.0
+  warmup_epochs: 0.0
+  seed: 261001
+  mask_seen_atoms_training: true
+sampling:
+  # Restored after the matched step-6250 FID50k comparison: 59.40 -> 46.26.
+  atom_temperature: 0.9
+  atom_top_k: 16384
+  atom_top_p: 0.9
+  coeff_temperature: 1.0
+  coeff_top_k: 0
+  coeff_top_p: 0.85
+evaluation:
+  metric_backend: original-rqvae
+  fid_num_samples: 50000
+  fid_real_split: train
+  fid_every: 5
+  fid_early_epochs: 2
+  sample_grid_every: 626
+  sample_grid_size: 512
+  sample_grid_samples_per_class: 64
+  classes: [933, 849, 258, 22, 277, 926, 106, 269]
+execution:
+  gpus: 8
+  accumulation: 4
+  compiled_blocks: true
+  activation_checkpointing: false
+  encoder_precision: fp32
+  teacher_tf32: false
+  checkpoint_policy: local_recovery_and_immutable_verified_cloud_upload
+  isolated_trial: /tmp/laser-compound512-gpt1400m-20261023
+  recipe: /tmp/laser-compound512-gpt1400m-20261023/recipe.json

@@ -1,0 +1,7 @@
+{
+  "passed": true,
+  "global_step": 3,
+  "images": 512,
+  "training_rng_unchanged": true,
+  "optimizer_unchanged": true
+}

@@ -27,12 +27,14 @@ def test_normalization_precedes_clamping_and_geometry_uses_clamped_coefficients(
     torch.testing.assert_close(contributions.flatten(), torch.tensor([15., -10., 3., -6.]))
 
 
-def test_ffhq_temperature_matches_half_unit_gaussian_on_uniform_bins():
+@pytest.mark.parametrize('target_sigma', [.5, .125])
+def test_temperature_matches_gaussian_sigma_on_uniform_bins(target_sigma):
     aux = identity_aux()
-    _, probabilities = aux.compound_coeff_ids(torch.zeros(1, 1, 1, 4), temp=.5, stochastic=False)
+    _, probabilities = aux.compound_coeff_ids(
+        torch.zeros(1, 1, 1, 4), temp=2*target_sigma**2, stochastic=False)
     p = probabilities[0, 0, 0, 0].double()
     bins = aux.coeff_bins.double()
     mean = (p*bins).sum()
     sigma = (p*(bins-mean).square()).sum().sqrt().item()
-    assert sigma == pytest.approx(.5, rel=1e-4)
-    assert sigma/(6/2047) == pytest.approx(170.5833333333, rel=1e-4)
+    assert sigma == pytest.approx(target_sigma, rel=1e-4)
+    assert sigma/(6/2047) == pytest.approx(target_sigma/(6/2047), rel=1e-4)

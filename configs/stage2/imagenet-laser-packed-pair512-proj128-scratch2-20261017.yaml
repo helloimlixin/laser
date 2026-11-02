@@ -1,0 +1,65 @@
+version: laser-native-packed-pair-integer-v1
+run_id: imagenet-laser-pairid512-proj128-scratch2-4h100-20261017
+name: LASER all pair IDs | global 128D classifier | original RQ backbone | fresh2
+seed: 261001
+epochs: 2
+global_batch: 2048
+microbatch: 16
+lr_schedule_epochs: 100
+decoder: native_packed_pair_integer
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  num_atoms: 16384
+  coefficient_bins: 512
+  vocab_size: 8388608
+  depth: 4
+  coefficient_max: 3.0
+  coefficient_scales:
+  - 8.203365325927734
+  - 4.265638828277588
+  - 3.0662174224853516
+  - 1.8273425102233887
+targets:
+  mode: soft_coefficient
+  temperature: 0.01125
+  encoder_batch_size: 8
+  loss_row_chunk_size: 1
+objective: single_global_pair_cross_entropy
+auxiliary_loss_terms: 0
+optimization:
+  peak_lr: 0.0005
+  warmup_epochs: 0
+  minimum_lr_ratio: 0.0
+augmentation: original RQ Resize256 RandomCrop256 RandomHorizontalFlip from the first
+  batch
+sampling:
+  temperature: 1.0
+  top_k: 0
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 8
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+preview:
+  designated_classes: true
+  every_updates: 200
+  first_update: 1
+  fixed_seed: 261001
+  overview_per_class: 10
+  grid_rows: 8
+  grid_columns: 8
+execution:
+  classifier: projected_global_pair_ids
+  projection_dim: 128
+  launch_status: requires_full_vocabulary_gpu_preflight
+  chunked_training_loss: true
+  loss_row_chunk_size: 128
+  loss_class_chunk_size: 262144
+initialization:
+  reset_stage2_seed_after_tokenizer: true
+  paired_fresh_backbone: true
+  reference_vocab_size: 65537

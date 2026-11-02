@@ -9,8 +9,18 @@ only on the ordered support prefix through the same depth.
 from __future__ import annotations
 
 import torch
+from functools import wraps
 
 
+def _fp32_coordinates(function):
+    @wraps(function)
+    def wrapped(support_vectors, *args, **kwargs):
+        with torch.autocast(device_type=support_vectors.device.type, enabled=False):
+            return function(support_vectors, *args, **kwargs)
+    return wrapped
+
+
+@_fp32_coordinates
 def ordered_support_basis(
     support_vectors: torch.Tensor,
     *,
@@ -54,6 +64,7 @@ def ordered_support_basis(
     return torch.stack(basis_rows, dim=-2), lower
 
 
+@_fp32_coordinates
 def dictionary_to_orthogonal_coefficients(
     support_vectors: torch.Tensor,
     dictionary_coefficients: torch.Tensor,
@@ -74,6 +85,7 @@ def dictionary_to_orthogonal_coefficients(
     return gamma, basis
 
 
+@_fp32_coordinates
 def orthogonal_to_dictionary_coefficients(
     support_vectors: torch.Tensor,
     orthogonal_coefficients: torch.Tensor,
@@ -96,6 +108,7 @@ def orthogonal_to_dictionary_coefficients(
     return coefficients, basis
 
 
+@_fp32_coordinates
 def reconstruct_from_orthogonal(
     support_vectors: torch.Tensor,
     orthogonal_coefficients: torch.Tensor,

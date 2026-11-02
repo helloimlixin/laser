@@ -1,6 +1,7 @@
 """Check FFHQ-style percentile scaling and clipping on fresh ImageNet views."""
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -12,7 +13,12 @@ def main():
     p.add_argument('--distribution', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--images', type=int, default=4096)
+    p.add_argument('--target-sigma-normalized', type=float, default=.5)
     args = p.parse_args()
+    if not math.isfinite(args.target_sigma_normalized) or args.target_sigma_normalized <= 0:
+        p.error('Target sigma must be finite and positive')
+    sigma = args.target_sigma_normalized
+    temperature = 2 * sigma**2
     sys.path[:0] = [str(args.base/'source'), str(args.base/'source/runtime')]
     import numpy as np
     import torch
@@ -53,7 +59,7 @@ def main():
             clipped = raw.clamp(-3, 3)
             z = aux.physical_contributions(atoms, c).sum(-2)
             limited_z = new_aux.physical_contributions(atoms, clipped).sum(-2)
-            ids, probabilities = new_aux.compound_coeff_ids(clipped, temp=.5, stochastic=False)
+            ids, probabilities = new_aux.compound_coeff_ids(clipped, temp=temperature, stochastic=False)
             quantized = new_aux.coeff_bins[ids]
             quantized_z = new_aux.physical_contributions(atoms, quantized).sum(-2)
             latent_energy += z.square().sum().item()
@@ -87,21 +93,21 @@ def main():
             clipped_fraction=(normalized.abs()>3).float().mean().item(),
             clipped_normalized_rms=clipped.square().mean().sqrt().item(),
             clipped_normalized_range=[clipped.min().item(),clipped.max().item()],
-            noise_sigma_normalized=.5, noise_sigma_bins=.5/(6/2047),
-            sigma_over_clipped_rms=.5/clipped.square().mean().sqrt().item(),
-            physical_clamping_limit=3*scales[d], physical_noise_sigma=.5*scales[d]))
+            noise_sigma_normalized=sigma, noise_sigma_bins=sigma/(6/2047),
+            sigma_over_clipped_rms=sigma/clipped.square().mean().sqrt().item(),
+            physical_clamping_limit=3*scales[d], physical_noise_sigma=sigma*scales[d]))
     clipped_fraction=sum(d['clipped_fraction'] for d in depths)/4
     report = dict(passed=clipped_fraction<=.02, calibration_images=source['images'], validation_images=args.images,
         validation_seed=261095, validation_augmentation_epoch=0, coefficients_per_depth=args.images*64,
         coefficient_scales=scales, uniform_bins=dict(count=2048,range=[-3,3],width=6/2047),
-        target_temperature=.5, target_sigma_normalized=.5, target_sigma_bins=.5/(6/2047),
+        target_temperature=temperature, target_sigma_normalized=sigma, target_sigma_bins=sigma/(6/2047),
         clipping=True, clipping_fraction=clipped_fraction, depths=depths,
         clipping_latent_relative_rms=(clipping_error/latent_energy)**.5,
         clipping_and_quantization_latent_relative_rms=(quantization_error/latent_energy)**.5,
         expected_fixed_atom_noise_relative_rms=(noise_error/clipped_latent_energy)**.5,
         clipped_quantized_decode_mae_255=pixel_error/pixel_values, decoded_validation_images=128,
         ffhq_cache_clipped_fraction=.004971986636519432,
-        matching_rule='q99.5(abs(physical coefficient))/3 per depth; clamp normalized coefficients to [-3,3]; Gaussian temperature .5 -> nominal sigma .5',
+        matching_rule=f'q99.5(abs(physical coefficient))/3 per depth; clamp normalized coefficients to [-3,3]; Gaussian temperature {temperature:g} -> nominal sigma {sigma:g}',
         limitations='ImageNet calibration and validation are independent 4096-image subsets, not the full corpus. Noise energy is a codec diagnostic and does not establish prior FID.',
         elapsed_seconds=time.time()-started, peak_memory_gib=torch.cuda.max_memory_allocated()/2**30)
     assert report['passed']

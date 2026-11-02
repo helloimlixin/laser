@@ -164,6 +164,29 @@ class ImageFolderDataModule(pl.LightningDataModule):
             return
 
         root = self._resolve_data_dir()
+        if self.dataset_name == "imagenet" and (root / "train-index.npz").is_file():
+            from src.training.rq_imagenet_runtime import TarImageNet
+
+            # Use the original ImageNet short-side resize and crop protocol.
+            # Worker RNGs supply fresh views each epoch under Lightning.
+            crop = self._resize_to()
+            train_ops = [transforms.Resize(max(crop))]
+            if bool(self.config.augment):
+                train_ops.extend([transforms.RandomCrop(crop), transforms.RandomHorizontalFlip()])
+            else:
+                train_ops.append(transforms.CenterCrop(crop))
+            normalize = [transforms.ToTensor(), transforms.Normalize(self.config.mean, self.config.std)]
+            self.train_dataset = TarImageNet(
+                root, "train", transforms.Compose(train_ops + normalize),
+                seed=int(self.config.seed), deterministic_train_views=False,
+            )
+            self.val_dataset = TarImageNet(
+                root, "val", transforms.Compose([
+                    transforms.Resize(max(crop)), transforms.CenterCrop(crop), *normalize,
+                ]),
+            )
+            self.test_dataset = self.val_dataset
+            return
         categories = _lsun_categories(self.dataset_name) if self.dataset_name.startswith("lsun_") else ()
         for category in categories:
             train_db = root / f"{category}_train_lmdb"
