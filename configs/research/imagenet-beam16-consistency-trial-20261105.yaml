@@ -1,0 +1,39 @@
+name: ImageNet beam16 | frozen tokenizer | matched consistency pilot
+source_run: imnet-j16384-a4096-beam16-rfid451-scratch100-2b300-20261104
+source_base: /tmp/laser-beam16-resume/frozen
+local: /tmp/laser-beam16-consistency-20261105
+output: /workspace/Projects/laser/outputs/imnet-beam16-consistency-trial-20261105
+source_step: 10750
+updates: 1252
+steps_per_epoch: 626
+global_batch: 2048
+microbatch: 32
+memory_gib: 44
+loader_workers: 2
+head_seed: 26110501
+noise_seed: 26110502
+projection_dim: 512
+shallow_layer: 0
+deep_layer: 31
+maximum_noise: 0.02
+ramp_updates: 64
+maximum_auxiliary_weight: 0.05
+maximum_initial_auxiliary_gradient_ratio: 0.1
+calibration_images: 8
+save_every_updates: 250
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  seed: 26110503
+  batch: 128
+  decode_batch: 16
+  temperature: 1.0
+  top_k: 1024
+  top_p: 0.95
+  inception_splits: 10
+arms:
+  - consistency
+  - control
+method: reAR-inspired RQ-stack adaptation; shallow current-site and deep next-site summed-embedding cosine losses
+reference: https://arxiv.org/html/2510.04450v1

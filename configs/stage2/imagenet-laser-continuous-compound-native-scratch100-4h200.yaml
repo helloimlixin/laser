@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - imagenet-laser-continuous-compound-pilot
+  - _self_
+
+mode: train
+run_id: imagenet-laser-continuous-compound-native-scratch100-4h200-20261107
+name: ImageNet original LASER | continuous compound | fresh100 | 4 H200
+epochs: 100
+microbatch: 64
+global_batch: 2048
+lr_schedule_epochs: 100
+data:
+  class_index: /tmp/imagenet-laser-continuous-compound-pilot-20261107/archive-class-index.json
+training:
+  devices: 4
+  index_workers: 8
+  rq_config: outputs/imagenet-laser-compound512-native-scratch2-4h100-20261016/reproducibility/stage2-training-config.yaml
+  reference_stats: outputs/imagenet-laser-rq-minimal-rfid421-scratch20-20261014/reproducibility/imagenet_256_train.npz
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+  archive_md5: 1d675b47d978889d74fa0da5fadfb00e
+  max_restarts: 3
+checkpoint:
+  every_updates: 100
+  at_first_update: true
+logging:
+  wandb: false
+initialization:
+  fresh_stage2: true
+  fresh_optimizer: true
+  reset_stage2_seed_after_tokenizer: true
+evaluation:
+  batch_size: 128
+  every_epochs: 2
+  include_epoch_one: true

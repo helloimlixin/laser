@@ -182,6 +182,29 @@ coverage to `tests/`. New experiments should not need another launcher script.
 Old flag-based and pipeline commands are handled separately in
 `src/training/legacy_cli.py` for compatibility.
 
+Full ImageNet continuous-coefficient compound training keeps the original OMP
+supports and FP32 least-squares values, and replaces coefficient bins with
+conditional mixture densities. This recipe prepares the full training archive
+locally and launches 100 epochs on four GPUs with global batch 2,048:
+
+```bash
+python train.py --config configs/stage2/imagenet-laser-continuous-compound-native-scratch100-4h200.yaml
+```
+
+A separate bounded learning pilot is available:
+
+```bash
+python train.py --config configs/stage2/imagenet-laser-continuous-compound-pilot.yaml
+```
+
+Its default 32 updates fit 32 training images and evaluate 32 disjoint images
+from the same classes. This checks optimization and decoding, not generation
+FID. The recipe specifies the original checkpoint hash and archive path. A small
+synthetic check is available with `configs/experiments/continuous-compound-smoke.yaml`;
+override `pilot.device=cpu` to run it without a GPU. Pilot results include the
+separate atom and physical coefficient NLLs, which are not directly comparable
+to coefficient-bin cross entropy.
+
 ## Tests
 
 ```bash

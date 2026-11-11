@@ -14,7 +14,8 @@ class FrozenLaserTokenizer(nn.Module):
                  coeff_scales, sparsity_level):
         super().__init__()
         self.num_atoms = int(num_atoms)
-        self.coeff_vocab_size = int(coeff_vocab_size)
+        # None selects the continuous codec; no coefficient levels are created.
+        self.coeff_vocab_size = 0 if coeff_vocab_size is None else int(coeff_vocab_size)
         self.sparsity_level = int(sparsity_level)
         self.vocab_size = self.num_atoms + self.coeff_vocab_size
         self.clamp_coeffs = False
@@ -43,7 +44,8 @@ class FrozenLaserTokenizer(nn.Module):
         self.quant_conv, self.post_quant_conv = stage1.quant_conv, stage1.post_quant_conv
         dictionary_key = 'quantizer.dictionary' if 'quantizer.dictionary' in state else 'bottleneck.dictionary'
         self.register_buffer('dictionary', F.normalize(state[dictionary_key].float(), dim=0))
-        self.register_buffer('coeff_bins', torch.linspace(-coeff_max, coeff_max, self.coeff_vocab_size))
+        self.register_buffer('coeff_bins', torch.empty(0) if coeff_vocab_size is None else
+                             torch.linspace(-coeff_max, coeff_max, self.coeff_vocab_size))
         scales = torch.tensor(coeff_scales, dtype=torch.float32)
         if scales.shape != (self.sparsity_level,) or not torch.isfinite(scales).all() or not (scales > 0).all():
             raise ValueError('LASER requires a positive finite coefficient scale per pair')
@@ -53,6 +55,8 @@ class FrozenLaserTokenizer(nn.Module):
     @torch.no_grad()
     def sparse_targets(self, atoms, coeffs, *, temp=.01125, stochastic=True,
                        compact=True, hard=False):
+        if self.coeff_vocab_size == 0:
+            raise ValueError('Continuous coefficients do not have categorical targets')
         if not math.isfinite(temp) or temp <= 0:
             raise ValueError('Coefficient temperature must be positive and finite')
         atoms, coeffs = atoms.long(), coeffs.float()
@@ -74,6 +78,8 @@ class FrozenLaserTokenizer(nn.Module):
 
     @torch.no_grad()
     def decode_tokens(self, tokens):
+        if self.coeff_vocab_size == 0:
+            raise ValueError('Use continuous sparse codes to decode continuous coefficients')
         atoms = tokens[..., 0::2].long()
         ids = tokens[..., 1::2].long() - self.num_atoms
         coefficients = self.coeff_bins[ids] * self.coeff_scales

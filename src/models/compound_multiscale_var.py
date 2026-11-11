@@ -19,8 +19,8 @@ class CompoundLaserVAR(VAR):
         q = tokenizer.quantize
         self.num_atoms = int(q.vocab_size)
         self.coefficient_bins = int(q.coefficient_bins)
-        if self.coefficient_bins != 512:
-            raise ValueError('Compound LASER VAR requires exactly 512 coefficient bins')
+        if self.coefficient_bins < 2:
+            raise ValueError('Compound LASER VAR requires at least two coefficient bins')
         proxy = SimpleNamespace(Cvae=q.Cvae,
                                 vocab_size=self.num_atoms + self.coefficient_bins,
                                 quantize=q)
@@ -67,7 +67,7 @@ class CompoundLaserVAR(VAR):
         if ((atoms < 0) | (atoms >= self.num_atoms)).any():
             raise ValueError('Atom IDs must be in [0, num_atoms)')
         if ((coefficients < 0) | (coefficients >= self.coefficient_bins)).any():
-            raise ValueError('Coefficient bins must be in [0, 512)')
+            raise ValueError(f'Coefficient bins must be in [0, {self.coefficient_bins})')
         if self.sparsity > 1:
             ordered = atoms.sort(dim=-1).values
             if (ordered[..., 1:] == ordered[..., :-1]).any():

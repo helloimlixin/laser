@@ -1,0 +1,6 @@
+{
+  "encoder_batch": 32,
+  "cudnn_benchmark": true,
+  "cudnn_benchmark_limit": 3,
+  "checkpoint_every": 500
+}

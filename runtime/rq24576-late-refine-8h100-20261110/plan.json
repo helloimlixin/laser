@@ -1,0 +1,103 @@
+{
+  "run_id": "imagenet-rq24576-late-lowLR-noise-ema-8h100-20261110",
+  "name": "ImageNet | RQ24576 late94 lowLR noise anneal EMA | 8H100",
+  "parent_run_id": "imagenet-rq24576-native-scratch100-8h100-20261108",
+  "source_checkpoint": "/tmp/laser-rq24576-sampler-search-epoch94-images-20261110/frozen-checkpoint.pt",
+  "source_checkpoint_sha256": "0f43595470977ea4dbc375d16df040c82c5fad64020c6a674f5aa1d400198734",
+  "source_epoch": 94,
+  "source_step": 58844,
+  "source_selection_pending": false,
+  "target_epoch": 124,
+  "base": "/tmp/laser-rq24576-late-refine-8h100-20261110",
+  "output": "/workspace/Projects/laser/outputs/imagenet-rq24576-late-lowLR-noise-ema-8h100-20261110",
+  "world_size": 8,
+  "microbatch": 64,
+  "global_batch": 2048,
+  "final_codewords": 24576,
+  "tokenizer_changed": false,
+  "architecture_changed": false,
+  "source_stage1_sha256": "dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab",
+  "source_codebook_sha256": "8b3f295593b3193d28991554f7a16d629074ec6ce3072a477fb2772e484d86de",
+  "source_recipe_sha256": "4bd51b2da94d481ad988995d48448148fc32e3dcb3495cfd385f49def4312747",
+  "lr": {
+    "kind": "one_epoch_ramp_then_cosine",
+    "start_step": 58844,
+    "start_lr": 4.4281873178278475e-06,
+    "ramp_end_step": 59470,
+    "end_step": 77624,
+    "peak_lr": 1e-05,
+    "min_lr": 1e-06,
+    "original_horizon_steps": 62600,
+    "preserve_optimizer_state": true,
+    "preserve_optimizer_age": true
+  },
+  "teacher": {
+    "initial": 0.5,
+    "final": 0.25,
+    "start_step": 58844,
+    "anneal_steps": 1252,
+    "stochastic_prefixes": true,
+    "full_vocabulary": true
+  },
+  "ema_decay": 0.999,
+  "sampler": {
+    "temperature": [
+      0.925,
+      0.95,
+      0.975,
+      1.0
+    ],
+    "top_k": [
+      2048,
+      2560,
+      4096,
+      8192
+    ],
+    "top_p": [
+      0.95,
+      0.95,
+      0.98,
+      0.99
+    ]
+  },
+  "baseline": {
+    "fid": 12.65257290553177,
+    "inception_score": 102.42195129394531,
+    "inception_score_std": 2.295698881149292,
+    "sampler": {
+      "temperature": [
+        0.925,
+        0.95,
+        0.975,
+        1.0
+      ],
+      "top_k": [
+        2048,
+        2560,
+        4096,
+        8192
+      ],
+      "top_p": [
+        0.95,
+        0.95,
+        0.98,
+        0.99
+      ]
+    }
+  },
+  "evaluation": {
+    "generated_images": 50000,
+    "reference_images": 1281167,
+    "reference_split": "train",
+    "reference_sha256": "3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260",
+    "seed": 261001,
+    "is_shuffle_seed": 261002,
+    "rejection_sampling": false,
+    "target_fid": 11.56,
+    "ema_every_epochs": 2,
+    "raw_every_epochs": 4,
+    "raw_also_first_evaluation": true,
+    "log_images": true
+  },
+  "created_at": 1794323209.1348424
+}

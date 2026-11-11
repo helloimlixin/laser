@@ -1,0 +1,24 @@
+vocabularies: [4096, 8192, 16384, 24576, 32768]
+depth: 4
+channels: 256
+code_shape: [8, 8, 4]
+fitting_images: 50000
+heldout_training_images: 10000
+fitting_passes: 24
+vector_gain: 1.025
+centroid_prior_weight: 8.0
+seed: 26110824576
+initialization: source-frequency-subset-or-error-weighted-training-residuals
+zero_token: true
+encoding: native_greedy_residual_quantization
+stage1_checkpoint_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+source_run_directory: /tmp/laser-rq24576-native-8h100-20261108
+work_directory: /tmp/laser-residual-vocabulary-sweep-20261110
+output_directory: /workspace/Projects/laser/outputs/imagenet-residual-vocabulary-sweep-20261110
+evaluation:
+  images: 50000
+  split: official ImageNet2012 validation
+  batch_size: 16
+  metric: original_rqvae_inception
+  validation_used_for_fitting: false
+  memory_gib_per_gpu: 8

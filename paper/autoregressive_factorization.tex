@@ -1,0 +1,36 @@
+% Requires amsmath, amssymb, and natbib.
+% Include after tokenization.tex.
+
+\paragraph{Autoregressive factorization.}
+Let
+\begin{equation}
+    S=(t_{i,k})\in\mathcal{V}^{N\times K}
+\end{equation}
+denote the token representation of one latent sample, where $N$ is the number of spatial latent locations for images or temporal latent positions for audio, and $K$ is the residual depth. We use raster-scan order for images and chronological order for audio. We adopt the spatial--depth formulation of RQ-Transformer~\citep{lee2022rqvae} for efficient autoregressive generation over these integer tokens. The spatial transformer processes one summary per latent position, and the depth transformer models the $K$ tokens within each position. The resulting prior is
+\begin{equation}
+    p_{\theta}(S)=\prod_{i=1}^{N}\prod_{k=1}^{K}p_{\theta}\!\left(t_{i,k}\mid S_{<i,:},S_{i,<k}\right).
+    \label{eq:stage2-factorization}
+\end{equation}
+The model predicts the $K$ vector contributions at each latent position sequentially, conditioning on preceding positions and the contributions already generated at the current position. The same factorization applies to spatial and temporal latent grids, with the ordering and tokenizer defined for the corresponding modality.
+
+We use the frozen, depth-specific lookup vectors $e_k(t_{i,k})$ to construct the prior's context. The spatial transformer receives sums of learned projections of the vector contributions at preceding positions. The depth transformer conditions on the resulting spatial context and learned projections of the cumulative contributions $\sum_{\ell=1}^{k-1}e_{\ell}(t_{i,\ell})$ within the current position. Learned positional embeddings identify the latent position and residual depth. The lookup tables remain frozen while the projections and transformer parameters are learned. Each prediction is a categorical distribution over $\mathcal{V}$.
+
+Conditional generation uses the same ordering and factorization. Given a conditioning variable $\boldsymbol{c}$, we model
+\begin{equation}
+    p_{\theta}(S\mid\boldsymbol{c})=\prod_{i=1}^{N}\prod_{k=1}^{K}p_{\theta}\!\left(t_{i,k}\mid S_{<i,:},S_{i,<k},\boldsymbol{c}\right).
+    \label{eq:stage2-conditional-factorization}
+\end{equation}
+For class-conditional image generation, $\boldsymbol{c}$ represents the image class; for text-conditioned image generation, it represents the text context. For text-to-speech, the conditioning can include a phoneme sequence and speaker identity. An unconditional prior uses the factorization in Eq.~\eqref{eq:stage2-factorization} without $\boldsymbol{c}$.
+
+\paragraph{Geometry-aware training.}
+Let $S^{\mathrm{tr}}=(t^{\mathrm{tr}}_{i,k})$ be a token stack sampled from the stochastic residual teacher in Eq.~\eqref{eq:token-soft-target}. At depth $k$, the teacher distribution $q_{i,k}$ assigns probabilities using the squared distances from the residual left by earlier sampled contributions to the frozen vectors $e_k(v)$. The sampled stack supplies the causal prefixes, and the full distribution at each depth supplies the soft target. For a conditional prior, the per-sample loss is
+\begin{equation}
+    \mathcal{L}_{\mathrm{prior}}=-\frac{1}{NK}\sum_{i=1}^{N}\sum_{k=1}^{K}\sum_{v\in\mathcal{V}}q_{i,k}(v)\log p_{\theta}\!\left(v\mid S^{\mathrm{tr}}_{<i,:},S^{\mathrm{tr}}_{i,<k},\boldsymbol{c}\right).
+    \label{eq:stage2-prior-loss}
+\end{equation}
+Training averages this loss over data examples and teacher samples. Codewords whose squared distances from the residual differ by little relative to $\tau$ receive similar target probabilities. Resampling exposes the prior to different token decompositions of a latent feature.
+
+\paragraph{Generation.}
+At inference, we sample each token $t_{i,k}$ from the learned prior given the generated prefix $(S_{<i,:},S_{i,<k})$ and the conditioning input $\boldsymbol{c}$, when present. After sampling the full sequence, we look up each vector $e_k(t_{i,k})$ in the frozen table for depth $k$ and sum the $K$ contributions at each position as in Eq.~\eqref{eq:token-reconstruction}. We arrange the resulting features into a spatial grid for images or a temporal sequence for audio. The frozen Stage-1 decoder maps these features back to the signal domain.
+
+The generation experiments test whether this finite token interface retains enough of the sparse autoencoder's latent structure to support generation with a standard autoregressive prior.

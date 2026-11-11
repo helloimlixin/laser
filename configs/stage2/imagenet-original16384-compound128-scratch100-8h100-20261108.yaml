@@ -1,0 +1,165 @@
+version: original16384-compound128-soft-v1
+run_id: imagenet-original16384-compound128-scratch100-8h100-20261108
+name: ImageNet | ORIGINAL 16384 atoms | compound128 | fresh100 | 8H100
+seed: 261001
+epochs: 100
+lr_schedule_epochs: 100
+global_batch: 2048
+microbatch: 64
+auxiliary_loss_terms: 0
+decoder: native_compound_pair
+target_mode: stochastic_coefficient_codes
+tokenizer:
+  num_atoms: 16384
+  depth: 4
+  coefficient_bins: 128
+  coefficient_max: 3.0
+  coefficient_scales:
+  - 5.774693012237549
+  - 3.0010366439819336
+  - 1.9617128372192383
+  - 1.2301799058914185
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  dictionary_source: original Stage1 checkpoint, normalized exactly as the original
+    LASER tokenizer
+  source_artifact: helloimlixin-rutgers/laser/imga16384k4altbn64-b128-b300-20260830000755-stage1-checkpoints:v9
+  dictionary_sha256: 22b80b4a7dd19f626ad09d699b098e3d1c6582814e4735041804a5870e8f654a
+  dictionary_checkpoint_key: quantizer.dictionary
+targets:
+  encoder_batch_size: 8
+  coefficient_sigma_bins: 0.5
+  stochastic_prefixes: true
+  soft_coefficient_labels: true
+  atom_encoding: OMP4 with final least-squares refit
+  coefficient_range_calibration: 50000 class-balanced training images, 50/class; q0.9995
+    with 5% margin covering the original 16384-atom Stage1 coefficients
+sampling:
+  atom_temperature: 1.0
+  atom_top_k: 1024
+  atom_top_p: 0.95
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.95
+evaluation:
+  batch_size: 64
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+lineage:
+  dictionary_source: ORIGINAL 16384-atom Stage1 dictionary
+  source_checkpoint_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  supersedes_wrong_dictionary_run: imagenet-compound128-successful-scratch100-8h100-20261108
+  fresh_stage2: true
+  stage2_weights_loaded: false
+  optimizer_loaded: false
+initialization:
+  fresh_stage2: true
+  fresh_optimizer: true
+optimizer:
+  type: fused_adamw
+  lr: 0.0005
+  betas:
+  - 0.9
+  - 0.95
+  weight_decay: 0.0001
+  gradient_clip_norm: 0.1
+  warmup_epochs: 0
+  schedule: cosine to zero over62600updates
+calibration:
+  images: 50000
+  classes: 1000
+  images_per_class: 50
+  latent_sites: 3200000
+  split: train
+  validation_used: false
+  seed: 261108128
+  training_indices_sha256: ba60df5039f3985b8a590072ceaa0f10cb7e2e6d931b0222b8bfe1084ea26070
+  quantile: 0.9995
+  margin: 1.05
+  physical_bounds:
+  - 17.324079513549805
+  - 9.0031099319458
+  - 5.885138511657715
+  - 3.690539598464966
+  coefficient_scales:
+  - 5.774693012237549
+  - 3.0010366439819336
+  - 1.9617128372192383
+  - 1.2301799058914185
+  coefficient_steps:
+  - 0.2728201448917389
+  - 0.1417812556028366
+  - 0.09267934411764145
+  - 0.05811873450875282
+  calibration_clip_fraction:
+  - 0.0002334375021746382
+  - 0.00020187499467283487
+  - 0.00019843749760184437
+  - 0.00019624999549705535
+  coefficient_bins: 128
+  atoms: 16384
+  source_checkpoint_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  dictionary_sha256: 22b80b4a7dd19f626ad09d699b098e3d1c6582814e4735041804a5870e8f654a
+  raw_dictionary_sha256: 0c7b9ef22fde31edb541ea809ad062afc4895061b555ae7fca9e37a51408280c
+  dictionary_checkpoint_key: quantizer.dictionary
+  dictionary_source: original_stage1_checkpoint
+  time: 1794149051.6344676
+dictionary_verification:
+  passed: true
+  dictionary_checkpoint_key: quantizer.dictionary
+  raw_shape:
+  - 256
+  - 16384
+  atoms: 16384
+  coefficient_bins: 128
+  raw_dictionary_sha256: 0c7b9ef22fde31edb541ea809ad062afc4895061b555ae7fca9e37a51408280c
+  effective_original_dictionary_sha256: 22b80b4a7dd19f626ad09d699b098e3d1c6582814e4735041804a5870e8f654a
+  normalization: Exact F.normalize(dim=0) used by the original LASER tokenizer
+  learned_reduced_dictionary_loaded: false
+  source_checkpoint_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  time: 1794149075.277171
+execution:
+  world_size: 8
+  microbatch: 64
+  accumulation_steps: 4
+  global_batch: 2048
+  epochs: 100
+  hardware: 8 NVIDIA H100 80GB HBM3
+  bf16_training: true
+  fp16_native_sampling: true
+  fused_adamw: true
+  training_sdpa: true
+  gradient_clip_max_norm: 0.1
+  fresh_stage2: true
+  fresh_optimizer: true
+  measured_images_per_second: 1432.837161494648
+  num_atoms: 16384
+  coefficient_bins: 128
+  original_dictionary: true
+  expected_dictionary_shape:
+  - 256
+  - 16384
+verification:
+  passed: true
+  rfid_hard: 4.2181550148685005
+  rfid_soft: 4.22538548102068
+  rfid_continuous: 4.213211547366711
+  images: 50000
+  real_split: val
+  hard_quantization_latent_mse: 3.673810255088028e-05
+  soft_quantization_latent_mse: 0.00010619702336814952
+  clip_fraction: 0.000203203125
+  original_dictionary: true
+  dictionary_shape:
+  - 256
+  - 16384
+  dictionary_sha256: 22b80b4a7dd19f626ad09d699b098e3d1c6582814e4735041804a5870e8f654a
+  source_original_reported_rfid: 4.210914134979248
+  stage1_CNN_unchanged: true
+  dictionary_unchanged: true
+  frozen_codec_digest: de0e2f20cdad5bd8816e5b1d7438ee51301f23e43a6637e2eb4ce591e76eca27
+  coefficient_bins: 128
+  atoms: 16384
+  time: 1794149200.389688

@@ -1,0 +1,79 @@
+# @package _global_
+defaults:
+  - _self_
+
+stage: stage2
+backend: continuous_compound
+run_id: imagenet-laser-continuous-compound-pilot-20261107
+name: Original LASER OMP with continuous compound coefficients
+seed: 261001
+output_dir: outputs/${run_id}
+runtime_base: ${oc.env:TMPDIR,/tmp}/${run_id}
+resume: null
+target_mode: original_omp_continuous
+objective: weighted_atom_nll_and_physical_continuous_coefficient_nll
+auxiliary_loss_terms: 0
+atom_ce_weight: 1.5
+# These also make the recipe usable by the shared full ImageNet driver.
+microbatch: 64
+epochs: 2
+lr_schedule_epochs: 100
+evaluation:
+  batch_size: 128
+
+tokenizer:
+  checkpoint: outputs/imagenet-laser-rq-minimal-rfid421-scratch20-20261014/reproducibility/stage1-model.pt
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  source_rfid: 4.215039034200402
+  num_atoms: 16384
+  depth: 4
+  coefficient_scales: [4.587941646575928, 2.4749884605407715, 1.6106663942337036, 1.0176019668579102]
+targets:
+  encoder_batch_size: 8
+density:
+  components: 8
+  min_std: 0.03
+data:
+  synthetic: false
+  train_archive: ${oc.env:DATA_DIR,../data}/imagenet/archives/ILSVRC2012_img_train.verified-20261005.tar
+  image_size: 256
+arch:
+  type: rq-transformer
+  block_size: [8, 8, 4]
+  embed_dim: 1536
+  input_embed_dim: 256
+  shared_tok_emb: true
+  shared_cls_emb: true
+  input_emb_vqvae: true
+  head_emb_vqvae: true
+  cumsum_depth_ctx: true
+  vocab_size: 16384
+  vocab_size_cond: 1000
+  block_size_cond: 1
+  body:
+    n_layer: 42
+    block:
+      n_head: 24
+      resid_pdrop: 0.1
+  head:
+    n_layer: 6
+    block:
+      n_head: 24
+      resid_pdrop: 0.1
+optimizer:
+  lr: 0.0005
+  betas: [0.9, 0.95]
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+sampling:
+  atom_temperature: 0.9
+  atom_top_k: 0
+  atom_top_p: 0.9
+pilot:
+  device: cuda:0
+  amp: true
+  cpu_threads: 4
+  classes: 32
+  steps: 32
+  microbatch: 8
+  save_checkpoint: true

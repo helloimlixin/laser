@@ -1,0 +1,778 @@
+[
+  {
+    "name": "artifact/4332780967/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4332786148/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4332919349/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333058858/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333196341/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333339128/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333489548/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333637791/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333783018/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4333924184/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334059569/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334217366/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334233979/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334438868/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334619286/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334814724/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4334988976/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335147386/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335299764/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335455286/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335609396/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335767776/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335942873/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4335963700/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4336247107/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4336513655/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4336775775/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337096796/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337455046/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337490548/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337567461/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337572199/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337778497/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4337958441/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4338128753/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4338297721/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4338462563/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4338493235/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4338665281/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4338870072/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4339068262/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4339262939/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4339467765/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4339674449/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4339867957/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4340056239/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4340239620/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4346458035/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4346460232/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4346640853/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4346655137/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4346858564/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4347032532/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4347212109/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4347397631/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4347576948/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4347753450/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4347936417/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4348118154/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4348302199/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4348482235/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4348495631/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4348692833/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4348862730/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349035883/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349202301/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349375958/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349549552/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349717746/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349882832/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "artifact/4349911480/wandb_manifest.json",
+    "size": 0
+  },
+  {
+    "name": "code/train_matched_stage1.py",
+    "size": 22856
+  },
+  {
+    "name": "config.yaml",
+    "size": 64950
+  },
+  {
+    "name": "media/images/reconstruction/preview_1030_289f168ea3c289d102d4.png",
+    "size": 2026694
+  },
+  {
+    "name": "media/images/reconstruction/preview_1082_b4d59e9391512c86310c.png",
+    "size": 2058673
+  },
+  {
+    "name": "media/images/reconstruction/preview_112_772b191bf1ffda7c9ef8.png",
+    "size": 1909848
+  },
+  {
+    "name": "media/images/reconstruction/preview_1133_0a6dc9e8921e7fa49f63.png",
+    "size": 2053496
+  },
+  {
+    "name": "media/images/reconstruction/preview_1184_6ec4432b9dac05188a20.png",
+    "size": 2110464
+  },
+  {
+    "name": "media/images/reconstruction/preview_1235_58f39d38c3df69d47060.png",
+    "size": 2097771
+  },
+  {
+    "name": "media/images/reconstruction/preview_1286_262e078a51f5b40d4f65.png",
+    "size": 2114494
+  },
+  {
+    "name": "media/images/reconstruction/preview_1337_75454c00f6ad5fb6bac1.png",
+    "size": 2081724
+  },
+  {
+    "name": "media/images/reconstruction/preview_1388_bd9b2973366e7edffc26.png",
+    "size": 2057321
+  },
+  {
+    "name": "media/images/reconstruction/preview_1439_3df0334f0bd221c009ed.png",
+    "size": 2069906
+  },
+  {
+    "name": "media/images/reconstruction/preview_1490_49b6eb5c3c266d4dccb8.png",
+    "size": 2115758
+  },
+  {
+    "name": "media/images/reconstruction/preview_1541_11a057bf2a4c9a92dbc0.png",
+    "size": 2115799
+  },
+  {
+    "name": "media/images/reconstruction/preview_1592_5aa824b70721c86c9f73.png",
+    "size": 2105294
+  },
+  {
+    "name": "media/images/reconstruction/preview_163_b554eaf582683f61cd4e.png",
+    "size": 1921278
+  },
+  {
+    "name": "media/images/reconstruction/preview_1643_9a341c6650634896daef.png",
+    "size": 2080255
+  },
+  {
+    "name": "media/images/reconstruction/preview_1694_282d9e7a992ee58c44be.png",
+    "size": 2117563
+  },
+  {
+    "name": "media/images/reconstruction/preview_1745_4bb171ef9744bf2f6595.png",
+    "size": 2045104
+  },
+  {
+    "name": "media/images/reconstruction/preview_1796_982d02ecb0a693744f55.png",
+    "size": 2124386
+  },
+  {
+    "name": "media/images/reconstruction/preview_1847_8f992882ef16e8df7e8c.png",
+    "size": 2101659
+  },
+  {
+    "name": "media/images/reconstruction/preview_1898_fb4e5d7e0ed60e8a23cc.png",
+    "size": 2087975
+  },
+  {
+    "name": "media/images/reconstruction/preview_1949_b341e9ea98e7ce2338df.png",
+    "size": 2117688
+  },
+  {
+    "name": "media/images/reconstruction/preview_2000_0f6eac50b30b9f32a2cb.png",
+    "size": 2094541
+  },
+  {
+    "name": "media/images/reconstruction/preview_2051_da1014ebf32f93505499.png",
+    "size": 2140904
+  },
+  {
+    "name": "media/images/reconstruction/preview_2103_f3b124529aebec9a36f8.png",
+    "size": 2082855
+  },
+  {
+    "name": "media/images/reconstruction/preview_214_b9f199758a4ecf790898.png",
+    "size": 1945433
+  },
+  {
+    "name": "media/images/reconstruction/preview_2154_d11214d77488ab1fc183.png",
+    "size": 2085515
+  },
+  {
+    "name": "media/images/reconstruction/preview_2205_425d4ba0a427d99f5977.png",
+    "size": 2108058
+  },
+  {
+    "name": "media/images/reconstruction/preview_2256_4c6f75566a047aad2f39.png",
+    "size": 2113714
+  },
+  {
+    "name": "media/images/reconstruction/preview_2307_8b5a516597fd9064139e.png",
+    "size": 2117892
+  },
+  {
+    "name": "media/images/reconstruction/preview_2358_7aff702e5f9f042a2695.png",
+    "size": 2090705
+  },
+  {
+    "name": "media/images/reconstruction/preview_2409_e5a9630c926da9ffd191.png",
+    "size": 2113447
+  },
+  {
+    "name": "media/images/reconstruction/preview_2460_ee77446a8d5679a42a5b.png",
+    "size": 2120234
+  },
+  {
+    "name": "media/images/reconstruction/preview_2511_c565ce3e693d29cb145c.png",
+    "size": 2072761
+  },
+  {
+    "name": "media/images/reconstruction/preview_2562_cee8a48478c6b5c01aea.png",
+    "size": 2108015
+  },
+  {
+    "name": "media/images/reconstruction/preview_2614_13523086cded8f9d0121.png",
+    "size": 2106731
+  },
+  {
+    "name": "media/images/reconstruction/preview_265_4492aadf2452b749eb4a.png",
+    "size": 1930447
+  },
+  {
+    "name": "media/images/reconstruction/preview_2665_698f3dab81491eea0e2a.png",
+    "size": 2101911
+  },
+  {
+    "name": "media/images/reconstruction/preview_2716_0cf8c0e581f8937c1c47.png",
+    "size": 2131846
+  },
+  {
+    "name": "media/images/reconstruction/preview_2767_d72806a4826e12072e66.png",
+    "size": 2100879
+  },
+  {
+    "name": "media/images/reconstruction/preview_2818_81038392abcba6b00ac1.png",
+    "size": 2127055
+  },
+  {
+    "name": "media/images/reconstruction/preview_2869_4f2ee301e5ba581f6155.png",
+    "size": 2115374
+  },
+  {
+    "name": "media/images/reconstruction/preview_2920_3ffeb6fdf0be7b65c9c6.png",
+    "size": 2080132
+  },
+  {
+    "name": "media/images/reconstruction/preview_2971_350a8e279fc92a468b77.png",
+    "size": 2094658
+  },
+  {
+    "name": "media/images/reconstruction/preview_2_999175cf7a237b1cfa96.png",
+    "size": 2078925
+  },
+  {
+    "name": "media/images/reconstruction/preview_3022_ef6fb70c3c0ccef3ed91.png",
+    "size": 2101862
+  },
+  {
+    "name": "media/images/reconstruction/preview_3073_b61069a2c11e4ce16f7e.png",
+    "size": 2111124
+  },
+  {
+    "name": "media/images/reconstruction/preview_3125_7e4d1cfdc817bbb9d743.png",
+    "size": 2116676
+  },
+  {
+    "name": "media/images/reconstruction/preview_316_1a5d3011771342ed004e.png",
+    "size": 1987919
+  },
+  {
+    "name": "media/images/reconstruction/preview_3176_90cbc549535387cb2b70.png",
+    "size": 2121516
+  },
+  {
+    "name": "media/images/reconstruction/preview_3227_1dbb515a2fd3535da86d.png",
+    "size": 2138879
+  },
+  {
+    "name": "media/images/reconstruction/preview_3278_9cfb37b43295ec675bc4.png",
+    "size": 2115968
+  },
+  {
+    "name": "media/images/reconstruction/preview_3329_f3c681b85aeeffa29e32.png",
+    "size": 2082325
+  },
+  {
+    "name": "media/images/reconstruction/preview_3380_a29e46d2d1356e8a7bba.png",
+    "size": 2117797
+  },
+  {
+    "name": "media/images/reconstruction/preview_3431_3fb9424503e46c86755b.png",
+    "size": 2130708
+  },
+  {
+    "name": "media/images/reconstruction/preview_3482_b6caed7c6ee688074266.png",
+    "size": 2122746
+  },
+  {
+    "name": "media/images/reconstruction/preview_3533_25faeaa24f2d42671ef1.png",
+    "size": 2181318
+  },
+  {
+    "name": "media/images/reconstruction/preview_3584_d99c96af9b37ab402855.png",
+    "size": 2067972
+  },
+  {
+    "name": "media/images/reconstruction/preview_3635_60ec64b3e0cf75873d14.png",
+    "size": 2105440
+  },
+  {
+    "name": "media/images/reconstruction/preview_367_2b50da8a8425fea0476a.png",
+    "size": 1976712
+  },
+  {
+    "name": "media/images/reconstruction/preview_3686_501d23c3b13165a77fc6.png",
+    "size": 2102516
+  },
+  {
+    "name": "media/images/reconstruction/preview_3737_b2d904ef40171ae25db5.png",
+    "size": 2085061
+  },
+  {
+    "name": "media/images/reconstruction/preview_3788_aae17501dd7939534b99.png",
+    "size": 2120308
+  },
+  {
+    "name": "media/images/reconstruction/preview_3839_60fa91fe85b99bc6aa51.png",
+    "size": 2122390
+  },
+  {
+    "name": "media/images/reconstruction/preview_3890_917d68764a30c77ed065.png",
+    "size": 2093121
+  },
+  {
+    "name": "media/images/reconstruction/preview_3941_af05ad3ebe4c2050b120.png",
+    "size": 2104120
+  },
+  {
+    "name": "media/images/reconstruction/preview_3992_bf5d582d810534089c96.png",
+    "size": 2111640
+  },
+  {
+    "name": "media/images/reconstruction/preview_4054_1d317aeb364601665ddb.png",
+    "size": 2117215
+  },
+  {
+    "name": "media/images/reconstruction/preview_4105_dfc47baafbe7a6f79d3e.png",
+    "size": 2116076
+  },
+  {
+    "name": "media/images/reconstruction/preview_4157_cc773ea3e4cdb56b0a8a.png",
+    "size": 2141408
+  },
+  {
+    "name": "media/images/reconstruction/preview_418_4b168cafe811c819b3b4.png",
+    "size": 1935529
+  },
+  {
+    "name": "media/images/reconstruction/preview_4208_e76b8a8b6e39479293ee.png",
+    "size": 2143986
+  },
+  {
+    "name": "media/images/reconstruction/preview_4259_4f3c8465cb8f64ccb344.png",
+    "size": 2103265
+  },
+  {
+    "name": "media/images/reconstruction/preview_4310_e311deb5eece6de51b12.png",
+    "size": 2140653
+  },
+  {
+    "name": "media/images/reconstruction/preview_4361_5fbf77a38def688b38e4.png",
+    "size": 2113083
+  },
+  {
+    "name": "media/images/reconstruction/preview_4412_3acef050af4e3cc88390.png",
+    "size": 2119211
+  },
+  {
+    "name": "media/images/reconstruction/preview_4463_ca9431434762666813f8.png",
+    "size": 2117637
+  },
+  {
+    "name": "media/images/reconstruction/preview_4514_ccffc1bf8ba4de86f126.png",
+    "size": 2115091
+  },
+  {
+    "name": "media/images/reconstruction/preview_4565_f0b21382fd3a7fbb95b9.png",
+    "size": 2124875
+  },
+  {
+    "name": "media/images/reconstruction/preview_4616_580f3c52559465cc4cfe.png",
+    "size": 2098633
+  },
+  {
+    "name": "media/images/reconstruction/preview_4667_e168df67f621ded8d180.png",
+    "size": 2129619
+  },
+  {
+    "name": "media/images/reconstruction/preview_469_f4839c401a099fb2f649.png",
+    "size": 1918117
+  },
+  {
+    "name": "media/images/reconstruction/preview_4718_232ed214f2d09bdf773d.png",
+    "size": 2136635
+  },
+  {
+    "name": "media/images/reconstruction/preview_4769_55ac7ea960afab0919f5.png",
+    "size": 2095889
+  },
+  {
+    "name": "media/images/reconstruction/preview_4820_31ffa7ee786ac8fbb37e.png",
+    "size": 2113629
+  },
+  {
+    "name": "media/images/reconstruction/preview_4871_af9682d5b5ad2f20f310.png",
+    "size": 2116182
+  },
+  {
+    "name": "media/images/reconstruction/preview_4922_e4302127cfac7b896aa3.png",
+    "size": 2125254
+  },
+  {
+    "name": "media/images/reconstruction/preview_4973_ea0354bd58ce12d1ac13.png",
+    "size": 2127368
+  },
+  {
+    "name": "media/images/reconstruction/preview_5024_01651ee71b1470125fa5.png",
+    "size": 2123714
+  },
+  {
+    "name": "media/images/reconstruction/preview_5075_3d12fa0306231f80e4d9.png",
+    "size": 2108093
+  },
+  {
+    "name": "media/images/reconstruction/preview_5126_492cb0faf5f9b5d8d50d.png",
+    "size": 2123918
+  },
+  {
+    "name": "media/images/reconstruction/preview_5178_7c93e9b9470eeb1d227c.png",
+    "size": 2131062
+  },
+  {
+    "name": "media/images/reconstruction/preview_520_8852a18a752117083495.png",
+    "size": 2002801
+  },
+  {
+    "name": "media/images/reconstruction/preview_5229_ab13ff8ec5b256e7e372.png",
+    "size": 2131354
+  },
+  {
+    "name": "media/images/reconstruction/preview_5280_aa6c9cffa33e34cf8fc2.png",
+    "size": 2153632
+  },
+  {
+    "name": "media/images/reconstruction/preview_5331_3b0de997794bb12b5b3c.png",
+    "size": 2113783
+  },
+  {
+    "name": "media/images/reconstruction/preview_5382_8a8c4ca18873ef2e225d.png",
+    "size": 2137365
+  },
+  {
+    "name": "media/images/reconstruction/preview_5433_77e70d4b41cf1f589e89.png",
+    "size": 2119238
+  },
+  {
+    "name": "media/images/reconstruction/preview_5484_a4ac5c4b6907b2bf669b.png",
+    "size": 2135652
+  },
+  {
+    "name": "media/images/reconstruction/preview_5535_872c7834a48fe5fa159c.png",
+    "size": 2130108
+  },
+  {
+    "name": "media/images/reconstruction/preview_5586_db029bb3a4b0c61ecbb0.png",
+    "size": 2122546
+  },
+  {
+    "name": "media/images/reconstruction/preview_5637_c4fcdc08d72858f7b0e6.png",
+    "size": 2106698
+  },
+  {
+    "name": "media/images/reconstruction/preview_5688_c90969aedb31cdc3e870.png",
+    "size": 2133323
+  },
+  {
+    "name": "media/images/reconstruction/preview_571_081206f894fd7ea7fcdb.png",
+    "size": 1984362
+  },
+  {
+    "name": "media/images/reconstruction/preview_5739_4aebc2305c2c434ce232.png",
+    "size": 2123925
+  },
+  {
+    "name": "media/images/reconstruction/preview_5790_e80c5372047b1b87f18a.png",
+    "size": 2122320
+  },
+  {
+    "name": "media/images/reconstruction/preview_5841_5b5c5df9617e74dbc3db.png",
+    "size": 2116349
+  },
+  {
+    "name": "media/images/reconstruction/preview_5892_17cf71a4aef7178b1e20.png",
+    "size": 2101537
+  },
+  {
+    "name": "media/images/reconstruction/preview_5943_8675e4d146e3df2b501a.png",
+    "size": 2143130
+  },
+  {
+    "name": "media/images/reconstruction/preview_61_9d7b07bab69fbd10e2a3.png",
+    "size": 1921024
+  },
+  {
+    "name": "media/images/reconstruction/preview_622_39b249c182f88035d062.png",
+    "size": 1998857
+  },
+  {
+    "name": "media/images/reconstruction/preview_673_87fe88db50e2436dbc6e.png",
+    "size": 1997552
+  },
+  {
+    "name": "media/images/reconstruction/preview_724_48135f6ecccd803d5b40.png",
+    "size": 1987788
+  },
+  {
+    "name": "media/images/reconstruction/preview_775_60b7e6de954460522eb7.png",
+    "size": 1976829
+  },
+  {
+    "name": "media/images/reconstruction/preview_826_f5e86625d9bcd834c7fa.png",
+    "size": 2026045
+  },
+  {
+    "name": "media/images/reconstruction/preview_877_2492afaf72607cc111cf.png",
+    "size": 2011444
+  },
+  {
+    "name": "media/images/reconstruction/preview_928_1aa58dba752d9f1f57f8.png",
+    "size": 2031499
+  },
+  {
+    "name": "media/images/reconstruction/preview_979_e4b8b5151871f3585954.png",
+    "size": 2021419
+  },
+  {
+    "name": "output.log",
+    "size": 1222860
+  },
+  {
+    "name": "requirements.txt",
+    "size": 4190
+  },
+  {
+    "name": "wandb-metadata.json",
+    "size": 2072
+  },
+  {
+    "name": "wandb-summary.json",
+    "size": 3319
+  }
+]

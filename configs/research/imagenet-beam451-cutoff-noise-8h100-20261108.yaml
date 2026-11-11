@@ -1,0 +1,61 @@
+source_run: helloimlixin-rutgers/laser/imagenet-beam451-aligned-joint16k-scratch100-4h100-20261107
+experiment: beam451-cutoff05-single-8h100-20261108
+hardware: 8 NVIDIA H100 80GB HBM3
+supervisor: runtime/duplicate-beam451-8h100-20261108/supervise.py
+output: outputs/imagenet-beam451-aligned-joint16k-scratch100-8h100-20261108
+seed: 261001
+global_batch: 2048
+microbatch: 128
+lr: 0.0005
+lr_schedule_epochs: 100
+fresh_stage2: true
+stage1_frozen: true
+tokenizer_validation_rfid: 4.514300868542591
+teacher_beam_width: 16
+objective: native_soft_target_cross_entropy
+calibration:
+  images: 2048
+  split: train
+  seed: 261108
+  measured_expected_excess_latent_error_limit: 0.01
+  entropy_target: 0.2
+  entropy_target_attained: false
+continuation:
+  gpus: 8
+  epochs_total: 100
+  microbatch: 128
+  accumulation_steps: 2
+  preserve:
+  - model
+  - optimizer
+  - scheduler
+  - scaler
+  - data_cursor
+  - saved_rank_rng
+  checkpoint_every_updates: 250
+  retain_checkpoints: latest_two_and_best
+  selection: Explicit user choice of cutoff5%; no duplicate control
+baseline_run: helloimlixin-rutgers/laser/imagenet-beam451-aligned-joint16k-scratch100-4h100-20261107
+run_id: imagenet-beam451-cutoff05-scratch100-8h100-20261108
+targets:
+  sequence_temperature: 2.0
+  max_relative_candidate_error: 0.05
+  measured_conditional_entropy_nats_per_token: 0.14130243289400823
+  measured_expected_relative_latent_error: 0.009086790685614687
+  teacher_sampled_reconstruction_rfid: null
+evaluation:
+  generated_images: 50000
+  reference_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  sampling:
+    temperature: 1.0
+    top_k: 1024
+    top_p: 0.95
+allocation:
+  gpus: 8
+  concurrent_experiments: 1
+  microbatch: 128
+  accumulation_steps: 2
+  global_batch: 2048

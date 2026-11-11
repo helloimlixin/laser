@@ -1,0 +1,66 @@
+name: ImageNet beam16 joint16k | 1.69B | native soft T0.5 | fresh200 | 4H200
+version: native-rq-uniform05-canonical-sampling-v2
+run_id: imagenet-beam16-joint1694m-native-scratch200-4h200-20261107
+decoder: native_joint_integer
+backbone: upstream_rqtransformer
+seed: 261001
+epochs: 200
+lr_schedule_epochs: 200
+microbatch: 256
+global_batch: 2048
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+target_mode: joint_residual_codes
+tokenizer:
+  atoms: 4096
+  depth: 4
+  vocab_size: 16384
+  coefficient_levels_per_atom: 4
+  encoding_beam_width: 16
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: a261b0aeb7470b0bf005164ee047df77b56bb78eed40eec7376d7eddbc3f8eba
+  candidate: native-teacher-with-verified-beam-reconstruction
+  measured_rfid: 4.514300868542591
+  source_reported_stage1_rfid: 4.210914134979248
+  encoder_decoder_frozen: true
+  learned_compact_dictionary: true
+  per_image_coefficient_refitting: false
+  teacher_encoding_beam_width: 1
+  reconstruction_codebook_sha256: 3d885355d303ef285d5481b755b3607c781984a0f6d971f0704019d2e6c5a061
+  native_greedy_rfid: 4.926736693144846
+  paired_tokenizer_artifact: helloimlixin-rutgers/laser/imagenet-atoms4096-joint16384-native-teacher-beam-reconstruction-tokenizer:v0
+targets:
+  mode: native_stochastic_soft
+  encoding: unmodified upstream RQBottleneck.get_soft_codes
+  chunk_size: 1024
+  temperature: 0.5
+  stochastic_prefixes: true
+  temperature_calibration_required: false
+sampling:
+  temperature: 1.0
+  top_k: 1024
+  top_p: 0.95
+evaluation:
+  batch_size: 256
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+initialization:
+  reference_vocab_size: 16384
+  paired_fresh_backbone: false
+preview:
+  images_per_class: 64
+  grid:
+  - 8
+  - 8
+  every_steps: 250
+  first_step: 10
+lineage:
+  source_run: imnet-j16384-best14574-originalcosine-continue100-4h100-20261105
+  fresh_stage2: true
+  source_reconstruction_verification: imagenet-beam16-validation50k-20261107
+  source_ar_weights_loaded: false
+  source_optimizer_loaded: false

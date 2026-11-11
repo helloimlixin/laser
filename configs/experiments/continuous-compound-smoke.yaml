@@ -1,0 +1,33 @@
+# @package _global_
+defaults:
+  - /stage2/imagenet-laser-continuous-compound-pilot
+  - _self_
+
+run_id: continuous-compound-synthetic-smoke
+data:
+  synthetic: true
+tokenizer:
+  num_atoms: 31
+  coefficient_scales: [3.0, 2.0, 1.0, 0.5]
+arch:
+  block_size: [2, 2, 4]
+  embed_dim: 32
+  input_embed_dim: 8
+  vocab_size: 31
+  vocab_size_cond: 8
+  body:
+    n_layer: 2
+    block:
+      n_head: 4
+      resid_pdrop: 0.0
+  head:
+    n_layer: 2
+    block:
+      n_head: 4
+      resid_pdrop: 0.0
+optimizer:
+  lr: 0.005
+pilot:
+  classes: 8
+  steps: 12
+  microbatch: 8

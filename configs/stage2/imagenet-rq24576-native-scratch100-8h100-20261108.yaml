@@ -1,0 +1,62 @@
+version: native-rq24576-vectors-v1
+run_id: imagenet-rq24576-native-scratch100-8h100-20261108
+name: ImageNet | native RQ24576 | no beam | fresh100 | 8H100
+seed: 261001
+epochs: 100
+global_batch: 2048
+microbatch: 64
+lr_schedule_epochs: 100
+backbone: upstream_rqtransformer
+decoder: native_joint_integer
+target_mode: native_stochastic_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 8b3f295593b3193d28991554f7a16d629074ec6ce3072a477fb2772e484d86de
+  vocab_size: 24576
+  depth: 4
+  channels: 256
+  final_codewords: 24576
+  separate_coefficient_tokens: false
+  learned_compact_dictionary: false
+  learned_vector_codebooks: true
+  encoder_decoder_frozen: true
+  measured_rfid: 4.561264923772001
+  teacher_sampled_rfid: 5.162126255323869
+targets:
+  encoding: upstream RQBottleneck.get_soft_codes
+  temperature: 0.5
+  stochastic_prefixes: true
+  measured_entropy: 2.120044584147036
+  beam_search: false
+  mixture_teacher: false
+  full_vocabulary: true
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature: 1.0
+  top_k: 1024
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 64
+initialization:
+  reference_vocab_size: 24576
+  paired_fresh_backbone: false
+  policy: native vocabulary and Stage2Model._init_weights
+  stage2_checkpoint_loaded: false
+lineage:
+  source_CNN_checkpoint: original LASER rFID4.21
+  source_CNN_frozen: true
+  dictionary_request: 24576 final RQ codewords
+  source_codeword_initialization: 16384 existing vectors plus8191 training-residual
+    prototypes and zero
+  fitting_images: 50000
+  heldout_training_images: 10000
+  validation_used_for_fitting: false
+  fresh_stage2: true
+  fresh_optimizer: true
+  tokenizer_artifact: helloimlixin-rutgers/laser/imagenet-native-rq24576-tokenizer-20261108:v0

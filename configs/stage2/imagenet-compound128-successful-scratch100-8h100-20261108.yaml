@@ -1,0 +1,134 @@
+version: learned4096-compound128-soft-v1
+run_id: imagenet-compound128-successful-scratch100-8h100-20261108
+name: ImageNet | successful D4096 | compound128 soft | fresh100 | 8H100
+seed: 261001
+epochs: 100
+lr_schedule_epochs: 100
+global_batch: 2048
+microbatch: 128
+auxiliary_loss_terms: 0
+decoder: native_compound_pair
+target_mode: stochastic_coefficient_codes
+tokenizer:
+  num_atoms: 4096
+  depth: 4
+  coefficient_bins: 128
+  coefficient_max: 3.0
+  coefficient_scales:
+  - 5.806098937988281
+  - 3.14408802986145
+  - 2.1360206604003906
+  - 1.4162449836730957
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  source_joint_codebook_sha256: a261b0aeb7470b0bf005164ee047df77b56bb78eed40eec7376d7eddbc3f8eba
+  source_joint_rfid: 4.514300868542591
+targets:
+  encoder_batch_size: 8
+  coefficient_sigma_bins: 0.5
+  stochastic_prefixes: true
+  soft_coefficient_labels: true
+  atom_encoding: OMP4 with final least-squares refit
+  coefficient_range_calibration: 50000 class-balanced training images, 50/class; q0.9995
+    with 5% margin and original joint centers covered
+sampling:
+  atom_temperature: 1.0
+  atom_top_k: 1024
+  atom_top_p: 0.95
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.95
+evaluation:
+  batch_size: 64
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+lineage:
+  source_run: helloimlixin-rutgers/laser/imnet-j16384-best14574-originalcosine-continue100-4h100-20261105
+  best_source_fid: 14.1633995743926
+  fresh_stage2: true
+  stage2_weights_loaded: false
+  optimizer_loaded: false
+  change: 128-bin atom-conditioned coefficients on the successful learned4096 dictionary
+initialization:
+  fresh_stage2: true
+  fresh_optimizer: true
+optimizer:
+  type: fused_adamw
+  lr: 0.0005
+  betas:
+  - 0.9
+  - 0.95
+  weight_decay: 0.0001
+  gradient_clip_norm: 0.1
+  warmup_epochs: 0
+  schedule: cosine to zero over62600updates
+calibration:
+  images: 50000
+  classes: 1000
+  images_per_class: 50
+  latent_sites: 3200000
+  split: train
+  validation_used: false
+  seed: 261108128
+  training_indices_sha256: ba60df5039f3985b8a590072ceaa0f10cb7e2e6d931b0222b8bfe1084ea26070
+  quantile: 0.9995
+  margin: 1.05
+  physical_bounds:
+  - 17.418296813964844
+  - 9.43226432800293
+  - 6.408061981201172
+  - 4.248734951019287
+  coefficient_scales:
+  - 5.806098937988281
+  - 3.14408802986145
+  - 2.1360206604003906
+  - 1.4162449836730957
+  coefficient_steps:
+  - 0.2743038833141327
+  - 0.14853960275650024
+  - 0.1009143590927124
+  - 0.06690920889377594
+  calibration_clip_fraction:
+  - 0.00023062499531079084
+  - 0.0001449999981559813
+  - 0.00021187499805819243
+  - 0.00019781249284278601
+  coefficient_bins: 128
+  atoms: 4096
+  source_joint_codebook_sha256: a261b0aeb7470b0bf005164ee047df77b56bb78eed40eec7376d7eddbc3f8eba
+  dictionary_sha256: ecd25be5d75603deb10370719b8f6a4b697f3830cd7f09cb51be649b6fa945f0
+  time: 1794124912.243587
+execution:
+  world_size: 8
+  microbatch: 128
+  accumulation_steps: 2
+  global_batch: 2048
+  epochs: 100
+  hardware: 8 NVIDIA H100 80GB HBM3
+  bf16_training: true
+  fp16_native_sampling: true
+  fused_adamw: true
+  training_sdpa: true
+  gradient_clip_max_norm: 0.1
+  fresh_stage2: true
+  fresh_optimizer: true
+  measured_images_per_second: 1525.7653665004657
+verification:
+  passed: true
+  rfid_hard: 4.5824836000056735
+  rfid_soft: 4.5918371448261155
+  rfid_continuous: 4.580804052764449
+  images: 50000
+  real_split: val
+  hard_quantization_latent_mse: 3.8698101907211823e-05
+  soft_quantization_latent_mse: 0.00011168213038123213
+  clip_fraction: 0.00020890625
+  source_joint_rfid: 4.514300868542591
+  stage1_CNN_unchanged: true
+  dictionary_unchanged: true
+  frozen_codec_digest: f75899275d71801db2b16792c2ea09bb492ffed0a2f67c436b6049f8fe9c6890
+  coefficient_bins: 128
+  atoms: 4096
+  time: 1794125060.3950808

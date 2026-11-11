@@ -1,0 +1,32 @@
+[
+  {
+    "_step": 1031,
+    "reconstruction_full/epoch": 1,
+    "reconstruction_full/step": 10009,
+    "reconstruction_full/rfid": 9.099032776251192
+  },
+  {
+    "_step": 2053,
+    "reconstruction_full/epoch": 2,
+    "reconstruction_full/step": 20018,
+    "reconstruction_full/rfid": 5.440646916554954
+  },
+  {
+    "_step": 3076,
+    "reconstruction_full/epoch": 3,
+    "reconstruction_full/step": 30027,
+    "reconstruction_full/rfid": 3.53509685096202
+  },
+  {
+    "_step": 4109,
+    "reconstruction_full/epoch": 4,
+    "reconstruction_full/step": 40036,
+    "reconstruction_full/rfid": 2.9342634986184635
+  },
+  {
+    "_step": 5131,
+    "reconstruction_full/epoch": 5,
+    "reconstruction_full/step": 50045,
+    "reconstruction_full/rfid": 3.1663600053379355
+  }
+]

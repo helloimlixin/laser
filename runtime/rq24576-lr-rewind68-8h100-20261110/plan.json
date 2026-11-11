@@ -1,0 +1,91 @@
+{
+  "run_id": "imagenet-rq24576-rewind68-lrhold100-8h100-20261110",
+  "name": "ImageNet | RQ24576 | replay62to68 + LR hold | 8H100",
+  "parent_run_id": "imagenet-rq24576-native-scratch100-8h100-20261108",
+  "source_checkpoint": "/tmp/laser-rq24576-lr-rewind68-8h100-20261110/inputs/parent-epoch62.pt",
+  "source_epoch": 62,
+  "source_step": 38812,
+  "source_checkpoint_sha256": "3e2ff71949f61f048b7a663f6b05a79c589cf6b277fb85419948a0dd623eeb4d",
+  "requested_rewind_epoch": 68,
+  "requested_rewind_step": 42568,
+  "exact_epoch68_checkpoint_available": false,
+  "replay_from_retained_epoch62": true,
+  "replay_is_not_claimed_bitwise_identical": true,
+  "original_epoch68_evaluation": {
+    "train/epoch": 68,
+    "train/global_step": 42568,
+    "eval/fid": 15.991912763346193,
+    "eval/inception_score": 92.01533508300781,
+    "eval/inception_score_std": 1.6724110841751099,
+    "generated_images": 50000,
+    "real_images": 1281167,
+    "real_split": "train",
+    "rejection_sampling": false,
+    "sampler": {
+      "temperature": 1.0,
+      "top_k": [
+        1024
+      ],
+      "top_p": [
+        0.95
+      ]
+    }
+  },
+  "policy": {
+    "kind": "original_cosine_then_ramp_hold_cosine",
+    "change_epoch": 68,
+    "warmup_epochs": 1,
+    "hold_until_epoch": 84,
+    "peak_lr": 0.00015,
+    "min_lr": 1e-05,
+    "end_epoch": 100,
+    "steps_per_epoch": 626,
+    "original_base_lr": 0.0005,
+    "original_horizon_steps": 62600,
+    "preserve_optimizer_state": true,
+    "preserve_optimizer_age": true,
+    "original_schedule_used_before_change": true
+  },
+  "base": "/tmp/laser-rq24576-lr-rewind68-8h100-20261110",
+  "output": "/workspace/Projects/laser/outputs/imagenet-rq24576-rewind68-lrhold100-8h100-20261110",
+  "runtime": "/workspace/Projects/laser/runtime/rq24576-lr-rewind68-8h100-20261110",
+  "world_size": 8,
+  "microbatch": 64,
+  "global_batch": 2048,
+  "teacher_temperature": 0.5,
+  "final_codewords": 24576,
+  "tokenizer_changed": false,
+  "architecture_changed": false,
+  "source_recipe_sha256": "4bd51b2da94d481ad988995d48448148fc32e3dcb3495cfd385f49def4312747",
+  "source_codebook_sha256": "8b3f295593b3193d28991554f7a16d629074ec6ce3072a477fb2772e484d86de",
+  "source_stage1_sha256": "dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab",
+  "evaluation": {
+    "generated_images": 50000,
+    "reference_images": 1281167,
+    "reference_split": "train",
+    "routine_every_epochs": 2,
+    "tuned_epochs": [
+      70,
+      80,
+      86,
+      94,
+      100
+    ],
+    "tuned_sampler": {
+      "temperature": 0.975,
+      "top_k": [
+        1536,
+        2048,
+        3072,
+        6144
+      ],
+      "top_p": [
+        0.95,
+        0.95,
+        0.98,
+        0.99
+      ]
+    }
+  },
+  "created_at": 1794298849.5079646
+}

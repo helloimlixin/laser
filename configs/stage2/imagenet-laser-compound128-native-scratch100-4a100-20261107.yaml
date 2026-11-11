@@ -1,0 +1,60 @@
+version: original-compound128-hard-coefficients-v1
+backbone: upstream_rqtransformer
+run_id: imagenet-laser-compound128-native-scratch100-4a100-20261107
+name: ImageNet original LASER | compound128 | fresh100
+seed: 261001
+epochs: 100
+global_batch: 2048
+microbatch: 64
+lr_schedule_epochs: 100
+decoder: native_compound_pair
+target_mode: hard_sparse_tokens
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  source_rfid: 4.215039034200402
+  num_atoms: 16384
+  depth: 4
+  coefficient_bins: 128
+  coefficient_max: 3.0
+  coefficient_scales:
+  - 4.587941646575928
+  - 2.4749884605407715
+  - 1.6106663942337036
+  - 1.0176019668579102
+targets:
+  encoder_batch_size: 8
+  coefficient_quantization: nearest_bin
+  stochastic_prefixes: false
+  coefficient_noise: false
+atom_ce_weight: 1.5
+objective: historical_weighted_atom_and_hard_coefficient_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  atom_temperature: 0.9
+  atom_top_k: 0
+  atom_top_p: 0.9
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.85
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 128
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+verification:
+  maximum_reconstruction_rfid: 4.73
+  reference_original_checkpoint_rfid: 4.215039034200402
+initialization:
+  fresh_stage2: true
+  fresh_optimizer: true
+  stage2_checkpoint_loaded: false
+lineage:
+  earlier_compound_recipe: imagenet-laser-compound512-native-scratch2-4h100-20261016
+  replaced_run: imnet-j16384-a4096-native-beam-mix-scratch4-4a100-20261107
+  change: 128 coefficient bins, deterministic source sparse support and nearest-bin
+    coefficient targets
+  teacher_mixture: false
+  atom_reduction: false

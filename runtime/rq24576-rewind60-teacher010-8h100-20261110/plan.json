@@ -1,0 +1,140 @@
+{
+  "run_id": "imagenet-rq24576-rewind60-teacher010-8h100-20261110",
+  "name": "ImageNet | RQ24576 rewind60 | noise matched T0.085 | 8H100",
+  "parent_run_id": "imagenet-rq24576-native-scratch100-8h100-20261108",
+  "source_checkpoint": "/tmp/laser-rq24576-rewind60-teacher010-8h100-20261110/inputs/source-epoch58.pt",
+  "source_checkpoint_sha256": "af6b6fe35c76fa1e90fbfd4495622283a6e77221760166faaf218c10716f5833",
+  "source_epoch": 58,
+  "source_step": 36308,
+  "source_selection_pending": false,
+  "target_epoch": 100,
+  "base": "/tmp/laser-rq24576-rewind60-teacher010-8h100-20261110",
+  "output": "/workspace/Projects/laser/outputs/imagenet-rq24576-rewind60-teacher010-8h100-20261110",
+  "world_size": 8,
+  "microbatch": 64,
+  "global_batch": 2048,
+  "final_codewords": 24576,
+  "tokenizer_changed": false,
+  "architecture_changed": false,
+  "source_stage1_sha256": "dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab",
+  "source_codebook_sha256": "8b3f295593b3193d28991554f7a16d629074ec6ce3072a477fb2772e484d86de",
+  "source_recipe_sha256": "4bd51b2da94d481ad988995d48448148fc32e3dcb3495cfd385f49def4312747",
+  "lr": {
+    "kind": "original_cosine_100",
+    "base_lr": 0.0005,
+    "min_lr": 0.0,
+    "original_horizon_steps": 62600,
+    "preserve_optimizer_state": true,
+    "preserve_optimizer_age": true
+  },
+  "teacher": {
+    "kind": "step_after_replay",
+    "initial": 0.5,
+    "final": 0.085,
+    "change_step": 37560,
+    "stochastic_prefixes": true,
+    "full_vocabulary": true
+  },
+  "ema_decay": 0.999,
+  "sampler": {
+    "temperature": 0.975,
+    "top_k": [
+      1536,
+      2048,
+      3072,
+      6144
+    ],
+    "top_p": [
+      0.95,
+      0.95,
+      0.98,
+      0.99
+    ]
+  },
+  "baseline": null,
+  "evaluation": {
+    "generated_images": 50000,
+    "reference_images": 1281167,
+    "reference_split": "train",
+    "reference_sha256": "3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260",
+    "seed": 261001,
+    "is_shuffle_seed": 261002,
+    "rejection_sampling": false,
+    "target_fid": 11.56,
+    "ema_every_epochs": 2,
+    "raw_every_epochs": 4,
+    "raw_also_first_evaluation": true,
+    "log_images": true,
+    "first_epoch": 62
+  },
+  "created_at": 1794334851.463259,
+  "replaces_trial": "imagenet-rq24576-refine80-lowLR-noise-ema-8h100-20261110",
+  "source_selection_reason": "User requested an earlier starting point than epoch94; exact original epoch80 full state retained.",
+  "requested_rewind_epoch": 60,
+  "requested_rewind_step": 37560,
+  "exact_epoch60_checkpoint_available": false,
+  "replay_from_epoch58": true,
+  "replay_claimed_bitwise_identical": false,
+  "original_requested_temperature": 0.1,
+  "noise_match_calibration": {
+    "passed": true,
+    "selected_temperature": 0.085,
+    "selected": {
+      "temperature": 0.085,
+      "fit_error_ratio": 1.009173690685828,
+      "heldout_fresh_seed_error_ratio": 1.009267543911572,
+      "heldout_nmse": 0.04170875095600652,
+      "heldout_original_nmse": 0.1896695861285984
+    },
+    "original_error_ratios": {
+      "fit": 1.0091760129570613,
+      "heldout": 1.009275826047525
+    },
+    "candidates": [
+      {
+        "temperature": 0.075,
+        "fit_error_ratio": 1.0068987622923355,
+        "heldout_fresh_seed_error_ratio": 1.007061401381153,
+        "heldout_nmse": 0.04161758043345303,
+        "heldout_original_nmse": 0.1896695861285984
+      },
+      {
+        "temperature": 0.08,
+        "fit_error_ratio": 1.0079674586604237,
+        "heldout_fresh_seed_error_ratio": 1.0081599867570543,
+        "heldout_nmse": 0.04166298031193301,
+        "heldout_original_nmse": 0.1896695861285984
+      },
+      {
+        "temperature": 0.085,
+        "fit_error_ratio": 1.009173690685828,
+        "heldout_fresh_seed_error_ratio": 1.009267543911572,
+        "heldout_nmse": 0.04170875095600652,
+        "heldout_original_nmse": 0.1896695861285984
+      },
+      {
+        "temperature": 0.09,
+        "fit_error_ratio": 1.010485445280287,
+        "heldout_fresh_seed_error_ratio": 1.010491255936424,
+        "heldout_nmse": 0.041759321788680505,
+        "heldout_original_nmse": 0.1896695861285984
+      },
+      {
+        "temperature": 0.1,
+        "fit_error_ratio": 1.013265555392241,
+        "heldout_fresh_seed_error_ratio": 1.013328888750809,
+        "heldout_nmse": 0.04187658912881617,
+        "heldout_original_nmse": 0.1896695861285984
+      }
+    ],
+    "fit_training_images": 5000,
+    "heldout_training_images": 5000,
+    "fresh_validation_sampling_seed": 781001,
+    "image_validation_set_used_for_fitting": false,
+    "maximum_heldout_ratio_difference": 0.0005,
+    "objective": "Match relative increase over greedy while retaining lower normalized latent error"
+  },
+  "validation_source_checkpoint": "/tmp/laser-rq24576-rewind60-teacher010-8h100-20261110/checkpoints/step-0036310.pt",
+  "validation_start_step": 36310,
+  "validation_source_checkpoint_sha256": "e9f58f3dc5cda6c4745b2d715344ce63bd7a8795fcf97302213b97d0d1024f74"
+}

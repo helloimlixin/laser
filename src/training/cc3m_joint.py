@@ -36,14 +36,14 @@ _RUNTIME_EXECUTION = {}
 
 def configure_execution(overrides):
     """Apply only execution controls, preserving the checkpoint training recipe."""
-    allowed = {'short_sequence_math', 'attention_batch_limit', 'encoder_batch',
+    allowed = {'short_sequence_math', 'cudnn_benchmark', 'cudnn_benchmark_limit', 'checkpoint_every', 'attention_batch_limit', 'encoder_batch',
                'target_chunk', 'ce_chunk_size'}
     if not isinstance(overrides, dict) or set(overrides)-allowed:
         raise ValueError('Unsupported CC3M execution override')
     for key, value in overrides.items():
-        if key == 'short_sequence_math':
+        if key in {'short_sequence_math', 'cudnn_benchmark'}:
             if not isinstance(value, bool):
-                raise ValueError('short_sequence_math must be boolean')
+                raise ValueError(f'{key} must be boolean')
         elif type(value) is not int or value < 1:
             raise ValueError(f'{key} must be a positive integer')
     _RUNTIME_EXECUTION.clear()
@@ -90,6 +90,17 @@ def build_model(cfg, device):
 
 
 def build_aux(cfg, device):
+    if cfg.get('tokenizer_backend') == 'native_vector':
+        from src.models.native_vector_tokenizer import NativeVectorTokenizer, file_digest, module_digest
+        for key in ('stage1', 'codebook'):
+            if file_digest(cfg[key]) != cfg[key+'_sha256']:
+                raise ValueError(f'Native vector {key} SHA256 mismatch')
+        aux = NativeVectorTokenizer(cfg['stage1'], cfg['codebook'])
+        if cfg['arch']['vocab_size'] != aux.quantizer.vocab_size:
+            raise ValueError('Transformer vocabulary must match the frozen vector tables')
+        if module_digest(aux.backbone) != aux.spec['source_cnn_digest']:
+            raise ValueError('Frozen LASER backbone differs from the tokenizer artifact')
+        return aux.to(device).eval()
     if cfg.get('tokenizer_backend') == 'native_beam_pair':
         from src.models.rfid_preserved_joint_tokenizer import RFIDPreservedJointTokenizer
         return RFIDPreservedJointTokenizer(cfg['stage1'], cfg['codebook'],
@@ -103,20 +114,68 @@ def optimizer_for(model, cfg):
                             weight_decay=cfg['weight_decay'], fused=True)
 
 
+_TEACHER_AUDITED = set()
+
+
+def image_targets(aux, latent, cfg):
+    """Draw prefixes and soft labels from the configured frozen teacher."""
+    if cfg.get('tokenizer_backend') == 'native_vector':
+        # Chunk by images: the upstream method has no chunk_size argument.
+        # Prefixes and labels both come from its full-vocabulary posterior.
+        parts = [aux.quantizer.get_soft_codes(chunk, temp=cfg['temperatures'], stochastic=True)
+                 for chunk in latent.split(execution_options(cfg)['target_chunk'])]
+        return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
+    if cfg.get('image_teacher') == 'beam_aligned':
+        from src.training.beam_aligned_teacher import aligned_targets
+        options = cfg['beam_teacher']
+        if options['beam_width'] != 16 or options['max_relative_candidate_error'] != .01:
+            raise ValueError('The validated beam teacher requires beam16 and the 1% candidate budget')
+        pool_fn = None
+        if cfg.get('execution', {}).get('exact_beam_cost', False):
+            from src.training.beam_aligned_kernels import beam_pool
+            pool_fn = beam_pool
+        audit_key = (cfg.get('run_id'), os.environ.get('RANK', '0'))
+        audit = audit_key not in _TEACHER_AUDITED
+        result = aligned_targets(aux.physical_book, latent,
+            float(options['sequence_temperature']), return_details=audit, pool_fn=pool_fn)
+        targets, codes = result[:2]
+        if audit:
+            _, _, pool, weights, chosen = result
+            if not torch.isfinite(targets).all():
+                raise FloatingPointError('Nonfinite beam-aligned targets')
+            torch.testing.assert_close(targets.sum(-1), torch.ones_like(codes, dtype=targets.dtype),
+                                       rtol=2e-5, atol=2e-5)
+            conditional_probability = targets.gather(-1, codes[..., None]).squeeze(-1).prod(-1).reshape(-1)
+            joint_probability = weights.gather(1, chosen[:, None]).squeeze(-1)
+            torch.testing.assert_close(conditional_probability, joint_probability, rtol=1e-4, atol=1e-6)
+            canonical_cost = pool['costs'].gather(1, pool['canonical_index'][:, None])
+            relative_error = ((pool['costs']-canonical_cost).clamp_min(0)*weights).sum(-1)/canonical_cost[:, 0].clamp_min(1e-8)
+            write_json(local_run_root(cfg)/f'teacher-audit-rank{audit_key[1]}.json', dict(
+                passed=True, teacher='beam16 sequence posterior with exact prefix conditionals',
+                sequence_temperature=float(options['sequence_temperature']), beam_width=16,
+                vocabulary=aux.physical_book.vocab_size, soft_targets=True,
+                prefixes_and_targets_share_joint_distribution=True,
+                ar_joint_probability_verified=True, native_greedy_teacher_used=False,
+                entropy_per_depth=[float(-(targets[..., d, :]*targets[..., d, :].clamp_min(1e-30).log()).sum(-1).mean())
+                                   for d in range(codes.shape[-1])],
+                mean_relative_latent_error_above_canonical=float(relative_error.mean()),
+                exact_beam_cost=pool_fn is not None))
+            _TEACHER_AUDITED.add(audit_key)
+        return targets, codes
+    execution = execution_options(cfg)
+    if cfg.get('tokenizer_backend') == 'native_beam_pair':
+        parts = [aux.quantizer.get_soft_codes(chunk, temp=cfg['temperatures'], stochastic=True)
+                 for chunk in latent.split(execution['target_chunk'])]
+        return torch.cat([part[0] for part in parts]), torch.cat([part[1] for part in parts])
+    return aux.quantizer.get_soft_codes(latent, cfg['temperatures'],
+        stochastic=True, chunk_size=execution['target_chunk'])
+
+
 def objective(model, aux, images, text, cfg):
     execution = execution_options(cfg)
     with torch.no_grad(), torch.autocast('cuda', enabled=False):
         latent = torch.cat([aux.encode(x.float()) for x in images.split(execution['encoder_batch'])])
-        if cfg.get('tokenizer_backend') == 'native_beam_pair':
-            # Keep the released stochastic residual teacher unchanged. Chunk
-            # only the image batch, since the native bottleneck expects BHWC.
-            parts = [aux.quantizer.get_soft_codes(chunk, temp=cfg['temperatures'], stochastic=True)
-                     for chunk in latent.split(execution['target_chunk'])]
-            targets = torch.cat([part[0] for part in parts])
-            codes = torch.cat([part[1] for part in parts])
-        else:
-            targets, codes = aux.quantizer.get_soft_codes(latent, cfg['temperatures'],
-                stochastic=True, chunk_size=execution['target_chunk'])
+        targets, codes = image_targets(aux, latent, cfg)
     with torch.autocast('cuda', dtype=torch.bfloat16):
         logits, text_logits = model(codes, model_aux=aux, cond=text, amp=True)
         if logits.dtype != torch.bfloat16 or text_logits.dtype != torch.bfloat16:
@@ -277,15 +336,42 @@ class Checkpoints:
     def _write(self, payload, name):
         local = Path(self.cfg['local_checkpoints'])/name
         local.parent.mkdir(parents=True, exist_ok=True)
-        tmp = local.with_suffix('.tmp')
+        artifact_upload = self.cfg.get('checkpoint_upload') == 'artifact'
+        target = (local.parent/f'step-{payload["global_step"]:07d}-{time.time_ns()}.pt'
+                  if artifact_upload else local)
+        tmp = target.with_suffix('.tmp')
         torch.save(payload, tmp)
-        tmp.replace(local)
+        tmp.replace(target)
+        if artifact_upload:
+            alias = local.with_suffix('.pending')
+            alias.unlink(missing_ok=True)
+            os.link(target, alias)
+            alias.replace(local)
         with local.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        write_json(local.with_suffix('.json'), dict(global_step=payload['global_step'],
-            bytes=local.stat().st_size, sha256=digest, path=str(local), time=time.time()))
+        receipt = dict(global_step=payload['global_step'], bytes=local.stat().st_size,
+                       sha256=digest, path=str(local), immutable_path=str(target), time=time.time())
         if self.wb is not None:
-            self.wb.save(str(local), base_path=str(local.parent), policy='now')
+            if artifact_upload:
+                import wandb
+                artifact = wandb.Artifact(self.cfg['run_id']+'-checkpoint', type='model',
+                    metadata=dict(global_step=payload['global_step'], epoch=payload['epoch'],
+                                  sha256=digest, metrics=payload.get('metrics'), image_teacher=self.cfg.get('image_teacher')))
+                artifact.add_file(str(target), name='last.pt', policy='immutable', skip_cache=True)
+                aliases = [f'step-{payload["global_step"]}']
+                aliases.append('latest' if name == 'last.pt' else name.removesuffix('.pt'))
+                artifact = self.wb.log_artifact(artifact, aliases=aliases)
+                artifact.wait()
+                assert str(artifact.state) == 'COMMITTED'
+                receipt.update(artifact=artifact.qualified_name, state='COMMITTED')
+            else:
+                self.wb.save(str(local), base_path=str(local.parent), policy='now')
+        write_json(local.with_suffix('.json'), receipt)
+        if artifact_upload and receipt.get('state') == 'COMMITTED':
+            # Hardlinked last/best aliases preserve their payloads when cold names are pruned.
+            for old in local.parent.glob('step-*.pt'):
+                if old != target:
+                    old.unlink()
         print(json.dumps(dict(checkpoint=str(local), global_step=payload['global_step'],
                               bytes=local.stat().st_size)), flush=True)
 
@@ -295,6 +381,8 @@ class Checkpoints:
 
 
 def benchmark(cfg):
+    torch.backends.cudnn.benchmark = execution_options(cfg).get('cudnn_benchmark', False)
+    torch.backends.cudnn.benchmark_limit = execution_options(cfg).get('cudnn_benchmark_limit', 10)
     device = torch.device('cuda', 0)
     seed_all(cfg['seed'])
     model, aux = build_model(cfg, device), build_aux(cfg, device)
@@ -362,9 +450,14 @@ def benchmark(cfg):
 def run(cfg, smoke=False):
     if OmegaConf.is_config(cfg):
         cfg = OmegaConf.to_container(cfg, resolve=True)
+    overrides = os.environ.get('LASER_CC3M_EXECUTION_OVERRIDES')
+    if overrides:
+        configure_execution(json.loads(Path(overrides).read_text()))
     torch.set_num_threads(4)
     torch.set_float32_matmul_precision('highest')
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = execution_options(cfg).get('cudnn_benchmark', False)
+    torch.backends.cudnn.benchmark_limit = execution_options(cfg).get('cudnn_benchmark_limit', 10)
     from src.training.cc3m_paper_metrics import load_reference
     load_reference(cfg)  # Fail before GPU setup if the reference or protocol is wrong.
     rank, local, world = [int(os.environ[x]) for x in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE')]
@@ -439,6 +532,13 @@ def run(cfg, smoke=False):
         wb.config.update({'execution_runtime': execution_options(cfg)}, allow_val_change=True)
         if cfg.get('tokenizer_backend') == 'native_beam_pair':
             wb.use_artifact(cfg['tokenizer_recipe']['paired_tokenizer_artifact'])
+        if cfg.get('tokenizer_backend') == 'native_vector':
+            wb.use_artifact(cfg['tokenizer_recipe']['source_artifact'])
+        if cfg.get('image_teacher') == 'beam_aligned':
+            wb.use_artifact(cfg['beam_teacher']['source_artifact'])
+            wb.summary.update({'teacher/kind': 'beam16 aligned conditional soft posterior',
+                'teacher/beam_width': 16, 'teacher/sequence_temperature': cfg['beam_teacher']['sequence_temperature'],
+                'teacher/native_greedy_teacher_used': False})
         wb.define_metric('train/global_step')
         wb.define_metric('train/*', step_metric='train/global_step')
         wb.define_metric('eval/*', step_metric='train/global_step')
@@ -451,7 +551,8 @@ def run(cfg, smoke=False):
                 wb.save(str(path), base_path=str(local_run_root(cfg)), policy='now')
         write_json(local_run_root(cfg)/'wandb.json', dict(url=wb.url, run_id=wb.id))
         store = Checkpoints(cfg, wb)
-        if step and (Path(cfg['local_checkpoints'])/'last.pt').exists():
+        if (step and cfg.get('checkpoint_upload') != 'artifact'
+                and (Path(cfg['local_checkpoints'])/'last.pt').exists()):
             wb.save(str(Path(cfg['local_checkpoints'])/'last.pt'),
                     base_path=cfg['local_checkpoints'], policy='now')
     restore_rng(training_rng, device)
@@ -551,7 +652,8 @@ def run(cfg, smoke=False):
                         dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
                         assert torch.equal(minimum, maximum), 'DDP replicas diverged'
                     else:
-                        if step == step_offset+1 or step % cfg['save_every'] == 0 or bool(stop_flag):
+                        checkpoint_every = execution_options(cfg).get('checkpoint_every', cfg['save_every'])
+                        if step == step_offset+1 or step % checkpoint_every == 0 or bool(stop_flag):
                             checkpoint(epoch, update+1)
                         if step == 1 or step % cfg['preview_every'] == 0:
                             if rank == 0:

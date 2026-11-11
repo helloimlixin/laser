@@ -1,0 +1,10 @@
+import os
+from pathlib import Path
+os.environ['WANDB_API_KEY']=Path('/root/.config/laser/wandb.key').read_text().strip()
+os.environ['WANDB_BASE_URL']='https://api.forge.coreweave.com'
+import wandb
+api=wandb.Api(timeout=180)
+a=api.artifact('helloimlixin-rutgers/laser/imga16384k4altbn64-b128-b300-20260830000755-stage1-checkpoints:v9')
+print(a.name,a.state,a.size,flush=True)
+for f in a.files(): print(f.name,f.size,flush=True)
+a.download(root='/tmp/laser-resume-h100-20261105/stage1-artifact')

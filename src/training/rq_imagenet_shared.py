@@ -47,6 +47,11 @@ def fresh_model(device):
     config.arch=model.config
     config.dataset.vocab_size=max(model.vocab_size)
     optimizer=create_resnet_optimizer(model,config.optimizer)
+    if getattr(PROFILE,'recipe',{}).get('execution',{}).get('fused_adamw',False):
+        if not isinstance(optimizer,torch.optim.AdamW):
+            raise ValueError('Fused AdamW requires the AdamW optimizer')
+        for group in optimizer.param_groups:
+            group.update(fused=True,foreach=False)
     assert not optimizer.state
     return model,optimizer,config
 
@@ -169,9 +174,10 @@ def preview(model, aux, device, rank, world, step, run):
             ordered = torch.empty(32,*images.shape[1:])
             for indices,values in gathered:
                 ordered[indices] = values
-            destination = OUT if run is not None else OUT/'smoke'
+            destination = (Path(os.environ.get('LASER_PRIVATE_SMOKE_DIR',str(OUT/'smoke')))
+                if getattr(PROFILE, 'execution_phase', 'train') == 'smoke' else OUT)
             path = destination/'samples'/f'step{step:06d}-fixed.png'
-            path.parent.mkdir(exist_ok=True)
+            path.parent.mkdir(parents=True,exist_ok=True)
             save_image(ordered,path,nrow=4)
             if run is not None:
                 import wandb
@@ -202,12 +208,13 @@ def generation(model,aux,device,rank,world,epoch,run,batch=None,seed=261001):
             if rank==0:
                 write_json(OUT/'generation-progress.json',dict(epoch=epoch,
                     generated_on_rank=first+count,samples_on_rank=local_count,time=time.time()))
-                if first==0 and run is not None and not getattr(PROFILE,'recipe',{}).get('preview'):
+                if first==0 and not getattr(PROFILE,'recipe',{}).get('preview'):
                     from torchvision.utils import save_image
                     path=OUT/f'samples/epoch{epoch:03d}.png';path.parent.mkdir(exist_ok=True)
                     save_image(images[:8],path,nrow=4)
-                    import wandb
-                    run.log({'samples/generated':wandb.Image(str(path)),'train/epoch':epoch})
+                    if run is not None:
+                        import wandb
+                        run.log({'samples/generated':wandb.Image(str(path)),'train/epoch':epoch})
         assert int(metric.fake_count)==local_count
         fid,is_mean,is_std=metric.compute(shuffle_for_inception=True)
         del metric
@@ -243,7 +250,13 @@ def reconstruction_check(aux,config,device,rank,world):
 def main(kind,base):
     global BASE,RUN,OUT,PROFILE
     BASE=Path(base)
-    if kind == 'laser_native_support_order':
+    if kind == 'laser_compound128':
+        from src.training.compound128_recipe import Compound128Recipe
+        PROFILE = Compound128Recipe(BASE)
+    elif kind == 'laser_continuous_compound':
+        from src.training.continuous_compound_recipe import ContinuousCompoundRecipe
+        PROFILE = ContinuousCompoundRecipe(BASE)
+    elif kind == 'laser_native_support_order':
         from src.training.laser_native_support_order_recipe import NativeSupportOrderRecipe
         PROFILE = NativeSupportOrderRecipe(BASE)
     elif kind == 'laser_compound_replay':
@@ -300,6 +313,7 @@ def main(kind,base):
         reconstruction_check(aux,stage1_config,device,rank,world)
         dist.destroy_process_group();return
     phase='smoke' if args.smoke_updates else 'train'
+    PROFILE.execution_phase=phase
     folder=Path(os.environ.get('LASER_PRIVATE_SMOKE_DIR',str(OUT/phase))) if phase=='smoke' else OUT/phase
     if phase=='train':
         if rank==0:local_training_logs(BASE,folder)
@@ -389,7 +403,7 @@ def main(kind,base):
     write_json(folder/f'startup-rank{rank}.json',initial)
     run=None
     resume_logged_step=0
-    if rank==0 and not args.smoke_updates:
+    if rank==0 and not args.smoke_updates and getattr(PROFILE, 'recipe', {}).get('logging', {}).get('wandb', True):
         import wandb
         os.environ['WANDB_API_KEY']=Path('/root/.config/laser/imagenet-stage2-wandb.key').read_text().strip()
         run=wandb.init(entity='helloimlixin-rutgers',project='laser',id=RUN,
@@ -602,7 +616,8 @@ def main(kind,base):
                     preview(model,aux,device,rank,world,global_step,run)
                 checkpoint_every=int(getattr(PROFILE,'execution_options',{}).get('checkpoint_every_updates',
                     getattr(PROFILE,'recipe',{}).get('checkpoint',{}).get('every_updates',0)))
-                if checkpoint_every and global_step%checkpoint_every==0:
+                first_checkpoint=(global_step==1 and getattr(PROFILE,'recipe',{}).get('checkpoint',{}).get('at_first_update',False))
+                if first_checkpoint or (checkpoint_every and global_step%checkpoint_every==0):
                     checkpoint(epoch,epoch,absolute+1)
         start_micro=0
         evaluation=None

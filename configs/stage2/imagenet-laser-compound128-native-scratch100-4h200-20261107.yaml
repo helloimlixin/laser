@@ -1,0 +1,128 @@
+# @package _global_
+defaults:
+  - _self_
+
+stage: stage2
+backend: compound128
+recipe_kind: laser_compound128
+version: original-compound128-h200-throughput-v1
+run_id: imagenet-laser-compound128-native-scratch100-4h200-20261107
+name: ImageNet original LASER | compound128 | fresh100 | 4 H200
+seed: 261001
+output_dir: outputs/${run_id}
+runtime_base: /tmp/${run_id}
+resume: null
+epochs: 100
+lr_schedule_epochs: 100
+global_batch: 2048
+microbatch: 256
+decoder: native_compound_pair
+target_mode: hard_sparse_tokens
+objective: weighted_atom_and_hard_coefficient_cross_entropy
+atom_ce_weight: 1.5
+auxiliary_loss_terms: 0
+tokenizer:
+  checkpoint: outputs/imagenet-laser-rq-minimal-rfid421-scratch20-20261014/reproducibility/stage1-model.pt
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  source_rfid: 4.215039034200402
+  num_atoms: 16384
+  depth: 4
+  coefficient_bins: 128
+  coefficient_max: 3.0
+  coefficient_scales: [4.587941646575928, 2.4749884605407715, 1.6106663942337036, 1.0176019668579102]
+targets:
+  encoder_batch_size: 8
+  coefficient_quantization: nearest_bin
+  stochastic_prefixes: false
+  coefficient_noise: false
+data:
+  synthetic: false
+  train_archive: /workspace/Projects/data/imagenet/archives/ILSVRC2012_img_train.verified-20261005.tar
+  class_index: /tmp/imagenet-laser-continuous-compound-pilot-20261107/archive-class-index.json
+  reuse_verified_data: /tmp/imagenet-laser-continuous-compound-native-scratch100-4h200-20261107/data
+training:
+  devices: 4
+  index_workers: 8
+  max_restarts: 3
+  rq_config: outputs/imagenet-laser-compound512-native-scratch2-4h100-20261016/reproducibility/stage2-training-config.yaml
+  reference_stats: outputs/imagenet-laser-rq-minimal-rfid421-scratch20-20261014/reproducibility/imagenet_256_train.npz
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+  archive_md5: 1d675b47d978889d74fa0da5fadfb00e
+arch:
+  type: rq-transformer
+  block_size: [8, 8, 4]
+  embed_dim: 1536
+  input_embed_dim: 256
+  shared_tok_emb: true
+  shared_cls_emb: true
+  input_emb_vqvae: true
+  head_emb_vqvae: true
+  cumsum_depth_ctx: true
+  vocab_size: 16384
+  vocab_size_cond: 1000
+  block_size_cond: 1
+  body:
+    n_layer: 42
+    block:
+      n_head: 24
+      resid_pdrop: 0.1
+  head:
+    n_layer: 6
+    block:
+      n_head: 24
+      resid_pdrop: 0.1
+optimizer:
+  lr: 0.0005
+  betas: [0.9, 0.95]
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+initialization:
+  fresh_stage2: true
+  fresh_optimizer: true
+  stage2_checkpoint_loaded: false
+  reset_stage2_seed_after_tokenizer: true
+training_rng:
+  policy: independent_rank_v1
+  base_seed: 261001
+sampling:
+  atom_temperature: 0.9
+  atom_top_k: 0
+  atom_top_p: 0.9
+  coefficient_temperature: 1.0
+  coefficient_top_k: 0
+  coefficient_top_p: 0.85
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 5
+  extra_epochs: [2, 4, 8]
+  include_epoch_one: true
+  batch_size: 128
+preview:
+  first_update: 10
+  every_updates: 200
+  images: 32
+  fixed_seed: 261001
+checkpoint:
+  every_updates: 250
+  at_first_update: true
+logging:
+  wandb: false
+  external_wandb: true
+  credentials_file: /root/.config/laser/wandb.key
+execution:
+  attention_backend: sdpa_spatial
+  fused_adamw: true
+  benchmark_candidates:
+    - {microbatch: 64, attention_backend: native}
+    - {microbatch: 128, attention_backend: native}
+    - {microbatch: 128, attention_backend: sdpa_spatial}
+    - {microbatch: 256, attention_backend: sdpa_spatial}
+  benchmark_updates: 6
+  ddp_preflight_updates: 4
+verification:
+  reconstruction_images: 50000
+  reconstruction_split: train_balanced50k
+  maximum_reconstruction_rfid: 4.73
+  maximum_rfid_increase: 0.15
