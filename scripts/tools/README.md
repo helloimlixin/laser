@@ -35,4 +35,6 @@ automatically; most runs do not need to call these utilities directly.
 - Other files support cache conversions, diagnostics, sampling reports, and local
   run maintenance. Their individual `--help` describes required inputs.
 
-Experiment launchers have moved to [`archive/scripts/`](../../archive/scripts/).
+Look in [`archive/scripts/`](../../archive/scripts/) for historical launchers
+and one-off diagnostics. Some older tools stay here because recipes or tests
+still call them by path.

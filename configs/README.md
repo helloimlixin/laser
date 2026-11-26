@@ -1,8 +1,17 @@
 # Training configuration
 
-Run `python train.py --config configs/stage1/<dataset>.yaml` or the corresponding
-`stage2` recipe. Dataset names are `celebahq`, `ffhq`, `lsun-church`, `lsun-bedroom`,
-`lsun-cat`, `imagenet`, and `cc3m`.
+For a new run, choose the file named after your dataset in [`stage1/`](stage1/)
+or [`stage2/`](stage2/). The standard recipe names are `celebahq`, `ffhq`,
+`lsun-church`, `lsun-bedroom`, `lsun-cat`, `imagenet`, `cc3m`, and `coco2014`.
+
+```bash
+python train.py --config configs/stage1/ffhq.yaml --dry-run
+```
+
+Use [`experiments/`](experiments/) for documented comparisons and the CPU smoke
+test, and [`research/`](research/) for standalone historical trials. Some
+historical recipes still live alongside the standard recipes because older
+launchers or regression tests refer to those paths.
 
 Hydra composes the `defaults` list in order. A dataset recipe includes its stage's
 `base.yaml`, selects a `data/` configuration, then applies its own settings. Model
