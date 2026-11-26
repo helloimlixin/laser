@@ -68,8 +68,6 @@ os.environ.setdefault("DEEPSPEED_LOG_LEVEL", "warning")
 # Required by cuBLAS for deterministic kernels on supported CUDA paths.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-torch.set_float32_matmul_precision('medium')
-
 from src.pl_trainer_util import resolve_val_check_interval
 from src.stage1_setup import (
     build_stage1_datamodule,
@@ -229,6 +227,7 @@ def run(cfg: DictConfig):
     Args:
         cfg: Hydra configuration object containing model and training parameters
     """
+    torch.set_float32_matmul_precision("medium")
     ckpt_path = getattr(cfg, "ckpt_path", None)
     if ckpt_path:
         ckpt_path = _resolve_ckpt_file(ckpt_path)

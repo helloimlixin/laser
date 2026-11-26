@@ -69,8 +69,6 @@ from src.stage2_preview import (
 )
 from src.wandb_media import log_wandb_payload
 
-torch.set_float32_matmul_precision("medium")
-
 CHECKPOINT_SAVE_TOP_K = 3
 CHECKPOINT_SAVE_LAST = True
 CHECKPOINT_EVERY_N_EPOCHS = 1
@@ -436,6 +434,7 @@ def build(cfg: DictConfig):
 
 
 def run(cfg: DictConfig):
+    torch.set_float32_matmul_precision("medium")
     mode = arch_name(getattr(cfg.ar, "type", "sparse_spatial_depth"))
     cfg.ar.type = mode
     deterministic = bool(getattr(cfg.train_ar, "deterministic", True))

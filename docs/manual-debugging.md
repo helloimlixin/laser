@@ -22,7 +22,7 @@ own module under [`src/training/`](../src/training/).
 debug_dir=$(mktemp -d)
 CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 WANDB_MODE=disabled \
   python train.py --config configs/experiments/continuous-compound-smoke.yaml \
-  pilot.device=cpu "output_dir=$debug_dir"
+  pilot.device=cpu "output_dir=$debug_dir" "runtime_base=$debug_dir/runtime"
 ls "$debug_dir"
 ```
 
