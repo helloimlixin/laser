@@ -346,7 +346,14 @@ def main(kind,base):
     sampler=ExactGlobalBatchSampler(dataset,2048,world,rank,accumulation,261001)
     steps_per_epoch=626
     scheduler=create_scheduler(optimizer,config.optimizer.warmup,steps_per_epoch,PROFILE.schedule_epochs)
-    scaler=torch.amp.GradScaler('cuda',enabled=bool(config.experiment.amp))
+    recipe = getattr(PROFILE, 'recipe', {})
+    logging_settings = recipe.get('logging', {})
+    training_dtype = recipe.get('execution', {}).get('training_autocast_dtype', 'float16')
+    if training_dtype not in ('float16','bfloat16'):
+        raise ValueError('Training autocast dtype must be float16 or bfloat16')
+    scaler = torch.amp.GradScaler(
+        'cuda', enabled=bool(config.experiment.amp) and training_dtype == 'float16',
+    )
     completed_epoch=start_micro=global_step=0
     restored_best_fid=math.inf
     restored_evaluation=None
@@ -399,13 +406,16 @@ def main(kind,base):
         world_size=world,microbatch=args.microbatch,accumulation_steps=accumulation,
         global_batch=2048,optimizer_updates_per_epoch=626,training_epochs=args.epochs,
         lr_schedule_epochs=PROFILE.schedule_epochs,**schedule_metadata(config,scheduler),
+        training_autocast_dtype=training_dtype,grad_scaler_enabled=scaler.is_enabled(),
         pid=os.getpid(),**PROFILE.metadata(),**rng_metadata)
     write_json(folder/f'startup-rank{rank}.json',initial)
     run=None
     resume_logged_step=0
-    if rank==0 and not args.smoke_updates and getattr(PROFILE, 'recipe', {}).get('logging', {}).get('wandb', True):
+    if rank==0 and not args.smoke_updates and logging_settings.get('wandb', True):
         import wandb
-        os.environ['WANDB_API_KEY']=Path('/root/.config/laser/imagenet-stage2-wandb.key').read_text().strip()
+        key_file = Path.home() / '.config/laser/imagenet-stage2-wandb.key'
+        if not os.environ.get('WANDB_API_KEY') and key_file.is_file():
+            os.environ['WANDB_API_KEY'] = key_file.read_text().strip()
         run=wandb.init(entity='helloimlixin-rutgers',project='laser',id=RUN,
             name=PROFILE.name,
             resume='must' if args.resume and not args.new_wandb_run else 'allow',dir=str(BASE/'wandb'),
@@ -452,7 +462,8 @@ def main(kind,base):
         for path in (OUT/'reproducibility').glob('*'):
             if path.is_file():run.save(str(path),base_path=str(OUT),policy='now')
         write_json(OUT/'wandb.json',dict(url=run.url,id=RUN))
-        fid_workspace(run)
+        if logging_settings.get('create_workspace', True):
+            fid_workspace(run)
         if args.new_wandb_run and restored_evaluation is not None:
             run.log({'train/global_step':global_step,'train/epoch':global_step/steps_per_epoch,
                 'eval/fid':restored_evaluation['fid'],

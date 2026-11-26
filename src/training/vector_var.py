@@ -11,11 +11,15 @@ def run(cfg):
     for name,value in expected.items():
         if int(cfg[name]) != value:
             raise ValueError(f"This frozen experiment requires {name}={value}; prepare a separate contract to change it")
-    command=[sys.executable,str(root/cfg.pipeline)]
-    env=dict(os.environ)
-    key=Path('/root/.config/laser/wandb.key')
-    if 'WANDB_API_KEY' not in env and key.exists():env['WANDB_API_KEY']=key.read_text().strip()
-    env.update(WANDB_BASE_URL='https://api.forge.coreweave.com',WANDB_DISABLE_GIT='true',
+    command = [sys.executable, str(root / cfg.pipeline)]
+    env = dict(os.environ)
+    for name in ('WANDB_SERVICE', '_WANDB_SERVICE'):
+        env.pop(name, None)
+    key_file = Path.home() / '.config/laser/wandb.key'
+    if not env.get('WANDB_API_KEY') and key_file.is_file():
+        env['WANDB_API_KEY'] = key_file.read_text().strip()
+    env.setdefault('WANDB_BASE_URL', 'https://api.forge.coreweave.com')
+    env.update(WANDB_DISABLE_GIT='true',
                OMP_NUM_THREADS='4',MKL_NUM_THREADS='4',OPENBLAS_NUM_THREADS='1',
                PYTHONUNBUFFERED='1',PYTORCH_ALLOC_CONF='expandable_segments:True',NCCL_NVLS_ENABLE='0',
                TORCHINDUCTOR_COMPILE_THREADS='2',

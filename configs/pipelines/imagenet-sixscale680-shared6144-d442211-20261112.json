@@ -1,0 +1,196 @@
+{
+  "codec": {
+    "train_archive": "/tmp/laser-matched680-vector6144-20261111/data/ILSVRC2012_img_train.tar",
+    "train_index": "/tmp/laser-shared6144-h200-20261112/source/data/train-index.npz",
+    "training_archive_receipt": "/tmp/laser-matched680-vector6144-20261111/data/ILSVRC2012_img_train.tar.verified.json",
+    "val_archive": "/tmp/laser-matched680-vector6144-20261111/data/ILSVRC2012_img_val.tar",
+    "val_index": "/tmp/laser-shared6144-h200-20261112/source/data/val-index.npz",
+    "val_labels": "/tmp/laser-shared6144-h200-20261112/source/data/val-labels.npy",
+    "fid_reference": "/tmp/laser-shared6144-h200-20261112/source/data/real-feature-moments.npz",
+    "source_checkpoint": "/tmp/laser-matched680-vector6144-20261111/checkpoint/checkpoint.pt",
+    "source_checkpoint_sha256": "cdea5ae33dff9943653f0fa8919db277547e6a4be39588472f26c45f0ce80599",
+    "initial_codebook": "/tmp/laser-shared6144-h200-20261112/recovery/vector-codebook.pt",
+    "initial_codebook_sha256": "898588dd1ff41aaafe75fdabb4c590d84829108145338af100bae65993abb7aa",
+    "tokenizer_artifact": "helloimlixin-rutgers/laser/imnet-s1-laser-matched680-full-continue-best-4gpu-20261105-tokenizer:v62",
+    "source_bundle": "/tmp/laser-sixscale680-20261112/source.tar.gz",
+    "scales": [
+      2,
+      4,
+      6,
+      8,
+      12,
+      16
+    ],
+    "depths": [
+      4,
+      4,
+      2,
+      2,
+      1,
+      1
+    ],
+    "tokens_per_scale": [
+      16,
+      64,
+      72,
+      128,
+      144,
+      256
+    ],
+    "tokens_per_image": 680,
+    "spatial_positions": 520,
+    "vocabulary": 6144,
+    "vector_dim": 32,
+    "shared_across_scales": true,
+    "shared_across_depths": true,
+    "physical_tables": 1,
+    "seed": 0,
+    "world_size": 2,
+    "workers": 12,
+    "checkpoint_every": 500,
+    "preview_every": 500,
+    "image_size": 256,
+    "augmentation": "Resize288 Lanczos; deterministic RandomCrop256 per epoch; no horizontal flip",
+    "precision": "bf16; FP32 quantization/losses; TF32 disabled",
+    "stage": "codec",
+    "output": "/tmp/laser-sixscale680-20261112/stage1",
+    "epochs": 5,
+    "lr": 1e-05,
+    "codebook_lr": 0.0001,
+    "discriminator_lr": 1e-05,
+    "warmup_updates": 100,
+    "critic_warmup_steps": 100,
+    "gan_ramp_steps": 200,
+    "microbatch": 64,
+    "accumulation": 2,
+    "global_batch": 256,
+    "compile": false,
+    "eval_batch": 32,
+    "quality_gate_rfid": 2.5,
+    "quality_gate_count": 50000,
+    "cnn_frozen": false,
+    "codebook_frozen": false,
+    "objective": "L1 + LPIPS + multiscale VQ/commitment + adaptive hinge GAN; pretrained critic",
+    "wandb": {
+      "id": "imnet-s1-sixscale680-shared6144-d442211-adapt-20261112",
+      "name": "ImageNet | six scales | k442211 | shared6144 | 680 tokens | codec adaptation | 2H200"
+    }
+  },
+  "prior": {
+    "train_archive": "/tmp/laser-matched680-vector6144-20261111/data/ILSVRC2012_img_train.tar",
+    "train_index": "/tmp/laser-shared6144-h200-20261112/source/data/train-index.npz",
+    "training_archive_receipt": "/tmp/laser-matched680-vector6144-20261111/data/ILSVRC2012_img_train.tar.verified.json",
+    "val_archive": "/tmp/laser-matched680-vector6144-20261111/data/ILSVRC2012_img_val.tar",
+    "val_index": "/tmp/laser-shared6144-h200-20261112/source/data/val-index.npz",
+    "val_labels": "/tmp/laser-shared6144-h200-20261112/source/data/val-labels.npy",
+    "fid_reference": "/tmp/laser-shared6144-h200-20261112/source/data/real-feature-moments.npz",
+    "source_checkpoint": "/tmp/laser-matched680-vector6144-20261111/checkpoint/checkpoint.pt",
+    "source_checkpoint_sha256": "cdea5ae33dff9943653f0fa8919db277547e6a4be39588472f26c45f0ce80599",
+    "initial_codebook": "/tmp/laser-shared6144-h200-20261112/recovery/vector-codebook.pt",
+    "initial_codebook_sha256": "898588dd1ff41aaafe75fdabb4c590d84829108145338af100bae65993abb7aa",
+    "tokenizer_artifact": "helloimlixin-rutgers/laser/imnet-s1-laser-matched680-full-continue-best-4gpu-20261105-tokenizer:v62",
+    "source_bundle": "/tmp/laser-sixscale680-20261112/source.tar.gz",
+    "scales": [
+      2,
+      4,
+      6,
+      8,
+      12,
+      16
+    ],
+    "depths": [
+      4,
+      4,
+      2,
+      2,
+      1,
+      1
+    ],
+    "tokens_per_scale": [
+      16,
+      64,
+      72,
+      128,
+      144,
+      256
+    ],
+    "tokens_per_image": 680,
+    "spatial_positions": 520,
+    "vocabulary": 6144,
+    "vector_dim": 32,
+    "shared_across_scales": true,
+    "shared_across_depths": true,
+    "physical_tables": 1,
+    "seed": 0,
+    "world_size": 2,
+    "workers": 12,
+    "checkpoint_every": 1000,
+    "preview_every": 500,
+    "image_size": 256,
+    "augmentation": "Resize288 Lanczos; deterministic RandomCrop256 per epoch; no horizontal flip",
+    "precision": "bf16; FP32 quantization/losses; TF32 disabled",
+    "stage": "prior",
+    "output": "/tmp/laser-sixscale680-20261112/stage2",
+    "epochs": 200,
+    "lr": 0.0003,
+    "warmup_epochs": 4,
+    "prior_seed": 1001,
+    "microbatch": 192,
+    "accumulation": 2,
+    "global_batch": 768,
+    "compile": true,
+    "cnn_frozen": true,
+    "codebook_frozen": true,
+    "fresh_prior": true,
+    "num_classes": 1000,
+    "class_dropout": 0.1,
+    "objective": "hard integer cross entropy; equal weight per one of 680 emitted IDs; no label smoothing",
+    "fid_samples": 50000,
+    "generation_batch_size": 32,
+    "evaluation_seed": 26110601,
+    "generation_cfg": 1.5,
+    "generation_cfg6_every": 5,
+    "top_k": 900,
+    "top_p": 0.96,
+    "wandb": {
+      "id": "imnet-s2-sixscale680-shared6144-d442211-var-d16-20261112",
+      "name": "ImageNet | six scales | k442211 | shared6144 | 680 tokens | fresh VAR-d16 | 2H200"
+    }
+  },
+  "stage1_candidates": [
+    [
+      128,
+      1
+    ],
+    [
+      64,
+      2
+    ],
+    [
+      32,
+      4
+    ]
+  ],
+  "stage2_candidates": [
+    [
+      384,
+      1
+    ],
+    [
+      192,
+      2
+    ],
+    [
+      128,
+      3
+    ],
+    [
+      96,
+      4
+    ]
+  ],
+  "benchmark_steps": 6,
+  "handoff": "full validation 50k rFID <= 2.5; freeze approved codec; start fresh prior",
+  "baseline_checkpoint": "helloimlixin-rutgers/laser/imnet-s2-matched680-shared6144-var-d16-4h100-20261112-prior:v61",
+  "source_directory": "/tmp/laser-sixscale680-20261112/code"
+}

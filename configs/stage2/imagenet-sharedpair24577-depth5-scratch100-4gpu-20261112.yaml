@@ -1,0 +1,85 @@
+version: shared-physical-pair24577-depth5-v1
+run_id: imagenet-sharedpair24577-depth5-scratch100-4gpu-20261112
+name: ImageNet | shared pair24577 | depth5 320 tokens | fresh100 | 4 RTX6000
+seed: 261001
+epochs: 100
+lr_schedule_epochs: 100
+global_batch: 2048
+microbatch: 64
+backbone: upstream_rqtransformer
+decoder: native_joint_integer
+target_mode: joint_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 285eb81d8b1a0d0081b2c559411575a11b1cde3bb879e1811b7ce5541f06f971
+  vocab_size: 24577
+  atoms: 8192
+  depth: 5
+  tokens_per_image: 320
+  measured_rfid: 4.35616720773811
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  shared_codebook_across_depths: true
+  coefficient_values_shared: true
+  depth_multipliers: false
+  separate_coefficient_tokens: false
+targets:
+  policy: soft_stochastic
+  temperature:
+  - 0.05576885690782665
+  - 0.03092897907395005
+  - 0.06699217298822044
+  - 0.06723273733212828
+  - 0.06108487591289401
+  chunk_size: 512
+  stochastic_prefixes: true
+  encoding: native_greedy_shared_physical_pair_codes
+  calibration:
+    policy: Shared-book-specific original-RQ corruption matching
+    report: /workspace/Projects/laser/outputs/imagenet-sharedpair24577-depth5-scratch100-4gpu-20261112/calibration/report.json
+    calibration_images: 128
+    validation_images: 128
+    selection_uses_validation: false
+    physical_codewords_rescaled: false
+    matching: Normalized hard-error progress and sampled-to-hard final latent error
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature: 1.0
+  top_k: 2048
+  top_p: 0.95
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 64
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+initialization:
+  reference_vocab_size: 24577
+  paired_fresh_backbone: false
+  reset_stage2_seed_after_tokenizer: true
+  stage2_checkpoint_loaded: false
+execution:
+  training_autocast_dtype: bfloat16
+  fused_adamw: true
+training_rng:
+  policy: independent_rank_v1
+  base_seed: 261001
+preview:
+  every_updates: 500
+  first_update: 10
+  fixed_seed: 261001
+checkpoint:
+  every_updates: 500
+  at_first_update: true
+  preserve_best_fid: true
+lineage:
+  tokenizer_quality_report: /workspace/Projects/laser/outputs/imagenet-shared-pair24577-improve-20261112/full-rfid.json
+  tokenizer_artifact: helloimlixin-rutgers/laser/imagenet-shared-pair24577-improve-20261112-validated-tokenizers:v0
+  stage2_initialization: fresh random weights and optimizer
+  previous_buggy_prior_loaded: false
+logging:
+  wandb: true
+  create_workspace: false

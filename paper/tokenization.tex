@@ -1,80 +1,60 @@
-% Replacement fragment; requires amsmath, amssymb, booktabs, and natbib.
+% Methods fragment; requires amsmath, amssymb, and natbib.
 % Include with \input{tokenization.tex}.
 
-The autoencoder produces a structured but partly continuous latent representation: the support of $\boldsymbol{\gamma}_i$ is discrete, while its nonzero coefficients are real-valued. For a categorical autoregressive prior, we fit a finite vocabulary of vector contributions to the frozen encoder features. The Stage-1 dictionary, encoder, and decoder are kept fixed during this offline fit and throughout prior training.
-
 \paragraph{Sparse coefficient tokenization.}
-Let $\boldsymbol{z}_i\in\mathbb{R}^{C}$ denote the raw encoder feature at latent site $i$. At each residual depth $k\in\{1,\ldots,K\}$, the tokenizer has a separate lookup table
+Sparse representations combine discrete atom identities with real-valued coefficients. To model them with a categorical autoregressive prior, we construct a finite vocabulary in which each token identifies an atom and one of its admissible coefficient values. A latent feature is then represented by a short sequence of additive dictionary contributions.
+
+Let $D_{\mathrm{tok}}=[d_1,\ldots,d_M]\in\mathbb{R}^{C\times M}$ be a tokenization dictionary with unit-norm columns. For each atom $d_j$, we associate $L_j$ distinct, nonzero coefficient levels $\{a_{j,b}\}_{b=1}^{L_j}$, which may be signed. Assign each pair $(j,b)$ an integer index
 \begin{equation}
-    E_k=\{e_k(v)\in\mathbb{R}^{C}:v\in\mathcal{V}\},
-    \qquad \mathcal{V}=\{0,\ldots,T-1\}.
+    \iota(j,b)=1+\sum_{m<j}L_m+(b-1),
+    \qquad
+    \mathcal{V}=\left\{0,\ldots,\sum_{j=1}^{M}L_j\right\}.
+\end{equation}
+The token-to-vector mapping is
+\begin{equation}
+    e(0)=\boldsymbol{0},
+    \qquad
+    e\bigl(\iota(j,b)\bigr)=a_{j,b}d_j.
     \label{eq:token-contribution}
 \end{equation}
-Each integer selects one complete vector contribution, including its direction and magnitude. The vectors are optimized independently within each residual depth. Depth is implicit in the token position and determines which lookup table is used. Unless otherwise specified, our ImageNet configuration uses $C=256$, $K=4$, and
-\begin{equation}
-    |\mathcal{V}|=T=24{,}576.
-\end{equation}
-One entry in each table is fixed to zero, $e_k(0)=\boldsymbol{0}$, and is included in these $T$ choices. There are $KT$ stored vectors in total, giving 98,304 vectors in the default configuration and $T$ categorical choices at each token position. Each $256\times256$ image is represented by an $8\times8\times4$ array of 256 integers. No separate coefficient token is required.
+The vocabulary contains $1+\sum_j L_j$ entries, including a zero contribution, and is shared across all residual steps. Thus each integer has a fixed vector contribution throughout the sequence. Allowing $L_j$ to vary allocates coefficient resolution across atoms under a finite vocabulary budget.
 
-We fit the residual vector tables offline using encoder features from 50,000 class-balanced ImageNet training images (50 per class), with random crops and horizontal flips. Fitting alternates greedy residual assignments and regularized centroid updates. We vary the number of vectors per depth while keeping the encoder, decoder, residual depth, fitting data, initialization rule, and optimization budget fixed. Each configuration uses 24 fitting passes and a common vector gain of 1.025, established using 10,000 disjoint training images. All vector tables are frozen before prior training.
-
-For deterministic reconstruction, we use native greedy residual quantization. Starting from $\boldsymbol{r}_{i,0}=\boldsymbol{z}_i$, we compute
+We encode an encoder feature $\boldsymbol{z}_i\in\mathbb{R}^{C}$ by greedy residual assignment. Starting from $\boldsymbol{r}_{i,0}=\boldsymbol{z}_i$, we compute
 \begin{equation}
-    t_{i,k}=\underset{v\in\mathcal{V}}{\operatorname{arg\,min}}
-        \|\boldsymbol{r}_{i,k-1}-e_k(v)\|_2^2,
+    t_{i,k}
+    =\underset{v\in\mathcal{V}}{\operatorname{arg\,min}}
+      \left\|\boldsymbol{r}_{i,k-1}-e(v)\right\|_2^2,
     \qquad
-    \boldsymbol{r}_{i,k}=\boldsymbol{r}_{i,k-1}-e_k(t_{i,k}).
+    \boldsymbol{r}_{i,k}
+    =\boldsymbol{r}_{i,k-1}-e(t_{i,k}),
     \label{eq:token-assignment}
 \end{equation}
-The discrete latent feature passed to the frozen decoder is
+for $k=1,\ldots,K$. Each step jointly selects an atom and coefficient level to approximate the current residual. The sequence follows residual selection order, and repeated selections of an atom are permitted. The reconstructed latent feature is
 \begin{equation}
     \widetilde{\boldsymbol{z}}_i
-    =\sum_{k=1}^{K}e_k(t_{i,k}).
+    =\sum_{k=1}^{K}e(t_{i,k}).
     \label{eq:token-reconstruction}
 \end{equation}
-Encoding selects fixed vector contributions and transmits only integer IDs, with no per-image coefficient refitting or continuous side information. Reusing an integer at different depths is permitted; its decoded contribution is determined by the corresponding depth table.
+Once selected, a contribution remains fixed during subsequent steps. The zero token allows fewer than $K$ effective contributions, and decoding requires only fixed lookups and addition.
 
-\begin{table}[!hbtp]
-    \centering
-    \small
-    \begin{tabular}{lrr}
-        \toprule
-        Representation & $T$ & rFID $\downarrow$ \\
-        \midrule
-        Continuous sparse & --- & 4.213 \\
-        \midrule
-        Residual vectors & 4,096 & 5.526 \\
-        Residual vectors & 8,192 & 5.027 \\
-        Residual vectors & 16,384 & 4.709 \\
-        Residual vectors & 24,576 & 4.561 \\
-        Residual vectors & 32,768 & 4.513 \\
-        \bottomrule
-    \end{tabular}
-    \caption{Effect of residual vector vocabulary size on ImageNet reconstruction fidelity. The encoder and decoder are fixed across rows. Discrete configurations use $K=4$ contributions per site and 256 integer tokens per image. $T$ is the number of vectors per residual depth, including the zero contribution. The fitting data, initialization rule, 24-pass optimization budget, and vector gain are fixed across vocabulary sizes. rFID is measured on all 50,000 validation images using the original RQ-VAE Inception backend.}
-    \label{tab:tokenization-rfid}
-\end{table}
+This construction preserves an explicit sparse dictionary representation. Define the aggregated coefficient of atom $j$ by
+\begin{equation}
+    \widetilde{\gamma}_{i,j}
+    =\sum_{k=1}^{K}\sum_{b=1}^{L_j}
+      a_{j,b}\,
+      \mathbf{1}\!\left[t_{i,k}=\iota(j,b)\right].
+\end{equation}
+Then $\widetilde{\boldsymbol{z}}_i=D_{\mathrm{tok}}\widetilde{\boldsymbol{\gamma}}_i$ and $\|\widetilde{\boldsymbol{\gamma}}_i\|_0\leq K$. The discrete reconstructions therefore form a finite subset of the dictionary's union of subspaces. Coefficient resolution controls the available magnitudes along each atom, while residual depth controls the number of additive contributions and the token sequence length.
+
+The tokenization dictionary and coefficient levels are fitted to encoder features with the encoder and decoder fixed, and are subsequently frozen during prior training.
 
 \paragraph{Stochastic residual teacher.}
-For autoregressive prior training, we use the native RQ stochastic residual teacher~\citep{lee2022rqvae}. Starting from $\boldsymbol{r}^{\mathrm{tr}}_{i,0}=\boldsymbol{z}_i$, its distribution at depth $k$ is
+For autoregressive prior training, we use a stochastic residual teacher following RQ-Transformer~\citep{lee2022rqvae}, adapted to the shared atom--coefficient vocabulary. Starting from $\boldsymbol{r}^{\mathrm{tr}}_{i,0}=\boldsymbol{z}_i$, the conditional distribution at depth $k$ is
 \begin{equation}
-    q_{i,k}(v)
-    =
-    \frac{
-        \exp\!\left(-\|\boldsymbol{r}^{\mathrm{tr}}_{i,k-1}-e_k(v)\|_2^2/\tau\right)
-    }{
-        \sum_{u\in\mathcal{V}}
-        \exp\!\left(-\|\boldsymbol{r}^{\mathrm{tr}}_{i,k-1}-e_k(u)\|_2^2/\tau\right)
-    }.
+    q_{i,k}(v)=\frac{\exp\!\left(-\|\boldsymbol{r}^{\mathrm{tr}}_{i,k-1}-e(v)\|_2^2/\tau_k\right)}{\sum_{u\in\mathcal{V}}\exp\!\left(-\|\boldsymbol{r}^{\mathrm{tr}}_{i,k-1}-e(u)\|_2^2/\tau_k\right)},
+    \qquad \tau_k>0.
     \label{eq:token-soft-target}
 \end{equation}
-We sample $t^{\mathrm{tr}}_{i,k}\sim q_{i,k}$ and update $\boldsymbol{r}^{\mathrm{tr}}_{i,k}=\boldsymbol{r}^{\mathrm{tr}}_{i,k-1}-e_k(t^{\mathrm{tr}}_{i,k})$. The prior is trained by soft-target cross-entropy against these conditional distributions, using the sampled prefix tokens as context. The teacher softmax covers the full vocabulary. Its temperature controls target softness and is separate from the prior's generation sampling temperature.
+We sample $t^{\mathrm{tr}}_{i,k}\sim q_{i,k}$ and update $\boldsymbol{r}^{\mathrm{tr}}_{i,k}=\boldsymbol{r}^{\mathrm{tr}}_{i,k-1}-e(t^{\mathrm{tr}}_{i,k})$. Each subsequent teacher distribution is therefore conditioned on the sampled prefix. The prior is trained by soft-target cross-entropy over the full vocabulary, using the sampled tokens as causal context and the corresponding distributions $q_{i,k}$ as prediction targets. This exposes the prior to alternative discrete decompositions while assigning greater probability to contributions that better approximate the current residual.
 
-At generation time, the prior predicts vector IDs autoregressively, and the frozen decoder receives their sum in Eq.~\eqref{eq:token-reconstruction}. The Stage-1 dictionary, encoder, decoder, and fitted vector tables remain frozen throughout prior training.
-
-% Continuous reconstruction rFID: 4.213210725808494.
-% Stage-1 SHA256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
-% Native residual vector tokenizer: outputs/imagenet-rq24576-tokenizer-20261108/full-validation.json
-% Controlled vocabulary sweep: configs/research/imagenet-residual-vocabulary-sweep-20261110.yaml
-
-% Completed vocabulary sweep: outputs/imagenet-residual-vocabulary-sweep-20261110/results.json
-% Every discrete row uses 50,000 official validation images and frozen vector tables.
+At generation time, the prior predicts joint atom--coefficient IDs autoregressively, and the decoder receives their sum in Eq.~\eqref{eq:token-reconstruction}. The encoder, decoder, tokenization dictionary, and coefficient levels remain frozen throughout prior training.

@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - _self_
+stage: stage2
+backend: vector_var
+pipeline: runtime/matched680-shared6144-20261112/pipeline.py
+output_dir: outputs/imnet-s2-matched680-shared6144-var-d16-4h100-20261112
+source_stage1_run: imnet-s1-laser-matched680-full-continue-best-4gpu-20261105
+source_stage1_artifact: helloimlixin-rutgers/laser/imnet-s1-laser-matched680-full-continue-best-4gpu-20261105-tokenizer:v62
+source_stage1_sha256: cdea5ae33dff9943653f0fa8919db277547e6a4be39588472f26c45f0ce80599
+vocabulary: 6144
+tokens_per_image: 680
+world_size: 4
+global_batch: 768
+epochs: 200
+# One 6144 x 32 physical vector table shared across all scales and both depths.
+# CNN stays frozen; training-only catalog selection and full validation gate
+# the fresh prior. The previous prior is checkpointed before hardware transfer.

@@ -1,0 +1,153 @@
+version: shared49153-depth4-prior-depth-rms-v1
+run_id: imagenet-sharedpair49153-depthrms-d4-trial-20261114
+name: ImageNet | shared49k D4 | prior depth RMS | paired trial | 8H100
+seed: 261001
+epochs: 100
+lr_schedule_epochs: 100
+global_batch: 2048
+microbatch: 64
+backbone: upstream_rqtransformer
+decoder: native_joint_integer
+target_mode: joint_residual_codes
+tokenizer:
+  sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+  codebook_sha256: 6a09e5d1d477c10e1ab0a1368c6224a08995df7e36c5761ea7c4e68c2d9db7bf
+  vocab_size: 49153
+  atoms: 12288
+  depth: 4
+  tokens_per_image: 256
+  measured_rfid: 4.638430153193838
+  learned_compact_dictionary: true
+  encoder_decoder_frozen: true
+  shared_codebook_across_depths: true
+  coefficient_values_shared: true
+  depth_multipliers: false
+  separate_coefficient_tokens: false
+targets:
+  policy: soft_stochastic
+  temperature:
+  - 0.47007024818107257
+  - 0.43009770486436716
+  - 0.4544221217353809
+  - 0.5644673152607834
+  chunk_size: 256
+  stochastic_prefixes: true
+  encoding: native_greedy_shared_physical_pair_codes
+  calibration:
+    reference: rq24576
+    reference_temperature: 0.5
+    report: /workspace/Projects/laser/outputs/imagenet-sharedpair49153-depth4-scratch100-8h100-20261114/noise-calibration.json
+    metric: Expected squared-distance excess on sampled causal prefixes, normalized
+      by hard final latent error; one-to-one depth matching
+    images: 512
+    heldout_images: 512
+    one_to_one_depth_matching: true
+    max_heldout_relative_error: 0.016665641399000286
+    temperatures_only: true
+    physical_vectors_rescaled: false
+objective: native_soft_target_cross_entropy
+auxiliary_loss_terms: 0
+sampling:
+  temperature:
+  - 0.925
+  - 0.95
+  - 0.975
+  - 1.0
+  top_k:
+  - 2048
+  - 2560
+  - 4096
+  - 8192
+  top_p:
+  - 0.95
+  - 0.95
+  - 0.98
+  - 0.99
+  min_p:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+evaluation:
+  generated_images: 50000
+  real_images: 1281167
+  reference_split: train
+  every_epochs: 2
+  include_epoch_one: true
+  batch_size: 64
+  reference_sha256: 3f9c92d15755e76ec312964a819e3e19b9cf3aadc618a7ae99f5e8aa96501260
+sampler_tuning:
+  epochs:
+  - 10
+  - 30
+  - 50
+  - 70
+  - 90
+  - 100
+  images_per_policy: 5000
+  replicate_seed: true
+  require_fid_and_is_improvement: true
+  no_rejection: true
+  no_guidance: true
+  training_rng_preserved: true
+  confirmation_images: 50000
+initialization:
+  reference_vocab_size: 49153
+  paired_fresh_backbone: false
+  reset_stage2_seed_after_tokenizer: true
+  stage2_checkpoint_loaded: false
+execution:
+  training_autocast_dtype: bfloat16
+  fused_adamw: true
+logging:
+  wandb: true
+  create_workspace: false
+training_rng:
+  policy: independent_rank_v1
+  base_seed: 261001
+preview:
+  every_updates: 500
+  first_update: 10
+  fixed_seed: 261001
+checkpoint:
+  every_updates: 500
+  at_first_update: true
+  preserve_best_fid: true
+lineage:
+  stage2_initialization: fresh random weights and empty optimizer
+  cancelled_depth5_weights_loaded: false
+  codebook_fitting_split: train
+  dictionary_selection_split: held-out training
+  noise_reference_run: imagenet-rq24576-native-scratch100-8h100-20261108
+  frozen_encoder_decoder_source: original LASER rFID4.21
+  cancelled_30721_weights_loaded: false
+  larger_dictionary_selected_on_heldout_train: true
+  paired_baseline_run: imagenet-sharedpair49153-depth4-scratch100-8h100-20261114
+  stage2_checkpoint_loaded: false
+  only_trial_change: fixed per-depth RMS equalization of prior input features
+prior_feature_normalization:
+  method: per_depth_prior_feature_rms_equalization
+  training_images: 512
+  seeds:
+  - 26111488000
+  - 26111488001
+  - 26111488002
+  - 26111488003
+  source_codebook_sha256: 6a09e5d1d477c10e1ab0a1368c6224a08995df7e36c5761ea7c4e68c2d9db7bf
+  source_feature_rms_by_depth:
+  - 7.035416587151446
+  - 4.184874153234357
+  - 2.7367432496896007
+  - 1.9722962982301295
+  common_rms: 4.426905649997201
+  multipliers:
+  - 0.6292314883075887
+  - 1.0578348327573446
+  - 1.6175816458117862
+  - 2.2445439125803524
+  preserves_mean_squared_feature_norm: true
+  physical_quantizer_unchanged: true
+  decoder_unchanged: true
+  training_targets_unchanged: true
+  rfid50k: 4.638430153193838
+  fit_split: training only, no validation images
