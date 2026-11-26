@@ -175,3 +175,76 @@ class AnchoredResidualVectorQuantizer(ResidualVectorQuantizer):
                 codes.append(torch.stack(new_ids,-1));residuals.append(torch.stack(teacher_r,-2))
                 accumulated=accumulated+self.contribution(total,scale)
             return dict(codes=torch.cat(codes,1),inputs=torch.cat(inputs,1),latent=accumulated,residuals=torch.cat(residuals,1))
+
+
+class SharedResidualVectorQuantizer(ResidualVectorQuantizer):
+    """One physical vector table, identical at every scale and sparse depth."""
+    def __init__(self, geometry, vectors, temperature=.5, chunk_size=8192):
+        nn.Module.__init__(self)
+        vectors = torch.as_tensor(vectors).detach().float().clone()
+        if (vectors.ndim != 2 or vectors.shape[1] != geometry.Cvae or
+                len(vectors) < 2 or not torch.isfinite(vectors).all() or
+                (vectors[0] != 0).any()):
+            raise ValueError('Expected one finite [vocabulary, channels] table with zero ID 0')
+        self.source = geometry.requires_grad_(False).eval()
+        self.Cvae, self.sparsity = geometry.Cvae, geometry.sparsity
+        self.v_patch_nums = tuple(geometry.v_patch_nums)
+        self.vocab_size, self.temperature, self.chunk_size = len(vectors), temperature, chunk_size
+        self.register_buffer('vectors', vectors)
+
+    def embed(self, ids, scale, depth):
+        return F.embedding(ids, self.vectors)
+
+    def distances(self, residual, scale, depth):
+        return torch.addmm(residual.square().sum(-1, keepdim=True) + self.vectors.square().sum(-1),
+                           residual, self.vectors.T, alpha=-2.)
+
+    def from_codes(self, codes):
+        with torch.autocast(device_type=codes.device.type, enabled=False):
+            return super().from_codes(codes)
+
+
+class SharedAnchoredResidualVectorQuantizer(SharedResidualVectorQuantizer):
+    """Re-encode source contributions using a strictly shared complete-vector book.
+
+    The source supplies encoder targets only. Every emitted ID is decoded by the
+    same global vector table, without scale/depth gains or an auxiliary channel.
+    """
+    def __init__(self, anchor_quantizer, vectors, **kwargs):
+        super().__init__(anchor_quantizer.source, vectors, **kwargs)
+        self._anchor = (anchor_quantizer.requires_grad_(False).eval(),)
+
+    @torch.no_grad()
+    def decompose(self, latent, stochastic=False):
+        with torch.autocast(device_type=latent.device.type, enabled=False):
+            z = latent.float()
+            anchor = self._anchor[0]
+            accumulated = torch.zeros_like(z)
+            codes, inputs, residuals = [], [], []
+            for scale, pn in enumerate(self.v_patch_nums):
+                if scale:
+                    inputs.append(self.next_input(accumulated, scale))
+                signal = F.interpolate(z-accumulated, (pn,pn), mode='area').flatten(2).transpose(1,2).contiguous()
+                old_ids, _ = anchor.quantize_scale(signal, scale, chunk_size=2048)
+                desired = anchor.embed_joint(old_ids, scale)
+                total, correction = torch.zeros_like(signal), torch.zeros_like(signal)
+                selected, centers = [], []
+                for depth in range(self.sparsity):
+                    center = desired[...,depth,:] + correction
+                    centers.append(center)
+                    pieces = []
+                    for part in center.reshape(-1,self.Cvae).split(self.chunk_size):
+                        distance = self.distances(part, scale, depth)
+                        chosen = (torch.multinomial((-distance/self.temperature).softmax(-1),1).squeeze(-1)
+                                  if stochastic else distance.argmin(-1))
+                        pieces.append(chosen)
+                    chosen = torch.cat(pieces).reshape(len(z),pn*pn)
+                    value = self.embed(chosen,scale,depth)
+                    selected.append(chosen)
+                    total.add_(value)
+                    correction = center-value
+                codes.append(torch.stack(selected,-1))
+                residuals.append(torch.stack(centers,-2))
+                accumulated = accumulated+self.contribution(total,scale)
+            return dict(codes=torch.cat(codes,1),inputs=torch.cat(inputs,1),latent=accumulated,
+                        residuals=torch.cat(residuals,1))

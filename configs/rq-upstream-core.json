@@ -2,7 +2,7 @@
   "upstream_commit": "341395e562ac347f5eb62db9f5f08b9f2cc42a60",
   "compatibility_patch": "Python 3.12 dataclass default_factory",
   "core_files": {
-    "rqvae/models/rqtransformer/transformers.py": "e2e5c7e36dd97cfa02d42aabbc5699baed9953b9afdbc221ddda65b10719698e",
+    "rqvae/models/rqtransformer/transformers.py": "4928b78eb6a0ca60fcfe5e6aaaeadd5160c794205ba99e4619a67d28de2036e3",
     "rqvae/models/rqtransformer/attentions.py": "cfcb3bb5e005cfc6e9a1641fe87e2c18db7afc8ae775b6711f64e5de3761561b",
     "rqvae/models/rqtransformer/primitives.py": "7df3e7a69e73593893daf4f9e1a5e8198e8400ffc4b8263d8b66559e5bca660c",
     "rqvae/models/rqtransformer/configs.py": "b86750e1a4f1a5712199345ca9158843a276ecee257ff6565f452ce9d2f15cf2",

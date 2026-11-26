@@ -142,6 +142,76 @@ class JointAtomCoefficientRQ(nn.Module):
                 codes.reshape(*x.shape[:-1], self.depth))
 
 
+class SharedAtomCoefficientRQ(JointAtomCoefficientRQ):
+    """One physical pair table, with no depth-specific copies or multipliers.
+
+    The depth-expanded properties keep the existing RQ interface. Only the
+    one-dimensional tables are persisted, so a checkpoint cannot untie them.
+    """
+
+    def __init__(self, dictionary, atom_ids, coefficients, depth, zero_code_id=0):
+        if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
+            raise ValueError('Shared codebook requires a positive integer depth')
+        atoms = torch.as_tensor(atom_ids)
+        values = torch.as_tensor(coefficients)
+        if atoms.ndim == 1 and values.ndim == 1:
+            atoms, values = atoms.expand(depth, -1), values.expand(depth, -1)
+        if atoms.ndim != 2 or values.shape != atoms.shape or atoms.shape[0] != depth:
+            raise ValueError('Expected one shared pair table or equal [D,V] tables')
+        if not (torch.equal(atoms, atoms[:1].expand_as(atoms)) and
+                torch.equal(values, values[:1].expand_as(values))):
+            raise ValueError('Shared IDs must identify the same physical pair at every depth')
+        # Reuse all physical-codebook validation, without keeping its D copies.
+        validated = JointAtomCoefficientRQ(dictionary, atoms[:1], values[:1], zero_code_id)
+        pairs = torch.stack((validated.atom_ids[0].double(), validated.coefficients[0].double()), -1)
+        if len(torch.unique(pairs, dim=0)) != validated.vocab_size:
+            raise ValueError('Every shared ID must identify a distinct atom/coefficient pair')
+        nn.Module.__init__(self)
+        self.depth, self.vocab_size = depth, validated.vocab_size
+        self.zero_code_id = zero_code_id
+        self.encoding_beam_width = 1
+        self.training_target_mode = 'stochastic_soft'
+        self.shared_codebook = True
+        self.register_buffer('dictionary', validated.dictionary)
+        self.register_buffer('norms', validated.norms)
+        self.register_buffer('shared_atom_ids', validated.atom_ids[0].clone())
+        self.register_buffer('shared_coefficients', validated.coefficients[0].clone())
+
+    @property
+    def atom_ids(self):
+        return self.shared_atom_ids.expand(self.depth, -1)
+
+    @property
+    def coefficients(self):
+        return self.shared_coefficients.expand(self.depth, -1)
+
+    def pairs_from_ids(self, codes):
+        if codes.dtype != torch.long or (codes < 0).any() or (codes >= self.vocab_size).any():
+            raise ValueError('Expected int64 IDs inside the shared pair vocabulary')
+        return self.shared_atom_ids[codes], self.shared_coefficients[codes]
+
+    def ids_from_pairs(self, atoms, coefficients):
+        """Look up exact physical float32 pairs; unknown pairs are errors."""
+        if (atoms.dtype != torch.long or atoms.shape != coefficients.shape or
+                not coefficients.is_floating_point() or not torch.isfinite(coefficients).all() or
+                (atoms < 0).any() or (atoms >= self.dictionary.shape[1]).any()):
+            raise ValueError('Expected equal-shaped valid atom IDs and physical coefficients')
+        if atoms.device != self.dictionary.device or coefficients.device != atoms.device:
+            raise ValueError('Pairs and shared codebook must be on the same device')
+
+        def keys(a, c):
+            c = c.float().contiguous()
+            c = torch.where(c == 0, 0., c)  # Canonicalize signed zero.
+            return (a << 32) | (c.view(torch.int32).long() & 0xffffffff)
+
+        table, order = keys(self.shared_atom_ids, self.shared_coefficients).sort()
+        query = keys(atoms, coefficients)
+        positions = torch.searchsorted(table, query).clamp(max=self.vocab_size - 1)
+        if not torch.equal(table[positions], query):
+            raise ValueError('Pair is absent from the finite shared vocabulary; quantize it first')
+        return order[positions]
+
+
 class FrozenJointLaserTokenizer(nn.Module):
     def __init__(self, checkpoint, codebook):
         super().__init__()
@@ -172,11 +242,21 @@ class FrozenJointLaserTokenizer(nn.Module):
             spec = dict(spec, vectors=torch.stack(tables))
         if not vector_book and spec['kind'] != 'laser_joint_atom_coefficient_rq':
             raise ValueError('Expected a finite joint LASER codebook')
-        depth = spec['vectors'].shape[0] if vector_book else spec['atom_ids'].shape[0]
+        shared_pairs = not vector_book and spec.get('shared_codebook_across_depths', False)
+        if not vector_book and spec.get('format_version') == 4:
+            depth = spec.get('depth')
+            if (shared_pairs is not True or spec['atom_ids'].ndim != 1 or
+                    spec['coefficients'].shape != spec['atom_ids'].shape or
+                    not isinstance(depth, int) or isinstance(depth, bool) or depth < 1 or
+                    spec.get('vocabulary') != len(spec['atom_ids']) or
+                    spec.get('unique_physical_banks') != 1):
+                raise ValueError('Version4 requires one canonical shared pair table and a valid depth')
+        depth = (int(spec['depth']) if shared_pairs and spec['atom_ids'].ndim == 1 else
+                 spec['vectors'].shape[0] if vector_book else spec['atom_ids'].shape[0])
         learned = spec.get('learned_compact_dictionary', False)
         source_atoms = None if vector_book else spec['dictionary'].shape[1]
         if learned or vector_book:
-            if (spec.get('format_version') not in ((1,) if vector_book else (2, 3)) or
+            if (spec.get('format_version') not in ((1,) if vector_book else (2, 3, 4)) or
                     spec.get('encoder_decoder_frozen') is not True):
                 raise ValueError('Learned joint codebooks require a versioned frozen-CNN schema')
             with Path(checkpoint).open('rb') as handle:
@@ -203,6 +283,11 @@ class FrozenJointLaserTokenizer(nn.Module):
         elif vector_book:
             from src.models.joint_rate_distortion import JointVectorBook
             self.quantizer = JointVectorBook(spec['vectors'])
+        elif shared_pairs and spec.get('format_version') == 4:
+            if spec.get('encoding_beam_width', 1) != 1:
+                raise ValueError('Shared pair tokenizer requires greedy residual encoding')
+            self.quantizer = SharedAtomCoefficientRQ(spec['dictionary'], spec['atom_ids'],
+                spec['coefficients'], depth, zero_code_id=spec.get('zero_code_id', 0))
         else:
             self.quantizer = JointAtomCoefficientRQ(spec['dictionary'], spec['atom_ids'], spec['coefficients'],
                 zero_code_id=spec.get('zero_code_id', 0),

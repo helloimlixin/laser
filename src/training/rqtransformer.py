@@ -70,7 +70,7 @@ from src.shared_physical_coefficients import (
     guard_shared_physical_checkpoint,
     require_shared_physical_cache,
 )
-from layout_migration import validate_resume_layout, restore_resized_rng
+from runtime.layout_migration import restore_resized_rng, validate_resume_layout
 
 
 FACE_DATASETS = frozenset({"celebahq", "ffhq"})

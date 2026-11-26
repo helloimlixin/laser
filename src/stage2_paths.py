@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import glob
+import stat
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 
-def _sorted_existing(paths: Iterable[Path]) -> list[Path]:
-    existing = [path for path in paths if path.exists() and path.is_file()]
-    return sorted(existing, key=lambda path: (path.stat().st_mtime, str(path)), reverse=True)
+def _latest_existing_file(paths: Iterable[Path]) -> Path | None:
+    latest: Path | None = None
+    latest_key: tuple[float, str] | None = None
+    for path in paths:
+        try:
+            info = path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        key = (info.st_mtime, str(path))
+        if latest_key is None or key > latest_key:
+            latest, latest_key = path, key
+    return latest
 
 
-def latest_matching_file(patterns: Iterable[str | Path]) -> Optional[Path]:
+def latest_matching_file(patterns: Iterable[str | Path]) -> Path | None:
     candidates: list[Path] = []
     for pattern in patterns:
         pattern = str(pattern)
@@ -20,15 +32,14 @@ def latest_matching_file(patterns: Iterable[str | Path]) -> Optional[Path]:
             candidates.extend(Path(path) for path in glob.glob(pattern))
         else:
             candidates.append(Path(pattern))
-    existing = _sorted_existing(path.resolve() for path in candidates)
-    return existing[0] if existing else None
+    return _latest_existing_file(path.resolve() for path in candidates)
 
 
 def infer_latest_stage1_checkpoint(
     *,
     output_root: str | Path = "outputs",
     model_type: str = "laser",
-) -> Optional[Path]:
+) -> Path | None:
     root = Path(output_root).expanduser().resolve()
     return latest_matching_file(
         [
@@ -41,7 +52,7 @@ def infer_latest_stage1_checkpoint(
 def infer_latest_stage2_checkpoint(
     *,
     ar_output_dir: str | Path = "outputs/ar",
-) -> Optional[Path]:
+) -> Path | None:
     root = Path(ar_output_dir).expanduser().resolve()
     return latest_matching_file(
         [
@@ -106,9 +117,9 @@ def default_token_cache_path(
 def infer_latest_token_cache(
     *,
     ar_output_dir: str | Path = "outputs/ar",
-    dataset: Optional[str] = None,
-    split: Optional[str] = None,
-) -> Optional[Path]:
+    dataset: str | None = None,
+    split: str | None = None,
+) -> Path | None:
     root = token_cache_dir(ar_output_dir)
     filters = []
     if dataset:
@@ -121,5 +132,4 @@ def infer_latest_token_cache(
         stem = path.stem.lower()
         if all(token in stem for token in filters):
             matches.append(path.resolve())
-    existing = _sorted_existing(matches)
-    return existing[0] if existing else None
+    return _latest_existing_file(matches)

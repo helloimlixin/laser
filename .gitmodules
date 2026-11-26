@@ -1,0 +1,3 @@
+[submodule "third_party/rq-vae-transformer"]
+	path = third_party/rq-vae-transformer
+	url = https://github.com/helloimlixin/rq-vae-transformer.git

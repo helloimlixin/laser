@@ -5,6 +5,25 @@ import torch.distributed as dist
 from src.training.laser_compact_joint_vocabulary import reconstruct_fixed_codes
 
 
+def pack_shared_codebook(dictionary, atom_ids, coefficients, depth, **metadata):
+    """Persist one global integer-to-pair mapping, independent of depth."""
+    from src.models.laser_joint_tokenizer import SharedAtomCoefficientRQ
+    q = SharedAtomCoefficientRQ(dictionary, atom_ids, coefficients, depth)
+    return dict(metadata, kind='laser_joint_atom_coefficient_rq', format_version=4,
+        dictionary=q.dictionary.cpu(), atom_ids=q.shared_atom_ids.cpu(),
+        coefficients=q.shared_coefficients.cpu(), depth=depth,
+        vocabulary=q.vocab_size, zero_code_id=0,
+        shared_codebook_across_depths=True, shared_coefficient_values=True,
+        separate_coefficient_tokens=False, unique_physical_banks=1)
+
+
+def _copy_coefficients(quantizer, shared):
+    if hasattr(quantizer, 'shared_coefficients'):
+        quantizer.shared_coefficients.copy_(shared)
+    else:
+        quantizer.coefficients.copy_(shared.expand_as(quantizer.coefficients))
+
+
 def assert_shared_codewords(quantizer):
     if not (torch.equal(quantizer.atom_ids, quantizer.atom_ids[:1].expand_as(quantizer.atom_ids))
             and torch.equal(quantizer.coefficients, quantizer.coefficients[:1].expand_as(quantizer.coefficients))):
@@ -60,7 +79,7 @@ def refit_shared_book(quantizer, signals, codes, *, ridge_fraction=.01, prior_we
     quantizer.dictionary.copy_(updated / norm)
     shared = quantizer.coefficients[0].clone()
     shared[1:].mul_(norm[quantizer.atom_ids[0, 1:]])
-    quantizer.coefficients.copy_(shared.expand_as(quantizer.coefficients))
+    _copy_coefficients(quantizer, shared)
     quantizer.norms.copy_(quantizer.dictionary.square().sum(0))
     del gram, rhs, updated
     error = x - reconstruct_fixed_codes(quantizer, codes)
@@ -89,7 +108,7 @@ def refit_shared_book(quantizer, signals, codes, *, ridge_fraction=.01, prior_we
     dot = _sum(torch.stack([(error.double() * change).sum(), change.double().square().sum()]))
     step = float((dot[0] / dot[1].clamp_min(1.e-30)).clamp(0, 1))
     shared.add_(direction, alpha=step)
-    quantizer.coefficients.copy_(shared.expand_as(quantizer.coefficients))
+    _copy_coefficients(quantizer, shared)
     after = mse(x - reconstruct_fixed_codes(quantizer, codes))
     assert after_dictionary <= before + 2.e-6 * max(1., before)
     assert after <= after_dictionary + 2.e-6 * max(1., after_dictionary)

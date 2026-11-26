@@ -7,8 +7,11 @@ then a transformer over its atom/coefficient tokens (stage 2).
 ## Install
 
 Use Python 3.10+ and a PyTorch installation compatible with your GPU.
+From a Git checkout, initialize the pinned RQ-VAE dependency before running the
+upstream RQ recipes or their tests.
 
 ```bash
+git submodule update --init third_party/rq-vae-transformer
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -16,6 +19,9 @@ pip install -r requirements.txt
 
 Training logs to W&B. Run `wandb login`, or set `WANDB_MODE=offline` for local logs
 (`WANDB_MODE=disabled` disables W&B). Dataset downloads are separate from training.
+
+For a CPU smoke test or a step-through with Python's debugger, see the
+[manual debugging guide](docs/manual-debugging.md).
 
 ## Dataset paths
 
@@ -208,6 +214,7 @@ to coefficient-bin cross entropy.
 ## Tests
 
 ```bash
+python -m pip install pytest
 pytest -q tests/test_training_recipes.py tests/test_lsun_lmdb.py
 pytest -q
 ```

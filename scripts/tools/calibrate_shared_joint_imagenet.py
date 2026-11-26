@@ -27,6 +27,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cc3m-config', type=Path,
         help='Calibrate CC3M training crops and update this CC3M recipe')
+    parser.add_argument('--extra-excluded-indices', type=Path, action='append', default=[],
+        help='Additional NumPy image-ID arrays excluded from calibration and its holdout')
     args = parser.parse_args()
     base, out = args.base.resolve(), args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -103,6 +105,8 @@ def main():
         data = json.loads(path.read_text())
         for key in keys:
             excluded.update(data[key])
+    for path in args.extra_excluded_indices:
+        excluded.update(int(i) for i in np.load(path).reshape(-1))
     if cc3m:
         from src.data.cc3m_joint import CC3MJointDataset, epoch_order
         assert (base/'initial-shards-ready.json').is_file()

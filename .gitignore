@@ -175,17 +175,21 @@ cython_debug/
 # misc
 .idea/
 
-# .gitignore
+# Local experiment output and W&B logs
 outputs/
-wandb/
-__pycache__/
-*.pyc
-.env
-.venv/
+/wandb/
+lightning_logs/
 .venv-var-eval/
+
+# Machine-local run state and staged ImageNet inputs
+/.runtime/
+/runtime/active-training.json*
+/runtime/active-evaluation*.json*
+/runtime/*/data/ILSVRC2012_img_train.tar
+/runtime/*/data/train-index.npz
+
 # Pinned external VAR source; installation command is in docs/imagenet-laser-var.md.
 third_party/FoundationVision_VAR/
-lightning_logs/
 
 # Project-specific ignores
 tests/artifacts/

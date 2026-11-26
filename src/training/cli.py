@@ -13,6 +13,22 @@ from omegaconf import DictConfig, OmegaConf
 from src.training.paths import CONFIG_DIR
 
 
+BACKEND_STAGES = {
+    "lightning": {"stage1", "stage2"},
+    "rqtransformer": {"stage2"},
+    "var_laser": {"stage1", "stage2"},
+    "compact_rq": {"stage2"},
+    "church_finetune": {"stage1"},
+    "cc3m_text": {"stage2"},
+    "cc3m_joint": {"stage2"},
+    "dc_transformer": {"stage2"},
+    "rqvae_stage1": {"stage1"},
+    "continuous_compound": {"stage2"},
+    "compound128": {"stage2"},
+    "vector_var": {"stage2"},
+}
+
+
 def load_config(path: str | Path, overrides: list[str] | None = None) -> DictConfig:
     """Compose a recipe and apply CLI overrides last; reject unknown config keys."""
     path = Path(path).expanduser().resolve()
@@ -22,23 +38,22 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> DictCon
     config_name = path.relative_to(config_dir).with_suffix("").as_posix()
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.2"):
         cfg = compose(config_name=config_name, overrides=overrides or [])
-    if cfg.get("stage") not in {"stage1", "stage2"}:
+    stage = cfg.get("stage")
+    backend = cfg.get("backend", "lightning")
+    if stage not in BACKEND_STAGES["lightning"]:
         raise ValueError("Config stage must be stage1 or stage2.")
-    if cfg.get("backend", "lightning") not in {"lightning", "rqtransformer", "var_laser", "compact_rq", "church_finetune", "cc3m_text", "cc3m_joint", "dc_transformer", "rqvae_stage1", "continuous_compound", "compound128", "vector_var"}:
-        raise ValueError("Unknown training backend.")
-    if cfg.get("backend") in {"rqtransformer", "compact_rq", "cc3m_text", "cc3m_joint", "dc_transformer", "continuous_compound", "compound128", "vector_var"} and cfg.stage != "stage2":
-        raise ValueError(f"The {cfg.backend} backend requires stage2.")
-    if cfg.get("backend") == "church_finetune" and cfg.stage != "stage1":
-        raise ValueError("The church_finetune backend requires stage1.")
-    if cfg.get("backend") == "rqvae_stage1" and cfg.stage != "stage1":
-        raise ValueError("The rqvae_stage1 backend requires stage1.")
+    if backend not in BACKEND_STAGES:
+        raise ValueError(f"Unknown training backend: {backend!r}.")
+    if stage not in BACKEND_STAGES[backend]:
+        supported_stages = ", ".join(sorted(BACKEND_STAGES[backend]))
+        raise ValueError(f"The {backend} backend requires {supported_stages}.")
     return cfg
 
 
 def run(cfg: DictConfig) -> None:
     """Import only the requested stage, after configuration has been validated."""
     backend = cfg.get("backend", "lightning")
-    module = backend if backend in {"rqtransformer", "var_laser", "compact_rq", "church_finetune", "cc3m_text", "cc3m_joint", "dc_transformer", "rqvae_stage1", "continuous_compound", "compound128", "vector_var"} else cfg.stage
+    module = cfg.stage if backend == "lightning" else backend
     import_module(f"src.training.{module}").run(cfg)
 
 

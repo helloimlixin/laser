@@ -1,0 +1,17 @@
+vocabulary: 24577  # 24576 nonzero physical pairs plus one zero word; +20% over 20481.
+depth: 4
+seed: 261112
+fitting_images: 8192
+heldout_training_images: 1024
+fitting_passes: 12
+coefficient_candidates: [2, 4, 6, 8]
+encoder_batch_size: 8
+chunk_size: 512
+workers: 16
+cpu_threads: 4
+device: cuda:0
+checkpoint: outputs/imagenet-laser-rq-minimal-rfid421-scratch20-20261014/reproducibility/stage1-model.pt
+stage1_checkpoint_sha256: dd28db9306d526bdc9fbf8016403e106c4f317fd8f5c04792f0953e53310fdab
+source_codebook: outputs/imagenet-laser-sharedjoint20k-depth4-codebook-20261022/joint20k-depth4-codebook.pt
+data_directory: runtime/imagenet-shared-pair24577-20261112/data
+output_directory: outputs/imagenet-shared-pair24577-20261112

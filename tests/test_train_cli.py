@@ -162,7 +162,7 @@ def _assert_imagenet_pipeline_uses_rqvae_style_backbone(config_name, *, sparsity
     stage1_cmd = command_by_label["stage 1"]
     stage1_adv_cmd = command_by_label["stage 1 adversarial"]
 
-    assert _override_value(stage1_cmd, "model.backbone") == "ddpm"
+    assert _override_value(stage1_cmd, "model.backbone") == "rqvae"
     assert _override_value(stage1_cmd, "model.num_downsamples") == "5"
     assert _override_value(stage1_cmd, "model.channel_multipliers") == "[1,1,2,2,4,4]"
     assert _override_value(stage1_cmd, "model.backbone_latent_channels") == "256"

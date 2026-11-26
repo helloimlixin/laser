@@ -5,6 +5,7 @@ rich>=10.2.2
 hydra-core
 huggingface_hub
 wandb
+wandb-workspaces
 omegaconf
 tqdm
 torchmetrics
